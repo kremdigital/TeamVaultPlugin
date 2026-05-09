@@ -72,14 +72,25 @@ export class ApiError extends Error {
 export type RequestFn = (params: RequestUrlParam) => Promise<RequestUrlResponse>;
 
 const defaultRequest: RequestFn = async (params) => {
-  // Lazy import — `obsidian` ships only TypeScript types (no runtime),
-  // so a top-level `import { requestUrl } from 'obsidian'` would crash
-  // when this module is loaded outside Obsidian (Jest tests, CLI
-  // emulator). Node-side callers always supply their own `RequestFn`,
-  // so this branch never runs there.
-  const { requestUrl } = await import('obsidian');
-  const res = await requestUrl({ ...params, throw: false });
-  return res as unknown as RequestUrlResponse;
+  // We can't use static `import` here — `obsidian` ships only types, so
+  // the import would crash when this module is loaded outside Obsidian
+  // (Jest, CLI emulator). And we can't use `await import('obsidian')`
+  // either: esbuild leaves it as a runtime dynamic import in the bundle,
+  // and Electron's renderer doesn't support bare-specifier dynamic
+  // imports — they reject with a generic network-style error.
+  //
+  // The fix: synchronous `globalThis.require('obsidian')`. Electron's
+  // CommonJS resolver handles bare specifiers natively, esbuild leaves
+  // dynamic property access alone, and CLI / Jest never enter this path
+  // (they always supply a custom `RequestFn`).
+  const req = (globalThis as unknown as { require?: (id: string) => unknown }).require;
+  if (!req) {
+    throw new Error('default request: globalThis.require unavailable (not running in Obsidian?)');
+  }
+  const obsidian = req('obsidian') as {
+    requestUrl: (p: RequestUrlParam & { throw: false }) => Promise<RequestUrlResponse>;
+  };
+  return obsidian.requestUrl({ ...params, throw: false });
 };
 
 export class ApiClient {
