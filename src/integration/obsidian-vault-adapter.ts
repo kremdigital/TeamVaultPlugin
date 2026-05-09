@@ -63,6 +63,16 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     const dir = vaultPath.slice(0, idx);
     await ensureDir(this.vault, dir);
   }
+
+  async list(folderPath: string): Promise<string[]> {
+    // `vault.getFiles()` returns every TFile in the vault as vault-relative
+    // paths. Folders are filtered out by virtue of the type. We then narrow
+    // down to the binding's `localFolder` — `'/'` means the whole vault.
+    const norm = folderPath.replace(/^\/+/, '').replace(/\/+$/, '');
+    const all = this.vault.getFiles().map((f) => f.path);
+    if (norm === '') return all;
+    return all.filter((p) => p === norm || p.startsWith(`${norm}/`));
+  }
 }
 
 /** Recursively create every missing segment of a vault-relative folder. */

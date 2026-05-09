@@ -59,6 +59,12 @@ class MemoryVault implements VaultAdapter {
   async ensureParentFolder(): Promise<void> {
     /* no-op for the in-memory adapter */
   }
+  async list(folderPath: string): Promise<string[]> {
+    const norm = folderPath.replace(/^\/+/, '').replace(/\/+$/, '');
+    const paths = [...this.files.keys()];
+    if (norm === '') return paths;
+    return paths.filter((p) => p === norm || p.startsWith(`${norm}/`));
+  }
 
   private expect(path: string): ArrayBuffer {
     const buf = this.files.get(path);
@@ -433,10 +439,12 @@ describe('SyncEngine — server → local', () => {
 describe('SyncEngine — vector clock persistence', () => {
   it('bumps the local clock and writes it through the operation log', async () => {
     const h = buildHarness();
-    h.vault.files.set('a.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
+    // Place the file AFTER start so the initial-push pass doesn't find it
+    // and the only CREATE that bumps the clock is the watcher event below.
+    h.vault.files.set('a.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
 
     const promise = h.engine.handleVaultEvent({
       type: 'create',

@@ -34,4 +34,16 @@ export interface VaultAdapter {
 
   /** Make sure every parent folder of `vaultPath` exists. */
   ensureParentFolder(vaultPath: string): Promise<void>;
+
+  /**
+   * List vault-relative paths of every file recursively inside
+   * `folderPath` (or every file in the vault when `folderPath === '/'`).
+   * Folders are excluded; only file paths are returned. The order is
+   * unspecified.
+   *
+   * Used by the engine's initial-push pass — after `project:join` the
+   * engine scans every local file and uploads anything the server
+   * doesn't know about yet.
+   */
+  list(folderPath: string): Promise<string[]>;
 }

@@ -264,12 +264,38 @@ export class SyncEngine {
       this.persistVectorClock();
       this.setStatus('connected');
 
+      // Initial-push pass: walk the binding's local folder and upload any
+      // file the server doesn't know about yet. Without this the very
+      // first bind would only sync content created *after* the bind —
+      // pre-existing files would stay invisible to the engine because
+      // no watcher event ever fires for them.
+      void this.initialPush();
+
       // Drain offline pending operations in the background — each op is
       // ack-bound, and we don't want the connected status to depend on
       // every queued upload finishing first.
       void this.flushPendingOperations();
     } catch (err) {
       this.setStatus('error', err instanceof Error ? err.message : 'sync_failed');
+    }
+  }
+
+  /**
+   * Walk the binding's local folder, upload anything not in the server's
+   * file index. Idempotent — files already mirrored on the server are
+   * skipped via the `fileIndex` lookup. Errors per-file are swallowed so
+   * one bad file doesn't block the rest.
+   */
+  private async initialPush(): Promise<void> {
+    const paths = await this.vault.list(this.binding.localFolder);
+    for (const path of paths) {
+      if (this.fileIndex.byPath.has(path)) continue;
+      try {
+        await this.handleLocalCreate(path);
+      } catch {
+        // Per-file failures are swallowed — the watcher / next reconnect
+        // will surface them again.
+      }
     }
   }
 

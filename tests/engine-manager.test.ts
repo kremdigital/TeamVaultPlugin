@@ -58,6 +58,7 @@ const memVault: VaultAdapter = {
   delete: async () => undefined,
   rename: async () => undefined,
   ensureParentFolder: async () => undefined,
+  list: async () => [],
 };
 
 function makeDeps(servers: ServerConfig[], bindings: VaultBinding[]): EngineManagerDeps {
