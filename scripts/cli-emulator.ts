@@ -1,5 +1,5 @@
 /**
- * Obsidian Sync — CLI emulator.
+ * Obsidian Team — CLI emulator.
  *
  * Same protocol as the plugin (REST + Socket.IO) but driven from the
  * shell. Run via `pnpm cli` or `tsx scripts/cli-emulator.ts ...`.

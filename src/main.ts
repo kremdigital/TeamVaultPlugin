@@ -22,9 +22,10 @@ import { StatusBar } from '@/ui/status-bar';
 import { registerCommands } from '@/ui/commands';
 import { HISTORY_VIEW_TYPE, HistoryView } from '@/ui/views/history-view';
 import { uuid } from '@/utils/id';
+import { setPluginDir } from '@/utils/native-loader';
 
 /**
- * Obsidian Sync — plugin entry point.
+ * Obsidian Team — plugin entry point.
  *
  * The bulk of the work happens here at `onload()` time:
  *
@@ -125,13 +126,16 @@ export default class ObsidianSyncPlugin extends Plugin {
 
   private bootstrapState(): void {
     const dataDir = `.obsidian/plugins/${this.manifest.id}`;
-    const stateDb = `${this.app.vault.adapter.getName?.() ?? ''}/${dataDir}/state.db`;
-    // The OperationLog needs an OS-absolute path because better-sqlite3 talks
-    // to the filesystem directly. `FileSystemAdapter.getBasePath()` exposes
-    // it (desktop-only — the manifest enforces that).
+    // The OperationLog needs an OS-absolute path because better-sqlite3
+    // talks to the filesystem directly. `FileSystemAdapter.getBasePath()`
+    // exposes it (desktop-only — the manifest enforces that).
     const basePath =
       (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ?? '';
-    void stateDb;
+    // Register the absolute plugin folder with the native-loader so
+    // `loadNative('better-sqlite3')` can resolve under Obsidian's
+    // bundle-runtime require (which doesn't traverse the plugin's
+    // local node_modules through the bundled string specifier).
+    setPluginDir(`${basePath}/${dataDir}`);
     this.operationLog = new OperationLog({
       filePath: `${basePath}/${dataDir}/state.db`,
     });

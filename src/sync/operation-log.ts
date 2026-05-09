@@ -1,6 +1,9 @@
-import Database from 'better-sqlite3';
+import type DatabaseConstructorType from 'better-sqlite3';
 import type { Database as Db } from 'better-sqlite3';
+import { loadNative } from '@/utils/native-loader';
 import type { VectorClock } from './vector-clock';
+
+type DatabaseConstructor = typeof DatabaseConstructorType;
 
 /**
  * Local operation log — the offline-first backbone of the plugin.
@@ -108,6 +111,13 @@ export interface OperationLogOptions {
   filePath: string;
   /** Optional clock injection — tests substitute a deterministic source. */
   now?: () => number;
+  /**
+   * better-sqlite3 constructor injection. Tests pass it directly; in
+   * production we lazy-load via {@link loadNative} (Obsidian's bundle
+   * runtime can't resolve `require('better-sqlite3')` against the
+   * plugin folder, so we use an absolute path).
+   */
+  Database?: DatabaseConstructor;
 }
 
 interface PendingRow {
@@ -141,6 +151,7 @@ export class OperationLog {
   private readonly now: () => number;
 
   constructor(options: OperationLogOptions) {
+    const Database = options.Database ?? loadNative<DatabaseConstructor>('better-sqlite3');
     this.db = new Database(options.filePath);
     this.now = options.now ?? Date.now;
     // WAL is fine on disk; on `:memory:` SQLite ignores the pragma silently

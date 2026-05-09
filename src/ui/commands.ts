@@ -10,11 +10,11 @@ import { HISTORY_VIEW_TYPE } from './views/history-view';
  * once during `onload`.
  *
  * Commands:
- *   - "Obsidian Sync: Sync now"     — runDeepSync on every active engine.
- *   - "Obsidian Sync: Pause"        — manager.pause().
- *   - "Obsidian Sync: Resume"       — manager.resume().
- *   - "Obsidian Sync: Show history" — open the right-pane History view.
- *   - "Obsidian Sync: Settings"     — focus the plugin's settings tab.
+ *   - "Obsidian Team: Sync now"     — runDeepSync on every active engine.
+ *   - "Obsidian Team: Pause"        — manager.pause().
+ *   - "Obsidian Team: Resume"       — manager.resume().
+ *   - "Obsidian Team: Show history" — open the right-pane History view.
+ *   - "Obsidian Team: Settings"     — focus the plugin's settings tab.
  */
 
 export interface CommandsDeps {

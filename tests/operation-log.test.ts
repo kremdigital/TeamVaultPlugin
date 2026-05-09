@@ -1,3 +1,4 @@
+import Database from 'better-sqlite3';
 import { OperationLog, type FileMeta } from '@/sync/operation-log';
 
 let clock = 1_000_000;
@@ -5,7 +6,9 @@ const now = (): number => ++clock;
 
 function makeLog(): OperationLog {
   clock = 1_000_000;
-  return new OperationLog({ filePath: ':memory:', now });
+  // Inject the Database constructor explicitly — production code lazy-loads
+  // it through `native-loader`, which isn't reachable from Jest.
+  return new OperationLog({ filePath: ':memory:', now, Database });
 }
 
 function makeMeta(overrides: Partial<FileMeta> = {}): FileMeta {

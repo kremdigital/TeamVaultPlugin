@@ -1,6 +1,6 @@
 # Changelog
 
-All notable changes to the Obsidian Sync plugin land here. Format follows
+All notable changes to the Obsidian Team plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 

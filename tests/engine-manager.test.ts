@@ -1,4 +1,5 @@
 import { EngineManager, type AggregateStatus, type EngineManagerDeps } from '@/sync/engine-manager';
+import Database from 'better-sqlite3';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager } from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
@@ -63,7 +64,7 @@ function makeDeps(servers: ServerConfig[], bindings: VaultBinding[]): EngineMana
   return {
     getSettings: () => ({ servers, bindings }),
     vault: memVault,
-    operationLog: new OperationLog({ filePath: ':memory:' }),
+    operationLog: new OperationLog({ filePath: ':memory:', Database }),
     docManager: new DocManager(),
     recentlyApplied: new RecentlyApplied(),
     clientId: 'device-1',

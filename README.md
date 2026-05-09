@@ -1,8 +1,8 @@
-# Obsidian Sync — Plugin
+# Obsidian Team — Plugin
 
 Self-hosted vault synchronization for Obsidian with live collaborative editing
 through Yjs CRDT, offline-first edits, and version history. Companion to the
-[Obsidian Sync server](../server).
+[Obsidian Team server](../server).
 
 > **Status:** MVP, desktop-only. Mobile support deferred.
 
@@ -38,14 +38,14 @@ The plugin is not yet on Obsidian's Community Plugins list. Install manually:
 
 1. Download `main.js` and `manifest.json` from the latest release on GitHub.
 2. Copy them into `<your-vault>/.obsidian/plugins/obsidian-sync/`.
-3. In Obsidian → **Settings → Community plugins**, enable **"Obsidian Sync"**.
-4. Open the **Obsidian Sync** tab in Settings to add a server.
+3. In Obsidian → **Settings → Community plugins**, enable **"Obsidian Team"**.
+4. Open the **Obsidian Team** tab in Settings to add a server.
 
 ## Configuration
 
 ### 1. Get an API key from the server
 
-In the web UI of your Obsidian Sync server (e.g. `https://sync.example.com`):
+In the web UI of your Obsidian Team server (e.g. `https://sync.example.com`):
 
 1. Sign in.
 2. Go to **API Keys** in the sidebar.
@@ -54,7 +54,7 @@ In the web UI of your Obsidian Sync server (e.g. `https://sync.example.com`):
 
 ### 2. Add the server to the plugin
 
-In Obsidian → **Settings → Obsidian Sync → Servers**:
+In Obsidian → **Settings → Obsidian Team → Servers**:
 
 1. Click **Add server**.
 2. Enter a display name, the server URL (`https://...`), and the API key.
@@ -66,7 +66,7 @@ In Obsidian → **Settings → Obsidian Sync → Servers**:
 
 1. Make sure the project exists on the server (create it via the web UI;
    the plugin doesn't create projects).
-2. In **Obsidian Sync → Vaults**, click **Add binding**.
+2. In **Obsidian Team → Vaults**, click **Add binding**.
 3. Pick the server, the project, and the local folder. **`/` (root) means
    the entire vault.**
 4. Click **Bind**.
@@ -91,13 +91,13 @@ synchronizing. The status bar shows the aggregate state.
 
 Available from the command palette (`Ctrl/Cmd-P`):
 
-- **Obsidian Sync: Sync now** — runs a deep diff against every active
+- **Obsidian Team: Sync now** — runs a deep diff against every active
   binding (catches files that drifted while the plugin was offline).
-- **Obsidian Sync: Pause** — disconnects every engine until you resume.
-- **Obsidian Sync: Resume** — reconnect after a manual pause.
-- **Obsidian Sync: Active file history** — opens the right-pane history
+- **Obsidian Team: Pause** — disconnects every engine until you resume.
+- **Obsidian Team: Resume** — reconnect after a manual pause.
+- **Obsidian Team: Active file history** — opens the right-pane history
   view for the file currently in focus.
-- **Obsidian Sync: Open settings** — focuses the plugin's settings tab.
+- **Obsidian Team: Open settings** — focuses the plugin's settings tab.
 
 ## Status bar
 

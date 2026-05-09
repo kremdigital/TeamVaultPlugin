@@ -22,7 +22,7 @@ const copyToVault = process.argv.includes('--vault');
 const isProd = !isWatch;
 
 const banner = `/*
- * Obsidian Sync — built bundle.
+ * Obsidian Team — built bundle.
  * Do not edit directly. Source lives in src/.
  */`;
 
@@ -59,6 +59,13 @@ const options = {
     // in a long dependency chain (readdirp, etc.). Keep it external — the
     // host has Node available and the plugin's `node_modules/` ships it.
     'chokidar',
+    // NOTE: Yjs / y-protocols are NOT external — Obsidian's plugin loader
+    // doesn't traverse the plugin-local `node_modules/` for non-native
+    // packages, so `require('yjs')` fails at load time. Bundling pays a
+    // ~75 KB cost and prints a "Yjs was already imported" warning if
+    // Obsidian's CodeMirror collab integration happens to import Yjs —
+    // the warning is non-fatal and we never cross the instance boundary
+    // (Yjs documents only flow within the plugin).
     ...builtins,
   ],
   sourcemap: isWatch ? 'inline' : false,
