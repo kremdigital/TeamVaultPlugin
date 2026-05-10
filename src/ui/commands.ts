@@ -28,7 +28,7 @@ export interface CommandsDeps {
 
 export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   plugin.addCommand({
-    id: 'obsidian-sync-sync-now',
+    id: 'obsidian-team-sync-now',
     name: t('command.syncNow'),
     callback: () => {
       void runSyncNow(deps);
@@ -36,7 +36,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-sync-pause',
+    id: 'obsidian-team-pause',
     name: t('command.pause'),
     checkCallback: (checking) => {
       if (deps.manager.isPaused()) return false;
@@ -46,7 +46,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-sync-resume',
+    id: 'obsidian-team-resume',
     name: t('command.resume'),
     checkCallback: (checking) => {
       if (!deps.manager.isPaused()) return false;
@@ -56,7 +56,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-sync-history',
+    id: 'obsidian-team-history',
     name: t('command.history'),
     callback: () => {
       void deps.openHistoryView();
@@ -64,7 +64,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-sync-open-settings',
+    id: 'obsidian-team-open-settings',
     name: t('command.settings'),
     callback: () => deps.openSettings(),
   });

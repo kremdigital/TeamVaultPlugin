@@ -39,7 +39,7 @@ Initial MVP release.
   conflict notices always fire regardless).
 - File-rotated logger (`Logger` + `FileLogSink` + `ConsoleLogSink` +
   `CompositeLogSink`) writing to
-  `<vault>/.obsidian/plugins/obsidian-sync/sync.log` with size-based
+  `<vault>/.obsidian/plugins/obsidian-team/sync.log` with size-based
   rotation (default 1 MiB, 3 archives). DevTools mirror at debug level.
 - Russian + English i18n catalogs (Russian source-of-truth, English in
   parity), automated coverage test.

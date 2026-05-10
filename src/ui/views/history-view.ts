@@ -3,7 +3,7 @@ import { t } from '@/i18n';
 import { ApiClient, type ApiFileVersion } from '@/client/api';
 import type { ServerConfig } from '@/settings/settings';
 
-export const HISTORY_VIEW_TYPE = 'obsidian-sync-history';
+export const HISTORY_VIEW_TYPE = 'obsidian-team-history';
 
 /**
  * Right-pane "History" view. Shows the version timeline for the file
@@ -39,7 +39,7 @@ export class HistoryView extends ItemView {
   }
 
   override async onOpen(): Promise<void> {
-    this.container = this.contentEl.createDiv({ cls: 'obsidian-sync-history' });
+    this.container = this.contentEl.createDiv({ cls: 'obsidian-team-history' });
     await this.refresh();
     this.registerEvent(this.app.workspace.on('active-leaf-change', () => void this.refresh()));
   }

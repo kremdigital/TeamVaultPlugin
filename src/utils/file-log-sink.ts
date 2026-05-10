@@ -6,7 +6,7 @@ import { formatLogEntry, type LogEntry, type LogSink } from './logger';
  *
  * All paths are passed through unchanged — the caller (the plugin
  * top-level on Stage 13) hands us a vault-relative path under
- * `.obsidian/plugins/obsidian-sync/`.
+ * `.obsidian/plugins/obsidian-team/`.
  */
 export interface LogStorage {
   exists(path: string): Promise<boolean>;
@@ -24,7 +24,7 @@ export interface LogStorage {
 
 export interface FileLogSinkOptions {
   storage: LogStorage;
-  /** Vault-relative path, e.g. `.obsidian/plugins/obsidian-sync/sync.log`. */
+  /** Vault-relative path, e.g. `.obsidian/plugins/obsidian-team/sync.log`. */
   filePath: string;
   /** Trigger rotation when the active log exceeds this size (bytes). Default 1 MiB. */
   maxSizeBytes?: number;

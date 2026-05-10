@@ -66,7 +66,7 @@ describe('DocManager — persistence factory', () => {
     const dm = new DocManager({ persistenceFactory: factory });
     dm.get('b1', 'note.md');
     expect(FakePersistence.instances).toHaveLength(1);
-    expect(FakePersistence.instances[0]?.name).toMatch(/^obsidian-sync-b1-/);
+    expect(FakePersistence.instances[0]?.name).toMatch(/^obsidian-team-b1-/);
   });
 
   it('honors a custom dbName builder', () => {

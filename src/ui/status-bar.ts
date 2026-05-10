@@ -32,7 +32,7 @@ export class StatusBar {
     private readonly commands: StatusBarCommands,
   ) {
     this.el = container;
-    this.el.addClass('obsidian-sync-status');
+    this.el.addClass('obsidian-team-status');
     this.el.style.display = 'inline-flex';
     this.el.style.alignItems = 'center';
     this.el.style.gap = '4px';

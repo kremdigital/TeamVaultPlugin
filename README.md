@@ -37,7 +37,7 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 The plugin is not yet on Obsidian's Community Plugins list. Install manually:
 
 1. Download `main.js` and `manifest.json` from the latest release on GitHub.
-2. Copy them into `<your-vault>/.obsidian/plugins/obsidian-sync/`.
+2. Copy them into `<your-vault>/.obsidian/plugins/obsidian-team/`.
 3. In Obsidian → **Settings → Community plugins**, enable **"Obsidian Team"**.
 4. Open the **Obsidian Team** tab in Settings to add a server.
 

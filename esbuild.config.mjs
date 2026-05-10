@@ -81,7 +81,7 @@ async function copyArtifactsToVault() {
     console.warn('[vault] TEST_VAULT env not set — skipping copy');
     return;
   }
-  const dest = `${vault}/.obsidian/plugins/obsidian-sync`;
+  const dest = `${vault}/.obsidian/plugins/obsidian-team`;
   await copyFile('main.js', `${dest}/main.js`);
   await copyFile('manifest.json', `${dest}/manifest.json`);
   console.log(`[vault] copied main.js + manifest.json → ${dest}`);

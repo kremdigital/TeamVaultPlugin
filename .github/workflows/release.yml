@@ -51,7 +51,7 @@ jobs:
       - name: Touch styles.css
         run: |
           if [ ! -f styles.css ]; then
-            echo "/* obsidian-sync — no custom styles in v${{ github.ref_name }} */" > styles.css
+            echo "/* obsidian-team — no custom styles in v${{ github.ref_name }} */" > styles.css
           fi
 
       - name: Validate manifest version matches tag

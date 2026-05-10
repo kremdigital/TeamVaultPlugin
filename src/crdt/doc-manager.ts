@@ -19,9 +19,9 @@ import { applyTextDiff } from './text-diff';
  * files are versioned via REST blobs and don't get a Y.Doc.
  */
 
-export const REMOTE_ORIGIN = Symbol('obsidian-sync-remote');
-export const DISK_ORIGIN = Symbol('obsidian-sync-disk');
-export const EDITOR_ORIGIN = Symbol('obsidian-sync-editor');
+export const REMOTE_ORIGIN = Symbol('obsidian-team-remote');
+export const DISK_ORIGIN = Symbol('obsidian-team-disk');
+export const EDITOR_ORIGIN = Symbol('obsidian-team-editor');
 
 /**
  * Minimal contract a persistence backend must satisfy. `y-indexeddb`'s
@@ -41,7 +41,7 @@ export interface DocManagerOptions {
    */
   persistenceFactory?: PersistenceFactory;
   /**
-   * Database-name builder. Defaults to `obsidian-sync-{bindingId}-{slug}`,
+   * Database-name builder. Defaults to `obsidian-team-{bindingId}-{slug}`,
    * where slug is a URL-safe encoding of the file path. Exposed so tests
    * can verify naming, and so future schema bumps can prefix differently.
    */
@@ -65,7 +65,7 @@ function defaultDbName(bindingId: string, filePath: string): string {
   // IndexedDB names are case-sensitive but otherwise free-form; we still
   // prefer slash-free, predictable identifiers for grep-ability in DevTools.
   const slug = filePath.replace(/[^a-zA-Z0-9._-]+/g, '_');
-  return `obsidian-sync-${bindingId}-${slug}`;
+  return `obsidian-team-${bindingId}-${slug}`;
 }
 
 export class DocManager {

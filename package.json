@@ -1,5 +1,5 @@
 {
-  "name": "obsidian-sync-plugin",
+  "name": "obsidian-team-plugin",
   "version": "0.1.0",
   "description": "Self-hosted Obsidian vault synchronization with live collaboration.",
   "main": "main.js",

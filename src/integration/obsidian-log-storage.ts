@@ -3,7 +3,7 @@ import type { LogStorage } from '@/utils/file-log-sink';
 
 /**
  * Concrete `LogStorage` over `app.vault.adapter`. The file sink uses
- * vault-relative paths under `.obsidian/plugins/obsidian-sync/`, so we
+ * vault-relative paths under `.obsidian/plugins/obsidian-team/`, so we
  * never escape the vault sandbox.
  */
 export class ObsidianLogStorage implements LogStorage {

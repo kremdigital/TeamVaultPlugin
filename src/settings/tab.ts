@@ -39,7 +39,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   private renderServersSection(parent: HTMLElement): void {
     parent.createEl('h3', { text: t('settings.servers.heading') });
 
-    const list = parent.createDiv({ cls: 'obsidian-sync-server-list' });
+    const list = parent.createDiv({ cls: 'obsidian-team-server-list' });
     if (this.plugin.settings.servers.length === 0) {
       list.createEl('p', { text: t('settings.servers.empty') });
     } else {
@@ -107,7 +107,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   private renderBindingsSection(parent: HTMLElement): void {
     parent.createEl('h3', { text: t('settings.bindings.heading') });
 
-    const list = parent.createDiv({ cls: 'obsidian-sync-binding-list' });
+    const list = parent.createDiv({ cls: 'obsidian-team-binding-list' });
     if (this.plugin.settings.bindings.length === 0) {
       list.createEl('p', { text: t('settings.bindings.empty') });
     } else {
@@ -231,7 +231,7 @@ export class SyncSettingsTab extends PluginSettingTab {
           const log = await this.plugin.readLogFile();
           // Drop the snapshot into a vault note so users can read it without
           // hunting for the actual `.log` file on disk.
-          const path = `obsidian-sync-log-${Date.now()}.md`;
+          const path = `obsidian-team-log-${Date.now()}.md`;
           await this.app.vault.create(path, '```\n' + log + '\n```');
           new Notice(t('settings.behavior.log.openedNotice', { file: path }));
         }),

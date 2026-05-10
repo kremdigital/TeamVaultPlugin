@@ -18,7 +18,7 @@ TEST_VAULT="D:/DEV/Claude/ObsidianTeams/test-vault" pnpm build:vault
 Получишь:
 
 ```
-test-vault/.obsidian/plugins/obsidian-sync/
+test-vault/.obsidian/plugins/obsidian-team/
   main.js
   manifest.json
   .hotreload
@@ -32,14 +32,14 @@ external. Чтобы Obsidian мог `require()` их, нужно подсуну
 junction (без admin):
 
 ```cmd
-cd /d D:\DEV\Claude\ObsidianTeams\test-vault\.obsidian\plugins\obsidian-sync
+cd /d D:\DEV\Claude\ObsidianTeams\test-vault\.obsidian\plugins\obsidian-team
 mklink /J node_modules D:\DEV\Claude\ObsidianTeams\obsidian-plugin\node_modules
 ```
 
 На Linux/macOS:
 
 ```bash
-cd D:/DEV/Claude/ObsidianTeams/test-vault/.obsidian/plugins/obsidian-sync
+cd D:/DEV/Claude/ObsidianTeams/test-vault/.obsidian/plugins/obsidian-team
 ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
 ```
 
