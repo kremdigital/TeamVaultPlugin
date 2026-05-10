@@ -347,6 +347,28 @@ export class SyncEngine {
         data: buffer,
       });
       if (ack.ok) {
+        // Server ack carries `outcome.{fileId, path}` — record the file in
+        // the local index immediately. Without this the broadcast event
+        // that follows would treat the file as new and try to BINARY-
+        // download it (404), and the next CREATE pass on this path would
+        // re-upload (creating server-side conflict-renamed copies).
+        const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
+        if (outcome?.fileId && outcome?.path) {
+          const meta: FileMeta & { fileId: string } = {
+            bindingId: this.binding.id,
+            relativePath: outcome.path,
+            serverFileId: outcome.fileId,
+            fileId: outcome.fileId,
+            contentHash: hash,
+            size: buffer.byteLength,
+            fileType,
+            lastSyncedAt: Date.now(),
+          };
+          this.fileIndex.byPath.set(outcome.path, meta);
+          this.fileIndex.byId.set(outcome.fileId, meta);
+          this.operationLog.setFileMeta(meta);
+          if (fileType === 'TEXT') this.wireYjsForTextFile(outcome.fileId, outcome.path);
+        }
         this.persistVectorClock();
         return;
       }
@@ -471,11 +493,27 @@ export class SyncEngine {
   private async handleServerFileEvent(event: SocketFileEvent): Promise<void> {
     try {
       switch (event.type) {
-        case 'created':
-          await this.applyServerCreate(
-            event.result as { id: string; path: string; fileType: FileType },
-          );
+        case 'created': {
+          // Server broadcasts `{ result: { outcome, log }, log }`. Pull
+          // fileId + path out of `result.outcome`. Skip if we already
+          // know about this file — that's the echo of our own push.
+          const outcome = (
+            event.result as
+              | { outcome?: { fileId?: string; path?: string; kind?: string } }
+              | undefined
+          )?.outcome;
+          if (!outcome?.fileId || !outcome?.path) break;
+          if (this.fileIndex.byId.has(outcome.fileId)) break;
+          await this.applyServerCreate({
+            id: outcome.fileId,
+            path: outcome.path,
+            // Server doesn't ship the file type; classify locally. Good
+            // enough for the markdown / text vs. binary split we care
+            // about here.
+            fileType: classifyFileType(outcome.path),
+          });
           break;
+        }
         case 'updated-binary':
           await this.applyServerUpdateBinary(event.fileId);
           break;
