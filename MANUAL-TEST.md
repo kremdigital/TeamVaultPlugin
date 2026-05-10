@@ -90,9 +90,18 @@ ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
 
 1. Открыть один и тот же `.md` файл в двух Obsidian'ах (S1 + S2 vault).
 2. Печатать одновременно в разные места файла.
-3. Yjs должен слиять изменения за <500ms; обе стороны видят финальный
-   текст.
+3. Yjs должен слиять изменения за <2 сек round-trip; обе стороны видят
+   финальный текст.
 4. Проверить что нет конфликт-модалок (текст идёт через CRDT).
+
+> **Known limitation (MVP):** плагин ловит изменения через
+> `vault.on('modify')`, а не через editor-binding (`yCollab`). Это
+> значит **Ctrl+Z**, который не пишет в vault file (Obsidian
+> откатывает только editor buffer, если буфер совпадает с saved
+> state), **не синхронизируется** на другое устройство до
+> следующей правки / autosave. Полноценная посимвольная
+> collab через `yCollab` (Stage 5.2 готов, нужна интеграция в
+> plugin top-level) — отдельная фича, на следующую итерацию.
 
 ### S4 — Offline edit → reconnect drain
 
