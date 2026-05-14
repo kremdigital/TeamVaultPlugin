@@ -660,3 +660,133 @@ describe('SyncEngine — delete conflict resolver', () => {
     await engine.stop();
   });
 });
+
+describe('SyncEngine — S4 offline drain → reconnect', () => {
+  it('does not re-upload a queued CREATE during the post-drain initial-push pass', async () => {
+    const h = buildHarness();
+    h.vault.files.set('note.md', new TextEncoder().encode('offline edit').buffer as ArrayBuffer);
+
+    // Queue a CREATE while offline (socket not started yet).
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'note.md',
+      source: 'obsidian',
+    });
+    expect(h.log.pendingCount('b1')).toBe(1);
+
+    // Reconnect.
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] }); // join ack
+    await flushAsync(20); // let the drain surface its file:create emit
+
+    // The drain replayed the queued CREATE — exactly one file:create so far.
+    const afterDrain = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(afterDrain).toHaveLength(1);
+
+    // Ack it with a real outcome so the engine records the file in its index.
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'note.md' } });
+    await flushAsync(20); // let the drain finish + the initial-push pass run
+
+    // The initial-push pass must NOT re-upload note.md — the queued CREATE
+    // already synced it. A second file:create here is the S4 conflict-twin
+    // bug (initialPush racing the pending-queue drain).
+    const total = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(total).toHaveLength(1);
+    expect(h.log.pendingCount('b1')).toBe(0);
+  });
+
+  it('replays duplicate offline CREATEs for one path with a consistent fresh hash', async () => {
+    const h = buildHarness();
+    // Simulate create-then-edit while offline: the content captured at
+    // enqueue time differs from the content on disk at replay time.
+    h.vault.files.set('draft.md', new TextEncoder().encode('v1').buffer as ArrayBuffer);
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'draft.md',
+      source: 'obsidian',
+    });
+    h.vault.files.set('draft.md', new TextEncoder().encode('v2 edited').buffer as ArrayBuffer);
+    // A modify with no server record yet promotes to a second queued CREATE.
+    await h.engine.handleVaultEvent({
+      type: 'modify',
+      bindingId: 'b1',
+      path: 'draft.md',
+      source: 'obsidian',
+    });
+    expect(h.log.pendingCount('b1')).toBe(2);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    // First replayed CREATE.
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(1);
+    const firstHash = (creates[0]?.args[0] as { contentHash: string }).contentHash;
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'draft.md' } });
+    await flushAsync(20);
+
+    // Second replayed CREATE — must carry the SAME hash as the first (both
+    // read the same on-disk bytes). The old code sent the stale enqueue-time
+    // payload hash, so the two diverged and the server conflict-renamed the
+    // retry into `draft.conflict-<clientId>.md`.
+    const creates2 = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates2).toHaveLength(2);
+    const secondHash = (creates2[1]?.args[0] as { contentHash: string }).contentHash;
+    expect(secondHash).toBe(firstHash);
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'draft.md' } });
+    await flushAsync(20);
+  });
+
+  it('applyServerRename drops the stale source when the destination already exists', async () => {
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'old.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '1',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    // Both the rename source AND destination exist on disk — the situation
+    // the initial-push race used to create. `adapter.rename` would throw
+    // "Destination file already exists" and crash the engine to `error`.
+    h.vault.files.set('old.md', new TextEncoder().encode('a').buffer as ArrayBuffer);
+    h.vault.files.set('new.md', new TextEncoder().encode('b').buffer as ArrayBuffer);
+
+    const seen: EngineStatus[] = [];
+    h.engine.onStatus((s) => seen.push(s));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: 'new.md',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    // No crash to `error`; the stale source is gone, the destination stays.
+    expect(seen).not.toContain('error');
+    expect(await h.vault.exists('old.md')).toBe(false);
+    expect(await h.vault.exists('new.md')).toBe(true);
+    await h.engine.stop();
+  });
+});

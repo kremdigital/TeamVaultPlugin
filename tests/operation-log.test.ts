@@ -131,6 +131,27 @@ describe('OperationLog — pending operations', () => {
     expect(op.createdAt).toBe(1_000_001);
     log.close();
   });
+
+  it('pendingPaths reports queued filePaths and RENAME newPaths', () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'RENAME', filePath: 'b.md', newPath: 'c.md' });
+    log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'other.md' });
+    const paths = log.pendingPaths('b1');
+    expect(paths).toEqual(new Set(['a.md', 'b.md', 'c.md']));
+    // Binding isolation — b2's path must not leak in.
+    expect(paths.has('other.md')).toBe(false);
+    log.close();
+  });
+
+  it('pendingPaths drops a path once its op is markSent', () => {
+    const log = makeLog();
+    const op = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    expect(log.pendingPaths('b1').has('a.md')).toBe(true);
+    log.markSent([op.id]);
+    expect(log.pendingPaths('b1').has('a.md')).toBe(false);
+    log.close();
+  });
 });
 
 describe('OperationLog — file_meta', () => {

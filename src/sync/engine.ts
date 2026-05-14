@@ -264,32 +264,55 @@ export class SyncEngine {
       this.persistVectorClock();
       this.setStatus('connected');
 
-      // Initial-push pass: walk the binding's local folder and upload any
-      // file the server doesn't know about yet. Without this the very
-      // first bind would only sync content created *after* the bind —
-      // pre-existing files would stay invisible to the engine because
-      // no watcher event ever fires for them.
-      void this.initialPush();
-
-      // Drain offline pending operations in the background — each op is
-      // ack-bound, and we don't want the connected status to depend on
-      // every queued upload finishing first.
-      void this.flushPendingOperations();
+      // Reconnect catch-up tail, kicked off in the background so the
+      // `connected` status doesn't wait on every queued upload. Ordering
+      // inside is load-bearing — see `drainThenInitialPush`.
+      void this.drainThenInitialPush();
     } catch (err) {
       this.setStatus('error', err instanceof Error ? err.message : 'sync_failed');
     }
   }
 
   /**
+   * Reconnect catch-up tail. The pending-operation queue **must** drain
+   * before the initial-push pass runs — they used to race, and the race
+   * is exactly the S4 offline-drain bug: `initialPush` walks the vault
+   * and re-uploads a file that already has a queued CREATE/RENAME, so the
+   * server sees two operations for one path and conflict-renames the
+   * duplicate into `<name>.conflict-<clientId>`.
+   *
+   * Draining first means the queued ops (the user's real intent, in
+   * order) win, and `replayPending` keeps `fileIndex` authoritative as it
+   * goes — so the `initialPush` that follows recognises every file the
+   * queue already synced and skips it.
+   */
+  private async drainThenInitialPush(): Promise<void> {
+    try {
+      await this.flushPendingOperations();
+    } catch {
+      // A failed drain must not block the initial-push pass — pre-existing
+      // files still need their first upload, and whatever stayed queued is
+      // retried on the next reconnect. `initialPush` itself skips paths
+      // that are still queued.
+    }
+    await this.initialPush();
+  }
+
+  /**
    * Walk the binding's local folder, upload anything not in the server's
    * file index. Idempotent — files already mirrored on the server are
-   * skipped via the `fileIndex` lookup. Errors per-file are swallowed so
-   * one bad file doesn't block the rest.
+   * skipped via the `fileIndex` lookup, and files whose CREATE/RENAME is
+   * still queued are skipped via `pendingPaths` (the queue is the source
+   * of truth for those — re-uploading here would duplicate them on the
+   * server). Errors per-file are swallowed so one bad file doesn't block
+   * the rest.
    */
   private async initialPush(): Promise<void> {
     const paths = await this.vault.list(this.binding.localFolder);
+    const pending = this.operationLog.pendingPaths(this.binding.id);
     for (const path of paths) {
       if (this.fileIndex.byPath.has(path)) continue;
+      if (pending.has(path)) continue;
       try {
         await this.handleLocalCreate(path);
       } catch {
@@ -354,20 +377,7 @@ export class SyncEngine {
         // re-upload (creating server-side conflict-renamed copies).
         const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
         if (outcome?.fileId && outcome?.path) {
-          const meta: FileMeta & { fileId: string } = {
-            bindingId: this.binding.id,
-            relativePath: outcome.path,
-            serverFileId: outcome.fileId,
-            fileId: outcome.fileId,
-            contentHash: hash,
-            size: buffer.byteLength,
-            fileType,
-            lastSyncedAt: Date.now(),
-          };
-          this.fileIndex.byPath.set(outcome.path, meta);
-          this.fileIndex.byId.set(outcome.fileId, meta);
-          this.operationLog.setFileMeta(meta);
-          if (fileType === 'TEXT') this.wireYjsForTextFile(outcome.fileId, outcome.path);
+          this.recordCreatedFile(outcome.fileId, outcome.path, fileType, hash, buffer.byteLength);
         }
         this.persistVectorClock();
         return;
@@ -379,6 +389,37 @@ export class SyncEngine {
       contentHash: hash,
       size: buffer.byteLength,
     });
+  }
+
+  /**
+   * Record a freshly server-acknowledged CREATE in the in-memory file
+   * index + the SQLite mirror, and wire its Yjs doc when it's text.
+   * Shared by the online CREATE path (`handleLocalCreate`) and the
+   * offline-queue replay (`replayPending`) so both keep `fileIndex`
+   * authoritative — the initial-push pass relies on that to avoid
+   * re-uploading files the server already has.
+   */
+  private recordCreatedFile(
+    fileId: string,
+    path: string,
+    fileType: FileType,
+    contentHash: string,
+    size: number,
+  ): void {
+    const meta: FileMeta & { fileId: string } = {
+      bindingId: this.binding.id,
+      relativePath: path,
+      serverFileId: fileId,
+      fileId,
+      contentHash,
+      size,
+      fileType,
+      lastSyncedAt: Date.now(),
+    };
+    this.fileIndex.byPath.set(path, meta);
+    this.fileIndex.byId.set(fileId, meta);
+    this.operationLog.setFileMeta(meta);
+    if (fileType === 'TEXT') this.wireYjsForTextFile(fileId, path);
   }
 
   private async handleLocalModify(path: string): Promise<void> {
@@ -733,8 +774,18 @@ export class SyncEngine {
     this.recentlyApplied.mark(oldPath);
     this.recentlyApplied.mark(newPath);
     if (await this.vault.exists(oldPath)) {
-      await this.vault.ensureParentFolder(newPath);
-      await this.vault.rename(oldPath, newPath);
+      if (await this.vault.exists(newPath)) {
+        // Destination already materialised locally — e.g. an initial-push
+        // pass created it, or this rename was partially applied before.
+        // `adapter.rename` throws "Destination file already exists" here,
+        // which would otherwise crash the engine to `error` status. The
+        // server is authoritative and `newPath` is the canonical name, so
+        // drop the stale source instead of colliding into it.
+        await this.vault.delete(oldPath);
+      } else {
+        await this.vault.ensureParentFolder(newPath);
+        await this.vault.rename(oldPath, newPath);
+      }
     }
     this.operationLog.deleteFileMeta(this.binding.id, oldPath);
     meta.relativePath = newPath;
@@ -817,31 +868,66 @@ export class SyncEngine {
             return { ok: false, retryable: false, error: 'local_file_missing' };
           }
           const data = await this.vault.readBinary(op.filePath);
+          // Hash the bytes we're *actually* sending, not the stale
+          // `payload.contentHash` captured at enqueue time. A file created
+          // then edited while offline enqueues several CREATEs whose
+          // payload hashes diverge; replaying those stale hashes makes the
+          // server see "same path, different hash" and conflict-rename
+          // every retry. A fresh hash matches the bytes, so the server's
+          // idempotent-replay path collapses the duplicates instead.
+          const fileType = (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath);
+          const contentHash = await sha256Hex(data);
           const ack = await this.socket.emitFileCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
             filePath: op.filePath,
-            fileType: (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath),
-            contentHash: (op.payload['contentHash'] as string) ?? (await sha256Hex(data)),
+            fileType,
+            contentHash,
             size: data.byteLength,
             data,
           });
+          if (ack.ok) {
+            // Keep `fileIndex` authoritative so the initial-push pass that
+            // runs right after the drain skips this file instead of
+            // re-uploading it.
+            const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
+            if (outcome?.fileId && outcome?.path) {
+              this.recordCreatedFile(
+                outcome.fileId,
+                outcome.path,
+                fileType,
+                contentHash,
+                data.byteLength,
+              );
+            }
+          }
           return ackToOutcome(ack);
         }
         case 'UPDATE': {
           const fileId = String(op.payload['fileId'] ?? '');
           if (!fileId) return { ok: false, retryable: false, error: 'no_file_id' };
           const data = await this.vault.readBinary(op.filePath);
+          // Hash the bytes being sent, not the stale enqueue-time snapshot
+          // — same reasoning as the CREATE case above.
+          const contentHash = await sha256Hex(data);
           const ack = await this.socket.emitFileUpdateBinary({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
             fileId,
-            contentHash: (op.payload['contentHash'] as string) ?? (await sha256Hex(data)),
+            contentHash,
             size: data.byteLength,
             data,
           });
+          if (ack.ok) {
+            const meta = this.fileIndex.byId.get(fileId);
+            if (meta) {
+              meta.contentHash = contentHash;
+              meta.size = data.byteLength;
+              this.operationLog.setFileMeta(meta);
+            }
+          }
           return ackToOutcome(ack);
         }
         case 'DELETE': {
@@ -854,6 +940,12 @@ export class SyncEngine {
             fileId,
             filePath: op.filePath,
           });
+          if (ack.ok) {
+            const meta = this.fileIndex.byId.get(fileId);
+            if (meta) this.fileIndex.byPath.delete(meta.relativePath);
+            this.fileIndex.byId.delete(fileId);
+            this.operationLog.deleteFileMeta(this.binding.id, op.filePath);
+          }
           return ackToOutcome(ack);
         }
         case 'RENAME':
@@ -862,6 +954,7 @@ export class SyncEngine {
           if (!fileId || !op.newPath) {
             return { ok: false, retryable: false, error: 'missing_target' };
           }
+          const newPath = op.newPath;
           const event =
             op.opType === 'RENAME' ? this.socket.emitFileRename : this.socket.emitFileMove;
           const ack = await event.call(this.socket, {
@@ -870,8 +963,24 @@ export class SyncEngine {
             vectorClock: this.bumpClock(),
             fileId,
             filePath: op.filePath,
-            newPath: op.newPath,
+            newPath,
           });
+          if (ack.ok) {
+            // Move the index entry so the post-drain initial-push pass
+            // recognises the file at its new path instead of re-uploading
+            // it. If the server actually conflict-renamed (a genuine
+            // concurrent rename onto the same target), the broadcast
+            // `renamed` event reconciles `fileIndex` to the real path
+            // afterwards.
+            const meta = this.fileIndex.byId.get(fileId);
+            if (meta) {
+              this.operationLog.deleteFileMeta(this.binding.id, meta.relativePath);
+              this.fileIndex.byPath.delete(meta.relativePath);
+              meta.relativePath = newPath;
+              this.fileIndex.byPath.set(newPath, meta);
+              this.operationLog.setFileMeta(meta);
+            }
+          }
           return ackToOutcome(ack);
         }
       }

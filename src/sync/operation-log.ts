@@ -245,6 +245,28 @@ export class OperationLog {
     this.db.prepare(`DELETE FROM pending_operations WHERE id IN (${placeholders})`).run(...opIds);
   }
 
+  /**
+   * Distinct file paths that still have a queued operation — both the
+   * source `filePath` and any RENAME/MOVE `newPath`. The initial-push
+   * pass consults this so it never re-uploads a file whose CREATE/RENAME
+   * is still waiting in the queue (e.g. after a drain halted on a
+   * transient failure); the queued op is the source of truth there.
+   */
+  pendingPaths(bindingId: string): Set<string> {
+    const rows = this.db
+      .prepare<
+        [string],
+        { filePath: string; newPath: string | null }
+      >(`SELECT filePath, newPath FROM pending_operations WHERE bindingId = ?`)
+      .all(bindingId);
+    const out = new Set<string>();
+    for (const row of rows) {
+      out.add(row.filePath);
+      if (row.newPath) out.add(row.newPath);
+    }
+    return out;
+  }
+
   // -- file_meta --------------------------------------------------------------
 
   getFileMeta(bindingId: string, path: string): FileMeta | null {
