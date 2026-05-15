@@ -45,6 +45,15 @@ export interface YjsDocSnapshot {
   fileId: string;
   /** Yjs sync-step1 update encoded as a number array. */
   sync1: number[];
+  /**
+   * Server's `Y.encodeStateVector(doc)` so the client can compute the
+   * inverse — `Y.encodeStateAsUpdate(localDoc, stateVector)` returns the
+   * ops the server is missing, which the engine then pushes back via
+   * `yjs:update`. Required for offline edits to make it upstream on
+   * reconnect; without it the server's changed-detection silently no-ops
+   * every subsequent live edit (parent structs missing).
+   */
+  stateVector?: number[];
 }
 
 export type JoinResult =

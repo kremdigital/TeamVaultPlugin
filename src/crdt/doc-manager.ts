@@ -137,13 +137,20 @@ export class DocManager {
   }
 
   /**
-   * Take a sync-step1 / state-vector snapshot for `project:join` — Stage 7
-   * uses this to send the server "what I already have" so it can ship a
-   * minimal catch-up update.
+   * Take a snapshot of the doc as a Yjs update. Pass `targetStateVector`
+   * (the output of `Y.encodeStateVector` on the remote peer's doc) to get
+   * back only the ops the target is missing — used by the engine on
+   * reconnect to push local offline edits to the server.
+   *
+   * Without a target vector, returns the full state of the doc.
    */
-  encodeStateAsUpdate(bindingId: string, filePath: string): Uint8Array {
+  encodeStateAsUpdate(
+    bindingId: string,
+    filePath: string,
+    targetStateVector?: Uint8Array,
+  ): Uint8Array {
     const entry = this.acquire(bindingId, filePath);
-    return Y.encodeStateAsUpdate(entry.doc);
+    return Y.encodeStateAsUpdate(entry.doc, targetStateVector);
   }
 
   /** Whether this manager has an entry for the given key. */

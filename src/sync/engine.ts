@@ -246,13 +246,38 @@ export class SyncEngine {
         await this.applyServerOperation(op);
       }
 
-      // Hydrate Yjs docs from sync-step1 payloads.
+      // Hydrate Yjs docs from sync-step1 payloads — and, in the same loop,
+      // push back anything the server is missing. y-indexeddb keeps offline
+      // text edits across reloads but the local-update fan-out only fires
+      // for *future* edits, so without this round-trip the offline ops stay
+      // stuck client-side forever and the server's `changed`-detection sees
+      // every subsequent live edit as a no-op replay (the parent structs of
+      // the new op are missing on the server).
       for (const snap of result.yjsDocs) {
         const meta = this.fileIndex.byId.get(snap.fileId);
         if (!meta) continue;
         const update = Uint8Array.from(snap.sync1);
         this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
         await this.snapshotDocToDisk(meta.relativePath);
+
+        if (snap.stateVector && snap.stateVector.length > 0) {
+          const serverVector = Uint8Array.from(snap.stateVector);
+          const missing = this.docManager.encodeStateAsUpdate(
+            this.binding.id,
+            meta.relativePath,
+            serverVector,
+          );
+          // An "empty" Yjs delta is ~2 bytes (zero-struct, zero-delete
+          // markers). A larger buffer means we actually have local ops the
+          // server doesn't know about yet — push them.
+          if (missing.length > 2) {
+            void this.socket.emitYjsUpdate({
+              projectId: this.binding.projectId,
+              fileId: meta.fileId,
+              update: missing,
+            });
+          }
+        }
       }
 
       // Subscribe each known text doc to local-update emits — Yjs will

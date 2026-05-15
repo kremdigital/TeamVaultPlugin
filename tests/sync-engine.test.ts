@@ -740,6 +740,115 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     await flushAsync(20);
   });
 
+  it('pushes local-only Yjs ops back to the server on reconnect', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '0',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    // Simulate offline edits sitting in y-indexeddb: the docManager has
+    // local content the server has never seen.
+    h.doc.setText('b1', 'note.md', 'offline-only edits');
+
+    await h.engine.start();
+
+    // Server is at an empty Y.Doc — sync1 + stateVector both reflect that.
+    const emptyDoc = new Y.Doc();
+    const sync1 = Array.from(Y.encodeStateAsUpdate(emptyDoc));
+    const stateVector = Array.from(Y.encodeStateVector(emptyDoc));
+    emptyDoc.destroy();
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [{ fileId: 'f1', sync1, stateVector }],
+    });
+    await flushAsync(20);
+
+    // The engine must have emitted yjs:update carrying the offline ops.
+    // Without this fix the server stayed empty, then `applyYjsUpdate` saw
+    // every subsequent live edit as a no-op replay (`changed:false`,
+    // no broadcast).
+    const emits = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(emits.length).toBeGreaterThanOrEqual(1);
+    const payload = emits[0]?.args[0] as { fileId: string; update: number[] };
+    expect(payload.fileId).toBe('f1');
+    expect(payload.update.length).toBeGreaterThan(2);
+
+    // Decoding the emitted update on a fresh doc should reproduce the
+    // exact offline content.
+    const target = new Y.Doc();
+    Y.applyUpdate(target, Uint8Array.from(payload.update));
+    expect(target.getText('content').toString()).toBe('offline-only edits');
+    target.destroy();
+    await h.engine.stop();
+  });
+
+  it('skips the reconnect push when the local doc has nothing the server is missing', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '5',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    // Local doc starts empty — nothing offline. After applying server's
+    // sync1, the local state vector matches the server's exactly.
+    await h.engine.start();
+
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, 'hello');
+    const sync1 = Array.from(Y.encodeStateAsUpdate(serverDoc));
+    const stateVector = Array.from(Y.encodeStateVector(serverDoc));
+    serverDoc.destroy();
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [{ fileId: 'f1', sync1, stateVector }],
+    });
+    await flushAsync(20);
+
+    // No yjs:update emit — the server already had everything the client has.
+    const emits = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(emits).toHaveLength(0);
+    await h.engine.stop();
+  });
+
   it('applyServerRename drops the stale source when the destination already exists', async () => {
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', () => ({

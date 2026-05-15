@@ -243,4 +243,34 @@ describe('DocManager — encodeStateAsUpdate', () => {
     Y.applyUpdate(target, snapshot);
     expect(target.getText('content').toString()).toBe('hello world');
   });
+
+  it('with a target state vector returns only the ops the target is missing', () => {
+    // Set up two batches of edits, snapshot the state vector between them,
+    // then encode against that vector. Applying the resulting delta to a
+    // twin doc that holds only the first batch should land at the same
+    // final text — proving the delta really is "just the missing ops".
+    const dm = new DocManager();
+    dm.setText('b1', 'note.md', 'first');
+    const initial = dm.encodeStateAsUpdate('b1', 'note.md');
+    const targetVec = Y.encodeStateVector(dm.get('b1', 'note.md').doc);
+
+    dm.setText('b1', 'note.md', 'first second');
+    const delta = dm.encodeStateAsUpdate('b1', 'note.md', targetVec);
+
+    const twin = new Y.Doc();
+    Y.applyUpdate(twin, initial);
+    Y.applyUpdate(twin, delta);
+    expect(twin.getText('content').toString()).toBe('first second');
+    twin.destroy();
+  });
+
+  it('returns a near-empty update when the target already has everything', () => {
+    const dm = new DocManager();
+    dm.setText('b1', 'note.md', 'hello');
+    const vec = Y.encodeStateVector(dm.get('b1', 'note.md').doc);
+    const delta = dm.encodeStateAsUpdate('b1', 'note.md', vec);
+    // The engine's reconnect emit guard checks `length > 2`; a "nothing to
+    // send" delta must be small enough to fall under that threshold.
+    expect(delta.length).toBeLessThanOrEqual(2);
+  });
 });
