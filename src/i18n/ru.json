@@ -109,9 +109,12 @@
   "history.refresh": "Обновить",
   "history.openVersion": "Открыть версию",
   "settings.behavior.log.openName": "Журнал событий",
-  "settings.behavior.log.openDesc": "Открыть содержимое sync.log в новом vault-файле или очистить.",
+  "settings.behavior.log.openDesc": "Посмотреть содержимое sync.log в окне или очистить.",
   "settings.behavior.log.open": "Открыть лог",
   "settings.behavior.log.clear": "Очистить лог",
-  "settings.behavior.log.openedNotice": "Лог скопирован в \"{file}\".",
-  "settings.behavior.log.clearedNotice": "Лог очищен."
+  "settings.behavior.log.clearedNotice": "Лог очищен.",
+  "modal.log.title": "Лог синхронизации",
+  "modal.log.empty": "Лог пуст.",
+  "modal.log.copy": "Скопировать",
+  "modal.log.copiedNotice": "Лог скопирован в буфер обмена."
 }

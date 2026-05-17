@@ -109,9 +109,12 @@
   "history.refresh": "Refresh",
   "history.openVersion": "Open version",
   "settings.behavior.log.openName": "Event log",
-  "settings.behavior.log.openDesc": "Open the contents of sync.log as a new vault file, or clear it.",
+  "settings.behavior.log.openDesc": "View the contents of sync.log in a window, or clear it.",
   "settings.behavior.log.open": "Open log",
   "settings.behavior.log.clear": "Clear log",
-  "settings.behavior.log.openedNotice": "Log copied to \"{file}\".",
-  "settings.behavior.log.clearedNotice": "Log cleared."
+  "settings.behavior.log.clearedNotice": "Log cleared.",
+  "modal.log.title": "Sync log",
+  "modal.log.empty": "Log is empty.",
+  "modal.log.copy": "Copy",
+  "modal.log.copiedNotice": "Log copied to clipboard."
 }

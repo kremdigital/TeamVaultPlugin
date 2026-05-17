@@ -5,6 +5,7 @@ import { ApiClient, ApiError } from '@/client/api';
 import type { LogLevel, ServerConfig, VaultBinding } from './settings';
 import { AddServerModal } from './modals/server-modal';
 import { AddBindingModal } from './modals/binding-modal';
+import { LogViewerModal } from '@/ui/modals/log-viewer-modal';
 
 /**
  * Top-level settings UI. Three sections, in order:
@@ -228,12 +229,12 @@ export class SyncSettingsTab extends PluginSettingTab {
       .setDesc(t('settings.behavior.log.openDesc'))
       .addButton((btn) =>
         btn.setButtonText(t('settings.behavior.log.open')).onClick(async () => {
+          // Render the log in an in-app modal rather than a vault note.
+          // A note would get picked up by the sync engine and propagated
+          // to every other vault + the server — debug dumps are strictly
+          // local diagnostic content, never shared state.
           const log = await this.plugin.readLogFile();
-          // Drop the snapshot into a vault note so users can read it without
-          // hunting for the actual `.log` file on disk.
-          const path = `obsidian-team-log-${Date.now()}.md`;
-          await this.app.vault.create(path, '```\n' + log + '\n```');
-          new Notice(t('settings.behavior.log.openedNotice', { file: path }));
+          new LogViewerModal(this.app, log, () => this.plugin.clearLogFile()).open();
         }),
       )
       .addButton((btn) =>
