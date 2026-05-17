@@ -1164,6 +1164,172 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     await h.engine.stop();
   });
 
+  it('keep-both: no phantom file:delete or file:create on watcher echoes', async () => {
+    // S6 ветка C reproduction. When keep-both resolves a binary conflict
+    // it (1) renames the local image.png aside and (2) writes the server's
+    // bytes back to image.png. Each of those disk operations fans out into
+    // multiple watcher echoes — Obsidian's vault event + chokidar's FS
+    // event — that the engine must suppress via `recentlyApplied.mark`.
+    //
+    // The original bug: the keep-both branch only marked the `aside` path,
+    // so chokidar's `unlink(image.png)` from the rename leaked into
+    // `handleLocalDelete('image.png')` → emit `file:delete` → server
+    // soft-deleted image.png. The stale-delete guard couldn't help — at
+    // the moment the unlink fires, image.png genuinely IS gone from disk
+    // (the rename just moved it). The marks are the only line of defense.
+    //
+    // This test reproduces the leak by hijacking vault.rename and
+    // vault.createBinary to fire the chokidar-equivalent events inline,
+    // gated by `ra.take` exactly as the production fs-watcher does. With
+    // the engine marking both paths (ECHO_COUNT_RENAME each) plus the
+    // post-rename createBinary (ECHO_COUNT_CREATE), every take returns
+    // true and no leaked event reaches the engine.
+    const localBytes = new Uint8Array([1, 2, 3]).buffer;
+    const serverBytes = new Uint8Array([9, 9, 9, 9]).buffer;
+    const sha256 = (await import('@/sync/hash')).sha256Hex;
+    const localHash = await sha256(localBytes);
+    const serverHash = await sha256(serverBytes);
+
+    const vault = new MemoryVault();
+    vault.files.set('image.png', localBytes);
+    const log = new OperationLog({ filePath: ':memory:', Database });
+    const doc = new DocManager();
+    const ra = new RecentlyApplied();
+    const apiResponses = new Map<string, () => RequestUrlResponse>();
+    apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'image.png',
+            fileType: 'BINARY',
+            // Stored hash differs from both local and server → 3-way conflict.
+            contentHash: 'h-stored',
+            size: '3',
+            mimeType: 'image/png',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    apiResponses.set('GET /api/projects/p1/files/f1', () => ({
+      status: 200,
+      json: null,
+      arrayBuffer: serverBytes,
+      headers: {},
+      text: '',
+    }));
+
+    const api = new ApiClient(server, async (params) => {
+      const path = params.url.replace(server.url, '');
+      const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
+      if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
+      return responder();
+    });
+
+    const conflictResolver = {
+      resolveBinaryConflict: jest.fn(async () => 'keep-both' as const),
+      resolveDeleteConflict: jest.fn(async () => 'delete-local' as const),
+    };
+
+    const socket = new SocketClient({ server, clientId: 'device-1', factory });
+    const engine = new SyncEngine({
+      binding,
+      server,
+      clientId: 'device-1',
+      vault,
+      operationLog: log,
+      docManager: doc,
+      recentlyApplied: ra,
+      apiClient: api,
+      socketClient: socket,
+      conflictResolver,
+      now: () => 1700000000000,
+    });
+
+    await engine.start();
+    if (!FakeSocket.last) throw new Error('socket not built');
+    FakeSocket.last.ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // Hijack the vault ops so each disk-level call fires its chokidar
+    // echoes inline. The fs-watcher gates dispatch on `ra.take`, so we
+    // mirror that: take returns true → suppressed; false → dispatch
+    // through handleVaultEvent (using void so a leaked emit awaiting an
+    // ack doesn't deadlock the engine's keep-both flow). Both stale
+    // guards (handleLocalDelete's `exists` check, handleLocalCreate's
+    // `!exists` check) deliberately can't save us here — at the moment
+    // the unlink fires, image.png really is missing from disk.
+    const origRename = vault.rename.bind(vault);
+    vault.rename = async (oldP: string, newP: string): Promise<void> => {
+      await origRename(oldP, newP);
+      if (!ra.take(oldP)) {
+        void engine.handleVaultEvent({
+          type: 'delete',
+          bindingId: 'b1',
+          path: oldP,
+          source: 'fs',
+        });
+      }
+      if (!ra.take(newP)) {
+        void engine.handleVaultEvent({
+          type: 'create',
+          bindingId: 'b1',
+          path: newP,
+          source: 'fs',
+        });
+      }
+    };
+    const origCreateBinary = vault.createBinary.bind(vault);
+    vault.createBinary = async (p: string, buf: ArrayBuffer): Promise<void> => {
+      await origCreateBinary(p, buf);
+      if (!ra.take(p)) {
+        void engine.handleVaultEvent({
+          type: 'create',
+          bindingId: 'b1',
+          path: p,
+          source: 'fs',
+        });
+      }
+    };
+
+    const emitsBefore = FakeSocket.last.emits.length;
+    FakeSocket.last.fire('file:updated-binary', {
+      fileId: 'f1',
+      contentHash: serverHash,
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    // Phantom file:delete for image.png is the headline regression — it
+    // is what soft-deleted image.png on the server in the original repro.
+    // Phantom file:create on aside is the matching nested-conflict cause:
+    // the server already had image.conflict-<ts>.png by the time the
+    // leaked CREATE arrived (the rename moved image.png there), so the
+    // server conflict-renamed it to image.conflict-<ts>.conflict-<id>.png.
+    const newEmits = FakeSocket.last.emits.slice(emitsBefore);
+    const deletes = newEmits.filter((e) => e.event === 'file:delete');
+    const creates = newEmits.filter((e) => e.event === 'file:create');
+    expect(deletes).toEqual([]);
+    expect(creates).toEqual([]);
+
+    // Local state is the keep-both outcome: server bytes at image.png,
+    // local bytes at the aside.
+    expect(await sha256(await vault.readBinary('image.png'))).toBe(serverHash);
+    expect(await sha256(await vault.readBinary('image.conflict-1700000000000.png'))).toBe(
+      localHash,
+    );
+
+    await engine.stop();
+  });
+
   it('handleLocalDelete skips when the file is still on disk', async () => {
     // The stale-delete guard: chokidar can emit `unlink` mid-write
     // (atomic rename), and the matching `add` lands a beat later. If

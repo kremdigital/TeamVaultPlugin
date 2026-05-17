@@ -799,16 +799,21 @@ export class SyncEngine {
     this.operationLog.setFileMeta(meta);
     // Overwrite writes can split into chokidar `unlink` + `add` (the
     // atomic-rename pattern some editors and OS-level write paths use),
-    // so we budget for one Obsidian echo plus up to two chokidar echoes.
-    // A stray `unlink` falling through would dispatch a real `file:delete`
-    // and clear the path from `fileIndex`, which is exactly how a phantom
-    // `file:create` round-trip starts (the next watcher event finds an
-    // empty fileIndex and treats the path as brand-new).
-    this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_WRITE);
+    // so the writeBinary branch budgets for one Obsidian echo plus up to
+    // two chokidar echoes. A stray `unlink` falling through would dispatch
+    // a real `file:delete` and clear the path from `fileIndex`, which is
+    // exactly how a phantom `file:create` round-trip starts (the next
+    // watcher event finds an empty fileIndex and treats the path as
+    // brand-new). The createBinary branch only fires create-style echoes
+    // (Obsidian onCreate + chokidar `add`), so the smaller CREATE budget
+    // is exact — using WRITE there would leave a stale mark that could
+    // suppress a genuine next-second edit.
     if (await this.vault.exists(meta.relativePath)) {
+      this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_WRITE);
       await this.vault.writeBinary(meta.relativePath, newBuf);
     } else {
       await this.vault.ensureParentFolder(meta.relativePath);
+      this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_CREATE);
       await this.vault.createBinary(meta.relativePath, newBuf);
     }
   }
@@ -926,11 +931,14 @@ export class SyncEngine {
     // `unlink` + `add` (atomic-rename split). Budget for the worst case so
     // a stray `unlink` doesn't trigger handleLocalDelete and a stray `add`
     // doesn't then find an empty fileIndex and emit a phantom file:create.
-    this.recentlyApplied.mark(path, ECHO_COUNT_WRITE);
+    // The createText branch only sees create-style echoes (Obsidian
+    // onCreate + chokidar `add`), so the smaller CREATE budget is exact.
     if (await this.vault.exists(path)) {
+      this.recentlyApplied.mark(path, ECHO_COUNT_WRITE);
       await this.vault.writeText(path, text);
     } else {
       await this.vault.ensureParentFolder(path);
+      this.recentlyApplied.mark(path, ECHO_COUNT_CREATE);
       await this.vault.createText(path, text);
     }
   }
