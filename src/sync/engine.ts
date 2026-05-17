@@ -352,15 +352,24 @@ export class SyncEngine {
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
     for (const f of files) {
+      // Preserve the client's last-known `contentHash` (the "common
+      // ancestor" from the engine's perspective) for files we've synced
+      // before — overwriting it with the server's current hash would
+      // make `detectBinaryConflict` treat every server-side update as
+      // already-known (`storedHash === serverHash`), silently clobbering
+      // local edits. New files (no prior meta) fall back to the server's
+      // hash so applyServerCreate's binary download starts from a known
+      // baseline.
+      const existing = this.operationLog.getFileMeta(this.binding.id, f.path);
       const meta: FileMeta & { fileId: string } = {
         bindingId: this.binding.id,
         relativePath: f.path,
         serverFileId: f.id,
         fileId: f.id,
-        contentHash: f.contentHash,
-        size: f.size,
+        contentHash: existing?.contentHash ?? f.contentHash,
+        size: existing?.size ?? f.size,
         fileType: f.fileType,
-        lastSyncedAt: Date.now(),
+        lastSyncedAt: existing?.lastSyncedAt ?? Date.now(),
       };
       byPath.set(f.path, meta);
       byId.set(f.id, meta);
@@ -664,12 +673,14 @@ export class SyncEngine {
       this.wireYjsForTextFile(payload.id, payload.path);
     } else {
       const buf = await this.api.downloadFile(this.binding.projectId, payload.id);
-      this.recentlyApplied.mark(payload.path);
-      await this.vault.ensureParentFolder(payload.path);
-      await this.vault.createBinary(payload.path, buf);
+      // Same ordering as `applyServerUpdateBinary` — meta first, then the
+      // disk write, so the watcher echo's hash compare short-circuits.
       meta.size = buf.byteLength;
       meta.contentHash = await sha256Hex(buf);
       this.operationLog.setFileMeta(meta);
+      this.recentlyApplied.mark(payload.path);
+      await this.vault.ensureParentFolder(payload.path);
+      await this.vault.createBinary(payload.path, buf);
     }
   }
 
@@ -729,6 +740,18 @@ export class SyncEngine {
       }
     }
 
+    // Update `meta` BEFORE the disk write. The watcher echo loop is
+    // unavoidable — chokidar + Obsidian's `vault.on('modify')` BOTH fire
+    // for the same write, and `recentlyApplied.take` consumes only one of
+    // them. The second fires through to `handleLocalModify`, which uses
+    // `hash === meta.contentHash` as its short-circuit. If meta is still
+    // the *old* hash at that moment, the echo emits an UPDATE → server
+    // applies → broadcasts → `applyServerUpdateBinary` runs again → write
+    // → another echo → ... infinite loop. Setting meta first means the
+    // echo's hash compare matches and the short-circuit fires.
+    meta.size = newBuf.byteLength;
+    meta.contentHash = newHash;
+    this.operationLog.setFileMeta(meta);
     this.recentlyApplied.mark(meta.relativePath);
     if (await this.vault.exists(meta.relativePath)) {
       await this.vault.writeBinary(meta.relativePath, newBuf);
@@ -736,9 +759,6 @@ export class SyncEngine {
       await this.vault.ensureParentFolder(meta.relativePath);
       await this.vault.createBinary(meta.relativePath, newBuf);
     }
-    meta.size = newBuf.byteLength;
-    meta.contentHash = newHash;
-    this.operationLog.setFileMeta(meta);
   }
 
   private async applyServerDelete(fileId: string): Promise<void> {
@@ -836,18 +856,21 @@ export class SyncEngine {
   private async snapshotDocToDisk(path: string): Promise<void> {
     if (!this.docManager.has(this.binding.id, path)) return;
     const text = this.docManager.getText(this.binding.id, path);
+    const meta = this.fileIndex.byPath.get(path);
+    if (meta) {
+      // Update meta BEFORE the write so the watcher echo's hash compare
+      // in `handleLocalModify` short-circuits — same reasoning as in
+      // `applyServerUpdateBinary`.
+      meta.contentHash = await sha256Hex(text);
+      meta.size = new TextEncoder().encode(text).byteLength;
+      this.operationLog.setFileMeta(meta);
+    }
     this.recentlyApplied.mark(path);
     if (await this.vault.exists(path)) {
       await this.vault.writeText(path, text);
     } else {
       await this.vault.ensureParentFolder(path);
       await this.vault.createText(path, text);
-    }
-    const meta = this.fileIndex.byPath.get(path);
-    if (meta) {
-      meta.contentHash = await sha256Hex(text);
-      meta.size = new TextEncoder().encode(text).byteLength;
-      this.operationLog.setFileMeta(meta);
     }
   }
 

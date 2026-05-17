@@ -849,6 +849,171 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     await h.engine.stop();
   });
 
+  it('refreshFileIndex preserves the client-stored contentHash for known files', async () => {
+    // If refreshFileIndex blindly overwrites `storedHash` with the server's
+    // current hash, `detectBinaryConflict` sees stored == server for every
+    // remote update and silently adopts it — local edits get clobbered
+    // without a modal. The fix: preserve `storedHash` from the local
+    // operationLog mirror; only fall back to the server's hash for files
+    // we've never seen before.
+    const h = buildHarness();
+    // Pre-seed the local operation log with an OLD hash for image.png.
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: 'image.png',
+      serverFileId: 'f-img',
+      contentHash: 'OLD_CLIENT_HASH',
+      size: 100,
+      fileType: 'BINARY',
+      lastSyncedAt: 1700000000000,
+    });
+    // Server reports a different hash for the same file.
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f-img',
+            path: 'image.png',
+            fileType: 'BINARY',
+            contentHash: 'NEW_SERVER_HASH',
+            size: '200',
+            mimeType: 'image/png',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+          // A file we've never seen before — fileIndex should adopt the
+          // server's hash as the baseline.
+          {
+            id: 'f-new',
+            path: 'new.png',
+            fileType: 'BINARY',
+            contentHash: 'FRESH_HASH',
+            size: '50',
+            mimeType: 'image/png',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // The known file keeps its client-stored hash.
+    const imgMeta = h.log.getFileMeta('b1', 'image.png');
+    expect(imgMeta?.contentHash).toBe('OLD_CLIENT_HASH');
+    expect(imgMeta?.size).toBe(100);
+    // The fresh file picks up the server's hash.
+    const newMeta = h.log.getFileMeta('b1', 'new.png');
+    expect(newMeta?.contentHash).toBe('FRESH_HASH');
+    await h.engine.stop();
+  });
+
+  it('updates meta before writing to disk so watcher echoes short-circuit', async () => {
+    // chokidar AND Obsidian's `vault.on('modify')` BOTH fire for the same
+    // write, and `recentlyApplied.take` only consumes one of them. The
+    // second event falls through to `handleLocalModify`, where the only
+    // guard against a re-emit is `if (hash === meta.contentHash) return`.
+    // If meta is still the OLD hash at that moment, the echo emits an
+    // UPDATE → server applies → broadcasts → `applyServerUpdateBinary`
+    // runs again → another disk write → another echo → infinite loop.
+    // The fix updates meta BEFORE the disk write so the echo sees the new
+    // hash and short-circuits.
+    const initialBytes = new TextEncoder().encode('initial-bytes').buffer as ArrayBuffer;
+    const newBytes = new TextEncoder().encode('server-updated-bytes').buffer as ArrayBuffer;
+    const sha256 = (await import('@/sync/hash')).sha256Hex;
+    const initialHash = await sha256(initialBytes);
+    const newHash = await sha256(newBytes);
+
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f-img',
+            path: 'img.png',
+            fileType: 'BINARY',
+            contentHash: initialHash,
+            size: '13',
+            mimeType: 'image/png',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.apiResponses.set('GET /api/projects/p1/files/f-img', () => ({
+      status: 200,
+      json: null,
+      arrayBuffer: newBytes,
+      headers: {},
+      text: '',
+    }));
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: 'img.png',
+      serverFileId: 'f-img',
+      contentHash: initialHash,
+      size: 13,
+      fileType: 'BINARY',
+      lastSyncedAt: 1,
+    });
+    h.vault.files.set('img.png', initialBytes);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // Intercept writeBinary to fire the inevitable second watcher event
+    // INSIDE the write — simulating chokidar firing while the engine is
+    // mid-apply on a path Obsidian already consumed via recentlyApplied.
+    const origWrite = h.vault.writeBinary.bind(h.vault);
+    h.vault.writeBinary = async (path: string, buf: ArrayBuffer): Promise<void> => {
+      await origWrite(path, buf);
+      if (path === 'img.png') {
+        await h.engine.handleVaultEvent({
+          type: 'modify',
+          bindingId: 'b1',
+          path,
+          source: 'fs',
+        });
+      }
+    };
+
+    const emitsBefore = h.socket().emits.length;
+    h.socket().fire('file:updated-binary', {
+      fileId: 'f-img',
+      contentHash: newHash,
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    // The watcher echo must NOT have produced a second UPDATE emit. With
+    // the pre-fix ordering (meta-after-write), handleLocalModify here
+    // would see disk=newBytes, meta=initialHash → emit → loop.
+    const echoEmits = h.socket()
+      .emits.slice(emitsBefore)
+      .filter((e) => e.event === 'file:update-binary');
+    expect(echoEmits).toHaveLength(0);
+    await h.engine.stop();
+  });
+
   it('applyServerRename drops the stale source when the destination already exists', async () => {
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', () => ({
