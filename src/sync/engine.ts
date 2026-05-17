@@ -81,6 +81,30 @@ interface FileMetaIndex {
   byId: Map<string, FileMeta & { fileId: string }>;
 }
 
+/**
+ * How many watcher echoes a single system-applied disk operation can
+ * trigger — both Obsidian's `vault.on(...)` and chokidar fire for the
+ * same write, and chokidar can split an overwrite into `unlink` + `add`
+ * (the atomic-rename pattern Obsidian uses on some platforms). We use
+ * these counts in `recentlyApplied.mark(path, count)` so that every echo
+ * for a single write is suppressed instead of dispatching as a real
+ * `file:delete` or `file:create` round-trip to the server.
+ *
+ * If the count is *too low*, a fall-through `unlink` clears the path
+ * from `fileIndex` and the next echo emits a phantom `file:create` (the
+ * bug this constant family was added to prevent). If it's too high,
+ * a genuine external edit that lands within the 2 s TTL window may be
+ * suppressed — small, recoverable downside.
+ */
+/** Obsidian onModify + chokidar `change` (or `unlink` + `add` split). */
+const ECHO_COUNT_WRITE = 3;
+/** Obsidian onCreate + chokidar `add`. */
+const ECHO_COUNT_CREATE = 2;
+/** Obsidian onDelete + chokidar `unlink`. */
+const ECHO_COUNT_DELETE = 2;
+/** Per path: Obsidian onRename (fires take on both) + chokidar `unlink`/`add`. */
+const ECHO_COUNT_RENAME = 2;
+
 export class SyncEngine {
   private readonly binding: VaultBinding;
   private readonly server: ServerConfig;
@@ -388,6 +412,12 @@ export class SyncEngine {
       await this.handleLocalModify(path);
       return;
     }
+    // Stale-create guard: if the file isn't actually on disk anymore,
+    // this event is leftover from an atomic-rename write (chokidar saw
+    // the intermediate `add` but the file moved away again before we got
+    // here). Emitting would upload empty bytes and tip the server into a
+    // conflict-rename round-trip.
+    if (!(await this.vault.exists(path))) return;
     const fileType = classifyFileType(path);
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
@@ -502,6 +532,14 @@ export class SyncEngine {
 
   private async handleLocalDelete(path: string): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
+    // Stale-delete guard: if the file is still on disk, the watcher
+    // event is almost certainly a stray chokidar `unlink` from an
+    // atomic-rename overwrite (the matching `add` lands a beat later).
+    // Without this check the engine emits `file:delete`, the server
+    // applies it, broadcasts `file:deleted` back, our applyServerDelete
+    // strips the path out of `fileIndex` — and the next watcher event
+    // then finds an empty index and dispatches a phantom `file:create`.
+    if (await this.vault.exists(path)) return;
     const meta = this.fileIndex.byPath.get(path);
     const fileId = meta?.fileId ?? '';
     if (this.socket.isConnected() && fileId) {
@@ -678,7 +716,9 @@ export class SyncEngine {
       meta.size = buf.byteLength;
       meta.contentHash = await sha256Hex(buf);
       this.operationLog.setFileMeta(meta);
-      this.recentlyApplied.mark(payload.path);
+      // One createBinary fires Obsidian onCreate + chokidar 'add' — two
+      // echoes that both need consuming.
+      this.recentlyApplied.mark(payload.path, ECHO_COUNT_CREATE);
       await this.vault.ensureParentFolder(payload.path);
       await this.vault.createBinary(payload.path, buf);
     }
@@ -729,7 +769,12 @@ export class SyncEngine {
         if (resolution === 'keep-both') {
           // Move the local edits aside, then write the server's version.
           const aside = buildConflictPath(meta.relativePath, this.now());
-          this.recentlyApplied.mark(aside);
+          // A rename fires Obsidian onRename + chokidar 'unlink' (old) +
+          // 'add' (new) — both paths need their own echo budgets, or the
+          // engine's own handlers will turn the echo into a real
+          // file:delete / file:create round-trip to the server.
+          this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_RENAME);
+          this.recentlyApplied.mark(aside, ECHO_COUNT_RENAME);
           await this.vault.ensureParentFolder(aside);
           await this.vault.rename(meta.relativePath, aside);
           // Note: the renamed file is NOT auto-uploaded — the user can
@@ -752,7 +797,14 @@ export class SyncEngine {
     meta.size = newBuf.byteLength;
     meta.contentHash = newHash;
     this.operationLog.setFileMeta(meta);
-    this.recentlyApplied.mark(meta.relativePath);
+    // Overwrite writes can split into chokidar `unlink` + `add` (the
+    // atomic-rename pattern some editors and OS-level write paths use),
+    // so we budget for one Obsidian echo plus up to two chokidar echoes.
+    // A stray `unlink` falling through would dispatch a real `file:delete`
+    // and clear the path from `fileIndex`, which is exactly how a phantom
+    // `file:create` round-trip starts (the next watcher event finds an
+    // empty fileIndex and treats the path as brand-new).
+    this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_WRITE);
     if (await this.vault.exists(meta.relativePath)) {
       await this.vault.writeBinary(meta.relativePath, newBuf);
     } else {
@@ -801,7 +853,8 @@ export class SyncEngine {
       }
     }
 
-    this.recentlyApplied.mark(meta.relativePath);
+    // One delete fires Obsidian onDelete + chokidar `unlink`.
+    this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_DELETE);
     if (await this.vault.exists(meta.relativePath)) {
       await this.vault.delete(meta.relativePath);
     }
@@ -816,8 +869,11 @@ export class SyncEngine {
     if (!meta) return;
     const oldPath = meta.relativePath;
     if (oldPath === newPath) return;
-    this.recentlyApplied.mark(oldPath);
-    this.recentlyApplied.mark(newPath);
+    // Rename fires Obsidian onRename + chokidar `unlink` (old) + `add`
+    // (new). Each path needs its own echo budget — see the keep-both
+    // branch above for the same reasoning.
+    this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
+    this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
     if (await this.vault.exists(oldPath)) {
       if (await this.vault.exists(newPath)) {
         // Destination already materialised locally — e.g. an initial-push
@@ -865,7 +921,12 @@ export class SyncEngine {
       meta.size = new TextEncoder().encode(text).byteLength;
       this.operationLog.setFileMeta(meta);
     }
-    this.recentlyApplied.mark(path);
+    // See `applyServerUpdateBinary` — a single overwrite can fan out into
+    // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
+    // `unlink` + `add` (atomic-rename split). Budget for the worst case so
+    // a stray `unlink` doesn't trigger handleLocalDelete and a stray `add`
+    // doesn't then find an empty fileIndex and emit a phantom file:create.
+    this.recentlyApplied.mark(path, ECHO_COUNT_WRITE);
     if (await this.vault.exists(path)) {
       await this.vault.writeText(path, text);
     } else {

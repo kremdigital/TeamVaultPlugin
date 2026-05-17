@@ -1063,4 +1063,184 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     expect(await h.vault.exists('new.md')).toBe(true);
     await h.engine.stop();
   });
+
+  it('does not phantom-CREATE on a yjs:update snapshot write watcher echo', async () => {
+    // Reproduces the S6 manual-test bug: when vault A reloads and its
+    // reconnect-push fan-out broadcasts a yjs:update to vault B, vault
+    // B's snapshotDocToDisk writes the text to disk. On Windows that
+    // write can fan into chokidar `unlink` + `add` (the atomic-rename
+    // split), and Obsidian's `vault.on('modify')` fires too. With the
+    // pre-fix single-consume `recentlyApplied.take`, only one of the
+    // three echoes was suppressed: the leftover `unlink` cascaded into
+    // a `file:delete` round-trip that stripped the path from fileIndex,
+    // and the next `add` then found an empty index and emitted a
+    // phantom `file:create` — which the server conflict-renamed into
+    // `<path>.conflict-<clientId>.<ext>`.
+    const Y = await import('yjs');
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'from-shell-2.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '0',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    // The file is already on disk — both vaults were in-sync before the
+    // other side's reload.
+    h.vault.files.set(
+      'from-shell-2.md',
+      new TextEncoder().encode('synced content').buffer as ArrayBuffer,
+    );
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    // Wire the chokidar-style echoes inline with the disk write. The
+    // production order is: Obsidian onModify (consumes 1) → chokidar
+    // `unlink` (consumes 2) → chokidar `add` (consumes 3). Production
+    // delivers them through the watcher's `take`, but at the engine
+    // layer we drive them as direct `handleVaultEvent` calls so we can
+    // assert the engine's emit set without spinning up the FS watcher.
+    const origWriteText = h.vault.writeText.bind(h.vault);
+    h.vault.writeText = async (path: string, text: string): Promise<void> => {
+      await origWriteText(path, text);
+      if (path === 'from-shell-2.md') {
+        // The first three takes are consumed by the watcher (the
+        // engine's mark sets count=3); from the engine's perspective
+        // no events arrive. Simulate the *production* edge case where
+        // chokidar's `add` still leaks past the budget — a fourth
+        // event the engine must not turn into a phantom `file:create`.
+        h.ra.take(path);
+        h.ra.take(path);
+        h.ra.take(path);
+        await h.engine.handleVaultEvent({
+          type: 'create',
+          bindingId: 'b1',
+          path,
+          source: 'fs',
+        });
+      }
+    };
+
+    // Vault A's reconnect push lands as a yjs:update on the wire.
+    const remote = new Y.Doc();
+    remote.getText('content').insert(0, 'synced content');
+    const update = Y.encodeStateAsUpdate(remote);
+    remote.destroy();
+
+    const emitsBefore = h.socket().emits.length;
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(update) });
+    // Allow the 500 ms snapshot debouncer + the synthesised watcher
+    // event to surface.
+    await new Promise<void>((resolve) => setTimeout(resolve, 700));
+    await flushAsync(20);
+
+    // The phantom emit would have been `file:create` for 'from-shell-2.md'.
+    const creates = h
+      .socket()
+      .emits.slice(emitsBefore)
+      .filter((e) => e.event === 'file:create');
+    expect(creates).toEqual([]);
+    // And the fileIndex must STILL know about the path — the stale
+    // delete that previously stripped it out is what gave the next
+    // event nothing to short-circuit against.
+    expect(h.engine.getFileIdForPath('from-shell-2.md')).toBe('f1');
+    await h.engine.stop();
+  });
+
+  it('handleLocalDelete skips when the file is still on disk', async () => {
+    // The stale-delete guard: chokidar can emit `unlink` mid-write
+    // (atomic rename), and the matching `add` lands a beat later. If
+    // handleLocalDelete acted on that stray unlink, we'd file:delete a
+    // file that's still very much present, and the round-trip would
+    // strip the entry from fileIndex.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '5',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.vault.files.set('note.md', new TextEncoder().encode('hello').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    await h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: 'note.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    const deletes = h
+      .socket()
+      .emits.slice(before)
+      .filter((e) => e.event === 'file:delete');
+    expect(deletes).toEqual([]);
+    // And fileIndex is untouched.
+    expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
+    await h.engine.stop();
+  });
+
+  it('handleLocalCreate skips when the file is no longer on disk', async () => {
+    // Inverse of the stale-delete guard: chokidar's `add` can fire for
+    // a path that briefly existed during an atomic rename and is gone
+    // by the time we read it. Emitting an empty CREATE here would tip
+    // the server into a conflict-rename round-trip too.
+    const h = buildHarness();
+    // File was never written to disk — the synthesized event is stale.
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'transient.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    const creates = h
+      .socket()
+      .emits.slice(before)
+      .filter((e) => e.event === 'file:create');
+    expect(creates).toEqual([]);
+    await h.engine.stop();
+  });
 });

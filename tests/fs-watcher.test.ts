@@ -212,6 +212,28 @@ describe('FsWatcher — recently-applied suppression', () => {
       { type: 'create', bindingId: 'b1', path: 'a.md', source: 'fs' }, // 2nd one falls through
     ]);
   });
+
+  it('mark(path, count) suppresses up to `count` watcher events', () => {
+    // The bug this guards against: a system-applied write that fires
+    // multiple chokidar events (`unlink` + `add` for atomic-rename
+    // writes) used to leak the leftovers past `take()`. The leftover
+    // `unlink` would cascade into a `file:delete` round-trip and the
+    // engine would then phantom-CREATE the file on the next echo.
+    const ra = new RecentlyApplied({ ttlMs: 5000 });
+    const { events, fakeWatcher } = buildWatcher({
+      bindings: [binding()],
+      recentlyApplied: ra,
+    });
+    ra.mark('a.md', 3);
+    fakeWatcher().fire('unlink', '/vault/a.md');
+    fakeWatcher().fire('add', '/vault/a.md');
+    fakeWatcher().fire('add', '/vault/a.md');
+    // All three echoes consumed; nothing dispatched.
+    expect(events).toEqual([]);
+    // A fourth event falls through as a real change.
+    fakeWatcher().fire('add', '/vault/a.md');
+    expect(events).toEqual([{ type: 'create', bindingId: 'b1', path: 'a.md', source: 'fs' }]);
+  });
 });
 
 describe('FsWatcher — lifecycle', () => {

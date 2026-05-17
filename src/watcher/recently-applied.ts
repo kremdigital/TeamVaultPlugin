@@ -7,9 +7,21 @@
  *   3. Obsidian's `vault.on('modify', ...)` fires — but we DON'T want to
  *      ship the same change back upstream.
  *
- * The fix: right before applying, the sync engine calls `mark(path)`.
+ * The fix: right before applying, the sync engine calls `mark(path, count)`.
  * The watcher then consults `take(path)` (or `has(path)`) and skips the
  * event when there's an outstanding marker.
+ *
+ * One disk operation commonly produces *several* watcher events:
+ *   - Obsidian's `vault.on(...)` fires once for the editor's perspective.
+ *   - chokidar fires once for the FS perspective.
+ *   - on Windows, an in-place write can split into a chokidar
+ *     `unlink` + `add` pair if the editor used an atomic-rename pattern.
+ *
+ * `mark(path, count)` therefore takes a count of expected echoes (default
+ * 1 for the legacy single-take call sites) and `take()` decrements it,
+ * dropping the marker once the budget is spent. Re-marking the same path
+ * within the TTL *adds* to the remaining count so two overlapping system
+ * writes each get their own echo budget.
  *
  * Markers expire on a TTL (default 2 s). That's long enough that vault
  * events arriving on the next tick still see them, but short enough that
@@ -24,6 +36,8 @@ export interface RecentlyAppliedOptions {
 }
 
 interface Entry {
+  /** Remaining takes before the marker falls through as a real event. */
+  count: number;
   expiresAt: number;
 }
 
@@ -37,9 +51,26 @@ export class RecentlyApplied {
     this.now = options.now ?? Date.now;
   }
 
-  /** Mark a path as recently mutated by us. Bumps the TTL on repeats. */
-  mark(path: string): void {
-    this.entries.set(path, { expiresAt: this.now() + this.ttlMs });
+  /**
+   * Mark a path as recently mutated by us. `count` is how many incoming
+   * watcher events should be suppressed before the next one falls through
+   * as a real change — caller chooses based on how many echoes the disk
+   * operation is expected to produce.
+   *
+   * Re-marking the same path within the TTL ADDS to the remaining count
+   * (two overlapping system writes each contribute their own budget) and
+   * refreshes the expiry.
+   */
+  mark(path: string, count = 1): void {
+    if (count <= 0) return;
+    const existing = this.entries.get(path);
+    const expiresAt = this.now() + this.ttlMs;
+    if (existing && existing.expiresAt > this.now()) {
+      existing.count += count;
+      existing.expiresAt = expiresAt;
+      return;
+    }
+    this.entries.set(path, { count, expiresAt });
   }
 
   /** True if `path` has a non-expired marker. Does not consume it. */
@@ -54,14 +85,22 @@ export class RecentlyApplied {
   }
 
   /**
-   * Atomic "consume" — true (and removes the marker) if the path was
-   * marked, false otherwise. The watcher uses this to skip exactly one
-   * incoming event per `mark()` call — extra noise after that should
-   * fall through and be treated as a real change.
+   * Atomic "consume" — true (and decrements the remaining budget) if the
+   * path was marked, false otherwise. After every marked echo has been
+   * consumed, subsequent events fall through and are treated as real
+   * changes.
    */
   take(path: string): boolean {
-    if (!this.has(path)) return false;
-    this.entries.delete(path);
+    const entry = this.entries.get(path);
+    if (!entry) return false;
+    if (entry.expiresAt <= this.now()) {
+      this.entries.delete(path);
+      return false;
+    }
+    entry.count -= 1;
+    if (entry.count <= 0) {
+      this.entries.delete(path);
+    }
     return true;
   }
 
