@@ -1014,6 +1014,117 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     await h.engine.stop();
   });
 
+  it('catch-up replay skips DELETE for a fileId that is currently live on the server', async () => {
+    // Scenario: the catch-up's operation log returns a historical DELETE
+    // for a file that has since been re-created (tombstone-revival
+    // reuses the same `fileId`, so the stale op's fileId matches the
+    // freshly-refreshed fileIndex entry). Without the guard,
+    // `applyServerDelete` would either wipe the local copy or pop a
+    // spurious delete-vs-update modal. With the guard, the DELETE is
+    // dropped and the file stays intact.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f-survivor',
+            path: 'live-test.md',
+            fileType: 'TEXT',
+            contentHash: 'server-hash',
+            size: '5',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.vault.files.set('live-test.md', new TextEncoder().encode('local').buffer as ArrayBuffer);
+
+    // Spy on the resolver — it MUST NOT be called for this stale op.
+    const resolver = {
+      resolveBinaryConflict: jest.fn(async () => 'keep-server' as const),
+      resolveDeleteConflict: jest.fn(async () => 'delete-local' as const),
+    };
+    const log = new OperationLog({ filePath: ':memory:', Database });
+    const doc = new DocManager();
+    const ra = new RecentlyApplied();
+    const socket = new SocketClient({ server, clientId: 'device-1', factory });
+    const apiResponses = new Map<string, () => RequestUrlResponse>();
+    apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f-survivor',
+            path: 'live-test.md',
+            fileType: 'TEXT',
+            contentHash: 'server-hash',
+            size: '5',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    const api = new ApiClient(server, async (params) => {
+      const path = params.url.replace(server.url, '');
+      const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
+      if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
+      return responder();
+    });
+    const vault = new MemoryVault();
+    vault.files.set('live-test.md', new TextEncoder().encode('local-divergent').buffer as ArrayBuffer);
+    const engine = new SyncEngine({
+      binding,
+      server,
+      clientId: 'device-1',
+      vault,
+      operationLog: log,
+      docManager: doc,
+      recentlyApplied: ra,
+      apiClient: api,
+      socketClient: socket,
+      conflictResolver: resolver,
+    });
+
+    await engine.start();
+    if (!FakeSocket.last) throw new Error('socket not built');
+    FakeSocket.last.ackOk({
+      operations: [
+        {
+          id: 'op-stale-delete',
+          opType: 'DELETE',
+          filePath: 'live-test.md',
+          newPath: null,
+          authorId: 'u1',
+          vectorClock: { someClient: 1 },
+          payload: { fileId: 'f-survivor' },
+          createdAt: '2026-01-01',
+        },
+      ],
+      yjsDocs: [],
+    });
+    await flushAsync(20);
+
+    // Modal must NOT have been triggered, file must still be on disk.
+    expect(resolver.resolveDeleteConflict).not.toHaveBeenCalled();
+    expect(await vault.exists('live-test.md')).toBe(true);
+    await engine.stop();
+  });
+
   it('applyServerRename drops the stale source when the destination already exists', async () => {
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', () => ({

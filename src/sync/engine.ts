@@ -672,7 +672,17 @@ export class SyncEngine {
       }
       case 'DELETE': {
         const fileId = (op.payload as { fileId?: string } | null)?.fileId ?? '';
-        if (fileId) await this.applyServerDelete(fileId);
+        if (!fileId) break;
+        // Stale-DELETE guard for the catch-up replay. `refreshFileIndex`
+        // only returns files that are currently live on the server. If
+        // `fileId` is in our index, the file has been re-created since
+        // this DELETE was logged (typically via tombstone-revival, which
+        // reuses the same id) — re-applying the delete here would either
+        // wipe the local copy or pop a spurious delete-vs-update modal.
+        // Live broadcasts go through `handleServerFileEvent` and bypass
+        // this guard, so a genuine real-time delete still applies.
+        if (this.fileIndex.byId.has(fileId)) break;
+        await this.applyServerDelete(fileId);
         break;
       }
       case 'RENAME':
