@@ -650,7 +650,21 @@ export class SyncEngine {
     this.scheduleSnapshotToDisk(meta.relativePath);
   }
 
-  /** Apply one operation from the project:join catch-up. */
+  /**
+   * Apply one operation from the project:join catch-up.
+   *
+   * Per-op stale guards keyed off `fileIndex` (the post-`refreshFileIndex`
+   * snapshot of what's actually live on the server). When the catch-up
+   * replay returns ops for files that have since been deleted, recreated,
+   * or renamed, the ops are skipped instead of re-applied. Without these
+   * guards a `bindings_state` reset (or a very-first project:join after
+   * a long offline gap) replays the full history and produces spurious
+   * delete-vs-update modals, 404s from binary downloads of soft-deleted
+   * files, and inflated fileIndex entries for paths that no longer exist.
+   *
+   * Live real-time events still flow through `handleServerFileEvent` and
+   * bypass these guards entirely — concurrent ops always apply.
+   */
   private async applyServerOperation(op: ServerOperation): Promise<void> {
     switch (op.opType) {
       case 'CREATE': {
@@ -658,6 +672,11 @@ export class SyncEngine {
         const payload = (op.payload ?? {}) as { fileType?: FileType; fileId?: string };
         const fileId = payload.fileId ?? this.fileIndex.byPath.get(op.filePath)?.fileId ?? '';
         if (!fileId) return;
+        // Stale-CREATE guard: if `fileId` isn't currently on the server
+        // (per `refreshFileIndex`), the file was created and later
+        // deleted; re-applying would inflate the index with a phantom
+        // entry (TEXT) or 404 on the binary download.
+        if (!this.fileIndex.byId.has(fileId)) break;
         await this.applyServerCreate({
           id: fileId,
           path: op.filePath,
@@ -667,20 +686,20 @@ export class SyncEngine {
       }
       case 'UPDATE': {
         const fileId = (op.payload as { fileId?: string } | null)?.fileId ?? '';
-        if (fileId) await this.applyServerUpdateBinary(fileId);
+        if (!fileId) break;
+        // Stale-UPDATE guard: same logic — if the file is gone from the
+        // server, the binary download will 404 and crash the catch-up.
+        if (!this.fileIndex.byId.has(fileId)) break;
+        await this.applyServerUpdateBinary(fileId);
         break;
       }
       case 'DELETE': {
         const fileId = (op.payload as { fileId?: string } | null)?.fileId ?? '';
         if (!fileId) break;
-        // Stale-DELETE guard for the catch-up replay. `refreshFileIndex`
-        // only returns files that are currently live on the server. If
-        // `fileId` is in our index, the file has been re-created since
-        // this DELETE was logged (typically via tombstone-revival, which
-        // reuses the same id) — re-applying the delete here would either
-        // wipe the local copy or pop a spurious delete-vs-update modal.
-        // Live broadcasts go through `handleServerFileEvent` and bypass
-        // this guard, so a genuine real-time delete still applies.
+        // Stale-DELETE guard: if `fileId` IS in our index, the file has
+        // been re-created since (tombstone-revival keeps the same id);
+        // re-applying would wipe a live local copy or pop a spurious
+        // delete-vs-update modal.
         if (this.fileIndex.byId.has(fileId)) break;
         await this.applyServerDelete(fileId);
         break;
@@ -688,7 +707,14 @@ export class SyncEngine {
       case 'RENAME':
       case 'MOVE': {
         const fileId = (op.payload as { fileId?: string } | null)?.fileId ?? '';
-        if (fileId && op.newPath) await this.applyServerRename(fileId, op.newPath);
+        if (!fileId || !op.newPath) break;
+        // Stale-RENAME guard: if `fileId`'s current server path is
+        // already `newPath`, the rename has been applied or superseded.
+        // Also skip if the file is gone — nothing to rename.
+        const meta = this.fileIndex.byId.get(fileId);
+        if (!meta) break;
+        if (meta.relativePath === op.newPath) break;
+        await this.applyServerRename(fileId, op.newPath);
         break;
       }
     }
@@ -720,6 +746,11 @@ export class SyncEngine {
     if (payload.fileType === 'TEXT') {
       this.wireYjsForTextFile(payload.id, payload.path);
     } else {
+      // Catch-up replays can fire applyServerCreate for a binary file the
+      // client already has on disk (synced earlier). `createBinary` throws
+      // on existing paths, so just bail — meta is already up-to-date from
+      // refreshFileIndex.
+      if (await this.vault.exists(payload.path)) return;
       const buf = await this.api.downloadFile(this.binding.projectId, payload.id);
       // Same ordering as `applyServerUpdateBinary` — meta first, then the
       // disk write, so the watcher echo's hash compare short-circuits.
