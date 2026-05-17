@@ -279,10 +279,17 @@ export default class ObsidianSyncPlugin extends Plugin {
     setting?.openTabById(this.manifest.id);
   }
 
+  /**
+   * Toggle the right-pane History view — open + reveal if not yet
+   * mounted, detach if already there. Obsidian's sidebar tabs don't get
+   * an inline close X, and asking users to right-click → Close on the
+   * tab icon is poor discoverability for a feature surfaced primarily
+   * through the command palette and status bar.
+   */
   private async openHistoryView(): Promise<void> {
     const existing = this.app.workspace.getLeavesOfType(HISTORY_VIEW_TYPE)[0];
     if (existing) {
-      this.app.workspace.revealLeaf(existing);
+      existing.detach();
       return;
     }
     const leaf = this.app.workspace.getRightLeaf(false);

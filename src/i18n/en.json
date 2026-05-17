@@ -93,7 +93,7 @@
   "command.syncNow": "Obsidian Team: sync now",
   "command.pause": "Obsidian Team: pause sync",
   "command.resume": "Obsidian Team: resume sync",
-  "command.history": "Obsidian Team: active file history",
+  "command.history": "Obsidian Team: toggle active file history",
   "command.settings": "Obsidian Team: open settings",
   "notice.connected": "Connected to {server}.",
   "notice.disconnected": "Connection lost: {server}.",
