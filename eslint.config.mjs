@@ -57,6 +57,18 @@ export default [
     },
   },
   {
+    // Plain Node ESM build/release scripts (no TS, run directly by node).
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: {
+        process: 'readonly',
+        console: 'readonly',
+      },
+    },
+  },
+  {
     // Jest test globals — only inside tests/.
     files: ['tests/**/*.{ts,tsx}'],
     languageOptions: {

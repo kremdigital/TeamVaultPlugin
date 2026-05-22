@@ -1,20 +1,27 @@
-# Release workflow — triggered by pushing a `v*` tag.
+# Release workflow — triggered by pushing a version tag.
+#
+# Obsidian's Community Plugins catalogue requires the GitHub release tag
+# to be the *exact* manifest version with no `v` prefix (e.g. `0.1.0`).
+# We trigger on both `0.1.0` and the legacy `v0.1.0` shape so existing
+# muscle memory keeps working, but the catalogue-submittable release is
+# the no-prefix one.
 #
 # Builds `main.js` from source and publishes a GitHub release with the
 # three Obsidian-required artifacts: `main.js`, `manifest.json`,
-# `styles.css` (the plugin doesn't currently ship custom CSS, but
-# Obsidian's release-uploader looks for the file regardless — we attach
-# an empty stub so the upload doesn't 404).
+# `styles.css` (the plugin doesn't ship custom CSS, but Obsidian's
+# release-uploader looks for the file regardless — we attach an empty
+# stub so the upload doesn't 404).
 #
-# Bump `manifest.json#version` on `main`, commit, then:
-#   git tag v0.1.0 && git push origin v0.1.0
+# Bump `manifest.json#version` + `versions.json` on `main`, commit, then:
+#   git tag 0.1.0 && git push origin 0.1.0
 
 name: Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -51,22 +58,33 @@ jobs:
       - name: Touch styles.css
         run: |
           if [ ! -f styles.css ]; then
-            echo "/* obsidian-team — no custom styles in v${{ github.ref_name }} */" > styles.css
+            echo "/* obsidian-team — no custom styles */" > styles.css
           fi
 
-      - name: Validate manifest version matches tag
+      - name: Validate manifest + versions.json match the tag
         run: |
-          tag="${GITHUB_REF#refs/tags/v}"
+          # Strip an optional leading `v` so both `0.1.0` and `v0.1.0` work.
+          tag="${GITHUB_REF#refs/tags/}"
+          tag="${tag#v}"
           manifest=$(node -p "require('./manifest.json').version")
           if [ "$tag" != "$manifest" ]; then
-            echo "Manifest version ($manifest) does not match tag ($tag)" >&2
+            echo "manifest.json version ($manifest) does not match tag ($tag)" >&2
+            exit 1
+          fi
+          # versions.json must carry the version so the catalogue knows the
+          # minAppVersion for this release.
+          has_version=$(node -p "Object.prototype.hasOwnProperty.call(require('./versions.json'), '$tag')")
+          if [ "$has_version" != "true" ]; then
+            echo "versions.json is missing an entry for $tag" >&2
             exit 1
           fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          name: Obsidian Team ${{ github.ref_name }}
+          # Use the exact tag as the release name — no "Obsidian Team"
+          # prefix — so it reads cleanly in the catalogue listing.
+          name: ${{ github.ref_name }}
           body_path: CHANGELOG.md
           files: |
             main.js
