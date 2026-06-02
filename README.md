@@ -2,7 +2,10 @@
 
 Self-hosted vault synchronization for Obsidian with live collaborative editing
 through Yjs CRDT, offline-first edits, and version history. Companion to the
-[Team Vault server](../server).
+[Team Vault server](https://github.com/kremdigital/TeamVaultServer).
+
+- Plugin (this repo): <https://github.com/kremdigital/TeamVaultPlugin>
+- Server: <https://github.com/kremdigital/TeamVaultServer>
 
 > **Status:** MVP, desktop-only. Mobile support deferred.
 

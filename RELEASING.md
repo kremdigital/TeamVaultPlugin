@@ -69,7 +69,7 @@ things they may flag for this plugin:
   are native and there is no mobile storage layer yet.
 - The plugin describes itself as "Self-hosted" — make sure the README's
   setup section clearly explains where to point users for the server
-  side (link to `kremdigital/ObsidianTeamServer`).
+  side (link to `kremdigital/TeamVaultServer`).
 
 To address feedback: update the repo, cut a new patch release
 (`pnpm version patch` + tag), and the portal automatically re-reviews.
