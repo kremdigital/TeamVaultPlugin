@@ -37,37 +37,42 @@ Community Plugins catalogue.
 
 ## First-time catalogue submission
 
-The catalogue is a separate repo
-([`obsidianmd/obsidian-releases`](https://github.com/obsidianmd/obsidian-releases)).
+Obsidian moved community-plugin submissions off `obsidianmd/obsidian-releases`
+PRs in 2026; the catalogue is now driven by the portal at
+[community.obsidian.md](https://community.obsidian.md). The
+`community-plugins.json` mirror still exists, but PRs against it are
+disabled — the portal is the single entry point.
+
 Once a `X.Y.Z` GitHub release exists:
 
-1. Fork `obsidian-releases` and add an entry to
-   `community-plugins.json`:
+1. Sign in to <https://community.obsidian.md> with your **Obsidian
+   account** (not GitHub).
+2. Link your GitHub account in profile settings — this is what proves
+   you own `kremdigital/TeamVaultPlugin`.
+3. Sidebar → **Plugins** → **New plugin** → enter
+   `https://github.com/kremdigital/TeamVaultPlugin`.
+4. Review the Developer policies, agree, submit.
 
-   ```json
-   {
-     "id": "team-vault",
-     "name": "Team Vault",
-     "author": "krem.digital",
-     "description": "Self-hosted vault sync with live collaboration for Obsidian teams.",
-     "repo": "kremdigital/ObsidianTeamPlugin"
-   }
-   ```
+The automated review then checks:
 
-2. Open a PR. The validation bot checks:
-   - `manifest.json` is present at the repo root and valid.
-   - A GitHub release exists whose tag equals `manifest.version`.
-   - That release has `main.js` + `manifest.json` attached.
-   - The `id` is unique and not already taken.
+- `manifest.json` is present at the repo root and valid.
+- A GitHub release exists whose tag equals `manifest.version`.
+- That release has `main.js` + `manifest.json` attached.
+- The `id` is unique and not already taken, and does not contain the
+  substring `obsidian` (we renamed from `obsidian-team` → `team-vault`
+  in v0.2.0 for exactly this reason).
 
-3. A human reviewer then looks the plugin over. Known things they may
-   flag for this plugin:
-   - **Name / id contain "Obsidian"** — the guidelines discourage it.
-     We kept `team-vault` because the folder path is already in use
-     by testers; be ready to justify or rename if the reviewer insists
-     (renaming the `id` changes the install folder, so weigh it).
-   - **`isDesktopOnly: true`** is correct — `better-sqlite3` + `chokidar`
-     are native and there is no mobile storage layer yet.
+If the automated check passes, a human reviewer takes a look. Known
+things they may flag for this plugin:
+
+- **`isDesktopOnly: true`** is correct — `better-sqlite3` + `chokidar`
+  are native and there is no mobile storage layer yet.
+- The plugin describes itself as "Self-hosted" — make sure the README's
+  setup section clearly explains where to point users for the server
+  side (link to `kremdigital/ObsidianTeamServer`).
+
+To address feedback: update the repo, cut a new patch release
+(`pnpm version patch` + tag), and the portal automatically re-reviews.
 
 ## Checklist before tagging
 
