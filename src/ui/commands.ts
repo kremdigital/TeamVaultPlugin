@@ -10,11 +10,11 @@ import { HISTORY_VIEW_TYPE } from './views/history-view';
  * once during `onload`.
  *
  * Commands:
- *   - "Obsidian Team: Sync now"     — runDeepSync on every active engine.
- *   - "Obsidian Team: Pause"        — manager.pause().
- *   - "Obsidian Team: Resume"       — manager.resume().
- *   - "Obsidian Team: Show history" — open the right-pane History view.
- *   - "Obsidian Team: Settings"     — focus the plugin's settings tab.
+ *   - "Team Vault: Sync now"     — runDeepSync on every active engine.
+ *   - "Team Vault: Pause"        — manager.pause().
+ *   - "Team Vault: Resume"       — manager.resume().
+ *   - "Team Vault: Show history" — open the right-pane History view.
+ *   - "Team Vault: Settings"     — focus the plugin's settings tab.
  */
 
 export interface CommandsDeps {
@@ -28,7 +28,7 @@ export interface CommandsDeps {
 
 export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   plugin.addCommand({
-    id: 'obsidian-team-sync-now',
+    id: 'team-vault-sync-now',
     name: t('command.syncNow'),
     callback: () => {
       void runSyncNow(deps);
@@ -36,7 +36,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-team-pause',
+    id: 'team-vault-pause',
     name: t('command.pause'),
     checkCallback: (checking) => {
       if (deps.manager.isPaused()) return false;
@@ -46,7 +46,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-team-resume',
+    id: 'team-vault-resume',
     name: t('command.resume'),
     checkCallback: (checking) => {
       if (!deps.manager.isPaused()) return false;
@@ -56,7 +56,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-team-history',
+    id: 'team-vault-history',
     name: t('command.history'),
     callback: () => {
       void deps.openHistoryView();
@@ -64,7 +64,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'obsidian-team-open-settings',
+    id: 'team-vault-open-settings',
     name: t('command.settings'),
     callback: () => deps.openSettings(),
   });

@@ -5,7 +5,7 @@ import { t } from '@/i18n';
  * In-app viewer for `sync.log`.
  *
  * Earlier the "Open log" button dumped the log into a fresh
- * `obsidian-team-log-<ts>.md` note. That worked, but the note lived
+ * `team-vault-log-<ts>.md` note. That worked, but the note lived
  * inside the vault — so the sync engine immediately picked it up and
  * propagated the debug dump to every other vault and the server. Showing
  * the content in a modal keeps the log strictly local to the device.

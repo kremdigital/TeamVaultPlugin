@@ -13,7 +13,7 @@ export type {
 } from './types';
 
 /**
- * REST client for the Obsidian Team server.
+ * REST client for the Team Vault server.
  *
  * Goes through Obsidian's `requestUrl` (instead of plain `fetch`) because
  * `fetch` from the Electron renderer trips on cross-origin requests. The

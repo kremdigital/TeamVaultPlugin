@@ -7,7 +7,7 @@
  *     active level is dropped before the sink is called (cheap to leave
  *     `debug(...)` calls in production code).
  *   - **Sinks** are pluggable: the file sink (`FileLogSink`) writes to
- *     `<vault>/.obsidian/plugins/obsidian-team/sync.log` with size-based
+ *     `<vault>/.obsidian/plugins/team-vault/sync.log` with size-based
  *     rotation; the console sink mirrors output to DevTools when
  *     `logLevel = debug`. `CompositeSink` chains them together.
  *   - **Child loggers** carry a context object (`{ binding: 'b1' }`,

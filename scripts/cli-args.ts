@@ -101,7 +101,7 @@ export function parseArgs(argv: readonly string[]): CliArgs {
   return out;
 }
 
-export const HELP_TEXT = `Obsidian Team — CLI emulator
+export const HELP_TEXT = `Team Vault — CLI emulator
 
 Talks to the sync server with the same protocol the Obsidian plugin uses,
 so you can debug the wire format / API key / project setup without

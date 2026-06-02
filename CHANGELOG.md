@@ -1,8 +1,29 @@
 # Changelog
 
-All notable changes to the Obsidian Team plugin land here. Format follows
+All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
+
+## [0.2.0] — 2026-06-02
+
+Renamed for Obsidian Community Plugins compatibility.
+
+### Changed
+
+- **BREAKING:** Plugin `id` renamed from `obsidian-team` to `team-vault`.
+  The Obsidian Community Plugins catalogue forbids `obsidian` in plugin
+  ids; the new id keeps the spirit (a vault for your team) while
+  fitting the policy. Display name is now `Team Vault`.
+- Plugin install path moves from
+  `<vault>/.obsidian/plugins/obsidian-team/` to
+  `<vault>/.obsidian/plugins/team-vault/`. Existing installs need to
+  reinstall: their settings, operation log (`state.db`), and offline
+  Yjs state (`y-indexeddb` databases keyed off the old prefix) live
+  under the old path and will not be auto-migrated.
+- Command palette entries are now prefixed `Team Vault: …` instead of
+  `Obsidian Team: …`.
+- Internal `Y.Doc` origin labels, CSS class prefixes, and the y-indexeddb
+  `dbName` builder all carry the `team-vault` prefix.
 
 ## [0.1.0] — 2026-05-17
 
@@ -39,7 +60,7 @@ Initial MVP release.
   conflict notices always fire regardless).
 - File-rotated logger (`Logger` + `FileLogSink` + `ConsoleLogSink` +
   `CompositeLogSink`) writing to
-  `<vault>/.obsidian/plugins/obsidian-team/sync.log` with size-based
+  `<vault>/.obsidian/plugins/team-vault/sync.log` with size-based
   rotation (default 1 MiB, 3 archives). DevTools mirror at debug level.
 - Russian + English i18n catalogs (Russian source-of-truth, English in
   parity), automated coverage test.

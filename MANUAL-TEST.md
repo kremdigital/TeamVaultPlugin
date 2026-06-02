@@ -18,7 +18,7 @@ TEST_VAULT="D:/DEV/Claude/ObsidianTeams/test-vault" pnpm build:vault
 Получишь:
 
 ```
-test-vault/.obsidian/plugins/obsidian-team/
+test-vault/.obsidian/plugins/team-vault/
   main.js
   manifest.json
   .hotreload
@@ -32,14 +32,14 @@ external. Чтобы Obsidian мог `require()` их, нужно подсуну
 junction (без admin):
 
 ```cmd
-cd /d D:\DEV\Claude\ObsidianTeams\test-vault\.obsidian\plugins\obsidian-team
+cd /d D:\DEV\Claude\ObsidianTeams\test-vault\.obsidian\plugins\team-vault
 mklink /J node_modules D:\DEV\Claude\ObsidianTeams\obsidian-plugin\node_modules
 ```
 
 На Linux/macOS:
 
 ```bash
-cd D:/DEV/Claude/ObsidianTeams/test-vault/.obsidian/plugins/obsidian-team
+cd D:/DEV/Claude/ObsidianTeams/test-vault/.obsidian/plugins/team-vault
 ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
 ```
 
@@ -65,14 +65,14 @@ ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
 ### 4. Open Obsidian
 
 Открыть test-vault в Obsidian. Включить **Settings → Community plugins
-→ Obsidian Team**.
+→ Team Vault**.
 
 ## Scenarios
 
 ### S1 — First binding, push to empty project
 
 1. Положить в `test-vault` пару `.md` файлов (`note.md`, `subdir/x.md`).
-2. Settings → Obsidian Team → Add server → ввести URL + API-ключ →
+2. Settings → Team Vault → Add server → ввести URL + API-ключ →
    **Test** → ожидать «Подключено как <email>».
 3. Add binding → выбрать сервер + проект + `/` (root) → **Bind**.
 4. Status bar должен пройти `connecting → syncing → connected`.
@@ -167,15 +167,15 @@ ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
   меняется).
 - Click → меню: Sync now / Pause / History / Settings.
 - Cmd-P:
-  - "Obsidian Team: Pause" — после клика status bar → `paused`.
-  - "Obsidian Team: Resume" — обратно.
-  - "Obsidian Team: Sync now" → notice «Синхронизация завершена».
-  - "Obsidian Team: Active file history" — открывает правую панель.
-  - "Obsidian Team: Open settings" — фокус на settings tab.
+  - "Team Vault: Pause" — после клика status bar → `paused`.
+  - "Team Vault: Resume" — обратно.
+  - "Team Vault: Sync now" → notice «Синхронизация завершена».
+  - "Team Vault: Active file history" — открывает правую панель.
+  - "Team Vault: Open settings" — фокус на settings tab.
 
 ### S10 — Log buttons
 
-1. Settings → Obsidian Team → Behavior → log level: **debug**.
+1. Settings → Team Vault → Behavior → log level: **debug**.
 2. Сделать пару правок.
 3. Click "Открыть лог" → открывается новый vault-файл с содержимым
    `sync.log` в код-фенсе.

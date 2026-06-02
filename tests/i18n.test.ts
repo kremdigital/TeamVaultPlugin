@@ -4,7 +4,7 @@ describe('t()', () => {
   beforeEach(() => setLanguage('ru'));
 
   it('returns the Russian string for a known key', () => {
-    expect(t('settings.title')).toBe('Obsidian Team');
+    expect(t('settings.title')).toBe('Team Vault');
     expect(t('settings.servers.heading')).toBe('Серверы');
   });
 

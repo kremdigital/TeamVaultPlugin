@@ -46,8 +46,8 @@ Once a `X.Y.Z` GitHub release exists:
 
    ```json
    {
-     "id": "obsidian-team",
-     "name": "Obsidian Team",
+     "id": "team-vault",
+     "name": "Team Vault",
      "author": "krem.digital",
      "description": "Self-hosted vault sync with live collaboration for Obsidian teams.",
      "repo": "kremdigital/ObsidianTeamPlugin"
@@ -63,7 +63,7 @@ Once a `X.Y.Z` GitHub release exists:
 3. A human reviewer then looks the plugin over. Known things they may
    flag for this plugin:
    - **Name / id contain "Obsidian"** — the guidelines discourage it.
-     We kept `obsidian-team` because the folder path is already in use
+     We kept `team-vault` because the folder path is already in use
      by testers; be ready to justify or rename if the reviewer insists
      (renaming the `id` changes the install folder, so weigh it).
    - **`isDesktopOnly: true`** is correct — `better-sqlite3` + `chokidar`

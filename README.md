@@ -1,8 +1,8 @@
-# Obsidian Team — Plugin
+# Team Vault — Plugin
 
 Self-hosted vault synchronization for Obsidian with live collaborative editing
 through Yjs CRDT, offline-first edits, and version history. Companion to the
-[Obsidian Team server](../server).
+[Team Vault server](../server).
 
 > **Status:** MVP, desktop-only. Mobile support deferred.
 
@@ -37,15 +37,15 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 The plugin is not yet on Obsidian's Community Plugins list. Install manually:
 
 1. Download `main.js` and `manifest.json` from the latest release on GitHub.
-2. Copy them into `<your-vault>/.obsidian/plugins/obsidian-team/`.
-3. In Obsidian → **Settings → Community plugins**, enable **"Obsidian Team"**.
-4. Open the **Obsidian Team** tab in Settings to add a server.
+2. Copy them into `<your-vault>/.obsidian/plugins/team-vault/`.
+3. In Obsidian → **Settings → Community plugins**, enable **"Team Vault"**.
+4. Open the **Team Vault** tab in Settings to add a server.
 
 ## Configuration
 
 ### 1. Get an API key from the server
 
-In the web UI of your Obsidian Team server (e.g. `https://sync.example.com`):
+In the web UI of your Team Vault server (e.g. `https://sync.example.com`):
 
 1. Sign in.
 2. Go to **API Keys** in the sidebar.
@@ -54,7 +54,7 @@ In the web UI of your Obsidian Team server (e.g. `https://sync.example.com`):
 
 ### 2. Add the server to the plugin
 
-In Obsidian → **Settings → Obsidian Team → Servers**:
+In Obsidian → **Settings → Team Vault → Servers**:
 
 1. Click **Add server**.
 2. Enter a display name, the server URL (`https://...`), and the API key.
@@ -66,7 +66,7 @@ In Obsidian → **Settings → Obsidian Team → Servers**:
 
 1. Make sure the project exists on the server (create it via the web UI;
    the plugin doesn't create projects).
-2. In **Obsidian Team → Vaults**, click **Add binding**.
+2. In **Team Vault → Vaults**, click **Add binding**.
 3. Pick the server, the project, and the local folder. **`/` (root) means
    the entire vault.**
 4. Click **Bind**.
@@ -91,13 +91,13 @@ synchronizing. The status bar shows the aggregate state.
 
 Available from the command palette (`Ctrl/Cmd-P`):
 
-- **Obsidian Team: Sync now** — runs a deep diff against every active
+- **Team Vault: Sync now** — runs a deep diff against every active
   binding (catches files that drifted while the plugin was offline).
-- **Obsidian Team: Pause** — disconnects every engine until you resume.
-- **Obsidian Team: Resume** — reconnect after a manual pause.
-- **Obsidian Team: Active file history** — opens the right-pane history
+- **Team Vault: Pause** — disconnects every engine until you resume.
+- **Team Vault: Resume** — reconnect after a manual pause.
+- **Team Vault: Active file history** — opens the right-pane history
   view for the file currently in focus.
-- **Obsidian Team: Open settings** — focuses the plugin's settings tab.
+- **Team Vault: Open settings** — focuses the plugin's settings tab.
 
 ## Status bar
 

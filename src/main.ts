@@ -25,7 +25,7 @@ import { uuid } from '@/utils/id';
 import { setPluginDir } from '@/utils/native-loader';
 
 /**
- * Obsidian Team — plugin entry point.
+ * Team Vault — plugin entry point.
  *
  * The bulk of the work happens here at `onload()` time:
  *

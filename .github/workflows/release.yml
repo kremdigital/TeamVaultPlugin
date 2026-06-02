@@ -58,7 +58,7 @@ jobs:
       - name: Touch styles.css
         run: |
           if [ ! -f styles.css ]; then
-            echo "/* obsidian-team — no custom styles */" > styles.css
+            echo "/* team-vault — no custom styles */" > styles.css
           fi
 
       - name: Validate manifest + versions.json match the tag
@@ -82,7 +82,7 @@ jobs:
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          # Use the exact tag as the release name — no "Obsidian Team"
+          # Use the exact tag as the release name — no "Team Vault"
           # prefix — so it reads cleanly in the catalogue listing.
           name: ${{ github.ref_name }}
           body_path: CHANGELOG.md

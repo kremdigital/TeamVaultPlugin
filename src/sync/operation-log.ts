@@ -8,7 +8,7 @@ type DatabaseConstructor = typeof DatabaseConstructorType;
 /**
  * Local operation log — the offline-first backbone of the plugin.
  *
- * Lives in `<vault>/.obsidian/plugins/obsidian-team/state.db`, opened in WAL
+ * Lives in `<vault>/.obsidian/plugins/team-vault/state.db`, opened in WAL
  * mode for crash safety. Three logical concerns:
  *
  *   1. **`bindings_state`** — per-binding sync cursor (`lastVectorClock`,

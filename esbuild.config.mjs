@@ -22,7 +22,7 @@ const copyToVault = process.argv.includes('--vault');
 const isProd = !isWatch;
 
 const banner = `/*
- * Obsidian Team — built bundle.
+ * Team Vault — built bundle.
  * Do not edit directly. Source lives in src/.
  */`;
 
@@ -81,7 +81,7 @@ async function copyArtifactsToVault() {
     console.warn('[vault] TEST_VAULT env not set — skipping copy');
     return;
   }
-  const dest = `${vault}/.obsidian/plugins/obsidian-team`;
+  const dest = `${vault}/.obsidian/plugins/team-vault`;
   await copyFile('main.js', `${dest}/main.js`);
   await copyFile('manifest.json', `${dest}/manifest.json`);
   console.log(`[vault] copied main.js + manifest.json → ${dest}`);

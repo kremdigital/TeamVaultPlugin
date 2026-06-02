@@ -74,7 +74,7 @@ export class AddServerModal extends Modal {
             // Echo the underlying error to the DevTools console so the user
             // (and we, when debugging) can see the actual cause; the Notice
             // above only carries a localized one-liner.
-            console.error('[obsidian-team] server test failed', err);
+            console.error('[team-vault] server test failed', err);
             new Notice(t('settings.servers.test.failure', { error: errorToText(err) }));
           } finally {
             btn.setButtonText(t('modal.addServer.test'));

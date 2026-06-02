@@ -40,7 +40,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   private renderServersSection(parent: HTMLElement): void {
     parent.createEl('h3', { text: t('settings.servers.heading') });
 
-    const list = parent.createDiv({ cls: 'obsidian-team-server-list' });
+    const list = parent.createDiv({ cls: 'team-vault-server-list' });
     if (this.plugin.settings.servers.length === 0) {
       list.createEl('p', { text: t('settings.servers.empty') });
     } else {
@@ -108,7 +108,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   private renderBindingsSection(parent: HTMLElement): void {
     parent.createEl('h3', { text: t('settings.bindings.heading') });
 
-    const list = parent.createDiv({ cls: 'obsidian-team-binding-list' });
+    const list = parent.createDiv({ cls: 'team-vault-binding-list' });
     if (this.plugin.settings.bindings.length === 0) {
       list.createEl('p', { text: t('settings.bindings.empty') });
     } else {
