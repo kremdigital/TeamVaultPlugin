@@ -74,6 +74,9 @@
       "better-sqlite3",
       "esbuild",
       "unrs-resolver"
-    ]
+    ],
+    "overrides": {
+      "ws@>=8.0.0 <8.20.1": "^8.21.0"
+    }
   }
 }

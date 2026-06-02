@@ -4,6 +4,25 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] — 2026-06-02
+
+Security + housekeeping ahead of the catalogue submission.
+
+### Security
+
+- Pinned `ws` to `≥ 8.21.0` via `pnpm.overrides` to clear
+  GHSA-58qx-3vcg-4xpx (uninitialized memory disclosure), which entered
+  the tree transitively through `socket.io-client`. `pnpm audit` is now
+  clean. In Obsidian's Electron renderer `socket.io-client` uses the
+  native WebSocket rather than the `ws` package, so the vulnerable code
+  did not ship in `main.js`, but the override keeps the dependency tree
+  audit-clean.
+
+### Changed
+
+- Removed the legacy development logs (`log.md`, `tasks.md`) from the
+  repo. Project/agent documentation now lives at the workspace root.
+
 ## [0.2.0] — 2026-06-02
 
 Renamed for Obsidian Community Plugins compatibility.
