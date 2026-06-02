@@ -1,6 +1,6 @@
 {
   "name": "team-vault-plugin",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Self-hosted Obsidian vault synchronization with live collaboration.",
   "main": "main.js",
   "private": true,
