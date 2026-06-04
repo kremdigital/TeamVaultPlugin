@@ -111,7 +111,7 @@ export interface DeepSyncDiff {
 
 /**
  * Compare the server's authoritative file list against the local cache
- * inside `operationLog`. Used by the long-offline flow (`tasks.md` 8.3)
+ * inside `operationLog`. Used by the long-offline flow
  * to surface every divergence so the engine can replay the correct
  * operation per file.
  */

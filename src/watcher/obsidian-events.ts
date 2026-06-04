@@ -6,7 +6,7 @@ import type { RecentlyApplied } from './recently-applied';
 /**
  * Subscriber-friendly wrapper around `app.vault.on(create | modify | delete | rename)`.
  *
- * Stage 6 responsibilities (per `tasks.md` 6.1):
+ * Stage 6 responsibilities:
  *
  *   - Map each Obsidian event to a typed `VaultEvent` enriched with the
  *     binding it belongs to (or drop it if it doesn't fall inside any).

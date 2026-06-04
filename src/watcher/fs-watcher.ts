@@ -16,7 +16,7 @@ import type { VaultEvent, VaultEventHandler } from './obsidian-events';
 /**
  * Filesystem watcher.
  *
- * Stage 6 responsibilities (per `tasks.md` 6.2):
+ * Stage 6 responsibilities:
  *
  *   - Watch the vault root with chokidar so changes coming from outside
  *     Obsidian (CLI scripts, AI agents writing directly to disk, …) get

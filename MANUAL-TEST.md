@@ -1,4 +1,4 @@
-# Manual test plan — `tasks.md` 13.4
+# Manual test plan
 
 Чек-лист сценариев, которые `pnpm test` не покрывает (Yjs round-trip
 между двумя реальными Obsidian'ами, конфликт-модалки на живом сервере,

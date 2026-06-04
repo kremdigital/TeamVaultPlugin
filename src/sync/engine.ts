@@ -1153,7 +1153,7 @@ export class SyncEngine {
 
   /**
    * Compare local file metadata against the server's authoritative list.
-   * Used by the long-offline catch-up flow (`tasks.md` 8.3) and exposed
+   * Used by the long-offline catch-up flow and exposed
    * for the future "Deep sync" command (Stage 10).
    */
   async runDeepSyncDiff(): Promise<DeepSyncDiff> {
