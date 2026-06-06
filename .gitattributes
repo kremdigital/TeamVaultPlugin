@@ -1,0 +1,16 @@
+# Normalize all text to LF in the repository; check out with LF everywhere.
+* text=auto eol=lf
+
+# Shell scripts MUST stay LF — CRLF breaks the shebang/script on Linux.
+*.sh text eol=lf
+
+# Binary assets — never touch line endings.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.woff binary
+*.woff2 binary
+*.db binary
+*.wasm binary
