@@ -158,6 +158,12 @@ export default class ObsidianSyncPlugin extends Plugin {
       recentlyApplied: this.recentlyApplied,
       clientId: this.settings.clientId,
       conflictResolver,
+      onBindingSynced: (bindingId, at) => {
+        const binding = this.settings.bindings.find((b) => b.id === bindingId);
+        if (!binding) return;
+        binding.lastSyncedAt = at;
+        void this.saveSettings();
+      },
     });
   }
 

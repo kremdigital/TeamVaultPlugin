@@ -61,6 +61,12 @@ export interface EngineManagerDeps {
    */
   apiClient?: ((server: ServerConfig) => ApiClient) | undefined;
   socketClient?: ((server: ServerConfig, clientId: string) => SocketClient) | undefined;
+  /**
+   * Called when a binding finishes a sync cycle — its engine reaches
+   * `connected` after catch-up. Lets the host stamp the binding's
+   * `lastSyncedAt` and persist it to settings (`data.json`).
+   */
+  onBindingSynced?: ((bindingId: string, at: number) => void) | undefined;
 }
 
 export class EngineManager {
@@ -220,6 +226,11 @@ export class EngineManager {
     this.engines.set(binding.id, engine);
     const off = engine.onStatus((status, detail) => {
       this.statuses.set(binding.id, status);
+      // `connected` is the catch-up-complete transition: the binding has
+      // synced with the server. Let the host stamp lastSyncedAt + persist.
+      if (status === 'connected') {
+        this.deps.onBindingSynced?.(binding.id, Date.now());
+      }
       // Stash the latest detail so `getAggregateStatus()` keeps reporting
       // it consistently (otherwise a fresh call would lose context).
       this.lastDetail = detail;

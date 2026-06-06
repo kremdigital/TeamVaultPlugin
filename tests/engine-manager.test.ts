@@ -249,6 +249,54 @@ describe('EngineManager — aggregate status', () => {
   });
 });
 
+describe('EngineManager — onBindingSynced', () => {
+  it('fires with a fresh timestamp when an engine reaches connected', async () => {
+    const calls: Array<{ id: string; at: number }> = [];
+    const deps = makeDeps([server], [makeBinding({ id: 'a' })]);
+    deps.onBindingSynced = (id, at) => calls.push({ id, at });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    const before = Date.now();
+    FakeEngine.lastFor('a')?.setStatus('connected');
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0]?.id).toBe('a');
+    expect(calls[0]?.at).toBeGreaterThanOrEqual(before);
+    await m.stop();
+  });
+
+  it('does not fire for non-connected statuses', async () => {
+    const calls: string[] = [];
+    const deps = makeDeps([server], [makeBinding({ id: 'a' })]);
+    deps.onBindingSynced = (id) => calls.push(id);
+    const m = new EngineManager(deps);
+    await m.start(); // start() drives 'connecting' — must not count
+
+    FakeEngine.lastFor('a')?.setStatus('syncing');
+    FakeEngine.lastFor('a')?.setStatus('offline');
+    FakeEngine.lastFor('a')?.setStatus('error', 'boom');
+
+    expect(calls).toHaveLength(0);
+    await m.stop();
+  });
+
+  it('fires again on every reconnect (re-sync)', async () => {
+    const calls: number[] = [];
+    const deps = makeDeps([server], [makeBinding({ id: 'a' })]);
+    deps.onBindingSynced = (_id, at) => calls.push(at);
+    const m = new EngineManager(deps);
+    await m.start();
+
+    FakeEngine.lastFor('a')?.setStatus('connected');
+    FakeEngine.lastFor('a')?.setStatus('offline');
+    FakeEngine.lastFor('a')?.setStatus('connected');
+
+    expect(calls).toHaveLength(2);
+    await m.stop();
+  });
+});
+
 describe('EngineManager — vault event fan-out', () => {
   it('dispatches an event to the matching engine and ignores unknown ids', async () => {
     const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));

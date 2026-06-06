@@ -4,6 +4,17 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] — 2026-06-02
+
+### Fixed
+
+- A binding's `lastSyncedAt` (in `data.json`) was stamped once at creation
+  (`0`) and never updated — the engine only tracked sync state in the local
+  SQLite store. The `EngineManager` now reports each catch-up completion
+  (engine → `connected`) back to the host via a new `onBindingSynced`
+  callback, which updates the binding's `lastSyncedAt` and persists it.
+  It now reflects the last successful sync and refreshes on every reconnect.
+
 ## [0.2.1] — 2026-06-02
 
 Security + housekeeping ahead of the catalogue submission.
