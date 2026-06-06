@@ -30,9 +30,38 @@ export const EDITOR_ORIGIN = Symbol('team-vault-editor');
 export interface DocPersistence {
   whenSynced: Promise<unknown>;
   destroy(): Promise<void> | void;
+  /**
+   * Delete the backing data, not just close the connection. y-indexeddb's
+   * `clearData()` (which calls `deleteDB`) implements this; an in-memory or
+   * test backend with nothing on disk may omit it, in which case
+   * {@link DocManager.purgeBinding} falls back to deleting the db by name.
+   */
+  clearData?(): Promise<void> | void;
 }
 
 export type PersistenceFactory = (name: string, doc: Y.Doc) => DocPersistence | null;
+
+/**
+ * Enumerate + delete IndexedDB databases by name. {@link DocManager.purgeBinding}
+ * uses this to erase a removed binding's y-indexeddb stores — including docs
+ * never opened this session, which the in-memory cache never saw.
+ *
+ * The renderer's global `indexedDB` is adapted to this shape in `main.ts`
+ * (it references browser globals that don't belong in this env-agnostic
+ * module); tests inject a fake. The default is a no-op, so a `DocManager`
+ * built without one simply skips the on-disk delete.
+ */
+export interface IdbRegistry {
+  /** Names of every database visible to the renderer; `[]` if unsupported. */
+  list(): Promise<string[]>;
+  /** Delete one database by name. Resolves when gone (best-effort). */
+  delete(name: string): Promise<void>;
+}
+
+const NOOP_IDB: IdbRegistry = {
+  list: () => Promise.resolve([]),
+  delete: () => Promise.resolve(),
+};
 
 export interface DocManagerOptions {
   /**
@@ -46,6 +75,19 @@ export interface DocManagerOptions {
    * can verify naming, and so future schema bumps can prefix differently.
    */
   dbName?: (bindingId: string, filePath: string) => string;
+  /**
+   * Prefix shared by every database of a binding — defaults to
+   * `team-vault-{bindingId}-`. Must stay consistent with {@link dbName};
+   * {@link DocManager.purgeBinding} enumerates a binding's stores by it.
+   */
+  dbPrefix?: (bindingId: string) => string;
+  /**
+   * IndexedDB enumerate/delete seam used by {@link DocManager.purgeBinding}
+   * to drop a removed binding's offline stores. Production injects a registry
+   * backed by the renderer's `indexedDB`; tests inject a fake. Defaults to a
+   * no-op (skips the on-disk delete).
+   */
+  idb?: IdbRegistry;
 }
 
 /** Internal entry kept in the cache. */
@@ -61,21 +103,37 @@ interface ManagedEntry {
 
 const REMOTE_ORIGINS: ReadonlySet<unknown> = new Set([REMOTE_ORIGIN]);
 
+/** Shared root of every y-indexeddb database name this plugin creates. */
+const DB_PREFIX = 'team-vault-';
+
 function defaultDbName(bindingId: string, filePath: string): string {
   // IndexedDB names are case-sensitive but otherwise free-form; we still
   // prefer slash-free, predictable identifiers for grep-ability in DevTools.
   const slug = filePath.replace(/[^a-zA-Z0-9._-]+/g, '_');
-  return `team-vault-${bindingId}-${slug}`;
+  return `${defaultDbPrefix(bindingId)}${slug}`;
+}
+
+/**
+ * Prefix common to all of a binding's databases. The trailing `-` keeps
+ * binding ids from colliding by prefix (e.g. `b1` vs `b10`) when
+ * {@link DocManager.purgeBinding} filters enumerated database names.
+ */
+function defaultDbPrefix(bindingId: string): string {
+  return `${DB_PREFIX}${bindingId}-`;
 }
 
 export class DocManager {
   private readonly persistenceFactory: PersistenceFactory;
   private readonly dbName: (bindingId: string, filePath: string) => string;
+  private readonly dbPrefix: (bindingId: string) => string;
+  private readonly idb: IdbRegistry;
   private readonly cache = new Map<string, ManagedEntry>();
 
   constructor(options: DocManagerOptions = {}) {
     this.persistenceFactory = options.persistenceFactory ?? (() => null);
     this.dbName = options.dbName ?? defaultDbName;
+    this.dbPrefix = options.dbPrefix ?? defaultDbPrefix;
+    this.idb = options.idb ?? NOOP_IDB;
   }
 
   /**
@@ -188,6 +246,62 @@ export class DocManager {
     await Promise.all(pending);
   }
 
+  /**
+   * Delete (not just close) every y-indexeddb database belonging to a binding,
+   * including docs never loaded this session — the in-memory cache never saw
+   * those, so {@link releaseBinding} can't reach them. Call when a binding is
+   * removed from settings: `release` / `releaseBinding` only close the
+   * IndexedDB connection, leaking the on-disk data (the CRDT analogue of the
+   * operation-log `purgeBinding`).
+   *
+   * Cached (open) docs are cleared through their persistence (`clearData`,
+   * which closes the handle *and* deletes the db). The rest are found by
+   * enumerating the binding's `team-vault-{id}-` databases and deleting each
+   * by name. `knownPaths` — file paths from `OperationLog.listFileMeta`,
+   * captured BEFORE the log rows are purged — are a fallback for runtimes
+   * whose IndexedDB can't enumerate databases.
+   *
+   * Best-effort and idempotent: per-db failures are swallowed (the startup
+   * sweep retries). Returns the database names actually deleted.
+   */
+  async purgeBinding(bindingId: string, knownPaths: readonly string[] = []): Promise<string[]> {
+    const deleted = new Set<string>();
+
+    // 1. Cached docs hold the only live IndexedDB connections. Clear each
+    //    through its persistence (clearData = close + delete); closing first
+    //    is required so the deletes in step 3 aren't blocked by an open handle.
+    const cachePrefix = `${bindingId}::`;
+    const cachedPaths: string[] = [];
+    for (const key of [...this.cache.keys()]) {
+      if (!key.startsWith(cachePrefix)) continue;
+      const filePath = key.slice(cachePrefix.length);
+      cachedPaths.push(filePath);
+      if (await this.clearCached(bindingId, filePath)) {
+        deleted.add(this.dbName(bindingId, filePath));
+      }
+    }
+
+    // 2. Collect every other candidate name: enumerated by prefix
+    //    (authoritative — covers docs never opened this session, the common
+    //    case when deleting a binding), plus names derived from knownPaths and
+    //    the just-closed cached paths as a fallback when enumeration is absent.
+    const candidates = new Set<string>();
+    for (const path of knownPaths) candidates.add(this.dbName(bindingId, path));
+    for (const path of cachedPaths) candidates.add(this.dbName(bindingId, path));
+    const prefix = this.dbPrefix(bindingId);
+    for (const name of await this.listDbs()) {
+      if (name.startsWith(prefix)) candidates.add(name);
+    }
+
+    // 3. Delete each candidate by name (a no-op if clearData already erased it).
+    for (const name of candidates) {
+      if (deleted.has(name)) continue;
+      if (await this.deleteDb(name)) deleted.add(name);
+    }
+
+    return [...deleted];
+  }
+
   /** Drop everything. Idempotent. */
   async destroy(): Promise<void> {
     const keys = [...this.cache.keys()];
@@ -240,5 +354,49 @@ export class DocManager {
 
   private cacheKey(bindingId: string, filePath: string): string {
     return `${bindingId}::${filePath}`;
+  }
+
+  /**
+   * Evict a cached entry and erase its persisted data via `clearData`. Returns
+   * whether the data was actually deleted — `false` when the backend only
+   * supports `destroy` (close), so {@link purgeBinding} knows it must still
+   * delete the database by name.
+   */
+  private async clearCached(bindingId: string, filePath: string): Promise<boolean> {
+    const key = this.cacheKey(bindingId, filePath);
+    const entry = this.cache.get(key);
+    if (!entry) return false;
+    this.cache.delete(key);
+    entry.doc.off('update', entry.updateHandler);
+    let cleared = false;
+    if (entry.persistence?.clearData) {
+      await entry.persistence.clearData();
+      cleared = true;
+    } else if (entry.persistence) {
+      await entry.persistence.destroy();
+    } else {
+      cleared = true; // in-memory only — nothing on disk to delete.
+    }
+    entry.doc.destroy();
+    return cleared;
+  }
+
+  /** Enumerate database names; never throws (returns `[]` on failure). */
+  private async listDbs(): Promise<string[]> {
+    try {
+      return await this.idb.list();
+    } catch {
+      return [];
+    }
+  }
+
+  /** Delete one database; never throws (returns `false` on failure). */
+  private async deleteDb(name: string): Promise<boolean> {
+    try {
+      await this.idb.delete(name);
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

@@ -67,6 +67,13 @@ export interface BindingState {
   lastSyncedAt: number;
 }
 
+/** Per-table row counts removed by {@link OperationLog.purgeBinding}. */
+export interface PurgeResult {
+  pendingOperations: number;
+  fileMeta: number;
+  bindingsState: number;
+}
+
 /**
  * Migration list. Each entry is appended; `user_version` PRAGMA tracks how
  * many have been applied. Never edit a published migration — append a new
@@ -353,6 +360,47 @@ export class OperationLog {
            lastSyncedAt = excluded.lastSyncedAt`,
       )
       .run(bindingId, JSON.stringify(vc), at);
+  }
+
+  // -- cross-table maintenance ------------------------------------------------
+
+  /**
+   * Erase every trace of a binding from the log — its pending operations,
+   * file metadata, and sync cursor — in a single transaction. Called when a
+   * binding is removed from settings: without this, deleting a binding leaks
+   * state. Worse, its CREATE/UPDATE ops sit in `pending_operations` forever
+   * (the engine that would drain them no longer exists), so the queue only
+   * ever grows. Idempotent; returns how many rows each table shed.
+   */
+  purgeBinding(bindingId: string): PurgeResult {
+    const run = this.db.transaction((id: string): PurgeResult => {
+      const pendingOperations = this.db
+        .prepare(`DELETE FROM pending_operations WHERE bindingId = ?`)
+        .run(id).changes;
+      const fileMeta = this.db.prepare(`DELETE FROM file_meta WHERE bindingId = ?`).run(id).changes;
+      const bindingsState = this.db
+        .prepare(`DELETE FROM bindings_state WHERE bindingId = ?`)
+        .run(id).changes;
+      return { pendingOperations, fileMeta, bindingsState };
+    });
+    return run(bindingId);
+  }
+
+  /**
+   * Distinct binding ids with any state in the log, across all three tables.
+   * The startup orphan-sweep diffs this against the bindings in settings to
+   * find dead state left behind by earlier plugin versions (which never
+   * purged on delete) and hands each orphan to {@link purgeBinding}.
+   */
+  listBindingIds(): string[] {
+    const rows = this.db
+      .prepare<[], { bindingId: string }>(
+        `SELECT bindingId FROM pending_operations
+         UNION SELECT bindingId FROM file_meta
+         UNION SELECT bindingId FROM bindings_state`,
+      )
+      .all();
+    return rows.map((r) => r.bindingId);
   }
 }
 

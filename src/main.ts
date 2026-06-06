@@ -67,6 +67,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 
     this.bootstrapLogger();
     this.bootstrapState();
+    this.sweepOrphanedBindingState();
     this.bootstrapManager();
     this.bootstrapWatchers();
     this.bootstrapUi();
@@ -146,6 +147,26 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.recentlyApplied = new RecentlyApplied();
   }
 
+  /**
+   * One-time-per-launch reconciliation: drop local state for bindings that
+   * no longer exist in settings. Earlier plugin versions never cleaned up
+   * when a binding was deleted, so `state.db` accumulated dead pending
+   * operations (for engines that no longer exist and can never drain them)
+   * plus orphaned file_meta / bindings_state rows. From now on the
+   * `EngineManager` purges at delete time; this sweep mops up the backlog
+   * and anything a crash left behind. A merely-disabled binding is still in
+   * settings, so its queue is preserved.
+   */
+  private sweepOrphanedBindingState(): void {
+    if (!this.operationLog) return;
+    const known = new Set(this.settings.bindings.map((b) => b.id));
+    for (const bindingId of this.operationLog.listBindingIds()) {
+      if (known.has(bindingId)) continue;
+      const removed = this.operationLog.purgeBinding(bindingId);
+      this.logger?.info('swept orphaned binding state from local log', { bindingId, ...removed });
+    }
+  }
+
   private bootstrapManager(): void {
     if (!this.operationLog || !this.docManager || !this.recentlyApplied) return;
     const vault = new ObsidianVaultAdapter(this.app.vault);
@@ -158,6 +179,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       recentlyApplied: this.recentlyApplied,
       clientId: this.settings.clientId,
       conflictResolver,
+      logger: this.logger ?? undefined,
       onBindingSynced: (bindingId, at) => {
         const binding = this.settings.bindings.find((b) => b.id === bindingId);
         if (!binding) return;

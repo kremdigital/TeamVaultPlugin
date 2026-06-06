@@ -230,3 +230,75 @@ describe('OperationLog — bindings_state', () => {
     log.close();
   });
 });
+
+describe('OperationLog — purgeBinding', () => {
+  it('removes every trace of a binding across all three tables', () => {
+    const log = makeLog();
+    // b1: two pending ops, one meta row, one sync cursor.
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'UPDATE', filePath: 'a.md' });
+    log.setFileMeta(makeMeta({ bindingId: 'b1', relativePath: 'a.md' }));
+    log.updateLastVectorClock('b1', { n1: 3 });
+    // b2: must survive the purge untouched.
+    log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'keep.md' });
+    log.setFileMeta(makeMeta({ bindingId: 'b2', relativePath: 'keep.md' }));
+    log.updateLastVectorClock('b2', { n1: 1 });
+
+    const removed = log.purgeBinding('b1');
+    expect(removed).toEqual({ pendingOperations: 2, fileMeta: 1, bindingsState: 1 });
+
+    expect(log.pendingCount('b1')).toBe(0);
+    expect(log.listFileMeta('b1')).toHaveLength(0);
+    expect(log.getBindingState('b1')).toBeNull();
+
+    // b2 is fully intact.
+    expect(log.pendingCount('b2')).toBe(1);
+    expect(log.listFileMeta('b2')).toHaveLength(1);
+    expect(log.getBindingState('b2')?.lastVectorClock).toEqual({ n1: 1 });
+    log.close();
+  });
+
+  it('is idempotent — a second purge removes nothing', () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.setFileMeta(makeMeta({ bindingId: 'b1', relativePath: 'a.md' }));
+    log.purgeBinding('b1');
+    expect(log.purgeBinding('b1')).toEqual({
+      pendingOperations: 0,
+      fileMeta: 0,
+      bindingsState: 0,
+    });
+    log.close();
+  });
+
+  it('reports zero for a binding that was never seen', () => {
+    const log = makeLog();
+    expect(log.purgeBinding('ghost')).toEqual({
+      pendingOperations: 0,
+      fileMeta: 0,
+      bindingsState: 0,
+    });
+    log.close();
+  });
+});
+
+describe('OperationLog — listBindingIds', () => {
+  it('returns distinct ids drawn from any of the three tables', () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' }); // pending only
+    log.setFileMeta(makeMeta({ bindingId: 'b2' })); // file_meta only
+    log.updateLastVectorClock('b3', { n1: 1 }); // bindings_state only
+    // b1 also picks up meta + cursor — it must still appear exactly once.
+    log.setFileMeta(makeMeta({ bindingId: 'b1', relativePath: 'a.md' }));
+    log.updateLastVectorClock('b1', { n1: 2 });
+
+    expect([...log.listBindingIds()].sort()).toEqual(['b1', 'b2', 'b3']);
+    log.close();
+  });
+
+  it('is empty for a fresh log', () => {
+    const log = makeLog();
+    expect(log.listBindingIds()).toEqual([]);
+    log.close();
+  });
+});

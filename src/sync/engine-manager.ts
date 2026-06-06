@@ -8,6 +8,7 @@ import type { VaultAdapter } from './vault-adapter';
 import type { RecentlyApplied } from '@/watcher/recently-applied';
 import type { ConflictResolver } from './conflict';
 import type { VaultEvent } from '@/watcher/obsidian-events';
+import type { Logger } from '@/utils/logger';
 
 /**
  * Top-level coordinator that owns one `SyncEngine` per active binding,
@@ -53,6 +54,11 @@ export interface EngineManagerDeps {
   clientId: string;
   /** Optional UI hook for binary / delete conflicts. */
   conflictResolver?: ConflictResolver | undefined;
+  /**
+   * Root logger, forwarded to every `SyncEngine` (which scopes it with its
+   * own `bindingId`). When omitted, engines fall back to a silent logger.
+   */
+  logger?: Logger | undefined;
   /** Test seam — defaults to `new SyncEngine(deps)`. */
   engineFactory?: (deps: SyncEngineDeps) => SyncEngine;
   /**
@@ -115,6 +121,10 @@ export class EngineManager {
     const { servers, bindings } = this.deps.getSettings();
     const serverById = new Map(servers.map((s) => [s.id, s]));
     const desired = new Set<string>();
+    // Every binding still present in settings, regardless of `enabled` —
+    // distinguishes "removed" (purge local state) from "merely disabled"
+    // (keep its queue for when it's switched back on).
+    const known = new Set(bindings.map((b) => b.id));
 
     for (const binding of bindings) {
       if (!binding.enabled) continue;
@@ -127,7 +137,7 @@ export class EngineManager {
     }
 
     for (const id of [...this.engines.keys()]) {
-      if (!desired.has(id)) await this.dropEngine(id);
+      if (!desired.has(id)) await this.dropEngine(id, { purge: !known.has(id) });
     }
   }
 
@@ -218,6 +228,7 @@ export class EngineManager {
       ...(apiClient ? { apiClient } : {}),
       ...(socketClient ? { socketClient } : {}),
       ...(this.deps.conflictResolver ? { conflictResolver: this.deps.conflictResolver } : {}),
+      ...(this.deps.logger ? { logger: this.deps.logger } : {}),
     };
     const engine = this.deps.engineFactory
       ? this.deps.engineFactory(engineDeps)
@@ -241,7 +252,13 @@ export class EngineManager {
     await engine.start();
   }
 
-  private async dropEngine(id: string): Promise<void> {
+  /**
+   * Stop and forget an engine. `purge` additionally erases the binding's
+   * local state from the operation log — set only when the binding is gone
+   * from settings for good (see {@link refreshFromSettings}), never on a
+   * plain disable, pause, or shutdown, where the queue must survive.
+   */
+  private async dropEngine(id: string, opts: { purge?: boolean } = {}): Promise<void> {
     const engine = this.engines.get(id);
     if (engine) await engine.stop();
     const off = this.subs.get(id);
@@ -249,6 +266,22 @@ export class EngineManager {
     this.engines.delete(id);
     this.subs.delete(id);
     this.statuses.delete(id);
+    if (opts.purge) {
+      try {
+        const removed = this.deps.operationLog.purgeBinding(id);
+        this.deps.logger?.info('purged local state for removed binding', {
+          bindingId: id,
+          ...removed,
+        });
+      } catch (err) {
+        // Cleanup must never break roster reconciliation; the startup
+        // orphan-sweep will retry on next load.
+        this.deps.logger?.warn('failed to purge local state for removed binding', {
+          bindingId: id,
+          err,
+        });
+      }
+    }
     this.notifyAggregate();
   }
 

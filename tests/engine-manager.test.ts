@@ -297,6 +297,55 @@ describe('EngineManager — onBindingSynced', () => {
   });
 });
 
+describe('EngineManager — local-state purge', () => {
+  it('purges local state when a binding disappears from settings', async () => {
+    const bindings = [makeBinding({ id: 'a' }), makeBinding({ id: 'b' })];
+    const deps = makeDeps([server], bindings);
+    deps.operationLog.enqueueOperation('a', { opType: 'CREATE', filePath: 'gone.md' });
+    deps.operationLog.enqueueOperation('b', { opType: 'CREATE', filePath: 'keep.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    bindings.shift(); // remove 'a' entirely
+    await m.refreshFromSettings();
+
+    expect(FakeEngine.lastFor('a')?.stopCalls).toBe(1);
+    expect(deps.operationLog.pendingCount('a')).toBe(0);
+    // 'b' is still in settings — its queue is left alone.
+    expect(deps.operationLog.pendingCount('b')).toBe(1);
+    await m.stop();
+  });
+
+  it('keeps local state when a binding is only disabled', async () => {
+    const binding = makeBinding({ id: 'a' });
+    const deps = makeDeps([server], [binding]);
+    deps.operationLog.enqueueOperation('a', { opType: 'CREATE', filePath: 'note.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    binding.enabled = false; // dropped from the roster, but still in settings
+    await m.refreshFromSettings();
+
+    expect(FakeEngine.lastFor('a')?.stopCalls).toBe(1);
+    // Queue survives for when the binding is switched back on.
+    expect(deps.operationLog.pendingCount('a')).toBe(1);
+    await m.stop();
+  });
+
+  it('does not purge on pause', async () => {
+    const binding = makeBinding({ id: 'a' });
+    const deps = makeDeps([server], [binding]);
+    deps.operationLog.enqueueOperation('a', { opType: 'CREATE', filePath: 'note.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    await m.pause();
+
+    expect(deps.operationLog.pendingCount('a')).toBe(1);
+    await m.stop();
+  });
+});
+
 describe('EngineManager — vault event fan-out', () => {
   it('dispatches an event to the matching engine and ignores unknown ids', async () => {
     const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
