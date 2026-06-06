@@ -4,7 +4,7 @@ import { DEFAULT_SETTINGS, mergeWithDefaults, type PluginSettings } from '@/sett
 import { setLanguage } from '@/i18n';
 import { SyncSettingsTab } from '@/settings/tab';
 import { OperationLog } from '@/sync/operation-log';
-import { DocManager, type PersistenceFactory } from '@/crdt/doc-manager';
+import { DocManager, type IdbRegistry, type PersistenceFactory } from '@/crdt/doc-manager';
 import { EngineManager } from '@/sync/engine-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import { ObsidianWatcher, type VaultEvent } from '@/watcher/obsidian-events';
@@ -67,7 +67,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 
     this.bootstrapLogger();
     this.bootstrapState();
-    this.sweepOrphanedBindingState();
+    await this.sweepOrphanedBindingState();
     this.bootstrapManager();
     this.bootstrapWatchers();
     this.bootstrapUi();
@@ -143,7 +143,7 @@ export default class ObsidianSyncPlugin extends Plugin {
 
     const persistenceFactory: PersistenceFactory = (name, doc) =>
       new IndexeddbPersistence(name, doc);
-    this.docManager = new DocManager({ persistenceFactory });
+    this.docManager = new DocManager({ persistenceFactory, idb: browserIdbRegistry() });
     this.recentlyApplied = new RecentlyApplied();
   }
 
@@ -152,18 +152,34 @@ export default class ObsidianSyncPlugin extends Plugin {
    * no longer exist in settings. Earlier plugin versions never cleaned up
    * when a binding was deleted, so `state.db` accumulated dead pending
    * operations (for engines that no longer exist and can never drain them)
-   * plus orphaned file_meta / bindings_state rows. From now on the
-   * `EngineManager` purges at delete time; this sweep mops up the backlog
+   * plus orphaned file_meta / bindings_state rows, and the offline `Y.Doc`
+   * stores (y-indexeddb databases) leaked likewise. From now on the
+   * `EngineManager` purges both at delete time; this sweep mops up the backlog
    * and anything a crash left behind. A merely-disabled binding is still in
-   * settings, so its queue is preserved.
+   * settings, so its state is preserved.
    */
-  private sweepOrphanedBindingState(): void {
+  private async sweepOrphanedBindingState(): Promise<void> {
     if (!this.operationLog) return;
     const known = new Set(this.settings.bindings.map((b) => b.id));
     for (const bindingId of this.operationLog.listBindingIds()) {
       if (known.has(bindingId)) continue;
+      // Capture tracked file paths BEFORE wiping the log: purgeBinding clears
+      // file_meta, which the doc-manager purge uses as a fallback to locate
+      // y-indexeddb databases on runtimes that can't enumerate them.
+      const paths = this.operationLog.listFileMeta(bindingId).map((m) => m.relativePath);
       const removed = this.operationLog.purgeBinding(bindingId);
       this.logger?.info('swept orphaned binding state from local log', { bindingId, ...removed });
+      try {
+        const databases = (await this.docManager?.purgeBinding(bindingId, paths)) ?? [];
+        if (databases.length > 0) {
+          this.logger?.info('swept orphaned offline CRDT state', {
+            bindingId,
+            databases: databases.length,
+          });
+        }
+      } catch (err) {
+        this.logger?.warn('failed to sweep orphaned offline CRDT state', { bindingId, err });
+      }
     }
   }
 
@@ -325,4 +341,43 @@ export default class ObsidianSyncPlugin extends Plugin {
     await leaf.setViewState({ type: HISTORY_VIEW_TYPE, active: true });
     this.app.workspace.revealLeaf(leaf);
   }
+}
+
+/**
+ * Adapt the renderer's IndexedDB to the {@link IdbRegistry} seam the
+ * {@link DocManager} uses to purge a removed binding's offline stores. This
+ * lives in `main.ts` (the browser entry point) rather than the env-agnostic
+ * `doc-manager.ts` because it touches browser globals. `databases()` exists in
+ * Obsidian's Chromium renderer; we still guard it. Deletes are best-effort:
+ * a blocked or failed request resolves (never rejects) so one stuck database
+ * can't break roster reconciliation — the startup sweep retries.
+ */
+function browserIdbRegistry(): IdbRegistry {
+  const idb = typeof window !== 'undefined' ? window.indexedDB : undefined;
+  return {
+    list: async () => {
+      if (!idb?.databases) return [];
+      const infos = await idb.databases();
+      const names: string[] = [];
+      for (const info of infos) if (info.name) names.push(info.name);
+      return names;
+    },
+    delete: (name) =>
+      new Promise<void>((resolve) => {
+        if (!idb) {
+          resolve();
+          return;
+        }
+        try {
+          const request = idb.deleteDatabase(name);
+          request.onsuccess = () => resolve();
+          request.onerror = () => resolve();
+          // A still-open connection blocks deletion; ours are closed first, so
+          // this only fires for a foreign holder — resolve rather than hang.
+          request.onblocked = () => resolve();
+        } catch {
+          resolve();
+        }
+      }),
+  };
 }

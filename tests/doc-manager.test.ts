@@ -4,12 +4,14 @@ import {
   DocManager,
   REMOTE_ORIGIN,
   type DocPersistence,
+  type IdbRegistry,
   type PersistenceFactory,
 } from '@/crdt/doc-manager';
 
 class FakePersistence implements DocPersistence {
   static instances: FakePersistence[] = [];
   destroyed = false;
+  cleared = false;
   whenSynced: Promise<unknown>;
 
   constructor(
@@ -23,6 +25,30 @@ class FakePersistence implements DocPersistence {
   destroy(): void {
     this.destroyed = true;
   }
+
+  // Mirrors y-indexeddb: clearData closes the connection AND deletes the db.
+  clearData(): void {
+    this.cleared = true;
+    this.destroyed = true;
+  }
+}
+
+/** In-memory stand-in for the renderer's `indexedDB` enumerate/delete seam. */
+function makeFakeIdb(initial: string[]): {
+  registry: IdbRegistry;
+  names: Set<string>;
+  deleted: string[];
+} {
+  const names = new Set(initial);
+  const deleted: string[] = [];
+  const registry: IdbRegistry = {
+    list: () => Promise.resolve([...names]),
+    delete: (name) => {
+      if (names.delete(name)) deleted.push(name);
+      return Promise.resolve();
+    },
+  };
+  return { registry, names, deleted };
 }
 
 beforeEach(() => {
@@ -230,6 +256,76 @@ describe('DocManager — release / destroy', () => {
     expect(dm.has('b1', 'a.md')).toBe(false);
     expect(dm.has('b2', 'b.md')).toBe(false);
     expect(FakePersistence.instances.every((p) => p.destroyed)).toBe(true);
+  });
+});
+
+describe('DocManager — purgeBinding', () => {
+  it('clears cached docs through their persistence (clearData, not just destroy)', async () => {
+    const factory: PersistenceFactory = (name, doc) => new FakePersistence(name, doc);
+    const dm = new DocManager({ persistenceFactory: factory });
+    dm.get('b1', 'a.md');
+    dm.get('b1', 'b.md');
+    const [a, b] = FakePersistence.instances;
+
+    await dm.purgeBinding('b1');
+
+    // clearData (delete), not just destroy (close) — that's the whole fix.
+    expect(a?.cleared).toBe(true);
+    expect(b?.cleared).toBe(true);
+    expect(dm.has('b1', 'a.md')).toBe(false);
+    expect(dm.has('b1', 'b.md')).toBe(false);
+  });
+
+  it('deletes databases for docs never opened this session', async () => {
+    // The common case when deleting a binding: nothing is cached, so the
+    // purge must enumerate the binding's databases rather than walk the cache.
+    const idb = makeFakeIdb([
+      'team-vault-b1-a.md',
+      'team-vault-b1-sub_note.md',
+      'team-vault-b2-keep.md',
+    ]);
+    const dm = new DocManager({ idb: idb.registry });
+
+    const deleted = await dm.purgeBinding('b1');
+
+    expect(deleted.sort()).toEqual(['team-vault-b1-a.md', 'team-vault-b1-sub_note.md']);
+    expect([...idb.names]).toEqual(['team-vault-b2-keep.md']);
+  });
+
+  it('leaves other bindings’ databases untouched (prefix is dash-bounded)', async () => {
+    // b10 must survive a purge of b1 — the trailing dash disambiguates them.
+    const idb = makeFakeIdb(['team-vault-b1-x.md', 'team-vault-b10-y.md', 'team-vault-b2-z.md']);
+    const dm = new DocManager({ idb: idb.registry });
+
+    await dm.purgeBinding('b1');
+
+    expect([...idb.names].sort()).toEqual(['team-vault-b10-y.md', 'team-vault-b2-z.md']);
+  });
+
+  it('falls back to knownPaths when enumeration is unavailable', async () => {
+    const deleted: string[] = [];
+    const idb: IdbRegistry = {
+      list: () => Promise.resolve([]), // runtime without indexedDB.databases()
+      delete: (name) => {
+        deleted.push(name);
+        return Promise.resolve();
+      },
+    };
+    const dm = new DocManager({ idb });
+
+    await dm.purgeBinding('b1', ['note.md', 'dir/sub.md']);
+
+    expect(deleted.sort()).toEqual(['team-vault-b1-dir_sub.md', 'team-vault-b1-note.md']);
+  });
+
+  it('is best-effort — a failed delete does not throw', async () => {
+    const idb: IdbRegistry = {
+      list: () => Promise.resolve(['team-vault-b1-a.md']),
+      delete: () => Promise.reject(new Error('blocked')),
+    };
+    const dm = new DocManager({ idb });
+
+    await expect(dm.purgeBinding('b1')).resolves.toEqual([]);
   });
 });
 

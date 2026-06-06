@@ -267,6 +267,10 @@ export class EngineManager {
     this.subs.delete(id);
     this.statuses.delete(id);
     if (opts.purge) {
+      // Capture the tracked file list BEFORE wiping the log — purgeBinding
+      // clears file_meta, which the doc-manager purge uses as a fallback to
+      // locate y-indexeddb databases on runtimes that can't enumerate them.
+      const paths = this.deps.operationLog.listFileMeta(id).map((m) => m.relativePath);
       try {
         const removed = this.deps.operationLog.purgeBinding(id);
         this.deps.logger?.info('purged local state for removed binding', {
@@ -277,6 +281,20 @@ export class EngineManager {
         // Cleanup must never break roster reconciliation; the startup
         // orphan-sweep will retry on next load.
         this.deps.logger?.warn('failed to purge local state for removed binding', {
+          bindingId: id,
+          err,
+        });
+      }
+      // Offline CRDT state (y-indexeddb databases) is separate bookkeeping
+      // from the SQLite log; delete it too, or the binding's docs leak on disk.
+      try {
+        const databases = await this.deps.docManager.purgeBinding(id, paths);
+        this.deps.logger?.info('purged offline CRDT state for removed binding', {
+          bindingId: id,
+          databases: databases.length,
+        });
+      } catch (err) {
+        this.deps.logger?.warn('failed to purge offline CRDT state for removed binding', {
           bindingId: id,
           err,
         });

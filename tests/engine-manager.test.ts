@@ -1,7 +1,7 @@
 import { EngineManager, type AggregateStatus, type EngineManagerDeps } from '@/sync/engine-manager';
 import Database from 'better-sqlite3';
 import { OperationLog } from '@/sync/operation-log';
-import { DocManager } from '@/crdt/doc-manager';
+import { DocManager, type IdbRegistry } from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
@@ -61,7 +61,11 @@ const memVault: VaultAdapter = {
   list: async () => [],
 };
 
-function makeDeps(servers: ServerConfig[], bindings: VaultBinding[]): EngineManagerDeps {
+function makeDeps(
+  servers: ServerConfig[],
+  bindings: VaultBinding[],
+  over: Partial<EngineManagerDeps> = {},
+): EngineManagerDeps {
   return {
     getSettings: () => ({ servers, bindings }),
     vault: memVault,
@@ -73,7 +77,26 @@ function makeDeps(servers: ServerConfig[], bindings: VaultBinding[]): EngineMana
       const fake = new FakeEngine(deps.binding.id);
       return fake as unknown as SyncEngine;
     },
+    ...over,
   };
+}
+
+/** In-memory stand-in for the renderer's `indexedDB` enumerate/delete seam. */
+function makeFakeIdb(initial: string[]): {
+  registry: IdbRegistry;
+  names: Set<string>;
+  deleted: string[];
+} {
+  const names = new Set(initial);
+  const deleted: string[] = [];
+  const registry: IdbRegistry = {
+    list: () => Promise.resolve([...names]),
+    delete: (name) => {
+      if (names.delete(name)) deleted.push(name);
+      return Promise.resolve();
+    },
+  };
+  return { registry, names, deleted };
 }
 
 const server: ServerConfig = {
@@ -342,6 +365,55 @@ describe('EngineManager — local-state purge', () => {
     await m.pause();
 
     expect(deps.operationLog.pendingCount('a')).toBe(1);
+    await m.stop();
+  });
+});
+
+describe('EngineManager — offline CRDT purge', () => {
+  it('purges y-indexeddb state when a binding disappears from settings', async () => {
+    const idb = makeFakeIdb(['team-vault-a-gone.md', 'team-vault-b-keep.md']);
+    const docManager = new DocManager({ idb: idb.registry });
+    const bindings = [makeBinding({ id: 'a' }), makeBinding({ id: 'b' })];
+    const m = new EngineManager(makeDeps([server], bindings, { docManager }));
+    await m.start();
+
+    bindings.shift(); // remove 'a' entirely
+    await m.refreshFromSettings();
+
+    expect(FakeEngine.lastFor('a')?.stopCalls).toBe(1);
+    expect(idb.deleted).toEqual(['team-vault-a-gone.md']);
+    // 'b' is still in settings — its offline store is left alone.
+    expect([...idb.names]).toEqual(['team-vault-b-keep.md']);
+    await m.stop();
+  });
+
+  it('keeps y-indexeddb state when a binding is only disabled', async () => {
+    const idb = makeFakeIdb(['team-vault-a-note.md']);
+    const docManager = new DocManager({ idb: idb.registry });
+    const binding = makeBinding({ id: 'a' });
+    const m = new EngineManager(makeDeps([server], [binding], { docManager }));
+    await m.start();
+
+    binding.enabled = false; // dropped from the roster, but still in settings
+    await m.refreshFromSettings();
+
+    expect(FakeEngine.lastFor('a')?.stopCalls).toBe(1);
+    // Offline edits survive for when the binding is switched back on.
+    expect(idb.deleted).toEqual([]);
+    expect([...idb.names]).toEqual(['team-vault-a-note.md']);
+    await m.stop();
+  });
+
+  it('does not purge y-indexeddb state on pause', async () => {
+    const idb = makeFakeIdb(['team-vault-a-note.md']);
+    const docManager = new DocManager({ idb: idb.registry });
+    const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })], { docManager }));
+    await m.start();
+
+    await m.pause();
+
+    expect(idb.deleted).toEqual([]);
+    expect([...idb.names]).toEqual(['team-vault-a-note.md']);
     await m.stop();
   });
 });

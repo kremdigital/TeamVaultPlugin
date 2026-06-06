@@ -4,6 +4,24 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Deleting a binding leaked its **offline CRDT state** — the local-state
+  analogue of the `state.db` leak fixed in 0.2.3. Each tracked text file keeps
+  a per-file `y-indexeddb` database (`team-vault-{bindingId}-{slug}`); removing
+  a binding only closed any open connections — it never deleted the databases,
+  and files not opened that session (the common case for a binding you're
+  deleting) were never touched at all, so a deleted binding's Yjs stores piled
+  up on disk forever. `DocManager.purgeBinding` now clears cached docs through
+  y-indexeddb's `clearData()` and enumerates + deletes every
+  `team-vault-{bindingId}-*` database. It fires in the same two places as the
+  operation-log purge: when a binding is removed from settings (not merely
+  _disabled_, which keeps its offline edits for when it's switched back on),
+  and the one-time startup sweep. Local-only cleanup — the sync wire protocol
+  is untouched.
+
 ## [0.2.3] — 2026-06-06
 
 ### Fixed
