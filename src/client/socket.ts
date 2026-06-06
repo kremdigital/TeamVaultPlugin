@@ -60,9 +60,22 @@ export type JoinResult =
   | {
       ok: true;
       operations: ServerOperation[];
-      yjsDocs: YjsDocSnapshot[];
+      /** Inline catch-up (legacy / non-streaming servers). */
+      yjsDocs?: YjsDocSnapshot[];
+      /** Set when the server is streaming the catch-up via `yjs:catchup`. */
+      yjsStream?: boolean;
+      /** Number of docs that will stream (for progress). */
+      yjsCount?: number;
     }
   | { ok: false; error: string };
+
+/** One streamed Yjs catch-up batch (`yjs:catchup`), mirrors the server. */
+export interface YjsCatchupBatch {
+  projectId: string;
+  docs: YjsDocSnapshot[];
+  /** True on the final batch — catch-up is complete. */
+  done: boolean;
+}
 
 export type FileEvent =
   | { type: 'created'; result: unknown; log: ServerLogEntry }
@@ -206,6 +219,7 @@ export class SocketClient {
   private errorCbs = new Set<EventCb<Error>>();
   private fileEventCbs = new Set<EventCb<FileEvent>>();
   private yjsCbs = new Set<EventCb<YjsUpdateMessage>>();
+  private yjsCatchupCbs = new Set<EventCb<YjsCatchupBatch>>();
 
   constructor(options: SocketClientOptions) {
     this.factory = options.factory ?? defaultFactory;
@@ -318,6 +332,19 @@ export class SocketClient {
       });
     });
 
+    // Streamed Yjs catch-up after a `project:join` with `streamYjs: true`.
+    socket.on('yjs:catchup', (raw: unknown) => {
+      const data = raw as
+        | { projectId?: string; docs?: YjsDocSnapshot[]; done?: boolean }
+        | undefined;
+      if (!data || typeof data.projectId !== 'string' || !Array.isArray(data.docs)) return;
+      this.fan(this.yjsCatchupCbs, {
+        projectId: data.projectId,
+        docs: data.docs,
+        done: data.done === true,
+      });
+    });
+
     socket.connect();
   }
 
@@ -351,13 +378,22 @@ export class SocketClient {
     this.yjsCbs.add(cb);
     return () => this.yjsCbs.delete(cb);
   }
+  onYjsCatchup(cb: (batch: YjsCatchupBatch) => void): () => void {
+    this.yjsCatchupCbs.add(cb);
+    return () => this.yjsCatchupCbs.delete(cb);
+  }
 
   // -- Outgoing emits -------------------------------------------------------
 
-  joinProject(projectId: string, sinceVectorClock: VectorClock | null = null): Promise<JoinResult> {
+  joinProject(
+    projectId: string,
+    sinceVectorClock: VectorClock | null = null,
+    streamYjs = false,
+  ): Promise<JoinResult> {
     return this.emitWithAck<JoinResult>('project:join', {
       projectId,
       sinceVectorClock,
+      streamYjs,
     });
   }
 

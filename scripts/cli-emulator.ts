@@ -143,7 +143,7 @@ async function watch(args: CliArgs, projectId: string): Promise<void> {
     process.exit(1);
   }
   console.log(
-    `[join] ok — ${result.operations.length} catch-up ops, ${result.yjsDocs.length} yjs docs`,
+    `[join] ok — ${result.operations.length} catch-up ops, ${result.yjsDocs?.length ?? 0} yjs docs`,
   );
   console.log('[watch] streaming events (Ctrl+C to exit)…');
 

@@ -183,11 +183,12 @@ describe('SocketClient — emits', () => {
   it('joinProject sends the right payload and resolves with the server ack', async () => {
     const { client, socket } = captureSocket();
     client.connect();
-    const promise = client.joinProject('p1', { node1: 5 });
+    const promise = client.joinProject('p1', { node1: 5 }, true);
     expect(socket().emits[0]?.event).toBe('project:join');
     expect(socket().emits[0]?.args[0]).toEqual({
       projectId: 'p1',
       sinceVectorClock: { node1: 5 },
+      streamYjs: true,
     });
     socket().ackLast({ ok: true, operations: [], yjsDocs: [] });
     await expect(promise).resolves.toEqual({ ok: true, operations: [], yjsDocs: [] });

@@ -1,10 +1,12 @@
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
-import { ApiClient } from '@/client/api';
+import { ApiClient, ApiError } from '@/client/api';
 import {
   SocketClient,
   type FileEvent as SocketFileEvent,
   type ServerOperation,
   type YjsUpdateMessage,
+  type YjsDocSnapshot,
+  type YjsCatchupBatch,
 } from '@/client/socket';
 import { DocManager } from '@/crdt/doc-manager';
 import { OperationLog, type FileMeta, type OperationType } from './operation-log';
@@ -30,6 +32,19 @@ import type { VaultEvent } from '@/watcher/obsidian-events';
 import type { RecentlyApplied } from '@/watcher/recently-applied';
 import { isInBinding } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
+import { Logger, type LogSink } from '@/utils/logger';
+
+/**
+ * Silent fallback so the engine always has a logger to call, even when one
+ * isn't injected (most unit tests construct `SyncEngine` without one).
+ * Production wires the real `Logger` through the `EngineManager`.
+ */
+const NOOP_LOG_SINK: LogSink = {
+  write() {
+    /* discard — silent fallback when no logger is injected */
+  },
+};
+const SILENT_LOGGER = new Logger('error', NOOP_LOG_SINK);
 
 /**
  * Per-binding sync engine — the central orchestrator.
@@ -70,6 +85,13 @@ export interface SyncEngineDeps {
   conflictResolver?: ConflictResolver;
   /** Test seam — `Date.now` substitute. Used for `buildConflictPath`. */
   now?: () => number;
+  /**
+   * Logger for status transitions — errors at `error`, the rest at `debug`.
+   * Defaults to a silent logger; the `EngineManager` injects the real one
+   * so per-binding sync failures land in `sync.log` / DevTools instead of
+   * only flipping the status bar.
+   */
+  logger?: Logger;
 }
 
 export type EngineStatus = 'stopped' | 'connecting' | 'syncing' | 'connected' | 'error' | 'offline';
@@ -105,6 +127,9 @@ const ECHO_COUNT_DELETE = 2;
 /** Per path: Obsidian onRename (fires take on both) + chokidar `unlink`/`add`. */
 const ECHO_COUNT_RENAME = 2;
 
+/** Safety cap on waiting for a streamed Yjs catch-up before proceeding. */
+const CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;
+
 export class SyncEngine {
   private readonly binding: VaultBinding;
   private readonly server: ServerConfig;
@@ -118,6 +143,8 @@ export class SyncEngine {
   private readonly diskSnapshotDebounceMs: number;
   private readonly conflictResolver: ConflictResolver;
   private readonly now: () => number;
+  /** Binding-scoped logger — carries `component=engine bindingId=…` context. */
+  private readonly log: Logger;
 
   /** Local vector clock for the binding — bumped before each outgoing op. */
   private vectorClock: VectorClock;
@@ -142,6 +169,18 @@ export class SyncEngine {
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
 
+  /**
+   * Resolves the in-flight streamed Yjs catch-up once the server's final
+   * `yjs:catchup` batch (`done`) arrives. Armed before each `project:join`
+   * with `streamYjs`, cleared when the stream finishes (or times out).
+   */
+  private catchupResolve: (() => void) | null = null;
+  /** True once the file index is refreshed — gates catch-up batch processing
+   *  so a doc always finds its metadata (no join↔refresh race). */
+  private indexReady = false;
+  /** `yjs:catchup` batches that arrived before the index was ready. */
+  private pendingCatchup: YjsCatchupBatch[] = [];
+
   constructor(deps: SyncEngineDeps) {
     this.binding = deps.binding;
     this.server = deps.server;
@@ -156,6 +195,10 @@ export class SyncEngine {
     this.diskSnapshotDebounceMs = deps.diskSnapshotDebounceMs ?? 500;
     this.conflictResolver = deps.conflictResolver ?? defaultConflictResolver;
     this.now = deps.now ?? Date.now;
+    this.log = (deps.logger ?? SILENT_LOGGER).child({
+      component: 'engine',
+      bindingId: this.binding.id,
+    });
 
     const persisted = this.operationLog.getBindingState(this.binding.id);
     this.vectorClock = persisted?.lastVectorClock ?? this.binding.lastVectorClock ?? {};
@@ -180,11 +223,12 @@ export class SyncEngine {
     );
     this.cleanups.push(
       this.socket.onError((err) => {
-        this.setStatus('error', err.message);
+        this.setStatus('error', describeError(err, 'connect_error'));
       }),
     );
     this.cleanups.push(this.socket.onFileEvent((event) => void this.handleServerFileEvent(event)));
     this.cleanups.push(this.socket.onYjsUpdate((msg) => this.handleServerYjsUpdate(msg)));
+    this.cleanups.push(this.socket.onYjsCatchup((batch) => void this.handleYjsCatchup(batch)));
 
     this.socket.connect();
   }
@@ -254,13 +298,35 @@ export class SyncEngine {
   private async onSocketConnect(): Promise<void> {
     try {
       this.setStatus('syncing');
+      // Re-gate streamed catch-up for this connect: batches that arrive before
+      // the file index is ready get buffered (see `handleYjsCatchup`).
+      this.indexReady = false;
+      this.pendingCatchup = [];
+      // Arm the streamed-catch-up completion signal before the join so a fast
+      // server stream can't resolve before we're waiting on it.
+      const catchupDone = new Promise<void>((resolve) => {
+        this.catchupResolve = resolve;
+      });
+
       // Fire `project:join` synchronously (no await before it) so tests can
-      // observe the emit immediately, and let the file-index refresh run
-      // in parallel.
-      const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock);
+      // observe the emit immediately and the server starts streaming ASAP;
+      // refresh the file index in parallel. `streamYjs: true` asks the server
+      // to deliver the catch-up as batched `yjs:catchup` events.
+      const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
+
+      // Index is ready — let catch-up batches through, draining any that
+      // arrived during the join↔refresh window.
+      this.indexReady = true;
+      const buffered = this.pendingCatchup;
+      this.pendingCatchup = [];
+      for (const batch of buffered) {
+        await this.processCatchupBatch(batch);
+      }
+
       if (!result.ok) {
+        this.catchupResolve = null;
         this.setStatus('error', result.error);
         return;
       }
@@ -270,37 +336,15 @@ export class SyncEngine {
         await this.applyServerOperation(op);
       }
 
-      // Hydrate Yjs docs from sync-step1 payloads — and, in the same loop,
-      // push back anything the server is missing. y-indexeddb keeps offline
-      // text edits across reloads but the local-update fan-out only fires
-      // for *future* edits, so without this round-trip the offline ops stay
-      // stuck client-side forever and the server's `changed`-detection sees
-      // every subsequent live edit as a no-op replay (the parent structs of
-      // the new op are missing on the server).
-      for (const snap of result.yjsDocs) {
-        const meta = this.fileIndex.byId.get(snap.fileId);
-        if (!meta) continue;
-        const update = Uint8Array.from(snap.sync1);
-        this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
-        await this.snapshotDocToDisk(meta.relativePath);
-
-        if (snap.stateVector && snap.stateVector.length > 0) {
-          const serverVector = Uint8Array.from(snap.stateVector);
-          const missing = this.docManager.encodeStateAsUpdate(
-            this.binding.id,
-            meta.relativePath,
-            serverVector,
-          );
-          // An "empty" Yjs delta is ~2 bytes (zero-struct, zero-delete
-          // markers). A larger buffer means we actually have local ops the
-          // server doesn't know about yet — push them.
-          if (missing.length > 2) {
-            void this.socket.emitYjsUpdate({
-              projectId: this.binding.projectId,
-              fileId: meta.fileId,
-              update: missing,
-            });
-          }
+      // Hydrate Yjs docs. New servers STREAM them via `yjs:catchup` (handled by
+      // `handleYjsCatchup`); we wait for the `done` batch here. Legacy servers
+      // return them inline in the ack — apply those directly.
+      if (result.yjsStream) {
+        await this.waitForCatchup(catchupDone);
+      } else {
+        this.catchupResolve = null;
+        for (const snap of result.yjsDocs ?? []) {
+          await this.applyCatchupDoc(snap);
         }
       }
 
@@ -318,8 +362,89 @@ export class SyncEngine {
       // inside is load-bearing — see `drainThenInitialPush`.
       void this.drainThenInitialPush();
     } catch (err) {
-      this.setStatus('error', err instanceof Error ? err.message : 'sync_failed');
+      this.catchupResolve = null;
+      this.setStatus('error', describeError(err, 'sync_failed'));
     }
+  }
+
+  /**
+   * Receives one streamed `yjs:catchup` batch. Each batch is its own socket
+   * message, so the event loop yields between them — a 600-file catch-up never
+   * blocks the heartbeat or the UI (the livelock the old all-at-once ack
+   * caused). Batches that beat the file-index refresh are buffered.
+   */
+  private async handleYjsCatchup(batch: YjsCatchupBatch): Promise<void> {
+    if (batch.projectId !== this.binding.projectId) return;
+    if (!this.indexReady) {
+      this.pendingCatchup.push(batch);
+      return;
+    }
+    await this.processCatchupBatch(batch);
+  }
+
+  /** Applies a catch-up batch's docs; the final `done` batch ends the wait. */
+  private async processCatchupBatch(batch: YjsCatchupBatch): Promise<void> {
+    for (const snap of batch.docs) {
+      await this.applyCatchupDoc(snap);
+    }
+    if (batch.done) {
+      this.catchupResolve?.();
+      this.catchupResolve = null;
+    }
+  }
+
+  /**
+   * Applies one doc's sync-step1 snapshot and, in the same pass, pushes back
+   * anything the server is missing. y-indexeddb keeps offline text edits across
+   * reloads but the local-update fan-out only fires for *future* edits, so
+   * without this round-trip offline ops stay stuck client-side forever and the
+   * server treats every subsequent live edit as a no-op replay (parent structs
+   * missing).
+   */
+  private async applyCatchupDoc(snap: YjsDocSnapshot): Promise<void> {
+    const meta = this.fileIndex.byId.get(snap.fileId);
+    if (!meta) return;
+    const update = Uint8Array.from(snap.sync1);
+    this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
+    await this.snapshotDocToDisk(meta.relativePath);
+
+    if (snap.stateVector && snap.stateVector.length > 0) {
+      const serverVector = Uint8Array.from(snap.stateVector);
+      const missing = this.docManager.encodeStateAsUpdate(
+        this.binding.id,
+        meta.relativePath,
+        serverVector,
+      );
+      // An "empty" Yjs delta is ~2 bytes (zero-struct, zero-delete markers).
+      // A larger buffer means we have local ops the server lacks — push them.
+      if (missing.length > 2) {
+        void this.socket.emitYjsUpdate({
+          projectId: this.binding.projectId,
+          fileId: meta.fileId,
+          update: missing,
+        });
+      }
+    }
+  }
+
+  /**
+   * Waits for the streamed catch-up to finish, but never hangs the whole
+   * connect on a stalled stream — after {@link CATCHUP_TIMEOUT_MS} we proceed
+   * to `connected` regardless (the initial-push drain reconciles the rest).
+   */
+  private waitForCatchup(done: Promise<void>): Promise<void> {
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const finish = (): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.catchupResolve = null;
+        resolve();
+      };
+      const timer = setTimeout(finish, CATCHUP_TIMEOUT_MS);
+      void done.then(finish);
+    });
   }
 
   /**
@@ -639,7 +764,7 @@ export class SyncEngine {
           break;
       }
     } catch (err) {
-      this.setStatus('error', err instanceof Error ? err.message : 'apply_failed');
+      this.setStatus('error', describeError(err, 'apply_failed'));
     }
   }
 
@@ -1178,6 +1303,18 @@ export class SyncEngine {
 
   private setStatus(status: EngineStatus, detail?: string): void {
     this.status = status;
+    // Observability: surface every transition through the logger so a sync
+    // failure is diagnosable from sync.log / DevTools, not just the status
+    // bar. `error` logs at error level (always written to the file sink);
+    // every other transition at debug (mirrored to console only when
+    // logLevel=debug). `detail` carries the cause — `project_not_found`, an
+    // HTTP code, a socket disconnect reason — and `bindingId` rides in the
+    // logger context so a multi-binding log stays greppable.
+    if (status === 'error') {
+      this.log.error('sync error', detail ?? '(no detail)');
+    } else {
+      this.log.debug('status', status, ...(detail !== undefined ? [detail] : []));
+    }
     for (const cb of this.statusListeners) {
       try {
         cb(status, detail);
@@ -1189,6 +1326,20 @@ export class SyncEngine {
 }
 
 // -- Local helpers ------------------------------------------------------------
+
+/**
+ * Render an error into a diagnostic `detail` string for the status bar and
+ * the error log. An `ApiError` carries its HTTP status separately from a
+ * bland `.message` ("Not found"), so we fold the code in —
+ * `not_found (HTTP 404)` makes a deleted project / file distinguishable
+ * from any other failure when reading `sync.log`. Generic errors fall back
+ * to their message; non-`Error` throws to the supplied `fallback` code.
+ */
+function describeError(err: unknown, fallback: string): string {
+  if (err instanceof ApiError) return `${err.kind} (HTTP ${err.status})`;
+  if (err instanceof Error) return err.message;
+  return fallback;
+}
 
 function mergeClocks(a: VectorClock, b: VectorClock): VectorClock {
   const out: VectorClock = { ...a };

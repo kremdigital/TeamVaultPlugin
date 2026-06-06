@@ -4,6 +4,41 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- Large vaults could not finish the initial sync. `project:join` returned the
+  full Yjs state of every text file in one ack, so the server loaded hundreds of
+  Y.Docs into memory at once and the client applied them synchronously —
+  blocking its event loop past the Socket.IO heartbeat, which dropped the socket
+  and triggered a reconnect→rejoin livelock (and drove the earlier server OOM).
+  The plugin now opts into a **streamed catch-up** (`streamYjs`): the server
+  ships the docs as batched `yjs:catchup` events and the client applies each
+  batch in its own tick, so neither the event loop nor the UI ever block. Falls
+  back to the inline array against older servers.
+- Deleting a binding leaked its local state. The binding's rows in the local
+  `state.db` (`pending_operations`, `file_meta`, `bindings_state`) were never
+  cleaned up, so each delete left dead state behind — including queued
+  operations for an engine that no longer exists and can never drain them, so
+  the pending queue only grew. `EngineManager` now purges a binding's local
+  state the moment it's removed from settings (a merely _disabled_ binding
+  keeps its queue for when it's switched back on), and a one-time sweep on
+  plugin load mops up state orphaned by earlier versions. No server round-trip
+  is involved; only stale local bookkeeping is removed.
+- Sync failures were silent everywhere but the status bar. When a binding's
+  project was deleted server-side — or any `project:join` / file-index fetch
+  failed — the engine flipped to the `error` state but wrote nothing to
+  `sync.log` or the DevTools console (the log showed only `plugin loaded`).
+  The root cause: the `Logger` built in `main.ts` was never passed down to
+  the `SyncEngine`, so the engine had no logger at all. `SyncEngine` now
+  takes a logger (forwarded through `EngineManager`) and logs every error
+  transition at `error` level with its `bindingId` and the cause, folding
+  the HTTP status code into the detail (e.g. `not_found (HTTP 404)`) so a
+  deleted project is distinguishable from other failures. Non-error
+  transitions log at `debug`. No data was ever at risk — local files stay
+  intact; this only restores diagnosability.
+
 ## [0.2.2] — 2026-06-02
 
 ### Fixed

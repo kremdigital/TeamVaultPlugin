@@ -12,6 +12,7 @@ import {
 } from '@/client/socket';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
+import { Logger, formatLogEntry, type LogEntry, type LogSink } from '@/utils/logger';
 
 /**
  * In-memory vault adapter — file map keyed by vault path. Binary is stored
@@ -117,6 +118,12 @@ class FakeSocket implements SocketLike {
     const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
     if (ack) ack({ ok: true, ...extra });
   }
+  /** Resolve the ack of the last emit with `ok: false` and an error code. */
+  ackErr(error: string): void {
+    const last = this.emits[this.emits.length - 1];
+    const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
+    if (ack) ack({ ok: false, error });
+  }
 }
 
 const factory: SocketFactory = (_url: string, _options: SocketFactoryOptions) => new FakeSocket();
@@ -153,7 +160,7 @@ interface Harness {
   apiResponses: Map<string, () => RequestUrlResponse>;
 }
 
-function buildHarness(joinResult?: unknown): Harness {
+function buildHarness(opts: { logger?: Logger } = {}): Harness {
   const vault = new MemoryVault();
   const log = new OperationLog({ filePath: ':memory:', Database });
   const doc = new DocManager();
@@ -189,11 +196,10 @@ function buildHarness(joinResult?: unknown): Harness {
     recentlyApplied: ra,
     apiClient: api,
     socketClient: socket,
+    ...(opts.logger ? { logger: opts.logger } : {}),
   };
   const engine = new SyncEngine(deps);
 
-  // Pre-program the join response so onSocketConnect can complete.
-  void joinResult;
   return {
     engine,
     vault,
@@ -799,6 +805,85 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     Y.applyUpdate(target, Uint8Array.from(payload.update));
     expect(target.getText('content').toString()).toBe('offline-only edits');
     target.destroy();
+    await h.engine.stop();
+  });
+
+  it('applies a streamed Yjs catch-up and only connects after the done batch', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '0',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    // Offline edits the server has never seen — must be pushed back on catch-up.
+    h.doc.setText('b1', 'note.md', 'offline-only edits');
+
+    await h.engine.start();
+    // Server signals streaming (no inline yjsDocs).
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+
+    // The catch-up is streaming — status must NOT reach connected until `done`.
+    expect(h.engine.getStatus()).not.toBe('connected');
+
+    const emptyDoc = new Y.Doc();
+    const sync1 = Array.from(Y.encodeStateAsUpdate(emptyDoc));
+    const stateVector = Array.from(Y.encodeStateVector(emptyDoc));
+    emptyDoc.destroy();
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [{ fileId: 'f1', sync1, stateVector }],
+      done: true,
+    });
+    await flushAsync(20);
+
+    // Now connected…
+    expect(h.engine.getStatus()).toBe('connected');
+    // …and the offline ops were pushed back (same round-trip as inline).
+    const emits = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(emits.length).toBeGreaterThanOrEqual(1);
+    const payload = emits[0]?.args[0] as { fileId: string; update: number[] };
+    expect(payload.fileId).toBe('f1');
+    const target = new Y.Doc();
+    Y.applyUpdate(target, Uint8Array.from(payload.update));
+    expect(target.getText('content').toString()).toBe('offline-only edits');
+    target.destroy();
+    await h.engine.stop();
+  });
+
+  it('ignores streamed catch-up batches for a different project', async () => {
+    const h = buildHarness();
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 0 });
+    await flushAsync(10);
+
+    // A `done` for some other project must not complete our catch-up.
+    h.socket().fire('yjs:catchup', { projectId: 'OTHER', docs: [], done: true });
+    await flushAsync(10);
+    expect(h.engine.getStatus()).not.toBe('connected');
+
+    // Our own `done` does.
+    h.socket().fire('yjs:catchup', { projectId: 'p1', docs: [], done: true });
+    await flushAsync(10);
+    expect(h.engine.getStatus()).toBe('connected');
     await h.engine.stop();
   });
 
@@ -1522,6 +1607,73 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       .emits.slice(before)
       .filter((e) => e.event === 'file:create');
     expect(creates).toEqual([]);
+    await h.engine.stop();
+  });
+});
+
+describe('SyncEngine — error logging (observability)', () => {
+  // A logger backed by an in-memory sink so the test can read exactly what
+  // the engine would have written to sync.log / DevTools. Level 'debug' so
+  // non-error transitions are recorded too — we filter to the error ones.
+  function captureLogger(): { logger: Logger; entries: LogEntry[] } {
+    const entries: LogEntry[] = [];
+    const sink: LogSink = {
+      write: (e) => {
+        entries.push(e);
+      },
+    };
+    return { logger: new Logger('debug', sink, { plugin: 'team-vault' }), entries };
+  }
+
+  it('logs the cause at error level with bindingId when project:join is NACKed', async () => {
+    const { logger, entries } = captureLogger();
+    const h = buildHarness({ logger });
+
+    await h.engine.start();
+    // The project was deleted server-side → join is rejected with a cause code.
+    h.socket().ackErr('project_not_found');
+    await flushAsync();
+
+    // Status still flips to error (unchanged behaviour)…
+    expect(h.engine.getStatus()).toBe('error');
+
+    // …but now the failure is also written to the logger — previously the
+    // status bar was the only place it surfaced (the "muteness" bug).
+    const errors = entries.filter((e) => e.level === 'error');
+    expect(errors).toHaveLength(1);
+    const entry = errors[0];
+    expect(entry?.context).toMatchObject({ component: 'engine', bindingId: 'b1' });
+    const line = entry ? formatLogEntry(entry) : '';
+    expect(line).toContain('bindingId=b1');
+    expect(line).toContain('project_not_found');
+
+    await h.engine.stop();
+  });
+
+  it('folds the HTTP status code into the logged detail when refreshFileIndex 404s', async () => {
+    const { logger, entries } = captureLogger();
+    const h = buildHarness({ logger });
+    // Deleted project → the REST file-list returns 404. The bare ApiError
+    // message is just "Not found"; the engine must fold in the status code so
+    // the log pinpoints the cause (project_not_found vs. some other failure).
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 404,
+      json: { error: 'not_found' },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    await h.engine.start();
+    await flushAsync();
+
+    expect(h.engine.getStatus()).toBe('error');
+    const errors = entries.filter((e) => e.level === 'error');
+    expect(errors).toHaveLength(1);
+    const line = errors[0] ? formatLogEntry(errors[0]) : '';
+    expect(line).toContain('404');
+    expect(line).toContain('not_found');
+
     await h.engine.stop();
   });
 });
