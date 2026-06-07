@@ -107,10 +107,19 @@ const REMOTE_ORIGINS: ReadonlySet<unknown> = new Set([REMOTE_ORIGIN]);
 const DB_PREFIX = 'team-vault-';
 
 function defaultDbName(bindingId: string, filePath: string): string {
-  // IndexedDB names are case-sensitive but otherwise free-form; we still
-  // prefer slash-free, predictable identifiers for grep-ability in DevTools.
-  const slug = filePath.replace(/[^a-zA-Z0-9._-]+/g, '_');
-  return `${defaultDbPrefix(bindingId)}${slug}`;
+  // The database name MUST be a lossless, injective function of the file
+  // path. The previous slug — `filePath.replace(/[^a-zA-Z0-9._-]+/g, '_')` —
+  // replaced every non-ASCII char (all Cyrillic/CJK letters) AND `/` with
+  // `_`, so distinct non-ASCII paths collapsed onto ONE database name
+  // (`персонажи/андрей-перминов.md` and `персонажи/иван-воренок.md` both →
+  // `_-_.md`). Files sharing an offline store accumulate each other's Y.Doc
+  // content — catastrophic content-mixing corruption on any non-Latin vault.
+  //
+  // `encodeURIComponent` is injective (distinct paths → distinct names),
+  // synchronous, and keeps ASCII paths readable for DevTools grep while
+  // percent-escaping `/` and every non-ASCII byte. IndexedDB names are
+  // free-form DOMStrings, so `%`-escapes are valid.
+  return `${defaultDbPrefix(bindingId)}${encodeURIComponent(filePath)}`;
 }
 
 /**

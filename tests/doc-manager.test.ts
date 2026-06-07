@@ -105,6 +105,27 @@ describe('DocManager — persistence factory', () => {
     expect(FakePersistence.instances[0]?.name).toBe('custom:b1:a/b/c.md');
   });
 
+  it('builds a DISTINCT database name for every path (no non-ASCII collision)', () => {
+    // Regression for the content-mixing data-corruption incident: the old slug
+    // `filePath.replace(/[^a-zA-Z0-9._-]+/g, '_')` collapsed every Cyrillic
+    // path onto one name (these four all became `team-vault-b1-_-_.md`), so the
+    // files shared one offline store and their Y.Doc contents merged. The
+    // default dbName must be injective: distinct paths → distinct names.
+    const factory: PersistenceFactory = (name, doc) => new FakePersistence(name, doc);
+    const dm = new DocManager({ persistenceFactory: factory });
+    const paths = [
+      'персонажи/андрей-перминов.md',
+      'персонажи/иван-воренок.md',
+      'персонажи/василий-звенигородский.md',
+      'события/порча-зерна.md',
+    ];
+    for (const p of paths) dm.get('b1', p);
+    const names = FakePersistence.instances.map((i) => i.name);
+    expect(new Set(names).size).toBe(paths.length);
+    // Every name keeps the binding-scoped prefix and is unique.
+    for (const name of names) expect(name.startsWith('team-vault-b1-')).toBe(true);
+  });
+
   it('reuses persistence across get() calls', () => {
     const factory: PersistenceFactory = (name, doc) => new FakePersistence(name, doc);
     const dm = new DocManager({ persistenceFactory: factory });
@@ -315,7 +336,8 @@ describe('DocManager — purgeBinding', () => {
 
     await dm.purgeBinding('b1', ['note.md', 'dir/sub.md']);
 
-    expect(deleted.sort()).toEqual(['team-vault-b1-dir_sub.md', 'team-vault-b1-note.md']);
+    // dbName is now lossless (encodeURIComponent): `/` → `%2F`.
+    expect(deleted.sort()).toEqual(['team-vault-b1-dir%2Fsub.md', 'team-vault-b1-note.md']);
   });
 
   it('is best-effort — a failed delete does not throw', async () => {
