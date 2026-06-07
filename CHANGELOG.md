@@ -4,6 +4,26 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.5] — 2026-06-07
+
+### Fixed
+
+- **Critical data corruption on non-Latin vaults.** Each text file's offline
+  `y-indexeddb` database was named `team-vault-{bindingId}-{slug}`, where the
+  slug was `filePath.replace(/[^a-zA-Z0-9._-]+/g, '_')` — every non-ASCII
+  character (all Cyrillic / CJK letters) and `/` collapsed to `_`. On a
+  Cyrillic vault this made distinct paths share **one** database name
+  (`персонажи/андрей-перминов.md` and `персонажи/иван-воренок.md` both →
+  `_-_.md`), so dozens of files read and wrote the **same** offline CRDT store.
+  Their `Y.Doc` contents accumulated into each other and every affected file
+  hydrated with the concatenated text of all its name-collisions — pages mixed
+  together across files, growing on each sync. The database name is now a
+  lossless, injective function of the path (`encodeURIComponent`), so distinct
+  files never share a store. A vault already corrupted by this bug must restore
+  the affected files from a clean snapshot and re-seed the server — the fix
+  prevents recurrence but cannot un-mix already-merged documents. ASCII-only
+  vaults were unaffected (their slugs never collided).
+
 ## [0.2.4] — 2026-06-07
 
 ### Fixed
