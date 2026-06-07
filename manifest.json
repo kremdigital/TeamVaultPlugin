@@ -1,7 +1,7 @@
 {
   "id": "team-vault",
   "name": "Team Vault",
-  "version": "0.2.4",
+  "version": "0.2.5",
   "minAppVersion": "1.5.0",
   "description": "Self-hosted vault sync with live collaboration for Obsidian teams.",
   "author": "krem.digital",
