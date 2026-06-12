@@ -54,6 +54,15 @@ export const ALWAYS_IGNORED_SEGMENTS = ['.obsidian', '.git', '.versions'] as con
 
 const ALWAYS_IGNORED_SUFFIX = ['.tmp', '~'] as const;
 
+/**
+ * Obsidian's desktop adapter writes files atomically: content goes to
+ * `<name>.tmp.<pid>.<hex>` first, then renames over the target. A crash or
+ * a locked target orphans the temp file — and since the name does NOT end
+ * in `.tmp`, the suffix filter above never caught it: the watcher and the
+ * initial-push pass treated the artifact as a real note and uploaded it.
+ */
+const ATOMIC_TMP_PATTERN = /\.tmp\.(\d+)\.[0-9a-f]+$/i;
+
 /** True if the file should be filtered out entirely, regardless of binding. */
 export function isAlwaysIgnored(vaultPath: string): boolean {
   if (vaultPath === '') return true;
@@ -65,5 +74,17 @@ export function isAlwaysIgnored(vaultPath: string): boolean {
   for (const suffix of ALWAYS_IGNORED_SUFFIX) {
     if (vaultPath.endsWith(suffix)) return true;
   }
-  return false;
+  return ATOMIC_TMP_PATTERN.test(vaultPath);
+}
+
+/**
+ * True for an atomic-write artifact left behind by a *previous* Obsidian
+ * session — the embedded pid differs from `currentPid`. Artifacts of the
+ * running process are skipped: their write may still be in flight. Used by
+ * the startup sweep that deletes the orphans.
+ */
+export function isOrphanedAtomicTmp(vaultPath: string, currentPid: number): boolean {
+  const match = ATOMIC_TMP_PATTERN.exec(vaultPath);
+  if (!match) return false;
+  return Number(match[1]) !== currentPid;
 }

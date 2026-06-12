@@ -4,6 +4,35 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Mass rollback of disk files on reconnect.** Edits made while the plugin
+  was off (git operations, external agents, another editor) exist only on
+  disk — the `Y.Doc` learns about local changes solely through watcher
+  events. The catch-up flow applied the server's doc state and immediately
+  snapshotted it to disk, silently rolling such files back to the last
+  server-known version (observed 2026-06-12: 56 freshly-edited files reverted
+  at once). Snapshots now _fold_ unseen disk edits into the doc first: when
+  the bytes on disk differ from the last hash the engine itself synced, the
+  disk content is diffed into the CRDT (so it survives the merge and is
+  pushed to the server) before anything is written. When the disk is
+  unchanged since the last sync, server content applies as before.
+- **Catch-up raced the offline doc store.** Nothing awaited y-indexeddb's
+  `whenSynced` before catch-up applied server state and snapshotted to disk,
+  so a doc could be observed half-loaded (effectively empty) — producing both
+  a bogus push-back diff and a rollback-style disk write. The engine now
+  awaits `DocManager.whenSynced` (with a 10 s cap so a wedged IndexedDB
+  degrades instead of stalling) before using a doc in catch-up or snapshots.
+- **Orphaned Obsidian atomic-write artifacts synced as real notes.** Obsidian
+  writes files as `<name>.tmp.<pid>.<hex>` + rename; a crash or locked target
+  orphans the temp file. The watcher's ignore list only matched the literal
+  `.tmp` suffix, so the artifacts were watched, uploaded by the initial-push
+  pass, and never cleaned up. They are now always ignored (watchers and
+  initial push), and a startup sweep deletes orphans from previous sessions
+  (the embedded pid differs from the running process) inside binding folders.
+
 ## [0.2.5] — 2026-06-07
 
 ### Fixed

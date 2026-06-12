@@ -55,6 +55,36 @@ beforeEach(() => {
   FakePersistence.instances = [];
 });
 
+describe('DocManager — whenSynced', () => {
+  it('resolves immediately for in-memory docs (no persistence)', async () => {
+    const dm = new DocManager();
+    await expect(dm.whenSynced('b1', 'note.md')).resolves.toBeUndefined();
+  });
+
+  it('waits for the persistence backend to finish loading', async () => {
+    let resolveLoad: (() => void) | undefined;
+    const factory: PersistenceFactory = (name, doc) => {
+      const p = new FakePersistence(name, doc);
+      p.whenSynced = new Promise<void>((resolve) => {
+        resolveLoad = resolve;
+      });
+      return p;
+    };
+    const dm = new DocManager({ persistenceFactory: factory });
+
+    let synced = false;
+    const wait = dm.whenSynced('b1', 'note.md').then(() => {
+      synced = true;
+    });
+    await Promise.resolve();
+    expect(synced).toBe(false); // still loading
+
+    resolveLoad?.();
+    await wait;
+    expect(synced).toBe(true);
+  });
+});
+
 describe('DocManager — caching', () => {
   it('returns the same Y.Doc for repeated get calls', () => {
     const dm = new DocManager();

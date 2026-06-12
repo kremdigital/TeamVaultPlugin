@@ -2,6 +2,7 @@ import {
   absoluteToVault,
   isAlwaysIgnored,
   isInBinding,
+  isOrphanedAtomicTmp,
   normalizeSeparators,
 } from '@/watcher/path-utils';
 
@@ -70,5 +71,30 @@ describe('isAlwaysIgnored', () => {
 
   it('keeps real markdown content', () => {
     expect(isAlwaysIgnored('notes/work/idea.md')).toBe(false);
+  });
+
+  it('drops Obsidian atomic-write artifacts (<name>.tmp.<pid>.<hex>)', () => {
+    expect(isAlwaysIgnored('DATA/wiki/index.md.tmp.14424.02a1a4a4e56e')).toBe(true);
+    expect(isAlwaysIgnored('log.md.tmp.1.ff')).toBe(true);
+  });
+
+  it('keeps notes that merely contain "tmp" in the name', () => {
+    expect(isAlwaysIgnored('notes/tmp-ideas.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/data.tmp.md')).toBe(false);
+  });
+});
+
+describe('isOrphanedAtomicTmp', () => {
+  it('matches artifacts from a different (dead) process', () => {
+    expect(isOrphanedAtomicTmp('wiki/index.md.tmp.14424.02a1a4a4e56e', 999)).toBe(true);
+  });
+
+  it('skips artifacts of the current process — write may be in flight', () => {
+    expect(isOrphanedAtomicTmp('wiki/index.md.tmp.14424.02a1a4a4e56e', 14424)).toBe(false);
+  });
+
+  it('never matches regular files', () => {
+    expect(isOrphanedAtomicTmp('wiki/index.md', 999)).toBe(false);
+    expect(isOrphanedAtomicTmp('notes/data.tmp.md', 999)).toBe(false);
   });
 });

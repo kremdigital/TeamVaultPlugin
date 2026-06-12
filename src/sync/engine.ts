@@ -30,7 +30,7 @@ import {
 } from './conflict';
 import type { VaultEvent } from '@/watcher/obsidian-events';
 import type { RecentlyApplied } from '@/watcher/recently-applied';
-import { isInBinding } from '@/watcher/path-utils';
+import { isAlwaysIgnored, isInBinding } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
 
@@ -404,6 +404,11 @@ export class SyncEngine {
   private async applyCatchupDoc(snap: YjsDocSnapshot): Promise<void> {
     const meta = this.fileIndex.byId.get(snap.fileId);
     if (!meta) return;
+    // The offline doc store (y-indexeddb) loads asynchronously. Applying the
+    // server's state to a doc that hasn't finished loading computes a bogus
+    // push-back diff and snapshots a local-history-less merge over the file
+    // on disk — a silent rollback.
+    await this.docManager.whenSynced(this.binding.id, meta.relativePath);
     const update = Uint8Array.from(snap.sync1);
     this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
     await this.snapshotDocToDisk(meta.relativePath);
@@ -485,6 +490,10 @@ export class SyncEngine {
     const paths = await this.vault.list(this.binding.localFolder);
     const pending = this.operationLog.pendingPaths(this.binding.id);
     for (const path of paths) {
+      // Watcher events are filtered upstream, but this pass walks the raw
+      // vault listing — without the same filter it uploads throw-away
+      // artifacts (e.g. Obsidian's orphaned `*.tmp.<pid>.<hex>` files).
+      if (isAlwaysIgnored(path)) continue;
       if (this.fileIndex.byPath.has(path)) continue;
       if (pending.has(path)) continue;
       try {
@@ -1080,8 +1089,40 @@ export class SyncEngine {
     d();
   }
 
+  /**
+   * Fold out-of-band disk edits into the `Y.Doc` before a snapshot
+   * overwrites the file. The doc only learns about local edits through
+   * watcher events (`handleLocalModify` → `setText`); anything written
+   * while the plugin was off — git checkout, an external agent, edits
+   * still inside the watcher's debounce window — exists ONLY on disk.
+   * Snapshotting without this fold rolls the file back to the doc's
+   * (stale) state: the 2026-06-12 mass-rollback incident, where a
+   * catch-up rewrote 56 freshly-edited files with old server content.
+   *
+   * `meta.contentHash` is the last state the engine itself synced or
+   * wrote. A different disk hash means the bytes on disk are ahead of the
+   * doc, so they're diffed in as local ops — those then ride the normal
+   * local-update fan-out (live) or the catch-up push-back (reconnect) to
+   * the server. When the disk still matches the last-synced hash the doc
+   * is the one that's ahead (an incoming remote edit) and no fold happens.
+   */
+  private async foldDiskEditsIntoDoc(path: string): Promise<void> {
+    const meta = this.fileIndex.byPath.get(path);
+    if (!meta || meta.fileType !== 'TEXT') return;
+    if (!(await this.vault.exists(path))) return;
+    const diskText = await this.vault.readText(path);
+    if (diskText === this.docManager.getText(this.binding.id, path)) return;
+    const diskHash = await sha256Hex(diskText);
+    if (diskHash === meta.contentHash) return;
+    this.docManager.setText(this.binding.id, path, diskText);
+  }
+
   private async snapshotDocToDisk(path: string): Promise<void> {
     if (!this.docManager.has(this.binding.id, path)) return;
+    // Never snapshot a doc whose offline store is still loading — its text
+    // is a partial view and the write would destroy the full copy on disk.
+    await this.docManager.whenSynced(this.binding.id, path);
+    await this.foldDiskEditsIntoDoc(path);
     const text = this.docManager.getText(this.binding.id, path);
     const meta = this.fileIndex.byPath.get(path);
     if (meta) {

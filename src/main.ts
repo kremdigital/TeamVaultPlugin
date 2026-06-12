@@ -9,6 +9,7 @@ import { EngineManager } from '@/sync/engine-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import { ObsidianWatcher, type VaultEvent } from '@/watcher/obsidian-events';
 import { FsWatcher } from '@/watcher/fs-watcher';
+import { isInBinding, isOrphanedAtomicTmp } from '@/watcher/path-utils';
 import { Logger, type LogLevel } from '@/utils/logger';
 import { ConsoleLogSink } from '@/utils/console-log-sink';
 import { CompositeLogSink } from '@/utils/composite-log-sink';
@@ -68,6 +69,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.bootstrapLogger();
     this.bootstrapState();
     await this.sweepOrphanedBindingState();
+    await this.sweepOrphanedTmpArtifacts();
     this.bootstrapManager();
     this.bootstrapWatchers();
     this.bootstrapUi();
@@ -179,6 +181,30 @@ export default class ObsidianSyncPlugin extends Plugin {
         }
       } catch (err) {
         this.logger?.warn('failed to sweep orphaned offline CRDT state', { bindingId, err });
+      }
+    }
+  }
+
+  /**
+   * Delete orphaned Obsidian atomic-write artifacts (`<name>.tmp.<pid>.<hex>`)
+   * inside binding folders. Obsidian writes files atomically — temp file,
+   * then rename — and a crash or a locked target leaves the temp behind.
+   * Earlier versions even uploaded the orphans (the watcher's `.tmp` suffix
+   * filter didn't match the pattern). Artifacts whose embedded pid belongs
+   * to the current process are skipped: their write may still be in flight.
+   * Best-effort — a failed delete is logged and retried next launch.
+   */
+  private async sweepOrphanedTmpArtifacts(): Promise<void> {
+    const pid = typeof process !== 'undefined' ? process.pid : undefined;
+    if (pid === undefined) return;
+    for (const file of this.app.vault.getFiles()) {
+      if (!isOrphanedAtomicTmp(file.path, pid)) continue;
+      if (!this.settings.bindings.some((b) => isInBinding(file.path, b.localFolder))) continue;
+      try {
+        await this.app.vault.adapter.remove(file.path);
+        this.logger?.info('removed orphaned tmp artifact', { path: file.path });
+      } catch (err) {
+        this.logger?.warn('failed to remove orphaned tmp artifact', { path: file.path, err });
       }
     }
   }

@@ -106,6 +106,9 @@ const REMOTE_ORIGINS: ReadonlySet<unknown> = new Set([REMOTE_ORIGIN]);
 /** Shared root of every y-indexeddb database name this plugin creates. */
 const DB_PREFIX = 'team-vault-';
 
+/** Cap on waiting for a persistence backend to load (see {@link DocManager.whenSynced}). */
+const WHEN_SYNCED_TIMEOUT_MS = 10_000;
+
 function defaultDbName(bindingId: string, filePath: string): string {
   // The database name MUST be a lossless, injective function of the file
   // path. The previous slug — `filePath.replace(/[^a-zA-Z0-9._-]+/g, '_')` —
@@ -177,6 +180,32 @@ export class DocManager {
   getText(bindingId: string, filePath: string): string {
     const entry = this.acquire(bindingId, filePath);
     return entry.ytext.toString();
+  }
+
+  /**
+   * Resolve once the doc's persistence backend (y-indexeddb) has loaded its
+   * stored state into the `Y.Doc`. The engine MUST await this before using
+   * a doc for catch-up or disk snapshots: persistence loads asynchronously,
+   * and a doc observed before `whenSynced` looks empty — merging server
+   * state into it and writing the result to disk rolls the file back to a
+   * local-history-less view. No-op for in-memory docs. Guarded by a timeout
+   * so a wedged IndexedDB degrades to the old behavior instead of stalling
+   * every snapshot forever.
+   */
+  async whenSynced(bindingId: string, filePath: string): Promise<void> {
+    const entry = this.acquire(bindingId, filePath);
+    if (!entry.persistence) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        entry.persistence.whenSynced,
+        new Promise<void>((resolve) => {
+          timer = setTimeout(resolve, WHEN_SYNCED_TIMEOUT_MS);
+        }),
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+    }
   }
 
   /**

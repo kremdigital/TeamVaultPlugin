@@ -160,7 +160,7 @@ interface Harness {
   apiResponses: Map<string, () => RequestUrlResponse>;
 }
 
-function buildHarness(opts: { logger?: Logger } = {}): Harness {
+function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harness {
   const vault = new MemoryVault();
   const log = new OperationLog({ filePath: ':memory:', Database });
   const doc = new DocManager();
@@ -197,6 +197,7 @@ function buildHarness(opts: { logger?: Logger } = {}): Harness {
     apiClient: api,
     socketClient: socket,
     ...(opts.logger ? { logger: opts.logger } : {}),
+    ...(opts.snapshotMs !== undefined ? { diskSnapshotDebounceMs: opts.snapshotMs } : {}),
   };
   const engine = new SyncEngine(deps);
 
@@ -1674,6 +1675,190 @@ describe('SyncEngine — error logging (observability)', () => {
     expect(line).toContain('404');
     expect(line).toContain('not_found');
 
+    await h.engine.stop();
+  });
+});
+
+describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
+  /** Standard one-file server listing used by every test in this block. */
+  function listFiles(h: Harness, contentHash: string): void {
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash,
+            size: '10',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+  }
+
+  function seedSyncedMeta(h: Harness, contentHash: string): void {
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: 'note.md',
+      serverFileId: 'f1',
+      contentHash,
+      size: 10,
+      fileType: 'TEXT',
+      lastSyncedAt: 1,
+    });
+  }
+
+  function putDisk(h: Harness, text: string): void {
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+  }
+
+  it('catch-up must not roll back a file edited on disk while the plugin was off', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const oldText = 'старая версия\n';
+    const newText = 'старая версия\nсвежая локальная правка\n';
+    const oldHash = await sha256Hex(oldText);
+
+    // The engine synced `oldText` in a previous session; the file was then
+    // edited on disk (git checkout / external agent) with the plugin off,
+    // and the local Y.Doc store is EMPTY (e.g. fresh database name).
+    listFiles(h, oldHash);
+    seedSyncedMeta(h, oldHash);
+    putDisk(h, newText);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, oldText);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(20);
+
+    // The disk keeps the local edits (this is the 56-file rollback bug)…
+    expect(await h.vault.readText('note.md')).toBe(newText);
+    // …the doc converged on them…
+    expect(h.doc.getText('b1', 'note.md')).toBe(newText);
+    // …and the push-back ships them to the server.
+    const emits = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(emits.length).toBeGreaterThanOrEqual(1);
+    const payload = emits[0]?.args[0] as { update: number[] };
+    Y.applyUpdate(serverDoc, Uint8Array.from(payload.update));
+    expect(serverDoc.getText('content').toString()).toBe(newText);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('catch-up still applies newer server content when the disk has no local edits', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const oldText = 'v1\n';
+    const serverText = 'v1\nremote edit\n';
+    const oldHash = await sha256Hex(oldText);
+
+    listFiles(h, oldHash);
+    seedSyncedMeta(h, oldHash);
+    putDisk(h, oldText); // unchanged since last sync
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, serverText);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(20);
+
+    // Normal sync: the server's newer text lands on disk.
+    expect(await h.vault.readText('note.md')).toBe(serverText);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a live yjs:update snapshot folds unseen disk edits instead of clobbering them', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness({ snapshotMs: 0 });
+    const oldText = 'v1\n';
+    const localText = 'v1\nlocal pending edit\n';
+    const oldHash = await sha256Hex(oldText);
+
+    listFiles(h, oldHash);
+    seedSyncedMeta(h, oldHash);
+    putDisk(h, localText); // edited on disk; the watcher debounce hasn't fired yet
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+
+    const remote = new Y.Doc();
+    remote.getText('content').insert(0, 'v1\nremote line\n');
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(remote)),
+    });
+    remote.destroy();
+    await flushAsync(20);
+
+    // The snapshot must not roll the disk back to a state without the
+    // local edit — disk content wins and is shipped upstream.
+    expect(await h.vault.readText('note.md')).toContain('local pending edit');
+    const pushed = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(pushed.length).toBeGreaterThanOrEqual(1);
+    await h.engine.stop();
+  });
+
+  it('initial push skips Obsidian atomic-write artifacts', async () => {
+    const h = buildHarness();
+    // Map iteration order = insertion order: the artifact comes first, so a
+    // missing filter would upload it before the real note.
+    h.vault.files.set(
+      'note.md.tmp.14424.02a1a4a4e56e',
+      new TextEncoder().encode('garbage').buffer as ArrayBuffer,
+    );
+    h.vault.files.set('real.md', new TextEncoder().encode('content').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    const paths = creates.map((e) => (e.args[0] as { filePath: string }).filePath);
+    expect(paths).toEqual(['real.md']);
+    h.socket().ackOk({ outcome: { fileId: 'f9', path: 'real.md' } });
+    await flushAsync();
     await h.engine.stop();
   });
 });
