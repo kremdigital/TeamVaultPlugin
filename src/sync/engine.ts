@@ -1198,6 +1198,17 @@ export class SyncEngine {
             // dropping the op is the right thing.
             return { ok: false, retryable: false, error: 'local_file_missing' };
           }
+          // The drain runs after `refreshFileIndex`, so a path the server
+          // already tracks means this CREATE was queued while offline for a
+          // file the server knew all along (e.g. a git checkout touching
+          // synced files). Replaying it as CREATE makes the server
+          // conflict-rename the duplicate (`<name>.conflict-<clientId>` —
+          // 56 junk copies in the 2026-06-12 incident). Route through the
+          // modify path instead: Yjs diff for text, binary UPDATE otherwise.
+          if (this.fileIndex.byPath.has(op.filePath)) {
+            await this.handleLocalModify(op.filePath);
+            return { ok: true };
+          }
           const data = await this.vault.readBinary(op.filePath);
           // Hash the bytes we're *actually* sending, not the stale
           // `payload.contentHash` captured at enqueue time. A file created

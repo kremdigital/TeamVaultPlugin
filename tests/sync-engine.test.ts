@@ -703,7 +703,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     expect(h.log.pendingCount('b1')).toBe(0);
   });
 
-  it('replays duplicate offline CREATEs for one path with a consistent fresh hash', async () => {
+  it('collapses duplicate offline CREATEs for one path into one CREATE + a modify', async () => {
     const h = buildHarness();
     // Simulate create-then-edit while offline: the content captured at
     // enqueue time differs from the content on disk at replay time.
@@ -728,23 +728,23 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync(20);
 
-    // First replayed CREATE.
+    // First replayed CREATE ships the fresh on-disk bytes.
     const creates = h.socket().emits.filter((e) => e.event === 'file:create');
     expect(creates).toHaveLength(1);
-    const firstHash = (creates[0]?.args[0] as { contentHash: string }).contentHash;
+    const sent = creates[0]?.args[0] as { contentHash: string; data: number[] };
+    expect(new TextDecoder().decode(Uint8Array.from(sent.data))).toBe('v2 edited');
     h.socket().ackOk({ outcome: { fileId: 'f1', path: 'draft.md' } });
     await flushAsync(20);
 
-    // Second replayed CREATE — must carry the SAME hash as the first (both
-    // read the same on-disk bytes). The old code sent the stale enqueue-time
-    // payload hash, so the two diverged and the server conflict-renamed the
-    // retry into `draft.conflict-<clientId>.md`.
+    // The ack recorded draft.md in the file index, so the second queued
+    // CREATE must NOT replay as another file:create — the server would
+    // conflict-rename a same-path re-create with a diverged hash into
+    // `draft.conflict-<clientId>.md` (the 2026-06-12 incident). It routes
+    // through the modify path instead (Yjs diff for this TEXT file).
     const creates2 = h.socket().emits.filter((e) => e.event === 'file:create');
-    expect(creates2).toHaveLength(2);
-    const secondHash = (creates2[1]?.args[0] as { contentHash: string }).contentHash;
-    expect(secondHash).toBe(firstHash);
-    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'draft.md' } });
-    await flushAsync(20);
+    expect(creates2).toHaveLength(1);
+    expect(h.doc.getText('b1', 'draft.md')).toBe('v2 edited');
+    expect(h.log.pendingCount('b1')).toBe(0);
   });
 
   it('pushes local-only Yjs ops back to the server on reconnect', async () => {
@@ -1837,6 +1837,51 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     expect(await h.vault.readText('note.md')).toContain('local pending edit');
     const pushed = h.socket().emits.filter((e) => e.event === 'yjs:update');
     expect(pushed.length).toBeGreaterThanOrEqual(1);
+    await h.engine.stop();
+  });
+
+  it('replays an offline CREATE for a server-known path as a modify, not a conflict-renaming CREATE', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const oldText = 'старое содержимое\n';
+    const newText = 'восстановленное содержимое\n';
+    const oldHash = await sha256Hex(oldText);
+
+    listFiles(h, oldHash);
+    seedSyncedMeta(h, oldHash);
+    putDisk(h, newText);
+
+    // A git checkout while the engine was offline looks like a fresh create
+    // to the watcher — the op queues because the socket is down.
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'note.md',
+      source: 'fs',
+    });
+    expect(h.log.pendingCount('b1')).toBe(1);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    // The server already tracks note.md — replaying the queued op as a
+    // CREATE would make the server conflict-rename the upload into
+    // `note.conflict-<clientId>.md`. It must go through the modify path.
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(0);
+    // The text reached the doc (and the wired fan-out ships it as yjs:update).
+    expect(h.doc.getText('b1', 'note.md')).toBe(newText);
+    const updates = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(updates.length).toBeGreaterThanOrEqual(1);
+    const target = new Y.Doc();
+    for (const u of updates) {
+      Y.applyUpdate(target, Uint8Array.from((u.args[0] as { update: number[] }).update));
+    }
+    expect(target.getText('content').toString()).toBe(newText);
+    target.destroy();
+    expect(h.log.pendingCount('b1')).toBe(0);
     await h.engine.stop();
   });
 

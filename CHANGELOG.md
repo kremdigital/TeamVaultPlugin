@@ -25,6 +25,14 @@ uses [Semantic Versioning](https://semver.org/).
   a bogus push-back diff and a rollback-style disk write. The engine now
   awaits `DocManager.whenSynced` (with a 10 s cap so a wedged IndexedDB
   degrades instead of stalling) before using a doc in catch-up or snapshots.
+- **Offline CREATE replay spawned `.conflict-<clientId>` duplicates.** A file
+  touched while the engine was offline (e.g. a git checkout over synced
+  files) queued a CREATE; on reconnect it replayed as `file:create` for a
+  path the server already tracked with different content, so the server
+  conflict-renamed the upload — 56 junk `<name>.conflict-<clientId>.md`
+  copies in the 2026-06-12 incident. The replay now consults the refreshed
+  file index: a server-known path routes through the modify path (Yjs diff
+  for text, binary UPDATE) instead of a re-create.
 - **Orphaned Obsidian atomic-write artifacts synced as real notes.** Obsidian
   writes files as `<name>.tmp.<pid>.<hex>` + rename; a crash or locked target
   orphans the temp file. The watcher's ignore list only matched the literal
