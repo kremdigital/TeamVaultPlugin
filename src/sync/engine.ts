@@ -568,7 +568,14 @@ export class SyncEngine {
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
 
-    if (this.socket.isConnected()) {
+    // Join-window guard: between socket connect and the fileIndex refresh
+    // the index can't tell a NEW file from a server-known one — emitting
+    // CREATE here makes the server conflict-rename every path whose hash
+    // diverged (the 2026-06-12 burst: Obsidian's startup create-flood hit
+    // this window and minted 120 `<name>.conflict-<clientId>.md` copies in
+    // two seconds). Queue instead — the post-connect drain consults the
+    // refreshed index and routes server-known paths through modify.
+    if (this.socket.isConnected() && this.indexReady) {
       const ack = await this.socket.emitFileCreate({
         projectId: this.binding.projectId,
         clientId: this.clientId,

@@ -8,6 +8,20 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Every Obsidian launch re-uploaded the vault and conflict-renamed
+  diverged files.** While the vault index loads at startup, Obsidian fires
+  `vault.on('create')` for _every existing file_. The watchers were
+  registered in `onload()`, so each launch turned into a vault-sized
+  create-flood that raced the engine's file-index refresh: paths the index
+  couldn't classify yet were emitted as `file:create`, and the server
+  conflict-renamed every one whose content hash had diverged — 120 junk
+  `<name>.conflict-<clientId>.md` copies in two seconds on 2026-06-12 (and
+  the same signature as the 2026-06-07 burst "right after reload").
+  Watchers now attach via `workspace.onLayoutReady` (the initial scan never
+  reaches the engine), and as defense in depth the engine queues — rather
+  than emits — any CREATE that arrives before the file index is ready; the
+  post-connect drain then routes server-known paths through the modify
+  path.
 - **Doubled file content ("snowball" duplication).** Editing a text file
   whose local `Y.Doc` had no ops yet — fresh offline store after a database
   rename, a doc whose catch-up batch hadn't landed, or y-indexeddb still

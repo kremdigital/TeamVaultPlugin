@@ -2095,6 +2095,38 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     await h.engine.stop();
   });
 
+  it('queues a create arriving in the join window instead of emitting file:create', async () => {
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const text = 'локальная версия\n';
+    listFiles(h, await sha256Hex('серверная версия\n'));
+    putDisk(h, text);
+
+    await h.engine.start();
+    // Socket is connected but the join ack hasn't been processed — the
+    // file index isn't ready. Obsidian's startup create-flood lands
+    // exactly here; emitting CREATE for a server-known path with a
+    // diverged hash makes the server conflict-rename it (the 2026-06-12
+    // burst of 120 `.conflict-*` copies).
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'note.md',
+      source: 'obsidian',
+    });
+    expect(h.socket().emits.filter((e) => e.event === 'file:create')).toHaveLength(0);
+    expect(h.log.pendingCount('b1')).toBe(1);
+
+    // After the join completes, the drain consults the refreshed index and
+    // routes the queued CREATE through the modify path — still no
+    // file:create, so nothing to conflict-rename.
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+    expect(h.socket().emits.filter((e) => e.event === 'file:create')).toHaveLength(0);
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+
   it('initial push skips Obsidian atomic-write artifacts', async () => {
     const h = buildHarness();
     // Map iteration order = insertion order: the artifact comes first, so a

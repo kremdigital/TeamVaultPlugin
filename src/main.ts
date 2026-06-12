@@ -71,7 +71,17 @@ export default class ObsidianSyncPlugin extends Plugin {
     await this.sweepOrphanedBindingState();
     await this.sweepOrphanedTmpArtifacts();
     this.bootstrapManager();
-    this.bootstrapWatchers();
+    // Watchers attach only after the workspace layout is ready: while the
+    // vault index loads, Obsidian fires `vault.on('create')` for EVERY
+    // existing file, and that startup flood raced the engines' file-index
+    // refresh — each launch re-uploaded the whole vault as `file:create`,
+    // and the server conflict-renamed every path whose content had
+    // diverged (the 2026-06-12 burst: 120 junk `.conflict-*` copies in two
+    // seconds). `onLayoutReady` marks the end of the initial scan; events
+    // after it are genuine user/file activity. Changes made while the
+    // plugin was off are reconciled by the connect-time catch-up, not by
+    // the startup flood.
+    this.app.workspace.onLayoutReady(() => this.bootstrapWatchers());
     this.bootstrapUi();
 
     // Kick off the manager — engines for active bindings start connecting.
