@@ -510,6 +510,10 @@ export class SyncEngine {
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
     for (const f of files) {
+      // Throw-away artifacts that an older client uploaded (e.g. Obsidian's
+      // `*.tmp.<pid>.<hex>` atomic-write leftovers) must stay invisible —
+      // indexing them would let server events materialise them on disk.
+      if (isAlwaysIgnored(f.path)) continue;
       // Preserve the client's last-known `contentHash` (the "common
       // ancestor" from the engine's perspective) for files we've synced
       // before — overwriting it with the server's current hash would
@@ -862,6 +866,9 @@ export class SyncEngine {
     path: string;
     fileType: FileType;
   }): Promise<void> {
+    // Mirror of the refreshFileIndex filter for live events: never
+    // materialise a throw-away artifact another client uploaded.
+    if (isAlwaysIgnored(payload.path)) return;
     const meta: FileMeta & { fileId: string } = {
       bindingId: this.binding.id,
       relativePath: payload.path,

@@ -1840,6 +1840,52 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     await h.engine.stop();
   });
 
+  it('never materialises a server-side atomic-write artifact locally', async () => {
+    const h = buildHarness();
+    // A stale artifact an older client uploaded, still live on the server.
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f-tmp',
+            path: 'wiki/index.md.tmp.14424.02a1a4a4e56e',
+            fileType: 'BINARY',
+            contentHash: 'h',
+            size: '7',
+            mimeType: 'application/octet-stream',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+
+    // Not indexed from the listing…
+    expect(h.engine.getFileIdForPath('wiki/index.md.tmp.14424.02a1a4a4e56e')).toBeNull();
+
+    // …and a live broadcast doesn't download or create it either.
+    h.socket().fire('file:created', {
+      result: { outcome: { fileId: 'f-tmp2', path: 'wiki/log.md.tmp.2340.cb727fa8dd9f' } },
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(10);
+    expect(await h.vault.exists('wiki/log.md.tmp.2340.cb727fa8dd9f')).toBe(false);
+    // No byte download was attempted for either artifact (GET /files/<id>).
+    const downloads = h.apiCalls.filter((c) => /\/files\/f-tmp2?$/.test(c.url));
+    expect(downloads).toHaveLength(0);
+    await h.engine.stop();
+  });
+
   it('initial push skips Obsidian atomic-write artifacts', async () => {
     const h = buildHarness();
     // Map iteration order = insertion order: the artifact comes first, so a
