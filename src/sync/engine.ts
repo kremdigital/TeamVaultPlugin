@@ -166,6 +166,13 @@ export class SyncEngine {
    */
   private snapshotDebouncers = new Map<string, DebouncedFunction<[]>>();
 
+  /**
+   * Per-path tail of the in-flight snapshot chain — `snapshotDocToDisk`
+   * appends to it so two snapshots of the same file never interleave
+   * their read-fold-write sequences.
+   */
+  private snapshotChains = new Map<string, Promise<void>>();
+
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
 
@@ -238,6 +245,7 @@ export class SyncEngine {
     this.cleanups = [];
     for (const d of this.snapshotDebouncers.values()) d.cancel();
     this.snapshotDebouncers.clear();
+    this.snapshotChains.clear();
     this.socket.disconnect();
     this.setStatus('stopped');
   }
@@ -635,6 +643,28 @@ export class SyncEngine {
     if (meta.fileType === 'TEXT') {
       // Text edits flow through Yjs. Read the disk content and diff into
       // the doc — the docManager fan-out will ship a `yjs:update` for us.
+      //
+      // Two guards against the "doubled content" corruption (2026-06-04:
+      // 203 files, 2026-06-12: 101 files — every file's text duplicated
+      // under itself):
+      //
+      //  1. Wait for the offline store. Diffing against a doc whose
+      //     y-indexeddb state is still loading sees an empty text and
+      //     re-inserts the entire file; when the stored ops finish
+      //     loading, the merge keeps BOTH copies.
+      //  2. Never diff a server-known non-empty file into an op-less doc.
+      //     The server holds its own insertion of this content (the
+      //     CREATE-time seed), so a local full-content insert is a second
+      //     independent copy — Yjs merge keeps both, server-side and then
+      //     on every client. Defer instead: the doc hydrates via the
+      //     catch-up stream or the live seed broadcast, and the next
+      //     snapshot folds the disk edits in as a minimal diff
+      //     (`foldDiskEditsIntoDoc`).
+      await this.docManager.whenSynced(this.binding.id, path);
+      if (!this.docManager.hasState(this.binding.id, path) && meta.size > 0) {
+        this.log.debug('defer text modify until doc hydrates', path);
+        return;
+      }
       const content = await this.vault.readText(path);
       this.docManager.setText(this.binding.id, path, content);
       return;
@@ -869,7 +899,12 @@ export class SyncEngine {
     // Mirror of the refreshFileIndex filter for live events: never
     // materialise a throw-away artifact another client uploaded.
     if (isAlwaysIgnored(payload.path)) return;
-    const meta: FileMeta & { fileId: string } = {
+    // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
+    // (the stale-CREATE guard requires it). Reuse that entry — resetting
+    // its contentHash/size to zero would break every downstream three-way
+    // compare (`detectBinaryConflict`, `foldDiskEditsIntoDoc`, the
+    // unhydrated-doc guard in `handleLocalModify`).
+    const meta: FileMeta & { fileId: string } = this.fileIndex.byId.get(payload.id) ?? {
       bindingId: this.binding.id,
       relativePath: payload.path,
       serverFileId: payload.id,
@@ -879,13 +914,14 @@ export class SyncEngine {
       fileType: payload.fileType,
       lastSyncedAt: Date.now(),
     };
-    this.fileIndex.byPath.set(payload.path, meta);
+    this.fileIndex.byPath.set(meta.relativePath, meta);
     this.fileIndex.byId.set(payload.id, meta);
 
     // Pull initial bytes — Yjs takes over for text after the first
-    // snapshot, but the file on disk needs to exist.
+    // snapshot, but the file on disk needs to exist. `meta.relativePath`
+    // (not `payload.path`) so a reused index entry keeps its current name.
     if (payload.fileType === 'TEXT') {
-      this.wireYjsForTextFile(payload.id, payload.path);
+      this.wireYjsForTextFile(payload.id, meta.relativePath);
     } else {
       // Catch-up replays can fire applyServerCreate for a binary file the
       // client already has on disk (synced earlier). `createBinary` throws
@@ -1106,6 +1142,10 @@ export class SyncEngine {
    * (stale) state: the 2026-06-12 mass-rollback incident, where a
    * catch-up rewrote 56 freshly-edited files with old server content.
    *
+   * `diskText` is the disk content the caller already read (`null` when
+   * the file doesn't exist) — one read shared between fold and the
+   * write-skip compare keeps the race window minimal.
+   *
    * `meta.contentHash` is the last state the engine itself synced or
    * wrote. A different disk hash means the bytes on disk are ahead of the
    * doc, so they're diffed in as local ops — those then ride the normal
@@ -1113,25 +1153,54 @@ export class SyncEngine {
    * the server. When the disk still matches the last-synced hash the doc
    * is the one that's ahead (an incoming remote edit) and no fold happens.
    */
-  private async foldDiskEditsIntoDoc(path: string): Promise<void> {
+  private async foldDiskEditsIntoDoc(path: string, diskText: string | null): Promise<void> {
     const meta = this.fileIndex.byPath.get(path);
     if (!meta || meta.fileType !== 'TEXT') return;
-    if (!(await this.vault.exists(path))) return;
-    const diskText = await this.vault.readText(path);
+    if (diskText === null) return;
     if (diskText === this.docManager.getText(this.binding.id, path)) return;
     const diskHash = await sha256Hex(diskText);
     if (diskHash === meta.contentHash) return;
     this.docManager.setText(this.binding.id, path, diskText);
   }
 
-  private async snapshotDocToDisk(path: string): Promise<void> {
+  /**
+   * Per-path serialization for snapshots. A live `yjs:update` debounce and
+   * a catch-up batch can both want to snapshot the same path; running the
+   * two read-fold-write sequences concurrently interleaves their disk I/O
+   * and can clobber one side's fold. Chain them instead.
+   */
+  private snapshotDocToDisk(path: string): Promise<void> {
+    const prev = this.snapshotChains.get(path) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(() => this.writeDocSnapshot(path));
+    const chained = next
+      .catch(() => undefined)
+      .then(() => {
+        if (this.snapshotChains.get(path) === chained) this.snapshotChains.delete(path);
+      });
+    this.snapshotChains.set(path, chained);
+    return next;
+  }
+
+  private async writeDocSnapshot(path: string): Promise<void> {
     if (!this.docManager.has(this.binding.id, path)) return;
     // Never snapshot a doc whose offline store is still loading — its text
     // is a partial view and the write would destroy the full copy on disk.
     await this.docManager.whenSynced(this.binding.id, path);
-    await this.foldDiskEditsIntoDoc(path);
-    const text = this.docManager.getText(this.binding.id, path);
     const meta = this.fileIndex.byPath.get(path);
+    // Half-applied docs must never reach the disk. Two flavors:
+    //  - op-less doc for a file the server has content for — its catch-up
+    //    batch / seed broadcast hasn't landed yet; writing now would
+    //    truncate the file to the doc's empty text;
+    //  - integrated ops with *pending* remote updates (out-of-order
+    //    delivery) — the visible text is a stale subset; writing now is
+    //    exactly the "files rolled back to old versions" incident.
+    // Skip — the missing update arrives, fires its own snapshot, and that
+    // one folds + writes the complete state.
+    if (meta && meta.size > 0 && !this.docManager.hasState(this.binding.id, path)) return;
+    if (this.docManager.hasPendingRemoteUpdates(this.binding.id, path)) return;
+    const diskText = (await this.vault.exists(path)) ? await this.vault.readText(path) : null;
+    await this.foldDiskEditsIntoDoc(path, diskText);
+    const text = this.docManager.getText(this.binding.id, path);
     if (meta) {
       // Update meta BEFORE the write so the watcher echo's hash compare
       // in `handleLocalModify` short-circuits — same reasoning as in
@@ -1140,6 +1209,13 @@ export class SyncEngine {
       meta.size = new TextEncoder().encode(text).byteLength;
       this.operationLog.setFileMeta(meta);
     }
+    // Disk already matches the doc — don't rewrite the file. The catch-up
+    // used to rewrite EVERY text file on EVERY connect: a mass write storm
+    // that churned Obsidian's atomic-write temp files (the orphaned
+    // `*.tmp.<pid>.<hex>` artifacts) and left hundreds of live echo
+    // budgets in `recentlyApplied`, where they swallowed genuine external
+    // edits arriving in the same window (the silent-rollback incident).
+    if (diskText !== null && diskText === text) return;
     // See `applyServerUpdateBinary` — a single overwrite can fan out into
     // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
     // `unlink` + `add` (atomic-rename split). Budget for the worst case so
@@ -1147,7 +1223,7 @@ export class SyncEngine {
     // doesn't then find an empty fileIndex and emit a phantom file:create.
     // The createText branch only sees create-style echoes (Obsidian
     // onCreate + chokidar `add`), so the smaller CREATE budget is exact.
-    if (await this.vault.exists(path)) {
+    if (diskText !== null) {
       this.recentlyApplied.mark(path, ECHO_COUNT_WRITE);
       await this.vault.writeText(path, text);
     } else {

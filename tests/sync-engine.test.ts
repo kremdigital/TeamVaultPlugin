@@ -704,6 +704,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
   });
 
   it('collapses duplicate offline CREATEs for one path into one CREATE + a modify', async () => {
+    const Y = await import('yjs');
     const h = buildHarness();
     // Simulate create-then-edit while offline: the content captured at
     // enqueue time differs from the content on disk at replay time.
@@ -743,8 +744,20 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     // through the modify path instead (Yjs diff for this TEXT file).
     const creates2 = h.socket().emits.filter((e) => e.event === 'file:create');
     expect(creates2).toHaveLength(1);
-    expect(h.doc.getText('b1', 'draft.md')).toBe('v2 edited');
     expect(h.log.pendingCount('b1')).toBe(0);
+    // The modify defers until the server's CREATE-time seed hydrates the
+    // doc (a diff into the still-empty doc would be a second independent
+    // insertion of the content — the doubled-file corruption). The real
+    // server broadcasts the seed to the whole room, sender included:
+    const seed = new Y.Doc();
+    seed.getText('content').insert(0, 'v2 edited');
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(seed)),
+    });
+    seed.destroy();
+    await flushAsync(20);
+    expect(h.doc.getText('b1', 'draft.md')).toBe('v2 edited');
   });
 
   it('pushes local-only Yjs ops back to the server on reconnect', async () => {
@@ -1863,7 +1876,21 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     expect(h.log.pendingCount('b1')).toBe(1);
 
     await h.engine.start();
-    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    // The real server streams every text doc's state during catch-up —
+    // the doc hydrates with the server's copy before the drain replays
+    // the queued op.
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, oldText);
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+    });
     await flushAsync(20);
 
     // The server already tracks note.md — replaying the queued op as a
@@ -1871,16 +1898,16 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     // `note.conflict-<clientId>.md`. It must go through the modify path.
     const creates = h.socket().emits.filter((e) => e.event === 'file:create');
     expect(creates).toHaveLength(0);
-    // The text reached the doc (and the wired fan-out ships it as yjs:update).
+    // The disk text reached the doc as a minimal diff over the server's
+    // copy, and the push-back ships it upstream.
     expect(h.doc.getText('b1', 'note.md')).toBe(newText);
     const updates = h.socket().emits.filter((e) => e.event === 'yjs:update');
     expect(updates.length).toBeGreaterThanOrEqual(1);
-    const target = new Y.Doc();
     for (const u of updates) {
-      Y.applyUpdate(target, Uint8Array.from((u.args[0] as { update: number[] }).update));
+      Y.applyUpdate(serverDoc, Uint8Array.from((u.args[0] as { update: number[] }).update));
     }
-    expect(target.getText('content').toString()).toBe(newText);
-    target.destroy();
+    expect(serverDoc.getText('content').toString()).toBe(newText);
+    serverDoc.destroy();
     expect(h.log.pendingCount('b1')).toBe(0);
     await h.engine.stop();
   });
@@ -1928,6 +1955,143 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     // No byte download was attempted for either artifact (GET /files/<id>).
     const downloads = h.apiCalls.filter((c) => /\/files\/f-tmp2?$/.test(c.url));
     expect(downloads).toHaveLength(0);
+    await h.engine.stop();
+  });
+
+  it('an external modify into an unhydrated doc must not duplicate the content', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const baseText = '# Сцена 18 — Казнь Перминова\n\nстарый текст\n';
+    const editedText = '# Сцена 18 — Казнь Перминова\n\nстарый текст\nсвежая правка\n';
+    const baseHash = await sha256Hex(baseText);
+
+    // Server knows the file; the local y-indexeddb store is EMPTY (fresh
+    // database name) and the disk was just edited by an external process.
+    listFiles(h, baseHash);
+    seedSyncedMeta(h, baseHash);
+    putDisk(h, editedText);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+
+    // The watcher's modify fires BEFORE the file's catch-up batch arrives —
+    // the doubled-content window. Diffing the full text into the op-less
+    // doc would create a second insertion of the whole file; it must defer.
+    await h.engine.handleVaultEvent({
+      type: 'modify',
+      bindingId: 'b1',
+      path: 'note.md',
+      source: 'fs',
+    });
+    await flushAsync(10);
+    expect(h.socket().emits.filter((e) => e.event === 'yjs:update')).toHaveLength(0);
+    expect(h.doc.getText('b1', 'note.md')).toBe('');
+
+    // The catch-up lands: the doc hydrates with the server's copy, the
+    // snapshot folds the disk edits in as a minimal diff, and the
+    // push-back ships them. Nothing is doubled — on either side.
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, baseText);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(20);
+
+    expect(h.doc.getText('b1', 'note.md')).toBe(editedText);
+    expect(await h.vault.readText('note.md')).toBe(editedText);
+    const pushed = h.socket().emits.filter((e) => e.event === 'yjs:update');
+    expect(pushed.length).toBeGreaterThanOrEqual(1);
+    for (const u of pushed) {
+      Y.applyUpdate(serverDoc, Uint8Array.from((u.args[0] as { update: number[] }).update));
+    }
+    // The incident signature was the whole content repeated under itself
+    // (two `# ` headings per file) — the converged server doc must hold
+    // the edited text exactly once.
+    expect(serverDoc.getText('content').toString()).toBe(editedText);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('never snapshots a half-applied doc (pending remote updates) over a real file', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness({ snapshotMs: 0 });
+    const baseText = 'строфа один\n';
+    const baseHash = await sha256Hex(baseText);
+
+    listFiles(h, baseHash);
+    seedSyncedMeta(h, baseHash);
+    putDisk(h, baseText);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+
+    // Two sequential server-side edits; the first update is lost/delayed,
+    // only the second arrives. Yjs parks it as pending — the doc's visible
+    // text is an empty stale subset. Snapshotting now would truncate the
+    // file on disk (the mass-rollback incident shape).
+    const remote = new Y.Doc();
+    const updates: Uint8Array[] = [];
+    remote.on('update', (u: Uint8Array) => updates.push(u));
+    remote.getText('content').insert(0, baseText);
+    remote.getText('content').insert(baseText.length, 'строфа два\n');
+    remote.destroy();
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(updates[1] ?? []) });
+    await flushAsync(20);
+    expect(await h.vault.readText('note.md')).toBe(baseText);
+
+    // The missing update arrives; both integrate and the snapshot writes
+    // the complete merged text.
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(updates[0] ?? []) });
+    await flushAsync(20);
+    expect(await h.vault.readText('note.md')).toBe('строфа один\nстрофа два\n');
+    await h.engine.stop();
+  });
+
+  it('catch-up does not rewrite files whose disk content already matches the doc', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness();
+    const text = 'неизменённый текст\n';
+    const hash = await sha256Hex(text);
+
+    listFiles(h, hash);
+    seedSyncedMeta(h, hash);
+    putDisk(h, text);
+
+    await h.engine.start();
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, text);
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+    });
+    serverDoc.destroy();
+    await flushAsync(20);
+
+    // The old behavior rewrote EVERY text file on EVERY connect — a write
+    // storm that churned atomic-write tmp artifacts and left live echo
+    // budgets that swallowed genuine external edits. An unchanged file must
+    // produce no write, hence no `recentlyApplied` echo budget.
+    expect(await h.vault.readText('note.md')).toBe(text);
+    expect(h.ra.size()).toBe(0);
     await h.engine.stop();
   });
 

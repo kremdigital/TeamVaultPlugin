@@ -183,6 +183,31 @@ export class DocManager {
   }
 
   /**
+   * True when the doc holds at least one integrated op — i.e. it has been
+   * hydrated from the server (catch-up / seed broadcast), loaded from the
+   * offline store, or locally edited. An op-less doc for a file the server
+   * already has content for is a red flag for the engine: diffing the full
+   * file text into it would create a SECOND, independent insertion of the
+   * same content, and the CRDT merge with the server's copy keeps both
+   * (the "doubled file" corruption).
+   */
+  hasState(bindingId: string, filePath: string): boolean {
+    const entry = this.acquire(bindingId, filePath);
+    return entry.doc.store.clients.size > 0;
+  }
+
+  /**
+   * True while the doc sits on remote updates it could not integrate yet
+   * (out-of-order delivery — Yjs parks them until the missing ops arrive).
+   * The doc's visible text is a stale subset in that window; snapshotting
+   * it to disk would roll the file back.
+   */
+  hasPendingRemoteUpdates(bindingId: string, filePath: string): boolean {
+    const entry = this.acquire(bindingId, filePath);
+    return entry.doc.store.pendingStructs !== null;
+  }
+
+  /**
    * Resolve once the doc's persistence backend (y-indexeddb) has loaded its
    * stored state into the `Y.Doc`. The engine MUST await this before using
    * a doc for catch-up or disk snapshots: persistence loads asynchronously,

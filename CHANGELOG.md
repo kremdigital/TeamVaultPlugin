@@ -4,6 +4,48 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+
+- **Doubled file content ("snowball" duplication).** Editing a text file
+  whose local `Y.Doc` had no ops yet — fresh offline store after a database
+  rename, a doc whose catch-up batch hadn't landed, or y-indexeddb still
+  loading — diffed the entire disk text into an empty doc. That full-content
+  insert was a _second, independent_ insertion of content the server already
+  held (its CREATE-time seed), and the CRDT merge kept both copies: every
+  affected file ended up with its whole text repeated under itself (observed
+  2026-06-12: 101 files; same shape as 2026-06-04: 203 files). Local text
+  modifies now await the offline store and **defer** when the doc is op-less
+  while the server is known to have content; the doc then hydrates via the
+  catch-up stream or the live seed broadcast, and the next snapshot folds the
+  disk edits in as a minimal diff over the server's copy.
+- **Half-applied docs could snapshot to disk.** A `yjs:update` delivered
+  out of order parks in Yjs as a pending struct; the doc's visible text is a
+  stale subset (or empty) until the missing update arrives. The disk
+  snapshot ran regardless, truncating or rolling the file back — one of the
+  silent-rollback shapes in the 2026-06-12 incident. Snapshots now skip
+  op-less docs for files the server has content for and any doc with pending
+  remote updates; the completing update triggers its own snapshot with the
+  full merged state.
+- **Catch-up rewrote every text file on every connect.** The snapshot path
+  wrote the doc text to disk even when the file already matched byte-for-byte
+  — a mass write storm on each reconnect (hundreds of files) that churned
+  Obsidian's atomic-write temp files (the orphaned `*.tmp.<pid>.<hex>`
+  artifacts) and left hundreds of live echo budgets in the watcher
+  suppression set, where they swallowed genuine external edits arriving in
+  the same window. Unchanged files are no longer rewritten; no write, no
+  echo budget, no temp-file churn.
+- **Concurrent snapshots of one file could interleave.** A live-update
+  debounce and a catch-up batch snapshotting the same path ran their
+  read-fold-write sequences concurrently and could clobber each other's
+  fold. Snapshots are now serialized per path.
+- **Catch-up CREATE replays wiped file metadata.** Re-applying a CREATE for
+  an already-indexed file reset its `contentHash`/`size` to empty, breaking
+  every downstream three-way compare (binary conflict detection, disk-edit
+  folding, the new unhydrated-doc guard). The existing index entry is now
+  reused as-is.
+
 ## [0.2.6] — 2026-06-12
 
 ### Fixed
