@@ -4,6 +4,28 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.8] — 2026-06-22
+
+### Fixed
+
+- **Large binary files (10–15 MB storyboard images) broke the sync
+  connection.** Binary file bytes were shipped over the Socket.IO channel as a
+  JSON `number[]` (~3.7× inflation), blowing the server's 16 MB message limit
+  and dropping the socket into a reconnect loop — files above ~3.6 MB never
+  synced (dense `websocket error` / `timeout` / `network (HTTP 0)` in
+  `sync.log`). Binary bytes now upload out-of-band over REST to a
+  content-addressed staging endpoint (`PUT /blobs/:hash`) via `fetch` — which
+  streams large bodies off the renderer thread, unlike Obsidian's `requestUrl`
+  — and the `file:create` / `file:update-binary` socket op carries only
+  metadata. The socket stays sized for tiny Yjs ops. Text files are unchanged
+  (content still rides inline and seeds Yjs). **Requires the matching server
+  build** (staging endpoint + CORS for the Obsidian origin).
+
+### Changed
+
+- Binary downloads (`downloadFile` / version downloads) now use the `fetch`
+  transport as well; JSON requests stay on `requestUrl`.
+
 ## [0.2.7] — 2026-06-12
 
 ### Fixed
