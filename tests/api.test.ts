@@ -1,4 +1,10 @@
-import { ApiClient, ApiError, type RequestFn, type RequestUrlResponse } from '@/client/api';
+import {
+  ApiClient,
+  ApiError,
+  type BinaryRequestFn,
+  type RequestFn,
+  type RequestUrlResponse,
+} from '@/client/api';
 
 const server = { url: 'https://sync.example.com', apiKey: 'osk_secret' };
 
@@ -26,6 +32,19 @@ function makeRequest(
 ): jest.Mock<Promise<RequestUrlResponse>, [Parameters<RequestFn>[0]]> {
   return jest.fn(async (req: Parameters<RequestFn>[0]) => responder(req));
 }
+
+/** Binary-transport mock (the `fetch`-backed seam used by downloads / blob
+ *  uploads). Mirrors {@link makeRequest} for the binary path. */
+function makeBinaryRequest(
+  responder: (req: Parameters<BinaryRequestFn>[0]) => RequestUrlResponse,
+): jest.Mock<Promise<RequestUrlResponse>, [Parameters<BinaryRequestFn>[0]]> {
+  return jest.fn(async (req: Parameters<BinaryRequestFn>[0]) => responder(req));
+}
+
+/** JSON-request stub for binary-only tests — fails loudly if `requestUrl` is hit. */
+const noRequest: RequestFn = async () => {
+  throw new Error('binary test should not call requestUrl');
+};
 
 describe('ApiClient — auth / discovery', () => {
   it('strips trailing slashes from base url and sends X-API-Key', async () => {
@@ -123,10 +142,26 @@ describe('ApiClient — files', () => {
 
   it('returns the raw ArrayBuffer for download', async () => {
     const buf = new ArrayBuffer(8);
-    const request = makeRequest(() => response({ status: 200, arrayBuffer: buf }));
-    const client = new ApiClient(server, request);
+    const binary = makeBinaryRequest(() => response({ status: 200, arrayBuffer: buf }));
+    const client = new ApiClient(server, noRequest, binary);
     const result = await client.downloadFile('p1', 'f1');
     expect(result).toBe(buf);
+    const [params] = binary.mock.calls[0] as [Parameters<BinaryRequestFn>[0]];
+    expect(params.method).toBe('GET');
+    expect(params.headers['X-API-Key']).toBe('osk_secret');
+  });
+
+  it('uploads a binary blob via PUT to /blobs over the fetch seam', async () => {
+    const binary = makeBinaryRequest(() => response({ status: 200, json: { hash: 'h', size: 3 } }));
+    const client = new ApiClient(server, noRequest, binary);
+    const buf = new TextEncoder().encode('png').buffer;
+    const hash = 'a'.repeat(64);
+    await client.uploadBlob('p1', hash, buf);
+    const [params] = binary.mock.calls[0] as [Parameters<BinaryRequestFn>[0]];
+    expect(params.method).toBe('PUT');
+    expect(params.url).toBe(`https://sync.example.com/api/projects/p1/blobs/${hash}`);
+    expect(params.headers['Content-Type']).toBe('application/octet-stream');
+    expect(params.body).toBe(buf);
   });
 
   it('uploads as multipart/form-data with path and file fields', async () => {
@@ -240,8 +275,8 @@ describe('ApiClient — versions', () => {
 
   it('downloads a specific version as bytes', async () => {
     const buf = new ArrayBuffer(4);
-    const request = makeRequest(() => response({ status: 200, arrayBuffer: buf }));
-    const client = new ApiClient(server, request);
+    const binary = makeBinaryRequest(() => response({ status: 200, arrayBuffer: buf }));
+    const client = new ApiClient(server, noRequest, binary);
     const result = await client.downloadFileVersion('p1', 'f1', 'v1');
     expect(result).toBe(buf);
   });

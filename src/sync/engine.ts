@@ -576,28 +576,36 @@ export class SyncEngine {
     // two seconds). Queue instead — the post-connect drain consults the
     // refreshed index and routes server-known paths through modify.
     if (this.socket.isConnected() && this.indexReady) {
-      const ack = await this.socket.emitFileCreate({
-        projectId: this.binding.projectId,
-        clientId: this.clientId,
-        vectorClock: this.bumpClock(),
-        filePath: path,
-        fileType,
-        contentHash: hash,
-        size: buffer.byteLength,
-        data: buffer,
-      });
-      if (ack.ok) {
-        // Server ack carries `outcome.{fileId, path}` — record the file in
-        // the local index immediately. Without this the broadcast event
-        // that follows would treat the file as new and try to BINARY-
-        // download it (404), and the next CREATE pass on this path would
-        // re-upload (creating server-side conflict-renamed copies).
-        const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
-        if (outcome?.fileId && outcome?.path) {
-          this.recordCreatedFile(outcome.fileId, outcome.path, fileType, hash, buffer.byteLength);
+      try {
+        // Binary bytes are staged over REST; text rides inline (small).
+        const data = await this.stageBinaryBlob(fileType, hash, buffer);
+        const ack = await this.socket.emitFileCreate({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          vectorClock: this.bumpClock(),
+          filePath: path,
+          fileType,
+          contentHash: hash,
+          size: buffer.byteLength,
+          ...(data !== undefined ? { data } : {}),
+        });
+        if (ack.ok) {
+          // Server ack carries `outcome.{fileId, path}` — record the file in
+          // the local index immediately. Without this the broadcast event
+          // that follows would treat the file as new and try to BINARY-
+          // download it (404), and the next CREATE pass on this path would
+          // re-upload (creating server-side conflict-renamed copies).
+          const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
+          if (outcome?.fileId && outcome?.path) {
+            this.recordCreatedFile(outcome.fileId, outcome.path, fileType, hash, buffer.byteLength);
+          }
+          this.persistVectorClock();
+          return;
         }
-        this.persistVectorClock();
-        return;
+      } catch {
+        // Staging upload or emit failed (offline / server error) — fall through
+        // to the offline queue, which replays on the next reconnect.
+        this.log.debug('create staging/emit failed; queueing', path);
       }
     }
     // Offline (or NACK) — queue and bail; the engine will replay on reconnect.
@@ -637,6 +645,24 @@ export class SyncEngine {
     this.fileIndex.byId.set(fileId, meta);
     this.operationLog.setFileMeta(meta);
     if (fileType === 'TEXT') this.wireYjsForTextFile(fileId, path);
+  }
+
+  /**
+   * Stage a binary file's bytes over REST (`PUT /blobs/:hash`) so the follow-up
+   * `file:create` / `file:update-binary` socket op can omit them — keeping
+   * multi-megabyte blobs off the Socket.IO channel (sized for tiny Yjs ops).
+   * Returns the value to inline as the op's `data`: the buffer for TEXT (rides
+   * inline, small), `undefined` for BINARY (already staged by hash). Throws on
+   * upload failure so callers fall back to the offline queue / retry.
+   */
+  private async stageBinaryBlob(
+    fileType: FileType,
+    contentHash: string,
+    buffer: ArrayBuffer,
+  ): Promise<ArrayBuffer | undefined> {
+    if (fileType !== 'BINARY') return buffer;
+    await this.api.uploadBlob(this.binding.projectId, contentHash, buffer);
+    return undefined;
   }
 
   private async handleLocalModify(path: string): Promise<void> {
@@ -681,21 +707,26 @@ export class SyncEngine {
     if (hash === meta.contentHash) return; // nothing changed
 
     if (this.socket.isConnected()) {
-      const ack = await this.socket.emitFileUpdateBinary({
-        projectId: this.binding.projectId,
-        clientId: this.clientId,
-        vectorClock: this.bumpClock(),
-        fileId: meta.fileId,
-        contentHash: hash,
-        size: buffer.byteLength,
-        data: buffer,
-      });
-      if (ack.ok) {
-        meta.contentHash = hash;
-        meta.size = buffer.byteLength;
-        this.operationLog.setFileMeta(meta);
-        this.persistVectorClock();
-        return;
+      try {
+        // Binary bytes go to the REST staging area; the socket op is metadata-only.
+        await this.api.uploadBlob(this.binding.projectId, hash, buffer);
+        const ack = await this.socket.emitFileUpdateBinary({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          vectorClock: this.bumpClock(),
+          fileId: meta.fileId,
+          contentHash: hash,
+          size: buffer.byteLength,
+        });
+        if (ack.ok) {
+          meta.contentHash = hash;
+          meta.size = buffer.byteLength;
+          this.operationLog.setFileMeta(meta);
+          this.persistVectorClock();
+          return;
+        }
+      } catch {
+        this.log.debug('binary update staging/emit failed; queueing', path);
       }
     }
     this.queue('UPDATE', path, null, {
@@ -976,15 +1007,22 @@ export class SyncEngine {
           // back as `file:updated-binary` — by then `meta.contentHash`
           // matches the local hash, so the second pass is a no-op.
           if (this.socket.isConnected()) {
-            await this.socket.emitFileUpdateBinary({
-              projectId: this.binding.projectId,
-              clientId: this.clientId,
-              vectorClock: this.bumpClock(),
-              fileId,
-              contentHash: localHash,
-              size: localBuf.byteLength,
-              data: localBuf,
-            });
+            try {
+              await this.api.uploadBlob(this.binding.projectId, localHash, localBuf);
+              await this.socket.emitFileUpdateBinary({
+                projectId: this.binding.projectId,
+                clientId: this.clientId,
+                vectorClock: this.bumpClock(),
+                fileId,
+                contentHash: localHash,
+                size: localBuf.byteLength,
+              });
+            } catch {
+              this.log.debug(
+                'keep-local binary push failed; reconcile on reconnect',
+                meta.relativePath,
+              );
+            }
           }
           meta.contentHash = localHash;
           meta.size = localBuf.byteLength;
@@ -1065,16 +1103,24 @@ export class SyncEngine {
           // Push the local content as a fresh CREATE so the server
           // un-deletes it. The recipient broadcast will reset our state.
           if (this.socket.isConnected()) {
-            await this.socket.emitFileCreate({
-              projectId: this.binding.projectId,
-              clientId: this.clientId,
-              vectorClock: this.bumpClock(),
-              filePath: meta.relativePath,
-              fileType: meta.fileType,
-              contentHash: localHash,
-              size: localBuf.byteLength,
-              data: localBuf,
-            });
+            try {
+              const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
+              await this.socket.emitFileCreate({
+                projectId: this.binding.projectId,
+                clientId: this.clientId,
+                vectorClock: this.bumpClock(),
+                filePath: meta.relativePath,
+                fileType: meta.fileType,
+                contentHash: localHash,
+                size: localBuf.byteLength,
+                ...(data !== undefined ? { data } : {}),
+              });
+            } catch {
+              this.log.debug(
+                'restore-server push failed; reconcile on reconnect',
+                meta.relativePath,
+              );
+            }
           }
           // Don't drop local state — we want the file to stay.
           return;
@@ -1302,6 +1348,13 @@ export class SyncEngine {
           // idempotent-replay path collapses the duplicates instead.
           const fileType = (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath);
           const contentHash = await sha256Hex(data);
+          let inlineData: ArrayBuffer | undefined;
+          try {
+            // Binary bytes go to the REST staging area; text rides inline.
+            inlineData = await this.stageBinaryBlob(fileType, contentHash, data);
+          } catch {
+            return { ok: false, retryable: true, error: 'blob_staging_failed' };
+          }
           const ack = await this.socket.emitFileCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -1310,7 +1363,7 @@ export class SyncEngine {
             fileType,
             contentHash,
             size: data.byteLength,
-            data,
+            ...(inlineData !== undefined ? { data: inlineData } : {}),
           });
           if (ack.ok) {
             // Keep `fileIndex` authoritative so the initial-push pass that
@@ -1336,6 +1389,11 @@ export class SyncEngine {
           // Hash the bytes being sent, not the stale enqueue-time snapshot
           // — same reasoning as the CREATE case above.
           const contentHash = await sha256Hex(data);
+          try {
+            await this.api.uploadBlob(this.binding.projectId, contentHash, data);
+          } catch {
+            return { ok: false, retryable: true, error: 'blob_staging_failed' };
+          }
           const ack = await this.socket.emitFileUpdateBinary({
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -1343,7 +1401,6 @@ export class SyncEngine {
             fileId,
             contentHash,
             size: data.byteLength,
-            data,
           });
           if (ack.ok) {
             const meta = this.fileIndex.byId.get(fileId);

@@ -93,15 +93,73 @@ const defaultRequest: RequestFn = async (params) => {
   return obsidian.requestUrl({ ...params, throw: false });
 };
 
+/** Params for a binary transfer (download / blob upload). `body` carries the
+ *  raw bytes for uploads; downloads pass none. */
+export interface BinaryRequestParam {
+  url: string;
+  method: string;
+  headers: Record<string, string>;
+  body?: ArrayBuffer;
+}
+
+/**
+ * Indirection for BINARY transfers — production uses the browser `fetch`.
+ *
+ * Binary files (10–15 MB storyboard images) must NOT go through `requestUrl`:
+ * it marshals the entire body across Electron's IPC bridge on the renderer
+ * thread and chokes on large uploads. `fetch` streams the body off-thread and
+ * handles big bodies. The server enables CORS for the binary routes (Origin
+ * `app://obsidian.md`, `X-API-Key` allowed), which is why these can use `fetch`
+ * while JSON requests stay on `requestUrl`. Returns the same
+ * {@link RequestUrlResponse} shape so error mapping is transport-agnostic.
+ */
+export type BinaryRequestFn = (params: BinaryRequestParam) => Promise<RequestUrlResponse>;
+
+const defaultBinaryRequest: BinaryRequestFn = async (params) => {
+  const init: RequestInit = {
+    method: params.method,
+    headers: params.headers,
+    ...(params.body !== undefined ? { body: params.body } : {}),
+  };
+  const res = await fetch(params.url, init);
+
+  const buf = await res.arrayBuffer();
+  const headers: Record<string, string> = {};
+  res.headers.forEach((value, key) => {
+    headers[key] = value;
+  });
+
+  // Parse JSON lazily from the same bytes (upload/blob responses are JSON;
+  // downloads are binary and left as the ArrayBuffer).
+  let json: unknown = null;
+  let text = '';
+  if ((res.headers.get('content-type') ?? '').includes('application/json') && buf.byteLength > 0) {
+    text = new TextDecoder().decode(buf);
+    try {
+      json = JSON.parse(text);
+    } catch {
+      json = null;
+    }
+  }
+
+  return { status: res.status, json, arrayBuffer: buf, headers, text };
+};
+
 export class ApiClient {
   private readonly baseUrl: string;
   private readonly apiKey: string;
   private readonly request: RequestFn;
+  private readonly binaryRequest: BinaryRequestFn;
 
-  constructor(server: Pick<ServerConfig, 'url' | 'apiKey'>, request: RequestFn = defaultRequest) {
+  constructor(
+    server: Pick<ServerConfig, 'url' | 'apiKey'>,
+    request: RequestFn = defaultRequest,
+    binaryRequest: BinaryRequestFn = defaultBinaryRequest,
+  ) {
     this.baseUrl = server.url.replace(/\/+$/, '');
     this.apiKey = server.apiKey;
     this.request = request;
+    this.binaryRequest = binaryRequest;
   }
 
   // -- Auth / discovery -------------------------------------------------------
@@ -170,6 +228,20 @@ export class ApiClient {
     const data = parsed as { file?: Omit<ApiFileMeta, 'size'> & { size: string } };
     if (!data.file) throw new ApiError('Malformed upload response', 'server', res.status, false);
     return parseFileMeta(data.file);
+  }
+
+  /**
+   * Upload a binary blob's bytes to the content-addressed staging area over
+   * `fetch` (off the renderer thread; handles 10–15 MB bodies). The caller then
+   * references it by hash in a metadata-only `file:create` /
+   * `file:update-binary` socket op, keeping large payloads off the socket.
+   */
+  async uploadBlob(projectId: string, contentHash: string, content: ArrayBuffer): Promise<void> {
+    await this.sendBinary(
+      'PUT',
+      `/api/projects/${encodeURIComponent(projectId)}/blobs/${encodeURIComponent(contentHash)}`,
+      { body: content, contentType: 'application/octet-stream' },
+    );
   }
 
   /** Replace the contents of an existing file. */
@@ -247,7 +319,7 @@ export class ApiClient {
   }
 
   private async binary(method: string, path: string): Promise<ArrayBuffer> {
-    const res = await this.send(method, path, {});
+    const res = await this.sendBinary(method, path, {});
     return res.arrayBuffer;
   }
 
@@ -265,6 +337,37 @@ export class ApiClient {
     let res: RequestUrlResponse;
     try {
       res = await this.request({
+        url: `${this.baseUrl}${path}`,
+        method,
+        headers,
+        ...(options.body !== undefined ? { body: options.body } : {}),
+      });
+    } catch (err) {
+      throw new ApiError(err instanceof Error ? err.message : 'network error', 'network', 0, true);
+    }
+    if (res.status >= 200 && res.status < 300) return res;
+    throw classifyError(res.status);
+  }
+
+  /**
+   * Binary-transport sibling of {@link send}: routes through `fetch` (the
+   * `binaryRequest` seam) instead of `requestUrl`, so 10–15 MB bodies aren't
+   * buffered across IPC. Same header set and error mapping as {@link send}.
+   */
+  private async sendBinary(
+    method: string,
+    path: string,
+    options: { body?: ArrayBuffer; contentType?: string },
+  ): Promise<RequestUrlResponse> {
+    const headers: Record<string, string> = {
+      'X-API-Key': this.apiKey,
+      Accept: 'application/json',
+    };
+    if (options.contentType) headers['Content-Type'] = options.contentType;
+
+    let res: RequestUrlResponse;
+    try {
+      res = await this.binaryRequest({
         url: `${this.baseUrl}${path}`,
         method,
         headers,

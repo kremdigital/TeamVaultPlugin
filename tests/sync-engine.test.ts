@@ -177,13 +177,23 @@ function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harn
     text: '',
   }));
 
-  const api = new ApiClient(server, async (params) => {
+  const respond = async (params: { url: string; method?: string }) => {
     apiCalls.push({ url: params.url, method: params.method });
     const path = params.url.replace(server.url, '');
+    if (params.method === 'PUT' && path.includes('/blobs/')) {
+      return {
+        status: 200,
+        json: { ok: true },
+        arrayBuffer: new ArrayBuffer(0),
+        headers: {},
+        text: '',
+      };
+    }
     const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
     if (!responder) throw new Error(`unexpected request: ${params.method ?? 'GET'} ${path}`);
     return responder();
-  });
+  };
+  const api = new ApiClient(server, respond, respond);
 
   const socket = new SocketClient({ server, clientId: 'device-1', factory });
   const deps: SyncEngineDeps = {
@@ -530,12 +540,24 @@ describe('SyncEngine — binary conflict resolver', () => {
       text: '',
     }));
 
-    const api = new ApiClient(server, async (params) => {
+    const respond = async (params: { url: string; method?: string }) => {
       const path = params.url.replace(server.url, '');
+      // Binary blob staging — accept any hash (the engine stages bytes here
+      // before the metadata-only socket op).
+      if (params.method === 'PUT' && path.includes('/blobs/')) {
+        return {
+          status: 200,
+          json: { ok: true },
+          arrayBuffer: new ArrayBuffer(0),
+          headers: {},
+          text: '',
+        };
+      }
       const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
       if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
       return responder();
-    });
+    };
+    const api = new ApiClient(server, respond, respond);
 
     const conflictResolver = {
       resolveBinaryConflict: jest.fn(async () => 'keep-both' as const),
@@ -618,12 +640,24 @@ describe('SyncEngine — delete conflict resolver', () => {
       text: '',
     }));
 
-    const api = new ApiClient(server, async (params) => {
+    const respond = async (params: { url: string; method?: string }) => {
       const path = params.url.replace(server.url, '');
+      // Binary blob staging — accept any hash (the engine stages bytes here
+      // before the metadata-only socket op).
+      if (params.method === 'PUT' && path.includes('/blobs/')) {
+        return {
+          status: 200,
+          json: { ok: true },
+          arrayBuffer: new ArrayBuffer(0),
+          headers: {},
+          text: '',
+        };
+      }
       const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
       if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
       return responder();
-    });
+    };
+    const api = new ApiClient(server, respond, respond);
 
     const conflictResolver = {
       resolveBinaryConflict: jest.fn(async () => 'keep-server' as const),
@@ -1179,12 +1213,24 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       headers: {},
       text: '',
     }));
-    const api = new ApiClient(server, async (params) => {
+    const respond = async (params: { url: string; method?: string }) => {
       const path = params.url.replace(server.url, '');
+      // Binary blob staging — accept any hash (the engine stages bytes here
+      // before the metadata-only socket op).
+      if (params.method === 'PUT' && path.includes('/blobs/')) {
+        return {
+          status: 200,
+          json: { ok: true },
+          arrayBuffer: new ArrayBuffer(0),
+          headers: {},
+          text: '',
+        };
+      }
       const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
       if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
       return responder();
-    });
+    };
+    const api = new ApiClient(server, respond, respond);
     const vault = new MemoryVault();
     vault.files.set(
       'live-test.md',
@@ -1441,12 +1487,24 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       text: '',
     }));
 
-    const api = new ApiClient(server, async (params) => {
+    const respond = async (params: { url: string; method?: string }) => {
       const path = params.url.replace(server.url, '');
+      // Binary blob staging — accept any hash (the engine stages bytes here
+      // before the metadata-only socket op).
+      if (params.method === 'PUT' && path.includes('/blobs/')) {
+        return {
+          status: 200,
+          json: { ok: true },
+          arrayBuffer: new ArrayBuffer(0),
+          headers: {},
+          text: '',
+        };
+      }
       const responder = apiResponses.get(`${params.method ?? 'GET'} ${path}`);
       if (!responder) throw new Error(`unexpected: ${params.method ?? 'GET'} ${path}`);
       return responder();
-    });
+    };
+    const api = new ApiClient(server, respond, respond);
 
     const conflictResolver = {
       resolveBinaryConflict: jest.fn(async () => 'keep-both' as const),

@@ -118,14 +118,18 @@ export interface FileCreatePayload extends BaseEnvelope {
   mimeType?: string | null;
   contentHash: string;
   size: number;
-  data: ArrayBuffer;
+  // Inline bytes (sent as number[] by `envelopeFor`). Present for TEXT (small);
+  // omitted for BINARY, whose bytes are staged over REST and referenced by
+  // hash — keeping multi-megabyte payloads off the socket. `envelopeFor` drops
+  // the field entirely when this is undefined.
+  data?: ArrayBuffer;
 }
 
 export interface FileUpdateBinaryPayload extends BaseEnvelope {
   fileId: string;
   contentHash: string;
   size: number;
-  data: ArrayBuffer;
+  data?: ArrayBuffer;
 }
 
 export interface FileDeletePayload extends BaseEnvelope {
@@ -436,7 +440,7 @@ export class SocketClient {
 
   private envelopeFor<T extends BaseEnvelope & { data?: ArrayBuffer }>(
     raw: T,
-    extras: { data?: ArrayBuffer },
+    extras: { data?: ArrayBuffer | undefined },
   ): Record<string, unknown> {
     const envelope: Record<string, unknown> = { ...(raw as Record<string, unknown>) };
     if (extras.data !== undefined) {
