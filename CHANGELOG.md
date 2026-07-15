@@ -4,6 +4,27 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [0.2.9] — 2026-07-15
+
+### Fixed
+
+- **Deleting a folder, or a file the client hadn't indexed, didn't stick — the
+  files came back from the server** (the storyboard-image resurrection).
+  Obsidian fires a single `delete` for a `TFolder` and the per-child chokidar
+  `unlink` events are unreliable under a burst, so folder deletes never reached
+  the server; and a delete for a path missing from the local index was queued
+  with an empty `fileId` and silently dropped as `no_file_id`. Now: a folder
+  delete is expanded into a delete for every indexed child (children are
+  pre-marked so the chokidar echo can't double-fire), and an empty `fileId` is
+  resolved from the server's live file list before the delete is sent.
+- **`initialPush` could re-upload a deleted-but-still-on-disk file and
+  resurrect it.** It now consults the server's tombstones
+  (`GET /files?includeDeleted`) and skips those paths, and **fails closed** if
+  that lookup errors (defers the upload pass rather than risk a resurrection).
+- **A debounced disk snapshot from a concurrent remote edit could recreate a
+  just-deleted note.** Local delete now releases the Yjs doc and cancels the
+  pending snapshot, matching the server-delete teardown.
+
 ## [0.2.8] — 2026-06-22
 
 ### Fixed
