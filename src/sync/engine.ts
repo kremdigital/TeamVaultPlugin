@@ -293,7 +293,8 @@ export class SyncEngine {
         await this.handleLocalModify(event.path);
         break;
       case 'delete':
-        await this.handleLocalDelete(event.path);
+        if (event.isFolder) await this.handleLocalFolderDelete(event.path);
+        else await this.handleLocalDelete(event.path);
         break;
       case 'rename':
         await this.handleLocalRename(event.oldPath, event.newPath);
@@ -497,6 +498,20 @@ export class SyncEngine {
   private async initialPush(): Promise<void> {
     const paths = await this.vault.list(this.binding.localFolder);
     const pending = this.operationLog.pendingPaths(this.binding.id);
+    // Paths the server currently holds as tombstones. Re-uploading one would
+    // resurrect an intentionally-deleted file: initialPush walks the raw disk,
+    // and a file the server deleted but that is still on disk would come back
+    // as a fresh CREATE. Honour the server's tombstones instead.
+    const tombstoned = await this.fetchServerTombstones();
+    if (tombstoned === null) {
+      // Couldn't confirm the server's tombstones. Don't risk re-uploading a
+      // deleted-but-still-on-disk file — after catch-up merges the delete
+      // clock, the server's causal guard can't stop the resurrection. Defer
+      // the whole pass; the next reconnect / a live watcher CREATE retries the
+      // genuinely-new files.
+      this.log.debug('initialPush: tombstone lookup failed; deferring upload pass');
+      return;
+    }
     for (const path of paths) {
       // Watcher events are filtered upstream, but this pass walks the raw
       // vault listing — without the same filter it uploads throw-away
@@ -504,12 +519,34 @@ export class SyncEngine {
       if (isAlwaysIgnored(path)) continue;
       if (this.fileIndex.byPath.has(path)) continue;
       if (pending.has(path)) continue;
+      if (tombstoned.has(path)) {
+        this.log.debug('initialPush: skipping server-tombstoned path', path);
+        continue;
+      }
       try {
         await this.handleLocalCreate(path);
       } catch {
         // Per-file failures are swallowed — the watcher / next reconnect
         // will surface them again.
       }
+    }
+  }
+
+  /**
+   * Vault paths the server currently holds as tombstones (soft-deleted). Used
+   * by `initialPush` to avoid resurrecting an intentionally-deleted file that
+   * is still on disk. Returns `null` on error (distinct from an empty set) so
+   * the caller can fail CLOSED — a failed lookup must not silently re-upload
+   * deleted files.
+   */
+  private async fetchServerTombstones(): Promise<Set<string> | null> {
+    try {
+      const files = await this.api.getProjectFiles(this.binding.projectId, {
+        includeDeleted: true,
+      });
+      return new Set(files.filter((f) => f.deletedAt !== null).map((f) => f.path));
+    } catch {
+      return null;
     }
   }
 
@@ -736,6 +773,46 @@ export class SyncEngine {
     });
   }
 
+  /**
+   * A whole folder was deleted in Obsidian. Obsidian emits one delete for the
+   * `TFolder` (never one per child), and the chokidar `unlink` events for the
+   * children are unreliable under a burst of hundreds. So enumerate every
+   * indexed path under the folder and delete each one explicitly — that is
+   * what makes a folder delete propagate durably to the server.
+   */
+  private async handleLocalFolderDelete(folderPath: string): Promise<void> {
+    if (!isInBinding(folderPath, this.binding.localFolder)) return;
+    const children: string[] = [];
+    for (const path of this.fileIndex.byPath.keys()) {
+      if (isInBinding(path, folderPath)) children.push(path);
+    }
+    if (children.length === 0) return;
+    this.log.debug('folder delete → expanding', folderPath, `(${children.length} files)`);
+    for (const path of children) {
+      // Obsidian delivered one event (the folder); the per-child unlinks come
+      // from chokidar, and the FS-watcher's Obsidian-dedupe only registered the
+      // folder path. Pre-mark each child so its chokidar `unlink` echo is
+      // swallowed instead of dispatching a second, racing handleLocalDelete.
+      this.recentlyApplied.mark(path);
+      await this.handleLocalDelete(path);
+    }
+  }
+
+  /**
+   * Resolve a file's server id by vault path from the live project listing.
+   * Used when a delete fires for a path missing from the local index (a
+   * folder-delete child that was never individually indexed, or a stale
+   * index). Returns '' when the server has no live file at that path.
+   */
+  private async resolveServerFileId(path: string): Promise<string> {
+    try {
+      const files = await this.api.getProjectFiles(this.binding.projectId);
+      return files.find((f) => f.path === path)?.id ?? '';
+    } catch {
+      return '';
+    }
+  }
+
   private async handleLocalDelete(path: string): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     // Stale-delete guard: if the file is still on disk, the watcher
@@ -747,7 +824,14 @@ export class SyncEngine {
     // then finds an empty index and dispatches a phantom `file:create`.
     if (await this.vault.exists(path)) return;
     const meta = this.fileIndex.byPath.get(path);
-    const fileId = meta?.fileId ?? '';
+    let fileId = meta?.fileId ?? '';
+    // The path may be absent from the local index (a folder-delete child, or
+    // a stale index). Resolve the id from the server's live file list before
+    // giving up — otherwise the DELETE is queued with an empty fileId and is
+    // later dropped as `no_file_id`, so the deletion never propagates.
+    if (!fileId && this.socket.isConnected()) {
+      fileId = await this.resolveServerFileId(path);
+    }
     if (this.socket.isConnected() && fileId) {
       const ack = await this.socket.emitFileDelete({
         projectId: this.binding.projectId,
@@ -760,9 +844,24 @@ export class SyncEngine {
         this.fileIndex.byPath.delete(path);
         this.fileIndex.byId.delete(fileId);
         this.operationLog.deleteFileMeta(this.binding.id, path);
+        // A concurrent remote yjs:update may have scheduled a debounced disk
+        // snapshot for this path. With meta gone but the doc still live,
+        // writeDocSnapshot's `docManager.has` guard stays true and (no `!meta`
+        // guard) it would recreate the just-deleted file. Cancel the pending
+        // snapshot and release the doc — the same teardown applyServerDelete does.
+        this.snapshotDebouncers.get(path)?.cancel();
+        this.snapshotDebouncers.delete(path);
+        await this.docManager.release(this.binding.id, path);
         this.persistVectorClock();
         return;
       }
+    }
+    if (!fileId) {
+      // No live server file at this path (already deleted, or never synced).
+      // Nothing to propagate — but log it rather than silently swallowing a
+      // delete that couldn't be resolved.
+      this.log.debug('local delete: no server fileId, nothing to propagate', path);
+      return;
     }
     this.queue('DELETE', path, null, { fileId });
   }
@@ -1413,8 +1512,18 @@ export class SyncEngine {
           return ackToOutcome(ack);
         }
         case 'DELETE': {
-          const fileId = String(op.payload['fileId'] ?? '');
-          if (!fileId) return { ok: false, retryable: false, error: 'no_file_id' };
+          let fileId = String(op.payload['fileId'] ?? '');
+          // A queued DELETE can carry an empty fileId (the path wasn't indexed
+          // when it was enqueued). Resolve it from the now-refreshed index
+          // before giving up, and log the drop rather than losing it silently.
+          if (!fileId) fileId = this.fileIndex.byPath.get(op.filePath)?.fileId ?? '';
+          if (!fileId) {
+            this.log.debug(
+              'replay DELETE dropped: no fileId (already gone server-side)',
+              op.filePath,
+            );
+            return { ok: false, retryable: false, error: 'no_file_id' };
+          }
           const ack = await this.socket.emitFileDelete({
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -1427,6 +1536,11 @@ export class SyncEngine {
             if (meta) this.fileIndex.byPath.delete(meta.relativePath);
             this.fileIndex.byId.delete(fileId);
             this.operationLog.deleteFileMeta(this.binding.id, op.filePath);
+            // Release the doc + drop any pending snapshot so a debounced write
+            // can't recreate the deleted file (see handleLocalDelete).
+            this.snapshotDebouncers.get(op.filePath)?.cancel();
+            this.snapshotDebouncers.delete(op.filePath);
+            await this.docManager.release(this.binding.id, op.filePath);
           }
           return ackToOutcome(ack);
         }

@@ -168,14 +168,19 @@ function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harn
   const apiCalls: Array<{ url: string; method?: string | undefined }> = [];
   const apiResponses = new Map<string, () => RequestUrlResponse>();
 
-  // Default empty `getProjectFiles` response — tests override per-case.
-  apiResponses.set('GET /api/projects/p1/files', () => ({
+  // Default empty `getProjectFiles` responses — tests override per-case.
+  // Both the live listing and the `includeDeleted` tombstone lookup default to
+  // empty so `initialPush` (which now fails closed on a failed tombstone
+  // lookup) proceeds unless a test opts into tombstones / a lookup failure.
+  const emptyFiles = () => ({
     status: 200,
     json: { files: [] },
     arrayBuffer: new ArrayBuffer(0),
     headers: {},
     text: '',
-  }));
+  });
+  apiResponses.set('GET /api/projects/p1/files', emptyFiles);
+  apiResponses.set('GET /api/projects/p1/files?includeDeleted=true', emptyFiles);
 
   const respond = async (params: { url: string; method?: string }) => {
     apiCalls.push({ url: params.url, method: params.method });
@@ -329,6 +334,147 @@ describe('SyncEngine — local delete', () => {
     expect(payload.filePath).toBe('note.md');
     h.socket().ackOk({ outcome: 'deleted' });
     await promise;
+  });
+});
+
+/** A full ApiFile-shaped record for `GET .../files` responder mocks. */
+function mkFile(over: {
+  id: string;
+  path: string;
+  deletedAt?: string | null;
+  fileType?: 'TEXT' | 'BINARY';
+}): Record<string, unknown> {
+  return {
+    id: over.id,
+    path: over.path,
+    fileType: over.fileType ?? 'TEXT',
+    contentHash: 'h',
+    size: '5',
+    mimeType: 'text/markdown',
+    deletedAt: over.deletedAt ?? null,
+    createdAt: '2026-01-01',
+    updatedAt: '2026-01-01',
+    lastModifiedById: 'u1',
+  };
+}
+
+describe('SyncEngine — delete durability', () => {
+  it('folder delete expands into a delete for every indexed child', async () => {
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          mkFile({ id: 'f1', path: 'notes/a.md' }),
+          mkFile({ id: 'f2', path: 'notes/b.md' }),
+          mkFile({ id: 'f3', path: 'notes/c.md' }),
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    // The children are gone from disk (the folder was deleted), so the
+    // stale-delete guard lets each one through.
+    const promise = h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: 'notes',
+      source: 'obsidian',
+      isFolder: true,
+    });
+    // Each child delete awaits its own ack; drive them one at a time.
+    for (let i = 0; i < 3; i++) {
+      await flushAsync();
+      h.socket().ackOk({ outcome: 'deleted' });
+    }
+    await promise;
+
+    const paths = h
+      .socket()
+      .emits.slice(before)
+      .filter((e) => e.event === 'file:delete')
+      .map((e) => (e.args[0] as { filePath: string }).filePath)
+      .sort();
+    expect(paths).toEqual(['notes/a.md', 'notes/b.md', 'notes/c.md']);
+  });
+
+  it('resolves an unindexed delete from the server file list instead of dropping it', async () => {
+    const h = buildHarness();
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // The file exists on the server but never made it into the local index
+    // (e.g. a folder-delete child, or a stale index) — and it's gone on disk.
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f9', path: 'orphan.md' })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    const before = h.socket().emits.length;
+    const promise = h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: 'orphan.md',
+      source: 'obsidian',
+    });
+    await flushAsync();
+    const emit = h
+      .socket()
+      .emits.slice(before)
+      .find((e) => e.event === 'file:delete');
+    expect(emit).toBeDefined();
+    expect((emit?.args[0] as { fileId: string }).fileId).toBe('f9');
+    h.socket().ackOk({ outcome: 'deleted' });
+    await promise;
+  });
+
+  it('initialPush does not resurrect a server-tombstoned path still on disk', async () => {
+    const h = buildHarness();
+    // On disk locally...
+    h.vault.files.set('gone.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    // ...but the server holds it as a tombstone.
+    h.apiResponses.set('GET /api/projects/p1/files?includeDeleted=true', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f5', path: 'gone.md', deletedAt: '2026-01-02' })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    // initialPush must have skipped it — no CREATE was emitted.
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(0);
+  });
+
+  it('initialPush defers (uploads nothing) when the tombstone lookup fails', async () => {
+    const h = buildHarness();
+    h.vault.files.set('new.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    // Live listing works (empty), but the includeDeleted lookup throws.
+    h.apiResponses.set('GET /api/projects/p1/files?includeDeleted=true', () => {
+      throw new Error('boom');
+    });
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    // Fail-closed: rather than risk resurrecting a deleted file, upload nothing.
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(0);
   });
 });
 

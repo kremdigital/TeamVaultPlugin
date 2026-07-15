@@ -103,11 +103,19 @@ describe('ObsidianWatcher — scoping', () => {
     expect(events).toEqual([]);
   });
 
-  it('drops folders', () => {
+  it('drops folder create/modify events', () => {
     const { vault, events } = buildWatcher([binding()]);
     vault.fire('create', { path: 'notes', kind: 'folder' });
     vault.fire('modify', { path: 'notes', kind: 'folder' });
     expect(events).toEqual([]);
+  });
+
+  it('forwards folder deletes with an isFolder marker (engine expands them)', () => {
+    const { vault, events } = buildWatcher([binding()]);
+    vault.fire('delete', { path: 'notes', kind: 'folder' });
+    expect(events).toEqual([
+      { type: 'delete', bindingId: 'b1', path: 'notes', source: 'obsidian', isFolder: true },
+    ]);
   });
 
   it('drops always-ignored paths', () => {

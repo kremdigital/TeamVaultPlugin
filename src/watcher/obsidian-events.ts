@@ -29,7 +29,13 @@ export type VaultEventSource = 'obsidian' | 'fs';
 export type VaultEvent =
   | { type: 'create'; bindingId: string; path: string; source: VaultEventSource }
   | { type: 'modify'; bindingId: string; path: string; source: VaultEventSource }
-  | { type: 'delete'; bindingId: string; path: string; source: VaultEventSource }
+  | {
+      type: 'delete';
+      bindingId: string;
+      path: string;
+      source: VaultEventSource;
+      isFolder?: boolean;
+    }
   | {
       type: 'rename';
       bindingId: string;
@@ -136,10 +142,21 @@ export class ObsidianWatcher {
   }
 
   private onDelete(file: WatchableFile): void {
-    if (!isFile(file)) return;
-    if (this.recentlyApplied.take(file.path)) return;
+    // Obsidian fires a single `delete` for a `TFolder` (never one per child),
+    // and chokidar `unlink` events for the children are unreliable under a
+    // burst. So instead of dropping folder deletes, forward them with an
+    // `isFolder` marker — the engine expands them into per-child deletes
+    // against its file index, the only reliable source of the children.
+    const folder = !isFile(file);
+    if (!folder && this.recentlyApplied.take(file.path)) return;
     this.dispatchForBindings(file.path, (bindingId) =>
-      this.fan({ type: 'delete', bindingId, path: file.path, source: 'obsidian' }),
+      this.fan({
+        type: 'delete',
+        bindingId,
+        path: file.path,
+        source: 'obsidian',
+        ...(folder ? { isFolder: true } : {}),
+      }),
     );
   }
 
