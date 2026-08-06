@@ -2563,3 +2563,115 @@ describe('SyncEngine — переименование из интерфейса 
     expect(h.ra.take('a.md')).toBe(false);
   });
 });
+
+/**
+ * Catch-up не должен делать работу, которой не требуется.
+ *
+ * Раньше `project:join` прогонял ВСЕ документы проекта: на каждый создавался
+ * `Y.Doc` со своей базой IndexedDB (одна на файл) и делалась запись на диск.
+ * На вальте «Ополченец» (1062 файла) это блокировало поток интерфейса на
+ * десятки секунд — Obsidian висел, пропускал heartbeat, получал разрыв и
+ * переподключался, запуская полный catch-up заново. Замеренные фазы `syncing`:
+ * 46 с → 30 с → 174 с → 94 с, 796 с CPU (инцидент 2026-08-06).
+ *
+ * Теперь документ, чьё содержимое уже совпадает с файлом на диске,
+ * пропускается целиком. Признак пропуска — `docManager.has` остаётся `false`:
+ * ни `Y.Doc`, ни база IndexedDB не создавались.
+ */
+describe('SyncEngine — catch-up пропускает совпадающие документы', () => {
+  function listOneFile(h: Harness, contentHash: string): void {
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'note.md',
+            fileType: 'TEXT',
+            contentHash,
+            size: '10',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+  }
+
+  async function runCatchup(h: Harness, serverText: string): Promise<void> {
+    const Y = await import('yjs');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, serverText);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(20);
+    serverDoc.destroy();
+  }
+
+  it('совпадающий документ не гидратируется: ни Y.Doc, ни IndexedDB, ни запись', async () => {
+    const { sha256Hex } = await import('@/sync/hash');
+    const text = 'одинаковый текст\n';
+    const h = buildHarness();
+    listOneFile(h, await sha256Hex(text));
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+
+    await runCatchup(h, text);
+
+    // Главное: документ так и не создан — дорогая часть catch-up пропущена.
+    expect(h.doc.has('b1', 'note.md')).toBe(false);
+    // Файл на диске не тронут.
+    expect(await h.vault.readText('note.md')).toBe(text);
+    // И обратную дельту слать нечего.
+    expect(h.socket().emits.filter((e) => e.event === 'yjs:update')).toHaveLength(0);
+    await h.engine.stop();
+  });
+
+  it('расходящийся документ гидратируется как раньше', async () => {
+    const { sha256Hex } = await import('@/sync/hash');
+    const diskText = 'локальная версия\n';
+    const serverText = 'серверная версия\n';
+    const h = buildHarness();
+    listOneFile(h, await sha256Hex(diskText));
+    h.vault.files.set('note.md', new TextEncoder().encode(diskText).buffer as ArrayBuffer);
+
+    await runCatchup(h, serverText);
+
+    // Содержимое разное — пропуск неприменим, документ поднят.
+    expect(h.doc.has('b1', 'note.md')).toBe(true);
+    await h.engine.stop();
+  });
+
+  it('пропуск не применяется к уже открытому документу', async () => {
+    const { sha256Hex } = await import('@/sync/hash');
+    const text = 'одинаковый текст\n';
+    const h = buildHarness();
+    listOneFile(h, await sha256Hex(text));
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+    // Заметка открыта в редакторе — у её документа может быть история,
+    // которой сервер не видел, поэтому пропускать нельзя.
+    h.doc.get('b1', 'note.md');
+
+    await runCatchup(h, text);
+
+    expect(h.doc.has('b1', 'note.md')).toBe(true);
+    await h.engine.stop();
+  });
+});

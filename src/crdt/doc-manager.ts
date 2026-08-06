@@ -140,6 +140,8 @@ export class DocManager {
   private readonly dbPrefix: (bindingId: string) => string;
   private readonly idb: IdbRegistry;
   private readonly cache = new Map<string, ManagedEntry>();
+  /** Подписчики на «в этом биндинге появился документ», см. {@link onDocAcquired}. */
+  private readonly acquiredSubs = new Map<string, Set<(filePath: string) => void>>();
 
   constructor(options: DocManagerOptions = {}) {
     this.persistenceFactory = options.persistenceFactory ?? (() => null);
@@ -249,6 +251,31 @@ export class DocManager {
    *
    * Returns an unsubscribe function.
    */
+  /**
+   * Подписка на появление документа в биндинге: колбэк зовётся, когда для
+   * файла впервые создаётся `Y.Doc` (и его база `y-indexeddb`).
+   *
+   * Нужна, чтобы навешивать отправку локальных правок **лениво**. Раньше
+   * движок после каждого `project:join` проходил по всем файлам проекта и звал
+   * `onLocalUpdate`, а тот создаёт документ — то есть поднимал `Y.Doc` и
+   * отдельную базу IndexedDB на КАЖДЫЙ файл. На вальте в 1062 файла это
+   * блокировало поток интерфейса и приводило к лайвлоку переподключений
+   * (инцидент 2026-08-06). Теперь подписка навешивается на те документы,
+   * которые действительно понадобились.
+   */
+  onDocAcquired(bindingId: string, cb: (filePath: string) => void): () => void {
+    let subs = this.acquiredSubs.get(bindingId);
+    if (!subs) {
+      subs = new Set();
+      this.acquiredSubs.set(bindingId, subs);
+    }
+    subs.add(cb);
+    return () => {
+      subs?.delete(cb);
+      if (subs && subs.size === 0) this.acquiredSubs.delete(bindingId);
+    };
+  }
+
   onLocalUpdate(bindingId: string, filePath: string, cb: (update: Uint8Array) => void): () => void {
     const entry = this.acquire(bindingId, filePath);
     entry.localSubs.add(cb);
@@ -412,6 +439,18 @@ export class DocManager {
       updateHandler,
     };
     this.cache.set(key, entry);
+    // Оповещаем ПОСЛЕ записи в кэш: подписчик может звать `onLocalUpdate` на
+    // этот же путь, и тот должен найти готовую запись, а не создать вторую.
+    const subs = this.acquiredSubs.get(bindingId);
+    if (subs) {
+      for (const cb of subs) {
+        try {
+          cb(filePath);
+        } catch {
+          // Ошибка подписчика не должна ломать создание документа.
+        }
+      }
+    }
     return entry;
   }
 

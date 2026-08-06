@@ -8,6 +8,7 @@ import {
   type YjsDocSnapshot,
   type YjsCatchupBatch,
 } from '@/client/socket';
+import * as Y from 'yjs';
 import { DocManager } from '@/crdt/doc-manager';
 import { OperationLog, type FileMeta, type OperationType } from './operation-log';
 import { classifyFileType, type FileType } from './file-type';
@@ -98,9 +99,11 @@ export type EngineStatus = 'stopped' | 'connecting' | 'syncing' | 'connected' | 
 
 export type StatusListener = (status: EngineStatus, detail?: string) => void;
 
+type IndexedMeta = FileMeta & { fileId: string };
+
 interface FileMetaIndex {
-  byPath: Map<string, FileMeta & { fileId: string }>;
-  byId: Map<string, FileMeta & { fileId: string }>;
+  byPath: Map<string, IndexedMeta>;
+  byId: Map<string, IndexedMeta>;
 }
 
 /**
@@ -357,11 +360,29 @@ export class SyncEngine {
         }
       }
 
-      // Subscribe each known text doc to local-update emits — Yjs will
-      // start broadcasting from here on out.
+      // Подписка на отправку локальных правок — ЛЕНИВО.
+      //
+      // Раньше здесь был проход по всем текстовым файлам проекта с вызовом
+      // `wireYjsForTextFile`, а тот через `onLocalUpdate` создаёт документ:
+      // `Y.Doc` плюс отдельная база `y-indexeddb` на КАЖДЫЙ файл. На вальте в
+      // 1062 файла это занимало поток интерфейса на десятки секунд, из-за чего
+      // пропускался heartbeat, соединение рвалось и catch-up начинался заново —
+      // лайвлок (инцидент 2026-08-06: фазы `syncing` 46 → 30 → 174 → 94 с).
+      //
+      // Теперь: уже поднятые документы подписываем сразу, а остальные — в
+      // момент, когда они действительно понадобятся (открытие заметки, правка,
+      // применение серверного апдейта).
       for (const meta of this.fileIndex.byPath.values()) {
-        if (meta.fileType === 'TEXT') this.wireYjsForTextFile(meta.fileId, meta.relativePath);
+        if (meta.fileType === 'TEXT' && this.docManager.has(this.binding.id, meta.relativePath)) {
+          this.wireYjsForTextFile(meta.fileId, meta.relativePath);
+        }
       }
+      this.cleanups.push(
+        this.docManager.onDocAcquired(this.binding.id, (filePath) => {
+          const meta = this.fileIndex.byPath.get(filePath);
+          if (meta?.fileType === 'TEXT') this.wireYjsForTextFile(meta.fileId, filePath);
+        }),
+      );
 
       this.persistVectorClock();
       this.setStatus('connected');
@@ -403,6 +424,51 @@ export class SyncEngine {
   }
 
   /**
+   * Нужно ли вообще гидратировать документ из catch-up.
+   *
+   * Раньше `project:join` прогонял ВСЕ документы проекта: на каждый создавался
+   * `Y.Doc` со своей базой IndexedDB (одна на файл) и делалась запись на диск.
+   * На вальте в 1062 файла это блокировало поток интерфейса на десятки секунд —
+   * Obsidian «висел», пропускал heartbeat, получал разрыв и переподключался,
+   * запуская полный catch-up заново. Лайвлок: замеренные фазы `syncing` —
+   * 46 с → 30 с → 174 с → 94 с, 796 с CPU (инцидент 2026-08-06 на «Ополченце»).
+   *
+   * Работа не нужна, когда файл на диске уже побайтово равен серверной версии:
+   * гидратировать нечего, локальных операций для отправки нет. Пропускаем
+   * такой документ целиком — ни `Y.Doc`, ни IndexedDB, ни записи на диск.
+   *
+   * Пропуск НЕ применяется, если:
+   * - документ уже загружен (открытая заметка, живые правки) — у него может
+   *   быть история, которой нет у сервера;
+   * - хэши расходятся — это и есть случай, ради которого catch-up нужен;
+   * - файла нет на диске или его не прочитать — пусть отработает обычный путь.
+   */
+  private async catchupDocIsRedundant(meta: IndexedMeta, snap: YjsDocSnapshot): Promise<boolean> {
+    if (this.docManager.has(this.binding.id, meta.relativePath)) return false;
+    try {
+      if (!(await this.vault.exists(meta.relativePath))) return false;
+      const disk = await this.vault.readText(meta.relativePath);
+      // Снимок разворачивается в ОДНОРАЗОВЫЙ Y.Doc — без y-indexeddb и без
+      // записи на диск. Дорогая часть catch-up именно в них, а не в разборе
+      // апдейта, поэтому такая проба остаётся дешёвой.
+      //
+      // Сравниваем содержимое, а НЕ contentHash из списка файлов: тот может
+      // отставать от состояния Yjs-документа, и пропуск по хэшу отбросил бы
+      // более новый серверный текст — тихий откат (ловится тестом
+      // «catch-up still applies newer server content…»).
+      const probe = new Y.Doc();
+      try {
+        Y.applyUpdate(probe, Uint8Array.from(snap.sync1));
+        return probe.getText('content').toString() === disk;
+      } finally {
+        probe.destroy();
+      }
+    } catch {
+      return false;
+    }
+  }
+
+  /**
    * Applies one doc's sync-step1 snapshot and, in the same pass, pushes back
    * anything the server is missing. y-indexeddb keeps offline text edits across
    * reloads but the local-update fan-out only fires for *future* edits, so
@@ -413,6 +479,7 @@ export class SyncEngine {
   private async applyCatchupDoc(snap: YjsDocSnapshot): Promise<void> {
     const meta = this.fileIndex.byId.get(snap.fileId);
     if (!meta) return;
+    if (await this.catchupDocIsRedundant(meta, snap)) return;
     // The offline doc store (y-indexeddb) loads asynchronously. Applying the
     // server's state to a doc that hasn't finished loading computes a bogus
     // push-back diff and snapshots a local-history-less merge over the file
@@ -568,7 +635,7 @@ export class SyncEngine {
       // hash so applyServerCreate's binary download starts from a known
       // baseline.
       const existing = this.operationLog.getFileMeta(this.binding.id, f.path);
-      const meta: FileMeta & { fileId: string } = {
+      const meta: IndexedMeta = {
         bindingId: this.binding.id,
         relativePath: f.path,
         serverFileId: f.id,
