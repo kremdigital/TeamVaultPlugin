@@ -867,6 +867,23 @@ export class SyncEngine {
   }
 
   private async handleLocalRename(oldPath: string, newPath: string): Promise<void> {
+    // Переименование в интерфейсе Obsidian порождает ТРИ события: собственное
+    // `vault.on('rename')` (мы здесь) плюс пару от сторожа — `unlink` старого
+    // пути и `add` нового. Без пометки эти два доходят до движка, и `unlink`
+    // успевает попасть в `handleLocalDelete` РАНЬШЕ, чем вернётся ack на
+    // rename: индекс ещё содержит старый путь, `fileId` находится — и уходит
+    // `file:delete`. Сервер применяет его следом за переименованием и убивает
+    // только что переименованный файл, а затем рассылает удаление обратно,
+    // стирая его и на диске.
+    //
+    // Проявляется тем сильнее, чем дольше ходит ack (удалённый сервер).
+    // Воспроизведено 2026-08-06 на проде: переименование и перемещение через
+    // UI уничтожали заметку, в журнале операций RENAME, следом DELETE.
+    //
+    // Серверные аппликаторы (`applyServerRename`) метят оба пути ровно так же.
+    this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
+    this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
+
     const meta = this.fileIndex.byPath.get(oldPath);
     const fileId = meta?.fileId ?? '';
     if (this.socket.isConnected() && fileId) {

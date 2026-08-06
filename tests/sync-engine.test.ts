@@ -2473,3 +2473,93 @@ describe('SyncEngine — правки внешним агентом (source: fs)
     await create;
   });
 });
+
+/**
+ * Переименование и перемещение через интерфейс Obsidian.
+ *
+ * Одно действие пользователя порождает ТРИ события: собственное
+ * `vault.on('rename')` и пару от сторожа — `unlink` старого пути и `add` нового.
+ * Пару обязан гасить `recentlyApplied`, иначе `unlink` уходит в
+ * `handleLocalDelete` раньше, чем вернётся ack на rename: индекс ещё содержит
+ * старый путь, `fileId` находится — и следом за RENAME на сервер уходит DELETE,
+ * убивающий только что переименованный файл.
+ *
+ * Воспроизведено 2026-08-06 на проде: переименование и перемещение через UI
+ * уничтожали заметку (в журнале RENAME, следом DELETE), файл пропадал и с
+ * сервера, и с диска.
+ */
+describe('SyncEngine — переименование из интерфейса Obsidian', () => {
+  async function harnessWithFile(path: string) {
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f-ren', path })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.vault.files.set(path, new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+    return h;
+  }
+
+  it('помечает оба пути, чтобы эхо сторожа не превратилось в удаление', async () => {
+    const h = await harnessWithFile('было.md');
+
+    const promise = h.engine.handleVaultEvent({
+      type: 'rename',
+      bindingId: 'b1',
+      oldPath: 'было.md',
+      newPath: 'стало.md',
+      source: 'obsidian',
+    });
+    await flushAsync();
+    h.socket().ackOk({ outcome: 'renamed' });
+    await promise;
+
+    // Регрессия: без этих пометок сторож доносил `unlink`/`add` до движка, и
+    // `unlink` старого пути превращался в file:delete переименованного файла.
+    expect(h.ra.take('было.md')).toBe(true);
+    expect(h.ra.take('стало.md')).toBe(true);
+  });
+
+  it('перемещение в другую папку помечается так же', async () => {
+    const h = await harnessWithFile('заметка.md');
+
+    const promise = h.engine.handleVaultEvent({
+      type: 'rename',
+      bindingId: 'b1',
+      oldPath: 'заметка.md',
+      newPath: 'папка/заметка.md',
+      source: 'obsidian',
+    });
+    await flushAsync();
+    h.socket().ackOk({ outcome: 'renamed' });
+    await promise;
+
+    expect(h.ra.take('заметка.md')).toBe(true);
+    expect(h.ra.take('папка/заметка.md')).toBe(true);
+  });
+
+  it('пометок хватает на обе половины эха (unlink + add)', async () => {
+    const h = await harnessWithFile('a.md');
+
+    const promise = h.engine.handleVaultEvent({
+      type: 'rename',
+      bindingId: 'b1',
+      oldPath: 'a.md',
+      newPath: 'b.md',
+      source: 'obsidian',
+    });
+    await flushAsync();
+    h.socket().ackOk({ outcome: 'renamed' });
+    await promise;
+
+    // ECHO_COUNT_RENAME = 2 на путь: сторож может прислать и unlink, и add.
+    expect(h.ra.take('a.md')).toBe(true);
+    expect(h.ra.take('a.md')).toBe(true);
+    expect(h.ra.take('a.md')).toBe(false);
+  });
+});
