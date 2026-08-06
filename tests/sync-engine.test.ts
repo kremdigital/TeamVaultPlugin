@@ -2353,3 +2353,123 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     await h.engine.stop();
   });
 });
+
+/**
+ * Правки ВНЕШНИМ процессом при работающем Obsidian.
+ *
+ * Реальный сценарий: пользователь держит вальт открытым, а над теми же файлами
+ * работает агент (или скрипт, или сторонний редактор). Такие правки Obsidian
+ * своими `vault.on(...)` НЕ видит — их ловит только сторож, и события приходят
+ * с `source: 'fs'`.
+ *
+ * Проверено вживую 2026-08-06 на вальте, привязанном к `S1Test2`: создание,
+ * правка (вставка и удаление), перемещение и удаление файла внешним процессом
+ * доходят до сервера. Эти тесты закрепляют поведение.
+ */
+describe('SyncEngine — правки внешним агентом (source: fs)', () => {
+  it('создание файла агентом уходит как file:create с содержимым', async () => {
+    const h = buildHarness();
+    h.vault.files.set('агент/заметка.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    const promise = h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'агент/заметка.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    const emit = h.socket().emits[before];
+    expect(emit?.event).toBe('file:create');
+    const payload = emit?.args[0] as { filePath: string; fileType: string; data: number[] };
+    expect(payload.filePath).toBe('агент/заметка.md');
+    expect(payload.fileType).toBe('TEXT');
+    expect(new TextDecoder().decode(new Uint8Array(payload.data))).toBe('текст');
+    h.socket().ackOk({ outcome: 'created' });
+    await promise;
+  });
+
+  it('удаление файла агентом уходит как file:delete с известным fileId', async () => {
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f-agent', path: 'агент/уйдёт.md' })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+    // Агент уже удалил файл с диска — в вальте его нет.
+    h.vault.files.delete('агент/уйдёт.md');
+
+    const before = h.socket().emits.length;
+    const promise = h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: 'агент/уйдёт.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    const emit = h.socket().emits[before];
+    expect(emit?.event).toBe('file:delete');
+    expect((emit?.args[0] as { fileId: string }).fileId).toBe('f-agent');
+    h.socket().ackOk({ outcome: 'deleted' });
+    await promise;
+  });
+
+  it('перемещение агентом приходит как unlink+add и сохраняет содержимое', async () => {
+    // `mv` внешним процессом сторож видит НЕ как переименование, а как пару
+    // событий: удаление старого пути и создание нового. Проверено на проде —
+    // в журнале операций именно CREATE(новый) + DELETE(старый), содержимое
+    // переносится с CREATE.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f-old', path: 'было.md' })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // Агент выполнил mv: старого пути нет, новый появился с тем же текстом.
+    h.vault.files.delete('было.md');
+    h.vault.files.set('папка/стало.md', new TextEncoder().encode('перенос').buffer as ArrayBuffer);
+
+    const before = h.socket().emits.length;
+    const del = h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: 'было.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    expect(h.socket().emits[before]?.event).toBe('file:delete');
+    h.socket().ackOk({ outcome: 'deleted' });
+    await del;
+
+    const afterDelete = h.socket().emits.length;
+    const create = h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: 'папка/стало.md',
+      source: 'fs',
+    });
+    await flushAsync();
+    const emit = h.socket().emits[afterDelete];
+    expect(emit?.event).toBe('file:create');
+    const payload = emit?.args[0] as { filePath: string; data: number[] };
+    expect(payload.filePath).toBe('папка/стало.md');
+    // Ключевое: содержимое не потеряно при переносе.
+    expect(new TextDecoder().decode(new Uint8Array(payload.data))).toBe('перенос');
+    h.socket().ackOk({ outcome: 'created' });
+    await create;
+  });
+});
