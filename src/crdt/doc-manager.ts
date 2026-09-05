@@ -82,6 +82,13 @@ export interface DocManagerOptions {
    */
   dbPrefix?: (bindingId: string) => string;
   /**
+   * Root shared by every database this plugin creates, whatever the binding —
+   * defaults to `team-vault-`. Must stay consistent with {@link dbPrefix};
+   * {@link DocManager.purgeUnknownBindings} tells our stores from other
+   * plugins' by it.
+   */
+  dbRoot?: string;
+  /**
    * IndexedDB enumerate/delete seam used by {@link DocManager.purgeBinding}
    * to drop a removed binding's offline stores. Production injects a registry
    * backed by the renderer's `indexedDB`; tests inject a fake. Defaults to a
@@ -138,6 +145,7 @@ export class DocManager {
   private readonly persistenceFactory: PersistenceFactory;
   private readonly dbName: (bindingId: string, filePath: string) => string;
   private readonly dbPrefix: (bindingId: string) => string;
+  private readonly dbRoot: string;
   private readonly idb: IdbRegistry;
   private readonly cache = new Map<string, ManagedEntry>();
   /** Подписчики на «в этом биндинге появился документ», см. {@link onDocAcquired}. */
@@ -147,6 +155,7 @@ export class DocManager {
     this.persistenceFactory = options.persistenceFactory ?? (() => null);
     this.dbName = options.dbName ?? defaultDbName;
     this.dbPrefix = options.dbPrefix ?? defaultDbPrefix;
+    this.dbRoot = options.dbRoot ?? DB_PREFIX;
     this.idb = options.idb ?? NOOP_IDB;
   }
 
@@ -385,6 +394,51 @@ export class DocManager {
 
     // 3. Delete each candidate by name (a no-op if clearData already erased it).
     for (const name of candidates) {
+      if (deleted.has(name)) continue;
+      if (await this.deleteDb(name)) deleted.add(name);
+    }
+
+    return [...deleted];
+  }
+
+  /**
+   * Delete every one of our y-indexeddb databases that does NOT belong to one
+   * of `knownBindingIds` — the backstop to {@link purgeBinding}.
+   *
+   * `purgeBinding` has to be told an id, and the startup sweep reads those
+   * ids from the operation log. When `state.db` is missing or wiped (restored
+   * from a backup, deleted by hand while chasing a sync bug) it names no
+   * bindings at all: the sweep finds nothing to do while a retired binding's
+   * offline CRDT stays on disk — and gets merged straight back in the moment
+   * that id is used again. Enumerating the databases themselves closes that
+   * hole: what we can see, we can retire.
+   *
+   * Databases of other plugins are left alone ({@link DocManagerOptions.dbRoot}
+   * bounds us), and anything still cached under an unknown binding is closed
+   * through {@link purgeBinding} first — `deleteDatabase` on an open handle
+   * blocks forever. Best-effort and idempotent; returns the names deleted.
+   */
+  async purgeUnknownBindings(knownBindingIds: Iterable<string>): Promise<string[]> {
+    const known = new Set(knownBindingIds);
+    const deleted = new Set<string>();
+
+    // Cached docs hold live connections; close+delete them through the
+    // per-binding purge so the enumeration below isn't blocked on a handle.
+    const cachedUnknown = new Set<string>();
+    for (const key of this.cache.keys()) {
+      const sep = key.indexOf('::');
+      if (sep < 0) continue;
+      const bindingId = key.slice(0, sep);
+      if (!known.has(bindingId)) cachedUnknown.add(bindingId);
+    }
+    for (const bindingId of cachedUnknown) {
+      for (const name of await this.purgeBinding(bindingId)) deleted.add(name);
+    }
+
+    const keep = [...known].map((id) => this.dbPrefix(id));
+    for (const name of await this.listDbs()) {
+      if (!name.startsWith(this.dbRoot)) continue;
+      if (keep.some((prefix) => name.startsWith(prefix))) continue;
       if (deleted.has(name)) continue;
       if (await this.deleteDb(name)) deleted.add(name);
     }

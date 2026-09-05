@@ -1,7 +1,7 @@
-import { Plugin, WorkspaceLeaf } from 'obsidian';
+import { Notice, Plugin, WorkspaceLeaf } from 'obsidian';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { DEFAULT_SETTINGS, mergeWithDefaults, type PluginSettings } from '@/settings/settings';
-import { setLanguage } from '@/i18n';
+import { setLanguage, t } from '@/i18n';
 import { SyncSettingsTab } from '@/settings/tab';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager, type IdbRegistry, type PersistenceFactory } from '@/crdt/doc-manager';
@@ -14,6 +14,7 @@ import { Logger, type LogLevel } from '@/utils/logger';
 import { ConsoleLogSink } from '@/utils/console-log-sink';
 import { CompositeLogSink } from '@/utils/composite-log-sink';
 import { FileLogSink } from '@/utils/file-log-sink';
+import { findDuplicatePluginFolders } from '@/integration/plugin-folders';
 import { ObsidianVaultAdapter } from '@/integration/obsidian-vault-adapter';
 import { ObsidianLogStorage } from '@/integration/obsidian-log-storage';
 import { ObsidianWatchableVault } from '@/integration/obsidian-watchable-vault';
@@ -68,8 +69,15 @@ export default class ObsidianSyncPlugin extends Plugin {
 
     this.bootstrapLogger();
     this.bootstrapState();
-    await this.sweepOrphanedBindingState();
-    await this.sweepOrphanedTmpArtifacts();
+    // A duplicate plugin folder means the settings we just loaded may not be
+    // the user's (see `integration/plugin-folders`). Everything below the
+    // sweeps is read-mostly, but the sweeps themselves delete local state
+    // keyed on those settings — so warn and skip them until the install is
+    // untangled, rather than wiping a live binding's offline CRDT.
+    if (!(await this.warnOnDuplicatePluginFolders())) {
+      await this.sweepOrphanedBindingState();
+      await this.sweepOrphanedTmpArtifacts();
+    }
     this.bootstrapManager();
     // Watchers attach only after the workspace layout is ready: while the
     // vault index loads, Obsidian fires `vault.on('create')` for EVERY
@@ -160,6 +168,45 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   /**
+   * Warn — loudly and stickily — when another folder under
+   * `.obsidian/plugins/` declares our `manifest.id`. Obsidian loads only one
+   * of them and the choice isn't the user's: the copy that wins supplies
+   * `data.json` (possibly empty, so nothing syncs and the status bar reads
+   * «no active vaults») while `state.db` / `sync.log` still resolve to the
+   * canonical `{manifest.id}` folder. The whole failure is invisible from
+   * inside the plugin — hence the notice naming the folder to remove.
+   *
+   * Returns `true` when a duplicate was found, which also gates the startup
+   * sweeps: with someone else's settings in hand they'd delete live state.
+   */
+  private async warnOnDuplicatePluginFolders(): Promise<boolean> {
+    let duplicates: string[];
+    try {
+      duplicates = await findDuplicatePluginFolders(this.app.vault.adapter, {
+        configDir: this.app.vault.configDir,
+        pluginId: this.manifest.id,
+        ...(this.manifest.dir !== undefined ? { ownDir: this.manifest.dir } : {}),
+      });
+    } catch (err) {
+      this.logger?.warn('failed to scan for duplicate plugin folders', { err });
+      return false;
+    }
+    if (duplicates.length === 0) return false;
+
+    const loaded = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    this.logger?.error('duplicate plugin folders share this plugin id', {
+      pluginId: this.manifest.id,
+      loaded,
+      version: this.manifest.version,
+      duplicates,
+    });
+    // Sticky (timeout 0): sync is effectively down until the user acts, and a
+    // notice that fades in five seconds is exactly what got missed before.
+    new Notice(t('notice.duplicatePluginFolder', { loaded, duplicates: duplicates.join(', ') }), 0);
+    return true;
+  }
+
+  /**
    * One-time-per-launch reconciliation: drop local state for bindings that
    * no longer exist in settings. Earlier plugin versions never cleaned up
    * when a binding was deleted, so `state.db` accumulated dead pending
@@ -192,6 +239,27 @@ export default class ObsidianSyncPlugin extends Plugin {
       } catch (err) {
         this.logger?.warn('failed to sweep orphaned offline CRDT state', { bindingId, err });
       }
+    }
+
+    // The loop above can only sweep binding ids the operation log still
+    // remembers. A missing or wiped `state.db` (restored from a backup,
+    // deleted by hand mid-incident) names none — and a retired binding's
+    // offline CRDT then sits on disk untouched, ready to be merged back the
+    // next time that id comes up. Enumerating the databases themselves is the
+    // backstop. Skipped when settings look unloaded rather than empty: with
+    // no servers AND no bindings we can't tell «user removed everything»
+    // from «we're reading the wrong data.json», and only one of those should
+    // erase local state.
+    if (this.settings.bindings.length === 0 && this.settings.servers.length === 0) return;
+    try {
+      const databases = (await this.docManager?.purgeUnknownBindings(known)) ?? [];
+      if (databases.length > 0) {
+        this.logger?.info('swept offline CRDT state of unknown bindings', {
+          databases: databases.length,
+        });
+      }
+    } catch (err) {
+      this.logger?.warn('failed to sweep offline CRDT state of unknown bindings', { err });
     }
   }
 

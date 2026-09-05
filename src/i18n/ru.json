@@ -100,6 +100,7 @@
   "notice.syncCompleted": "Синхронизация завершена.",
   "notice.conflict": "Конфликт в «{file}».",
   "notice.error": "Ошибка: {error}",
+  "notice.duplicatePluginFolder": "Team Vault: в .obsidian/plugins несколько папок с одним id. Загружена «{loaded}», лишние: {duplicates}. Синхронизация может работать не с теми настройками — удалите лишние папки и перезапустите Obsidian.",
   "history.title": "История версий",
   "history.empty": "Откройте файл в редакторе, чтобы увидеть его историю.",
   "history.loading": "Загружаем историю…",

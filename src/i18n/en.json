@@ -100,6 +100,7 @@
   "notice.syncCompleted": "Sync completed.",
   "notice.conflict": "Conflict in \"{file}\".",
   "notice.error": "Error: {error}",
+  "notice.duplicatePluginFolder": "Team Vault: several folders in .obsidian/plugins share one plugin id. Loaded \"{loaded}\"; extra: {duplicates}. Sync may be running on the wrong settings — remove the extra folders and restart Obsidian.",
   "history.title": "Version history",
   "history.empty": "Open a file to see its history.",
   "history.loading": "Loading history…",
