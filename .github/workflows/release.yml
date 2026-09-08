@@ -1,10 +1,7 @@
 # Release workflow — triggered by pushing a version tag.
 #
-# Obsidian's Community Plugins catalogue requires the GitHub release tag
+# Obsidian's Community Plugins directory requires the GitHub release tag
 # to be the *exact* manifest version with no `v` prefix (e.g. `0.1.0`).
-# We trigger on both `0.1.0` and the legacy `v0.1.0` shape so existing
-# muscle memory keeps working, but the catalogue-submittable release is
-# the no-prefix one.
 #
 # Builds `main.js` from source and publishes a GitHub release with the
 # three Obsidian-required artifacts: `main.js`, `manifest.json`,
@@ -19,8 +16,11 @@ name: Release
 on:
   push:
     tags:
+      # Flat form only. `npm version` also makes a local `vX.Y.Z` tag, but
+      # pushing it would fire this workflow twice and try to publish a second,
+      # duplicate release — and the directory only ever looks at the tag that
+      # equals `manifest.json#version`. Don't push the `v` tag.
       - '[0-9]+.[0-9]+.[0-9]+'
-      - 'v[0-9]+.[0-9]+.[0-9]+'
 
 permissions:
   contents: write
@@ -56,9 +56,7 @@ jobs:
 
       - name: Validate manifest + versions.json match the tag
         run: |
-          # Strip an optional leading `v` so both `0.1.0` and `v0.1.0` work.
           tag="${GITHUB_REF#refs/tags/}"
-          tag="${tag#v}"
           manifest=$(node -p "require('./manifest.json').version")
           if [ "$tag" != "$manifest" ]; then
             echo "manifest.json version ($manifest) does not match tag ($tag)" >&2

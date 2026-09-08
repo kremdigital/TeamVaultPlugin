@@ -31,9 +31,10 @@ Community Plugins catalogue.
    matches both `manifest.json` and `versions.json`, and publishes a
    GitHub release with `main.js`, `manifest.json`, `styles.css` attached.
 
-   > The workflow also accepts a legacy `vX.Y.Z` tag, but the catalogue
-   > bot only recognises the no-prefix form. Always tag the
-   > catalogue-facing release as `X.Y.Z`.
+   > `pnpm version` also leaves a local `vX.Y.Z` tag behind — **don't push
+   > it**. The workflow triggers on the flat form only; pushing both would
+   > publish two releases for one version (0.3.0 did, and the stray tag had
+   > to be deleted).
 
 ## First-time catalogue submission
 
