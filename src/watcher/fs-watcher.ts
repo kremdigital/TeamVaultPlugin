@@ -1,8 +1,7 @@
-import type * as chokidarTypes from 'chokidar';
+import { watch as chokidarWatch } from 'chokidar';
 import type { ChokidarOptions, FSWatcher } from 'chokidar';
 import type { VaultBinding } from '@/settings/settings';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
-import { loadNative } from '@/utils/native-loader';
 import {
   ALWAYS_IGNORED_SEGMENTS,
   absoluteToVault,
@@ -38,14 +37,13 @@ import type { VaultEvent, VaultEventHandler } from './obsidian-events';
 export type FsWatcherFactory = (paths: string[], options: ChokidarOptions) => FSWatcher;
 
 /**
- * Default factory — lazy-loads chokidar through `loadNative` so the
- * bundle's `require("chokidar")` doesn't fail under Obsidian's plugin
- * runtime. Tests inject their own factory via `FsWatcherOptions.factory`.
+ * Default factory. chokidar is pure JavaScript, so esbuild bundles it into
+ * `main.js` (only Node's own `fs`/`path`/`os` stay external, and Obsidian
+ * desktop has those). Until 0.3.0 it was loaded out of the plugin's
+ * `node_modules/` instead, which only ever existed on hand-built installs.
+ * Tests inject their own factory via `FsWatcherOptions.factory`.
  */
-const defaultFactory: FsWatcherFactory = (paths, options) => {
-  const chokidar = loadNative<typeof chokidarTypes>('chokidar');
-  return chokidar.watch(paths, options);
-};
+const defaultFactory: FsWatcherFactory = (paths, options) => chokidarWatch(paths, options);
 
 export interface FsWatcherOptions {
   vaultBasePath: string;

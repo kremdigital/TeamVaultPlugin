@@ -1,5 +1,4 @@
 import { SyncEngine, type EngineStatus, type SyncEngineDeps } from '@/sync/engine';
-import Database from 'better-sqlite3';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager } from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
@@ -162,7 +161,7 @@ interface Harness {
 
 function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harness {
   const vault = new MemoryVault();
-  const log = new OperationLog({ filePath: ':memory:', Database });
+  const log = new OperationLog();
   const doc = new DocManager();
   const ra = new RecentlyApplied();
   const apiCalls: Array<{ url: string; method?: string | undefined }> = [];
@@ -651,7 +650,7 @@ describe('SyncEngine — binary conflict resolver', () => {
 
     const vault = new MemoryVault();
     vault.files.set('image.png', localBytes);
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     const doc = new DocManager();
     const ra = new RecentlyApplied();
     const apiResponses = new Map<string, () => RequestUrlResponse>();
@@ -759,7 +758,7 @@ describe('SyncEngine — delete conflict resolver', () => {
 
     const vault = new MemoryVault();
     vault.files.set('important.png', localBytes);
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     const doc = new DocManager();
     const ra = new RecentlyApplied();
     const apiResponses = new Map<string, () => RequestUrlResponse>();
@@ -1332,7 +1331,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       resolveBinaryConflict: jest.fn(async () => 'keep-server' as const),
       resolveDeleteConflict: jest.fn(async () => 'delete-local' as const),
     };
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     const doc = new DocManager();
     const ra = new RecentlyApplied();
     const socket = new SocketClient({ server, clientId: 'device-1', factory });
@@ -1598,7 +1597,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
 
     const vault = new MemoryVault();
     vault.files.set('image.png', localBytes);
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     const doc = new DocManager();
     const ra = new RecentlyApplied();
     const apiResponses = new Map<string, () => RequestUrlResponse>();

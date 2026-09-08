@@ -50,7 +50,7 @@ export class AddBindingModal extends Modal {
   private render(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: t('modal.addBinding.title') });
+    this.titleEl.setText(t('modal.addBinding.title'));
 
     new Setting(contentEl).setName(t('modal.addBinding.server.label')).addDropdown((dd) => {
       dd.addOption('', t('modal.addBinding.server.placeholder'));

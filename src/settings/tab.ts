@@ -28,7 +28,9 @@ export class SyncSettingsTab extends PluginSettingTab {
   override display(): void {
     const { containerEl } = this;
     containerEl.empty();
-    containerEl.createEl('h2', { text: t('settings.title') });
+    // No plugin-name heading here: Obsidian already titles the tab with it,
+    // and the guidelines call a duplicate out. Sections below use
+    // `setHeading()` rather than raw <h3>.
 
     this.renderServersSection(containerEl);
     this.renderBindingsSection(containerEl);
@@ -38,7 +40,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   // -- Servers ----------------------------------------------------------------
 
   private renderServersSection(parent: HTMLElement): void {
-    parent.createEl('h3', { text: t('settings.servers.heading') });
+    new Setting(parent).setName(t('settings.servers.heading')).setHeading();
 
     const list = parent.createDiv({ cls: 'team-vault-server-list' });
     if (this.plugin.settings.servers.length === 0) {
@@ -106,7 +108,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   // -- Bindings ---------------------------------------------------------------
 
   private renderBindingsSection(parent: HTMLElement): void {
-    parent.createEl('h3', { text: t('settings.bindings.heading') });
+    new Setting(parent).setName(t('settings.bindings.heading')).setHeading();
 
     const list = parent.createDiv({ cls: 'team-vault-binding-list' });
     if (this.plugin.settings.bindings.length === 0) {
@@ -173,7 +175,7 @@ export class SyncSettingsTab extends PluginSettingTab {
   // -- Behavior ---------------------------------------------------------------
 
   private renderBehaviorSection(parent: HTMLElement): void {
-    parent.createEl('h3', { text: t('settings.behavior.heading') });
+    new Setting(parent).setName(t('settings.behavior.heading')).setHeading();
 
     new Setting(parent)
       .setName(t('settings.behavior.debounce.name'))

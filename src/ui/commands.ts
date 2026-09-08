@@ -26,9 +26,15 @@ export interface CommandsDeps {
   openSettings: () => void;
 }
 
+/**
+ * Command ids are bare — Obsidian prefixes them with the plugin id itself,
+ * so `sync-now` is exposed as `team-vault:sync-now`. Repeating the prefix
+ * here (as 0.2.x did) produced `team-vault:team-vault-sync-now`, which the
+ * submission requirements call out explicitly.
+ */
 export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   plugin.addCommand({
-    id: 'team-vault-sync-now',
+    id: 'sync-now',
     name: t('command.syncNow'),
     callback: () => {
       void runSyncNow(deps);
@@ -36,7 +42,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'team-vault-pause',
+    id: 'pause',
     name: t('command.pause'),
     checkCallback: (checking) => {
       if (deps.manager.isPaused()) return false;
@@ -46,7 +52,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'team-vault-resume',
+    id: 'resume',
     name: t('command.resume'),
     checkCallback: (checking) => {
       if (!deps.manager.isPaused()) return false;
@@ -56,7 +62,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'team-vault-history',
+    id: 'history',
     name: t('command.history'),
     callback: () => {
       void deps.openHistoryView();
@@ -64,7 +70,7 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   });
 
   plugin.addCommand({
-    id: 'team-vault-open-settings',
+    id: 'open-settings',
     name: t('command.settings'),
     callback: () => deps.openSettings(),
   });

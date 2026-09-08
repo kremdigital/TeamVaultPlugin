@@ -1,0 +1,61 @@
+/*
+ * Team Vault — plugin styles.
+ *
+ * Everything visual lives here rather than in `el.style.*`: inline styles
+ * can't be overridden by a user's snippet or theme, which is what the
+ * Obsidian plugin guidelines mean by "no hardcoded styling". Colours,
+ * spacing and fonts come from Obsidian's own CSS variables so the plugin
+ * follows whatever theme the reader has on.
+ */
+
+/* -- Status bar ---------------------------------------------------------- */
+
+.team-vault-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  cursor: pointer;
+}
+
+.team-vault-status__label {
+  font-size: var(--font-ui-smaller);
+}
+
+/* -- History view -------------------------------------------------------- */
+
+.team-vault-history-list {
+  list-style: none;
+  padding-left: 0;
+}
+
+.team-vault-history-item {
+  padding: 6px 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+
+.team-vault-history-item__head {
+  display: flex;
+  gap: 8px;
+}
+
+.team-vault-history-item__author {
+  font-size: var(--font-ui-smaller);
+  color: var(--text-muted);
+}
+
+.team-vault-history-item__message {
+  margin-top: 2px;
+}
+
+/* -- Log viewer modal ---------------------------------------------------- */
+
+.team-vault-log-body {
+  max-height: 60vh;
+  overflow: auto;
+  padding: 8px 12px;
+  background: var(--background-secondary);
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-smaller);
+  white-space: pre-wrap;
+  word-break: break-word;
+}

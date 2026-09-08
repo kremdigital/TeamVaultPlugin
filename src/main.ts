@@ -24,7 +24,6 @@ import { StatusBar } from '@/ui/status-bar';
 import { registerCommands } from '@/ui/commands';
 import { HISTORY_VIEW_TYPE, HistoryView } from '@/ui/views/history-view';
 import { uuid } from '@/utils/id';
-import { setPluginDir } from '@/utils/native-loader';
 
 /**
  * Team Vault — plugin entry point.
@@ -33,7 +32,7 @@ import { setPluginDir } from '@/utils/native-loader';
  *
  *   1. Load + repair settings, generate a stable `clientId` on first run.
  *   2. Build shared singletons: vault adapter, log storage, logger,
- *      operation log (SQLite), Yjs doc manager, recently-applied set,
+ *      operation log (JSON-backed), Yjs doc manager, recently-applied set,
  *      conflict resolver, notice service.
  *   3. Spin up two watchers (Obsidian events + filesystem) that fan
  *      events into the engine manager.
@@ -41,7 +40,7 @@ import { setPluginDir } from '@/utils/native-loader';
  *      bar, history view, and command palette entries.
  *
  * `onunload()` tears everything down in reverse order — disconnects
- * sockets, closes the SQLite handle, kills chokidar, removes UI hooks.
+ * sockets, flushes the operation log, kills chokidar, removes UI hooks.
  */
 export default class ObsidianSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
@@ -68,7 +67,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     }
 
     this.bootstrapLogger();
-    this.bootstrapState();
+    await this.bootstrapState();
     // A duplicate plugin folder means the settings we just loaded may not be
     // the user's (see `integration/plugin-folders`). Everything below the
     // sweeps is read-mostly, but the sweeps themselves delete local state
@@ -105,7 +104,8 @@ export default class ObsidianSyncPlugin extends Plugin {
     await this.fsWatcher?.stop().catch(() => undefined);
     this.obsidianWatcher?.stop();
     await this.docManager?.destroy().catch(() => undefined);
-    this.operationLog?.close();
+    // Flushes whatever the debounce still holds — the pending queue above all.
+    await this.operationLog?.close().catch(() => undefined);
   }
 
   async loadSettings(): Promise<void> {
@@ -145,21 +145,19 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.logger = new Logger(this.settings.logLevel, sinks, { plugin: this.manifest.id });
   }
 
-  private bootstrapState(): void {
-    const dataDir = `.obsidian/plugins/${this.manifest.id}`;
-    // The OperationLog needs an OS-absolute path because better-sqlite3
-    // talks to the filesystem directly. `FileSystemAdapter.getBasePath()`
-    // exposes it (desktop-only — the manifest enforces that).
-    const basePath =
-      (this.app.vault.adapter as unknown as { getBasePath?: () => string }).getBasePath?.() ?? '';
-    // Register the absolute plugin folder with the native-loader so
-    // `loadNative('better-sqlite3')` can resolve under Obsidian's
-    // bundle-runtime require (which doesn't traverse the plugin's
-    // local node_modules through the bundled string specifier).
-    setPluginDir(`${basePath}/${dataDir}`);
+  private async bootstrapState(): Promise<void> {
+    // Vault-relative, and read through the same storage seam as `sync.log`:
+    // the operation log used to be SQLite via `better-sqlite3`, a native
+    // module that only resolves when someone hand-installs the plugin's
+    // `node_modules/`. Directory installs ship three files and no
+    // dependencies, so that build could never load there. See the header of
+    // `sync/operation-log.ts`.
     this.operationLog = new OperationLog({
-      filePath: `${basePath}/${dataDir}/state.db`,
+      storage: new ObsidianLogStorage(this.app.vault),
+      filePath: `.obsidian/plugins/${this.manifest.id}/state.json`,
+      onError: (err) => this.logger?.warn('operation log persistence failed', { err }),
     });
+    await this.operationLog.load();
 
     const persistenceFactory: PersistenceFactory = (name, doc) =>
       new IndexeddbPersistence(name, doc);

@@ -1,31 +1,42 @@
-import type DatabaseConstructorType from 'better-sqlite3';
-import type { Database as Db } from 'better-sqlite3';
-import { loadNative } from '@/utils/native-loader';
+import type { LogStorage } from '@/utils/file-log-sink';
 import type { VectorClock } from './vector-clock';
-
-type DatabaseConstructor = typeof DatabaseConstructorType;
 
 /**
  * Local operation log — the offline-first backbone of the plugin.
  *
- * Lives in `<vault>/.obsidian/plugins/team-vault/state.db`, opened in WAL
- * mode for crash safety. Three logical concerns:
+ * Three logical concerns:
  *
- *   1. **`bindings_state`** — per-binding sync cursor (`lastVectorClock`,
+ *   1. **binding state** — per-binding sync cursor (`lastVectorClock`,
  *      `lastSyncedAt`). Used at reconnect to ask the server "what changed
  *      since this point".
  *
- *   2. **`pending_operations`** — operations produced locally that haven't
+ *   2. **pending operations** — operations produced locally that haven't
  *      been confirmed by the server yet. Drained on reconnect.
  *
- *   3. **`file_meta`** — local mirror of server-side metadata for every
- *      file we track: server file id, content hash, size, type. Lets us
- *      decide whether an incoming UPDATE actually changes anything and
- *      what to do at conflict time.
+ *   3. **file meta** — local mirror of server-side metadata for every file
+ *      we track: server file id, content hash, size, type. Lets us decide
+ *      whether an incoming UPDATE actually changes anything and what to do
+ *      at conflict time.
  *
- * The class is synchronous (better-sqlite3 is synchronous by design — it
- * runs against a single connection on the main thread, which is the right
- * trade-off for a desktop Obsidian plugin).
+ * ## Why this isn't SQLite any more
+ *
+ * Through 0.2.x this was `better-sqlite3` against `state.db`. That is a
+ * **native** module: a compiled `.node` binary that can't be bundled into
+ * `main.js` and has to be `require`d from `<plugin>/node_modules/`. The
+ * Obsidian Community directory installs exactly three files — `main.js`,
+ * `manifest.json`, `styles.css` — so on any install that wasn't hand-built
+ * the require threw and the whole plugin failed to load. The dependency had
+ * to go before the plugin could be published (or, for that matter, installed
+ * from our own GitHub releases).
+ *
+ * The replacement keeps the entire API **synchronous** — the engine reads
+ * the log on hot paths and an async API would ripple through every call
+ * site — by holding state in memory and persisting a single JSON document
+ * in the background. {@link load} must be awaited once at startup;
+ * everything after that is plain in-memory work plus a debounced write.
+ *
+ * Volume is modest by design: one entry per tracked file (a 1000-note vault
+ * lands around 160 KB) plus a queue that is normally empty.
  */
 
 export type OperationType = 'CREATE' | 'UPDATE' | 'DELETE' | 'RENAME' | 'MOVE';
@@ -67,7 +78,7 @@ export interface BindingState {
   lastSyncedAt: number;
 }
 
-/** Per-table row counts removed by {@link OperationLog.purgeBinding}. */
+/** Per-collection row counts removed by {@link OperationLog.purgeBinding}. */
 export interface PurgeResult {
   pendingOperations: number;
   fileMeta: number;
@@ -75,144 +86,132 @@ export interface PurgeResult {
 }
 
 /**
- * Migration list. Each entry is appended; `user_version` PRAGMA tracks how
- * many have been applied. Never edit a published migration — append a new
- * one. Order matters; index = migration number.
+ * On-disk format version. Bumped only when the JSON shape changes in a way
+ * {@link OperationLog.load} can't read; a document from the future is
+ * discarded rather than misread (the log is a cache — see {@link load}).
  */
-const MIGRATIONS: readonly string[] = [
-  // 1: initial schema.
-  `
-    CREATE TABLE IF NOT EXISTS bindings_state (
-      bindingId TEXT PRIMARY KEY,
-      lastVectorClock TEXT NOT NULL DEFAULT '{}',
-      lastSyncedAt INTEGER NOT NULL DEFAULT 0
-    );
+const FORMAT_VERSION = 1;
 
-    CREATE TABLE IF NOT EXISTS pending_operations (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      bindingId TEXT NOT NULL,
-      opType TEXT NOT NULL,
-      filePath TEXT NOT NULL,
-      newPath TEXT,
-      payload TEXT NOT NULL DEFAULT '{}',
-      createdAt INTEGER NOT NULL
-    );
-    CREATE INDEX IF NOT EXISTS idx_pending_binding ON pending_operations(bindingId, id);
-
-    CREATE TABLE IF NOT EXISTS file_meta (
-      bindingId TEXT NOT NULL,
-      relativePath TEXT NOT NULL,
-      serverFileId TEXT NOT NULL,
-      contentHash TEXT NOT NULL,
-      size INTEGER NOT NULL,
-      fileType TEXT NOT NULL,
-      lastSyncedAt INTEGER NOT NULL,
-      PRIMARY KEY (bindingId, relativePath)
-    );
-    CREATE INDEX IF NOT EXISTS idx_file_meta_binding ON file_meta(bindingId);
-  `,
-] as const;
+/** Default debounce for the background write. */
+const DEFAULT_FLUSH_DELAY_MS = 500;
 
 export interface OperationLogOptions {
-  /** Absolute path to the SQLite file, or `':memory:'` for tests. */
-  filePath: string;
+  /**
+   * Vault-relative path of the JSON document, e.g.
+   * `.obsidian/plugins/team-vault/state.json`. Omit (together with
+   * {@link storage}) for a memory-only log — that's what tests use.
+   */
+  filePath?: string;
+  /** Storage seam, shared with the file log sink. Omit for memory-only. */
+  storage?: LogStorage;
   /** Optional clock injection — tests substitute a deterministic source. */
   now?: () => number;
-  /**
-   * better-sqlite3 constructor injection. Tests pass it directly; in
-   * production we lazy-load via {@link loadNative} (Obsidian's bundle
-   * runtime can't resolve `require('better-sqlite3')` against the
-   * plugin folder, so we use an absolute path).
-   */
-  Database?: DatabaseConstructor;
+  /** Debounce before the background write. Default 500 ms. */
+  flushDelayMs?: number;
+  /** Persistence failures are reported here instead of throwing at call sites. */
+  onError?: (err: unknown) => void;
 }
 
-interface PendingRow {
-  id: number;
-  bindingId: string;
-  opType: string;
-  filePath: string;
-  newPath: string | null;
-  payload: string;
-  createdAt: number;
-}
-
-interface FileMetaRow {
-  bindingId: string;
-  relativePath: string;
-  serverFileId: string;
-  contentHash: string;
-  size: number;
-  fileType: string;
-  lastSyncedAt: number;
-}
-
-interface BindingStateRow {
-  bindingId: string;
-  lastVectorClock: string;
-  lastSyncedAt: number;
+/** Everything the log knows about one binding. */
+interface BindingBucket {
+  pending: PendingOperation[];
+  files: Map<string, FileMeta>;
+  state: BindingState | null;
 }
 
 export class OperationLog {
-  private readonly db: Db;
   private readonly now: () => number;
+  private readonly storage: LogStorage | null;
+  private readonly filePath: string | null;
+  private readonly flushDelayMs: number;
+  private readonly onError: (err: unknown) => void;
 
-  constructor(options: OperationLogOptions) {
-    const Database = options.Database ?? loadNative<DatabaseConstructor>('better-sqlite3');
-    this.db = new Database(options.filePath);
+  private readonly bindings = new Map<string, BindingBucket>();
+  /** Mirrors SQLite AUTOINCREMENT: ids keep climbing across deletes. */
+  private nextOpId = 1;
+
+  private dirty = false;
+  private timer: ReturnType<typeof setTimeout> | null = null;
+  /** Serializes writes so two flushes can't interleave on the same file. */
+  private chain: Promise<void> = Promise.resolve();
+  private closed = false;
+
+  constructor(options: OperationLogOptions = {}) {
     this.now = options.now ?? Date.now;
-    // WAL is fine on disk; on `:memory:` SQLite ignores the pragma silently
-    // (in-memory dbs don't have a separate journal file). Safe to set in both.
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
-    this.runMigrations();
+    this.storage = options.storage ?? null;
+    this.filePath = options.filePath ?? null;
+    this.flushDelayMs = options.flushDelayMs ?? DEFAULT_FLUSH_DELAY_MS;
+    this.onError = options.onError ?? ((): void => undefined);
   }
 
-  /** Apply any pending migrations. Safe to call repeatedly. */
-  private runMigrations(): void {
-    const current = this.db.pragma('user_version', { simple: true }) as number;
-    for (let i = current; i < MIGRATIONS.length; i++) {
-      const sql = MIGRATIONS[i];
-      if (!sql) continue;
-      this.db.exec(`BEGIN; ${sql}; PRAGMA user_version = ${i + 1}; COMMIT;`);
+  /** True when this instance has somewhere to persist to. */
+  private get persistent(): boolean {
+    return this.storage !== null && this.filePath !== null;
+  }
+
+  /**
+   * Read the document from storage. Call once, before the log is used.
+   *
+   * Deliberately forgiving: a missing, truncated, malformed or
+   * future-versioned document leaves the log empty rather than throwing.
+   * The log is a **cache** — the connect-time catch-up rebuilds file meta
+   * from the server, which is exactly what happened (successfully) when
+   * `state.db` was deleted by hand during the 2026-09-04 incident. Refusing
+   * to start would be a far worse failure than re-syncing.
+   */
+  async load(): Promise<void> {
+    if (!this.persistent) return;
+    const storage = this.storage!;
+    const path = this.filePath!;
+    let raw: string;
+    try {
+      if (!(await storage.exists(path))) return;
+      raw = await storage.read(path);
+    } catch (err) {
+      this.onError(err);
+      return;
+    }
+    try {
+      this.hydrate(JSON.parse(raw));
+    } catch (err) {
+      this.onError(err);
+      this.bindings.clear();
+      this.nextOpId = 1;
     }
   }
 
-  /** Current schema version — useful in tests. */
+  /** Format version of the in-memory document — useful in tests. */
   schemaVersion(): number {
-    return this.db.pragma('user_version', { simple: true }) as number;
+    return FORMAT_VERSION;
   }
 
-  close(): void {
-    this.db.close();
+  /** Flush pending changes and stop the background timer. Idempotent. */
+  async close(): Promise<void> {
+    this.closed = true;
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    await this.flush();
   }
 
-  // -- pending_operations -----------------------------------------------------
+  // -- pending operations -----------------------------------------------------
 
   enqueueOperation(bindingId: string, op: PendingOperationInput): PendingOperation {
-    const createdAt = this.now();
-    const result = this.db
-      .prepare(
-        `INSERT INTO pending_operations (bindingId, opType, filePath, newPath, payload, createdAt)
-         VALUES (?, ?, ?, ?, ?, ?)`,
-      )
-      .run(
-        bindingId,
-        op.opType,
-        op.filePath,
-        op.newPath ?? null,
-        JSON.stringify(op.payload ?? {}),
-        createdAt,
-      );
-    return {
-      id: Number(result.lastInsertRowid),
+    const entry: PendingOperation = {
+      id: this.nextOpId++,
       bindingId,
       opType: op.opType,
       filePath: op.filePath,
       newPath: op.newPath ?? null,
       payload: op.payload ?? {},
-      createdAt,
+      createdAt: this.now(),
     };
+    this.bucket(bindingId).pending.push(entry);
+    // The queue is the one part of the log that can't be reconstructed from
+    // the server, so it doesn't wait out the debounce.
+    this.touch({ immediate: true });
+    return { ...entry, payload: { ...entry.payload } };
   }
 
   /**
@@ -221,35 +220,31 @@ export class OperationLog {
    * batch.
    */
   dequeueOperations(bindingId: string): PendingOperation[] {
-    const rows = this.db
-      .prepare<[string], PendingRow>(
-        `SELECT id, bindingId, opType, filePath, newPath, payload, createdAt
-         FROM pending_operations
-         WHERE bindingId = ?
-         ORDER BY id ASC`,
-      )
-      .all(bindingId);
-    return rows.map(rowToPending);
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket) return [];
+    return bucket.pending.map((op) => ({ ...op, payload: { ...op.payload } }));
   }
 
-  /** Total number of pending operations across all bindings. */
+  /** Number of pending operations for one binding, or across all of them. */
   pendingCount(bindingId?: string): number {
     if (bindingId === undefined) {
-      const row = this.db.prepare(`SELECT COUNT(*) as n FROM pending_operations`).get() as {
-        n: number;
-      };
-      return row.n;
+      let total = 0;
+      for (const bucket of this.bindings.values()) total += bucket.pending.length;
+      return total;
     }
-    const row = this.db
-      .prepare(`SELECT COUNT(*) as n FROM pending_operations WHERE bindingId = ?`)
-      .get(bindingId) as { n: number };
-    return row.n;
+    return this.bindings.get(bindingId)?.pending.length ?? 0;
   }
 
   markSent(opIds: readonly number[]): void {
     if (opIds.length === 0) return;
-    const placeholders = opIds.map(() => '?').join(', ');
-    this.db.prepare(`DELETE FROM pending_operations WHERE id IN (${placeholders})`).run(...opIds);
+    const drop = new Set(opIds);
+    let removed = false;
+    for (const bucket of this.bindings.values()) {
+      const before = bucket.pending.length;
+      bucket.pending = bucket.pending.filter((op) => !drop.has(op.id));
+      if (bucket.pending.length !== before) removed = true;
+    }
+    if (removed) this.touch({ immediate: true });
   }
 
   /**
@@ -260,88 +255,49 @@ export class OperationLog {
    * transient failure); the queued op is the source of truth there.
    */
   pendingPaths(bindingId: string): Set<string> {
-    const rows = this.db
-      .prepare<
-        [string],
-        { filePath: string; newPath: string | null }
-      >(`SELECT filePath, newPath FROM pending_operations WHERE bindingId = ?`)
-      .all(bindingId);
     const out = new Set<string>();
-    for (const row of rows) {
-      out.add(row.filePath);
-      if (row.newPath) out.add(row.newPath);
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket) return out;
+    for (const op of bucket.pending) {
+      out.add(op.filePath);
+      if (op.newPath) out.add(op.newPath);
     }
     return out;
   }
 
-  // -- file_meta --------------------------------------------------------------
+  // -- file meta --------------------------------------------------------------
 
   getFileMeta(bindingId: string, path: string): FileMeta | null {
-    const row = this.db
-      .prepare<[string, string], FileMetaRow>(
-        `SELECT bindingId, relativePath, serverFileId, contentHash, size, fileType, lastSyncedAt
-         FROM file_meta WHERE bindingId = ? AND relativePath = ?`,
-      )
-      .get(bindingId, path);
-    return row ? rowToFileMeta(row) : null;
+    const meta = this.bindings.get(bindingId)?.files.get(path);
+    return meta ? { ...meta } : null;
   }
 
   setFileMeta(meta: FileMeta): void {
-    this.db
-      .prepare(
-        `INSERT INTO file_meta
-           (bindingId, relativePath, serverFileId, contentHash, size, fileType, lastSyncedAt)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(bindingId, relativePath) DO UPDATE SET
-           serverFileId = excluded.serverFileId,
-           contentHash = excluded.contentHash,
-           size = excluded.size,
-           fileType = excluded.fileType,
-           lastSyncedAt = excluded.lastSyncedAt`,
-      )
-      .run(
-        meta.bindingId,
-        meta.relativePath,
-        meta.serverFileId,
-        meta.contentHash,
-        meta.size,
-        meta.fileType,
-        meta.lastSyncedAt,
-      );
+    this.bucket(meta.bindingId).files.set(meta.relativePath, { ...meta });
+    this.touch();
   }
 
   deleteFileMeta(bindingId: string, path: string): void {
-    this.db
-      .prepare(`DELETE FROM file_meta WHERE bindingId = ? AND relativePath = ?`)
-      .run(bindingId, path);
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket) return;
+    if (bucket.files.delete(path)) this.touch();
   }
 
   listFileMeta(bindingId: string): FileMeta[] {
-    const rows = this.db
-      .prepare<[string], FileMetaRow>(
-        `SELECT bindingId, relativePath, serverFileId, contentHash, size, fileType, lastSyncedAt
-         FROM file_meta WHERE bindingId = ? ORDER BY relativePath ASC`,
-      )
-      .all(bindingId);
-    return rows.map(rowToFileMeta);
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket) return [];
+    return [...bucket.files.values()]
+      .map((meta) => ({ ...meta }))
+      .sort((a, b) =>
+        a.relativePath < b.relativePath ? -1 : a.relativePath > b.relativePath ? 1 : 0,
+      );
   }
 
-  // -- bindings_state ---------------------------------------------------------
+  // -- binding state ----------------------------------------------------------
 
   getBindingState(bindingId: string): BindingState | null {
-    const row = this.db
-      .prepare<
-        [string],
-        BindingStateRow
-      >(`SELECT bindingId, lastVectorClock, lastSyncedAt FROM bindings_state WHERE bindingId = ?`)
-      .get(bindingId);
-    return row
-      ? {
-          bindingId: row.bindingId,
-          lastVectorClock: parseVectorClock(row.lastVectorClock),
-          lastSyncedAt: row.lastSyncedAt,
-        }
-      : null;
+    const state = this.bindings.get(bindingId)?.state;
+    return state ? { ...state, lastVectorClock: { ...state.lastVectorClock } } : null;
   }
 
   /**
@@ -350,102 +306,245 @@ export class OperationLog {
    * (e.g. tests).
    */
   updateLastVectorClock(bindingId: string, vc: VectorClock, syncedAt?: number): void {
-    const at = syncedAt ?? this.now();
-    this.db
-      .prepare(
-        `INSERT INTO bindings_state (bindingId, lastVectorClock, lastSyncedAt)
-         VALUES (?, ?, ?)
-         ON CONFLICT(bindingId) DO UPDATE SET
-           lastVectorClock = excluded.lastVectorClock,
-           lastSyncedAt = excluded.lastSyncedAt`,
-      )
-      .run(bindingId, JSON.stringify(vc), at);
+    this.bucket(bindingId).state = {
+      bindingId,
+      lastVectorClock: { ...vc },
+      lastSyncedAt: syncedAt ?? this.now(),
+    };
+    this.touch();
   }
 
-  // -- cross-table maintenance ------------------------------------------------
+  // -- cross-collection maintenance -------------------------------------------
 
   /**
    * Erase every trace of a binding from the log — its pending operations,
-   * file metadata, and sync cursor — in a single transaction. Called when a
-   * binding is removed from settings: without this, deleting a binding leaks
-   * state. Worse, its CREATE/UPDATE ops sit in `pending_operations` forever
-   * (the engine that would drain them no longer exists), so the queue only
-   * ever grows. Idempotent; returns how many rows each table shed.
+   * file metadata, and sync cursor. Called when a binding is removed from
+   * settings: without this, deleting a binding leaks state. Worse, its
+   * CREATE/UPDATE ops sit in the queue forever (the engine that would drain
+   * them no longer exists), so it only ever grows. Idempotent; returns how
+   * many entries each collection shed.
    */
   purgeBinding(bindingId: string): PurgeResult {
-    const run = this.db.transaction((id: string): PurgeResult => {
-      const pendingOperations = this.db
-        .prepare(`DELETE FROM pending_operations WHERE bindingId = ?`)
-        .run(id).changes;
-      const fileMeta = this.db.prepare(`DELETE FROM file_meta WHERE bindingId = ?`).run(id).changes;
-      const bindingsState = this.db
-        .prepare(`DELETE FROM bindings_state WHERE bindingId = ?`)
-        .run(id).changes;
-      return { pendingOperations, fileMeta, bindingsState };
-    });
-    return run(bindingId);
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket) return { pendingOperations: 0, fileMeta: 0, bindingsState: 0 };
+    const result: PurgeResult = {
+      pendingOperations: bucket.pending.length,
+      fileMeta: bucket.files.size,
+      bindingsState: bucket.state ? 1 : 0,
+    };
+    this.bindings.delete(bindingId);
+    this.touch({ immediate: true });
+    return result;
   }
 
   /**
-   * Distinct binding ids with any state in the log, across all three tables.
-   * The startup orphan-sweep diffs this against the bindings in settings to
-   * find dead state left behind by earlier plugin versions (which never
-   * purged on delete) and hands each orphan to {@link purgeBinding}.
+   * Distinct binding ids with any state in the log. The startup orphan-sweep
+   * diffs this against the bindings in settings to find dead state left
+   * behind by earlier plugin versions (which never purged on delete) and
+   * hands each orphan to {@link purgeBinding}.
    */
   listBindingIds(): string[] {
-    const rows = this.db
-      .prepare<[], { bindingId: string }>(
-        `SELECT bindingId FROM pending_operations
-         UNION SELECT bindingId FROM file_meta
-         UNION SELECT bindingId FROM bindings_state`,
-      )
-      .all();
-    return rows.map((r) => r.bindingId);
+    const out: string[] = [];
+    for (const [id, bucket] of this.bindings) {
+      if (bucket.pending.length > 0 || bucket.files.size > 0 || bucket.state) out.push(id);
+    }
+    return out;
+  }
+
+  // -- persistence ------------------------------------------------------------
+
+  /**
+   * Write the document now, if anything changed. Awaiting this is only
+   * necessary at shutdown ({@link close}) or in tests — normal mutations
+   * schedule the write themselves.
+   */
+  async flush(): Promise<void> {
+    if (!this.persistent || !this.dirty) return;
+    this.chain = this.chain.then(() => this.writeOnce());
+    await this.chain;
+  }
+
+  /** Mark the document dirty and schedule (or force) a write. */
+  private touch(opts: { immediate?: boolean } = {}): void {
+    if (!this.persistent || this.closed) return;
+    this.dirty = true;
+    if (opts.immediate) {
+      void this.flush().catch((err: unknown) => this.onError(err));
+      return;
+    }
+    if (this.timer) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      void this.flush().catch((err: unknown) => this.onError(err));
+    }, this.flushDelayMs);
+  }
+
+  /**
+   * Serialize and write. Written to a sibling `.tmp` first and renamed over
+   * the target: `write` truncates before it writes, so a crash mid-write
+   * would otherwise leave a half-document — and the queue in it is the part
+   * the server can't reconstruct. If the rename dance fails (an adapter that
+   * won't replace an existing file, say) we fall back to writing in place,
+   * which is still better than dropping the change.
+   */
+  private async writeOnce(): Promise<void> {
+    if (!this.persistent || !this.dirty) return;
+    const storage = this.storage!;
+    const path = this.filePath!;
+    const payload = JSON.stringify(this.serialize());
+    // Clear BEFORE the await: mutations that land while the write is in
+    // flight must set the flag again and trigger their own write, rather
+    // than being swallowed by this one.
+    this.dirty = false;
+    const tmp = `${path}.tmp`;
+    try {
+      await storage.mkdir(path);
+      await storage.write(tmp, payload);
+      if (await storage.exists(path)) await storage.remove(path);
+      await storage.rename(tmp, path);
+    } catch (err) {
+      this.onError(err);
+      try {
+        await storage.write(path, payload);
+      } catch (fallbackErr) {
+        this.onError(fallbackErr);
+        // Keep the change queued for the next attempt.
+        this.dirty = true;
+      }
+    }
+  }
+
+  private bucket(bindingId: string): BindingBucket {
+    let bucket = this.bindings.get(bindingId);
+    if (!bucket) {
+      bucket = { pending: [], files: new Map(), state: null };
+      this.bindings.set(bindingId, bucket);
+    }
+    return bucket;
+  }
+
+  private serialize(): unknown {
+    const bindings: Record<string, unknown> = {};
+    for (const [id, bucket] of this.bindings) {
+      bindings[id] = {
+        pending: bucket.pending,
+        files: [...bucket.files.values()].map((meta) => ({
+          relativePath: meta.relativePath,
+          serverFileId: meta.serverFileId,
+          contentHash: meta.contentHash,
+          size: meta.size,
+          fileType: meta.fileType,
+          lastSyncedAt: meta.lastSyncedAt,
+        })),
+        state: bucket.state
+          ? {
+              lastVectorClock: bucket.state.lastVectorClock,
+              lastSyncedAt: bucket.state.lastSyncedAt,
+            }
+          : null,
+      };
+    }
+    return { version: FORMAT_VERSION, nextOpId: this.nextOpId, bindings };
+  }
+
+  /** Rebuild state from a parsed document, skipping anything malformed. */
+  private hydrate(doc: unknown): void {
+    if (!isRecord(doc)) return;
+    if (doc.version !== FORMAT_VERSION) return;
+    const bindings = doc.bindings;
+    if (!isRecord(bindings)) return;
+
+    let maxId = 0;
+    for (const [bindingId, rawBucket] of Object.entries(bindings)) {
+      if (!isRecord(rawBucket)) continue;
+      const bucket = this.bucket(bindingId);
+
+      if (Array.isArray(rawBucket.pending)) {
+        for (const rawOp of rawBucket.pending) {
+          const op = toPendingOperation(bindingId, rawOp);
+          if (!op) continue;
+          bucket.pending.push(op);
+          if (op.id > maxId) maxId = op.id;
+        }
+        bucket.pending.sort((a, b) => a.id - b.id);
+      }
+
+      if (Array.isArray(rawBucket.files)) {
+        for (const rawMeta of rawBucket.files) {
+          const meta = toFileMeta(bindingId, rawMeta);
+          if (meta) bucket.files.set(meta.relativePath, meta);
+        }
+      }
+
+      if (isRecord(rawBucket.state)) {
+        bucket.state = {
+          bindingId,
+          lastVectorClock: toVectorClock(rawBucket.state.lastVectorClock),
+          lastSyncedAt: toNumber(rawBucket.state.lastSyncedAt, 0),
+        };
+      }
+
+      // A bucket that turned out to hold nothing readable shouldn't make the
+      // binding look alive to `listBindingIds` — drop it.
+      if (bucket.pending.length === 0 && bucket.files.size === 0 && !bucket.state) {
+        this.bindings.delete(bindingId);
+      }
+    }
+
+    this.nextOpId = Math.max(toNumber(doc.nextOpId, 1), maxId + 1);
   }
 }
 
 // -- helpers ------------------------------------------------------------------
 
-function rowToPending(row: PendingRow): PendingOperation {
+const OP_TYPES: ReadonlySet<string> = new Set(['CREATE', 'UPDATE', 'DELETE', 'RENAME', 'MOVE']);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function toNumber(value: unknown, fallback: number): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+function toPendingOperation(bindingId: string, raw: unknown): PendingOperation | null {
+  if (!isRecord(raw)) return null;
+  const { id, opType, filePath } = raw;
+  if (typeof id !== 'number' || !Number.isFinite(id)) return null;
+  if (typeof opType !== 'string' || !OP_TYPES.has(opType)) return null;
+  if (typeof filePath !== 'string' || filePath.length === 0) return null;
   return {
-    id: row.id,
-    bindingId: row.bindingId,
-    opType: row.opType as OperationType,
-    filePath: row.filePath,
-    newPath: row.newPath,
-    payload: parseJsonObject(row.payload),
-    createdAt: row.createdAt,
+    id,
+    bindingId,
+    opType: opType as OperationType,
+    filePath,
+    newPath: typeof raw.newPath === 'string' ? raw.newPath : null,
+    payload: isRecord(raw.payload) ? raw.payload : {},
+    createdAt: toNumber(raw.createdAt, 0),
   };
 }
 
-function rowToFileMeta(row: FileMetaRow): FileMeta {
+function toFileMeta(bindingId: string, raw: unknown): FileMeta | null {
+  if (!isRecord(raw)) return null;
+  const { relativePath, serverFileId, contentHash, fileType } = raw;
+  if (typeof relativePath !== 'string' || relativePath.length === 0) return null;
+  if (typeof serverFileId !== 'string' || typeof contentHash !== 'string') return null;
+  if (fileType !== 'TEXT' && fileType !== 'BINARY') return null;
   return {
-    bindingId: row.bindingId,
-    relativePath: row.relativePath,
-    serverFileId: row.serverFileId,
-    contentHash: row.contentHash,
-    size: row.size,
-    fileType: row.fileType as FileType,
-    lastSyncedAt: row.lastSyncedAt,
+    bindingId,
+    relativePath,
+    serverFileId,
+    contentHash,
+    size: toNumber(raw.size, 0),
+    fileType,
+    lastSyncedAt: toNumber(raw.lastSyncedAt, 0),
   };
 }
 
-function parseJsonObject(raw: string): Record<string, unknown> {
-  try {
-    const parsed: unknown = JSON.parse(raw);
-    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
-      return parsed as Record<string, unknown>;
-    }
-  } catch {
-    // fall through
-  }
-  return {};
-}
-
-function parseVectorClock(raw: string): VectorClock {
-  const parsed = parseJsonObject(raw);
+function toVectorClock(raw: unknown): VectorClock {
   const out: VectorClock = {};
-  for (const [k, v] of Object.entries(parsed)) {
+  if (!isRecord(raw)) return out;
+  for (const [k, v] of Object.entries(raw)) {
     if (typeof v === 'number' && Number.isFinite(v)) out[k] = v;
   }
   return out;

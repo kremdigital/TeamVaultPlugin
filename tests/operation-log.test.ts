@@ -1,14 +1,13 @@
-import Database from 'better-sqlite3';
 import { OperationLog, type FileMeta } from '@/sync/operation-log';
+import type { LogStorage } from '@/utils/file-log-sink';
 
 let clock = 1_000_000;
 const now = (): number => ++clock;
 
 function makeLog(): OperationLog {
   clock = 1_000_000;
-  // Inject the Database constructor explicitly — production code lazy-loads
-  // it through `native-loader`, which isn't reachable from Jest.
-  return new OperationLog({ filePath: ':memory:', now, Database });
+  // No storage → memory-only. Persistence gets its own describe below.
+  return new OperationLog({ now });
 }
 
 function makeMeta(overrides: Partial<FileMeta> = {}): FileMeta {
@@ -24,22 +23,9 @@ function makeMeta(overrides: Partial<FileMeta> = {}): FileMeta {
   };
 }
 
-describe('OperationLog — schema', () => {
-  it('runs all migrations and reports a stable schema version', () => {
-    const log = makeLog();
-    expect(log.schemaVersion()).toBeGreaterThan(0);
-    log.close();
-  });
-
-  it('runMigrations is idempotent across reopens', () => {
-    const log1 = makeLog();
-    const v1 = log1.schemaVersion();
-    log1.close();
-    // Re-opening the same `:memory:` URL gives a fresh DB, so we just check
-    // that the second instance applies migrations to the same version.
-    const log2 = makeLog();
-    expect(log2.schemaVersion()).toBe(v1);
-    log2.close();
+describe('OperationLog — format', () => {
+  it('reports a stable format version', () => {
+    expect(makeLog().schemaVersion()).toBe(1);
   });
 });
 
@@ -60,7 +46,6 @@ describe('OperationLog — pending operations', () => {
     expect(all[0]?.id).toBe(op.id);
     expect(all[0]?.opType).toBe('CREATE');
     expect(all[0]?.newPath).toBeNull();
-    log.close();
   });
 
   it('preserves insertion order', () => {
@@ -71,7 +56,6 @@ describe('OperationLog — pending operations', () => {
     const ops = log.dequeueOperations('b1');
     expect(ops.map((o) => o.filePath)).toEqual(['a.md', 'b.md', 'a.md']);
     expect(ops.map((o) => o.opType)).toEqual(['CREATE', 'CREATE', 'DELETE']);
-    log.close();
   });
 
   it('isolates operations per binding', () => {
@@ -80,7 +64,6 @@ describe('OperationLog — pending operations', () => {
     log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'a.md' });
     expect(log.dequeueOperations('b1')).toHaveLength(1);
     expect(log.dequeueOperations('b2')).toHaveLength(1);
-    log.close();
   });
 
   it('stores newPath for RENAME / MOVE', () => {
@@ -92,7 +75,6 @@ describe('OperationLog — pending operations', () => {
     });
     const ops = log.dequeueOperations('b1');
     expect(ops[0]?.newPath).toBe('new.md');
-    log.close();
   });
 
   it('markSent removes the listed ids', () => {
@@ -103,7 +85,6 @@ describe('OperationLog — pending operations', () => {
     log.markSent([op1.id, op2.id]);
     expect(log.dequeueOperations('b1')).toHaveLength(1);
     expect(log.dequeueOperations('b1')[0]?.filePath).toBe('c.md');
-    log.close();
   });
 
   it('markSent is a no-op for an empty array', () => {
@@ -111,7 +92,6 @@ describe('OperationLog — pending operations', () => {
     log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
     log.markSent([]);
     expect(log.pendingCount('b1')).toBe(1);
-    log.close();
   });
 
   it('reports pending counts', () => {
@@ -122,14 +102,12 @@ describe('OperationLog — pending operations', () => {
     expect(log.pendingCount('b1')).toBe(2);
     expect(log.pendingCount('b2')).toBe(1);
     expect(log.pendingCount()).toBe(3);
-    log.close();
   });
 
   it('uses the injected clock for createdAt', () => {
     const log = makeLog();
     const op = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
     expect(op.createdAt).toBe(1_000_001);
-    log.close();
   });
 
   it('pendingPaths reports queued filePaths and RENAME newPaths', () => {
@@ -141,7 +119,6 @@ describe('OperationLog — pending operations', () => {
     expect(paths).toEqual(new Set(['a.md', 'b.md', 'c.md']));
     // Binding isolation — b2's path must not leak in.
     expect(paths.has('other.md')).toBe(false);
-    log.close();
   });
 
   it('pendingPaths drops a path once its op is markSent', () => {
@@ -150,7 +127,6 @@ describe('OperationLog — pending operations', () => {
     expect(log.pendingPaths('b1').has('a.md')).toBe(true);
     log.markSent([op.id]);
     expect(log.pendingPaths('b1').has('a.md')).toBe(false);
-    log.close();
   });
 });
 
@@ -160,13 +136,11 @@ describe('OperationLog — file_meta', () => {
     const meta = makeMeta();
     log.setFileMeta(meta);
     expect(log.getFileMeta('b1', 'note.md')).toEqual(meta);
-    log.close();
   });
 
   it('returns null for missing entries', () => {
     const log = makeLog();
     expect(log.getFileMeta('b1', 'absent.md')).toBeNull();
-    log.close();
   });
 
   it('overwrites on conflict (UPSERT)', () => {
@@ -176,7 +150,6 @@ describe('OperationLog — file_meta', () => {
     const after = log.getFileMeta('b1', 'note.md');
     expect(after?.contentHash).toBe('h2');
     expect(after?.size).toBe(100);
-    log.close();
   });
 
   it('isolates file_meta across bindings', () => {
@@ -185,7 +158,6 @@ describe('OperationLog — file_meta', () => {
     log.setFileMeta(makeMeta({ bindingId: 'b2' }));
     expect(log.listFileMeta('b1')).toHaveLength(1);
     expect(log.listFileMeta('b2')).toHaveLength(1);
-    log.close();
   });
 
   it('deletes a single meta entry', () => {
@@ -195,7 +167,6 @@ describe('OperationLog — file_meta', () => {
     log.deleteFileMeta('b1', 'a.md');
     expect(log.getFileMeta('b1', 'a.md')).toBeNull();
     expect(log.getFileMeta('b1', 'b.md')).not.toBeNull();
-    log.close();
   });
 });
 
@@ -203,7 +174,6 @@ describe('OperationLog — bindings_state', () => {
   it('returns null for unseen binding', () => {
     const log = makeLog();
     expect(log.getBindingState('b1')).toBeNull();
-    log.close();
   });
 
   it('persists and reads back a vector clock', () => {
@@ -212,7 +182,6 @@ describe('OperationLog — bindings_state', () => {
     const state = log.getBindingState('b1');
     expect(state?.lastVectorClock).toEqual({ n1: 5, n2: 3 });
     expect(state?.lastSyncedAt).toBe(1_000_001);
-    log.close();
   });
 
   it('overwrites on subsequent updates', () => {
@@ -220,14 +189,12 @@ describe('OperationLog — bindings_state', () => {
     log.updateLastVectorClock('b1', { n1: 1 });
     log.updateLastVectorClock('b1', { n1: 2, n2: 1 });
     expect(log.getBindingState('b1')?.lastVectorClock).toEqual({ n1: 2, n2: 1 });
-    log.close();
   });
 
   it('honors an explicit syncedAt override', () => {
     const log = makeLog();
     log.updateLastVectorClock('b1', { n1: 1 }, 42);
     expect(log.getBindingState('b1')?.lastSyncedAt).toBe(42);
-    log.close();
   });
 });
 
@@ -255,7 +222,6 @@ describe('OperationLog — purgeBinding', () => {
     expect(log.pendingCount('b2')).toBe(1);
     expect(log.listFileMeta('b2')).toHaveLength(1);
     expect(log.getBindingState('b2')?.lastVectorClock).toEqual({ n1: 1 });
-    log.close();
   });
 
   it('is idempotent — a second purge removes nothing', () => {
@@ -268,7 +234,6 @@ describe('OperationLog — purgeBinding', () => {
       fileMeta: 0,
       bindingsState: 0,
     });
-    log.close();
   });
 
   it('reports zero for a binding that was never seen', () => {
@@ -278,7 +243,6 @@ describe('OperationLog — purgeBinding', () => {
       fileMeta: 0,
       bindingsState: 0,
     });
-    log.close();
   });
 });
 
@@ -293,12 +257,220 @@ describe('OperationLog — listBindingIds', () => {
     log.updateLastVectorClock('b1', { n1: 2 });
 
     expect([...log.listBindingIds()].sort()).toEqual(['b1', 'b2', 'b3']);
-    log.close();
   });
 
   it('is empty for a fresh log', () => {
     const log = makeLog();
     expect(log.listBindingIds()).toEqual([]);
-    log.close();
+  });
+});
+
+/** In-memory `LogStorage` that records the call order. */
+function makeStorage(seed: Record<string, string> = {}): {
+  storage: LogStorage;
+  files: Map<string, string>;
+  calls: string[];
+} {
+  const files = new Map(Object.entries(seed));
+  const calls: string[] = [];
+  const storage: LogStorage = {
+    exists: (p) => {
+      calls.push(`exists ${p}`);
+      return Promise.resolve(files.has(p));
+    },
+    stat: (p) => Promise.resolve(files.has(p) ? { size: files.get(p)!.length } : null),
+    append: (p, data) => {
+      files.set(p, (files.get(p) ?? '') + data);
+      return Promise.resolve();
+    },
+    write: (p, data) => {
+      calls.push(`write ${p}`);
+      files.set(p, data);
+      return Promise.resolve();
+    },
+    rename: (from, to) => {
+      calls.push(`rename ${from} ${to}`);
+      files.set(to, files.get(from) ?? '');
+      files.delete(from);
+      return Promise.resolve();
+    },
+    remove: (p) => {
+      calls.push(`remove ${p}`);
+      files.delete(p);
+      return Promise.resolve();
+    },
+    read: (p) => Promise.resolve(files.get(p) ?? ''),
+    mkdir: () => Promise.resolve(),
+  };
+  return { storage, files, calls };
+}
+
+const PATH = '.obsidian/plugins/team-vault/state.json';
+
+describe('OperationLog — persistence', () => {
+  it('round-trips every collection through storage', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    const op = log.enqueueOperation('b1', {
+      opType: 'RENAME',
+      filePath: 'old.md',
+      newPath: 'new.md',
+      payload: { contentHash: 'h1' },
+    });
+    log.setFileMeta(makeMeta());
+    log.updateLastVectorClock('b1', { c1: 7 }, 555);
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+
+    expect(reopened.dequeueOperations('b1')).toEqual([
+      {
+        id: op.id,
+        bindingId: 'b1',
+        opType: 'RENAME',
+        filePath: 'old.md',
+        newPath: 'new.md',
+        payload: { contentHash: 'h1' },
+        createdAt: op.createdAt,
+      },
+    ]);
+    expect(reopened.getFileMeta('b1', 'note.md')).toEqual(makeMeta());
+    expect(reopened.getBindingState('b1')).toEqual({
+      bindingId: 'b1',
+      lastVectorClock: { c1: 7 },
+      lastSyncedAt: 555,
+    });
+    expect(files.has(PATH)).toBe(true);
+  });
+
+  it('keeps operation ids climbing after a reload, like AUTOINCREMENT did', async () => {
+    // Reusing an id would let a stale `markSent` ack drop a newer operation.
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    const first = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.markSent([first.id]);
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    const second = reopened.enqueueOperation('b1', { opType: 'CREATE', filePath: 'b.md' });
+
+    expect(second.id).toBeGreaterThan(first.id);
+  });
+
+  it('writes through a temp file and renames over the target', async () => {
+    // `write` truncates first, so a crash mid-write would leave a half
+    // document — and the queue inside it is what the server can't rebuild.
+    const { storage, calls } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await log.close();
+
+    expect(calls).toContain(`write ${PATH}.tmp`);
+    expect(calls).toContain(`rename ${PATH}.tmp ${PATH}`);
+    expect(calls.indexOf(`write ${PATH}.tmp`)).toBeLessThan(
+      calls.indexOf(`rename ${PATH}.tmp ${PATH}`),
+    );
+  });
+
+  it('starts empty — and does not throw — on a corrupt document', async () => {
+    // The log is a cache: the connect-time catch-up rebuilds file meta from
+    // the server, so refusing to start would be the worse failure.
+    const errors: unknown[] = [];
+    const { storage } = makeStorage({ [PATH]: '{ truncated' });
+    const log = new OperationLog({
+      storage,
+      filePath: PATH,
+      now,
+      onError: (err) => errors.push(err),
+    });
+
+    await expect(log.load()).resolves.toBeUndefined();
+    expect(log.listBindingIds()).toEqual([]);
+    expect(errors).toHaveLength(1);
+  });
+
+  it('ignores a document from a future format version', async () => {
+    const { storage } = makeStorage({
+      [PATH]: JSON.stringify({ version: 99, nextOpId: 5, bindings: { b1: { files: [] } } }),
+    });
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    await log.load();
+
+    expect(log.listBindingIds()).toEqual([]);
+  });
+
+  it('skips malformed entries but keeps the readable ones', async () => {
+    const { storage } = makeStorage({
+      [PATH]: JSON.stringify({
+        version: 1,
+        nextOpId: 3,
+        bindings: {
+          b1: {
+            pending: [
+              { id: 1, opType: 'NONSENSE', filePath: 'a.md' },
+              { id: 2, opType: 'CREATE', filePath: 'b.md', payload: {}, createdAt: 1 },
+            ],
+            files: [{ relativePath: 'x.md' }, { ...makeMeta(), relativePath: 'ok.md' }],
+            state: null,
+          },
+        },
+      }),
+    });
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    await log.load();
+
+    expect(log.dequeueOperations('b1').map((o) => o.filePath)).toEqual(['b.md']);
+    expect(log.listFileMeta('b1').map((m) => m.relativePath)).toEqual(['ok.md']);
+  });
+
+  it('does not report a binding whose stored bucket is empty', async () => {
+    const { storage } = makeStorage({
+      [PATH]: JSON.stringify({
+        version: 1,
+        nextOpId: 1,
+        bindings: { b1: { pending: [], files: [], state: null } },
+      }),
+    });
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    await log.load();
+
+    expect(log.listBindingIds()).toEqual([]);
+  });
+
+  it('load is a no-op when nothing was ever written', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+
+    await log.load();
+
+    expect(log.listBindingIds()).toEqual([]);
+    expect(log.pendingCount()).toBe(0);
+  });
+
+  it('reports write failures instead of throwing at the call site', async () => {
+    const errors: unknown[] = [];
+    const failing: LogStorage = {
+      ...makeStorage().storage,
+      write: () => Promise.reject(new Error('EACCES')),
+    };
+    const log = new OperationLog({
+      storage: failing,
+      filePath: PATH,
+      now,
+      onError: (err) => errors.push(err),
+    });
+
+    log.setFileMeta(makeMeta());
+    await expect(log.close()).resolves.toBeUndefined();
+    expect(errors.length).toBeGreaterThan(0);
+  });
+
+  it('a memory-only log never touches storage', async () => {
+    const log = new OperationLog({ now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await expect(log.flush()).resolves.toBeUndefined();
+    expect(log.pendingCount('b1')).toBe(1);
   });
 });

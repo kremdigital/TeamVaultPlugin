@@ -1,5 +1,4 @@
 import { computeDeepSyncDiff, flushPendingQueue, type PendingEmitter } from '@/sync/reconnect';
-import Database from 'better-sqlite3';
 import { OperationLog, type FileMeta } from '@/sync/operation-log';
 import type { ApiFile } from '@/client/api';
 
@@ -12,7 +11,7 @@ describe('flushPendingQueue', () => {
       payload?: Record<string, unknown>;
     }>,
   ): OperationLog {
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     for (const op of enqueued) {
       const input: {
         opType: 'CREATE' | 'UPDATE' | 'DELETE' | 'RENAME' | 'MOVE';
@@ -88,7 +87,7 @@ describe('flushPendingQueue', () => {
   });
 
   it('reports zero with an empty queue', async () => {
-    const log = new OperationLog({ filePath: ':memory:', Database });
+    const log = new OperationLog();
     const emit: PendingEmitter = async () => ({ ok: true });
     const result = await flushPendingQueue('b1', log, emit);
     expect(result).toEqual({ sent: 0, dropped: null, haltedOn: null, remaining: 0 });

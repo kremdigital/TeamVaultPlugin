@@ -8,9 +8,8 @@
 #
 # Builds `main.js` from source and publishes a GitHub release with the
 # three Obsidian-required artifacts: `main.js`, `manifest.json`,
-# `styles.css` (the plugin doesn't ship custom CSS, but Obsidian's
-# release-uploader looks for the file regardless — we attach an empty
-# stub so the upload doesn't 404).
+# `styles.css` (versioned since 0.3.0 — the plugin's own styling lives
+# there rather than in inline `el.style` assignments).
 #
 # Bump `manifest.json#version` + `versions.json` on `main`, commit, then:
 #   git tag 0.1.0 && git push origin 0.1.0
@@ -54,12 +53,6 @@ jobs:
 
       - name: Build
         run: pnpm build
-
-      - name: Touch styles.css
-        run: |
-          if [ ! -f styles.css ]; then
-            echo "/* team-vault — no custom styles */" > styles.css
-          fi
 
       - name: Validate manifest + versions.json match the tag
         run: |

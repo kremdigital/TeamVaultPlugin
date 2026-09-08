@@ -22,17 +22,9 @@ export class LogViewerModal extends Modal {
   override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: t('modal.log.title') });
+    this.titleEl.setText(t('modal.log.title'));
 
-    const body = contentEl.createEl('pre');
-    body.style.maxHeight = '60vh';
-    body.style.overflow = 'auto';
-    body.style.padding = '8px 12px';
-    body.style.background = 'var(--background-secondary)';
-    body.style.fontFamily = 'var(--font-monospace)';
-    body.style.fontSize = '12px';
-    body.style.whiteSpace = 'pre-wrap';
-    body.style.wordBreak = 'break-word';
+    const body = contentEl.createEl('pre', { cls: 'team-vault-log-body' });
     body.setText(this.content.length > 0 ? this.content : t('modal.log.empty'));
 
     new Setting(contentEl)

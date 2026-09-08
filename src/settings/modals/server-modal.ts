@@ -34,7 +34,7 @@ export class AddServerModal extends Modal {
   override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: t('modal.addServer.title') });
+    this.titleEl.setText(t('modal.addServer.title'));
 
     new Setting(contentEl).setName(t('modal.addServer.name.label')).addText((text) =>
       text.setPlaceholder(t('modal.addServer.name.placeholder')).onChange((value) => {
@@ -71,10 +71,9 @@ export class AddServerModal extends Modal {
           } catch (err) {
             this.tested = false;
             this.saveButton?.setDisabled(true);
-            // Echo the underlying error to the DevTools console so the user
-            // (and we, when debugging) can see the actual cause; the Notice
-            // above only carries a localized one-liner.
-            console.error('[team-vault] server test failed', err);
+            // The cause travels in the notice itself — no console echo. The
+            // guidelines ask plugins to keep the console clean, and anything
+            // worth keeping belongs in sync.log through the logger.
             new Notice(t('settings.servers.test.failure', { error: errorToText(err) }));
           } finally {
             btn.setButtonText(t('modal.addServer.test'));

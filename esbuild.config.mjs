@@ -51,14 +51,14 @@ const options = {
     '@lezer/common',
     '@lezer/highlight',
     '@lezer/lr',
-    // Native module — must be loaded at runtime via the host's `require`,
-    // not bundled as JS. Obsidian's plugin loader resolves it from the
-    // plugin's `node_modules/`.
-    'better-sqlite3',
-    // chokidar uses Node's `fs` / `path` / `os` heavily; bundling it pulls
-    // in a long dependency chain (readdirp, etc.). Keep it external — the
-    // host has Node available and the plugin's `node_modules/` ships it.
-    'chokidar',
+    // NOTE: nothing outside this list may stay external. Obsidian's plugin
+    // loader ships `main.js` + `manifest.json` + `styles.css` and nothing
+    // else, so a `require` that expects the plugin's own `node_modules/`
+    // resolves only on hand-built installs. That's why `better-sqlite3` was
+    // dropped entirely in 0.3.0 (the operation log is JSON now) and why
+    // `chokidar` — pure JS, `fs`/`path`/`os` stay external below — is
+    // bundled rather than required at runtime.
+    //
     // NOTE: Yjs / y-protocols are NOT external — Obsidian's plugin loader
     // doesn't traverse the plugin-local `node_modules/` for non-native
     // packages, so `require('yjs')` fails at load time. Bundling pays a

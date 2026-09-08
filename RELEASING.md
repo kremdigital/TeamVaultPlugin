@@ -62,14 +62,26 @@ The automated review then checks:
   substring `obsidian` (we renamed from `obsidian-team` → `team-vault`
   in v0.2.0 for exactly this reason).
 
-If the automated check passes, a human reviewer takes a look. Known
-things they may flag for this plugin:
+Review is automatic and runs against **every** version, not just the
+first submission: developer policies, code quality, known vulnerabilities.
+Popular and featured plugins additionally get a human pass.
 
-- **`isDesktopOnly: true`** is correct — `better-sqlite3` + `chokidar`
-  are native and there is no mobile storage layer yet.
-- The plugin describes itself as "Self-hosted" — make sure the README's
-  setup section clearly explains where to point users for the server
-  side (link to `kremdigital/TeamVaultServer`).
+Things to keep true for this plugin:
+
+- **`isDesktopOnly: true`** is correct — the filesystem watcher and the
+  operation log use Node APIs that mobile doesn't expose.
+- **No native modules, ever.** The directory installs `main.js`,
+  `manifest.json` and `styles.css` and nothing else, so anything that
+  expects the plugin's own `node_modules/` fails on every real install.
+  That's what forced the 0.3.0 rewrite of the operation log away from
+  `better-sqlite3`. Check `grep -o 'require("[^"]*")' main.js` after a
+  build: only `obsidian` and `node:*` may appear.
+- **`pnpm audit --prod` must be clean** — the scanner looks for known
+  vulnerabilities.
+- The plugin talks to a server and needs an API key, so the README must
+  keep its "Network use and privacy" section: which host is contacted,
+  what is sent, that there is no telemetry. That disclosure is what makes
+  the network use permissible under the Developer policies.
 
 To address feedback: update the repo, cut a new patch release
 (`pnpm version patch` + tag), and the portal automatically re-reviews.

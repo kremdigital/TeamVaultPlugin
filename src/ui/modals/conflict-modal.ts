@@ -46,7 +46,7 @@ class BinaryConflictModal extends Modal {
   override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: t('modal.conflict.title') });
+    this.titleEl.setText(t('modal.conflict.title'));
     contentEl.createEl('p', {
       text: t('modal.conflict.description', { file: this.context.filePath }),
     });
@@ -101,7 +101,7 @@ class DeleteConflictModal extends Modal {
   override onOpen(): void {
     const { contentEl } = this;
     contentEl.empty();
-    contentEl.createEl('h2', { text: t('modal.deleteConflict.title') });
+    this.titleEl.setText(t('modal.deleteConflict.title'));
     contentEl.createEl('p', {
       text: t('modal.deleteConflict.description', { file: this.context.filePath }),
     });

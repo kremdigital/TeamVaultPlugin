@@ -86,30 +86,23 @@ export class HistoryView extends ItemView {
       parent.createEl('p', { text: t('history.noVersions') });
       return;
     }
-    const list = parent.createEl('ul');
-    list.style.listStyle = 'none';
-    list.style.paddingLeft = '0';
+    const list = parent.createEl('ul', { cls: 'team-vault-history-list' });
     for (const v of versions) {
-      const item = list.createEl('li');
-      item.style.padding = '6px 0';
-      item.style.borderBottom = '1px solid var(--background-modifier-border)';
+      const item = list.createEl('li', { cls: 'team-vault-history-item' });
 
-      const head = item.createEl('div');
-      head.style.display = 'flex';
-      head.style.gap = '8px';
+      const head = item.createEl('div', { cls: 'team-vault-history-item__head' });
       head.createEl('strong', { text: `v${v.versionNumber}` });
       head.createEl('span', { text: new Date(v.createdAt).toLocaleString() });
 
-      const author = item.createEl('div');
-      author.style.fontSize = '11px';
-      author.style.color = 'var(--text-muted)';
-      author.setText(
-        v.author ? t('history.byUser', { name: v.author.name ?? '—', email: v.author.email }) : '—',
-      );
+      item.createEl('div', {
+        cls: 'team-vault-history-item__author',
+        text: v.author
+          ? t('history.byUser', { name: v.author.name ?? '—', email: v.author.email })
+          : '—',
+      });
 
       if (v.message) {
-        const msg = item.createEl('div', { text: v.message });
-        msg.style.marginTop = '2px';
+        item.createEl('div', { cls: 'team-vault-history-item__message', text: v.message });
       }
     }
   }

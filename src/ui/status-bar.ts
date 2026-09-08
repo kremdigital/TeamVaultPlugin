@@ -33,10 +33,6 @@ export class StatusBar {
   ) {
     this.el = container;
     this.el.addClass('team-vault-status');
-    this.el.style.display = 'inline-flex';
-    this.el.style.alignItems = 'center';
-    this.el.style.gap = '4px';
-    this.el.style.cursor = 'pointer';
 
     this.el.addEventListener('click', this.onClick);
 
@@ -59,8 +55,10 @@ export class StatusBar {
     this.el.empty();
     const iconEl = this.el.createSpan();
     setIcon(iconEl, iconForState(this.currentStatus.state));
-    const label = this.el.createSpan({ text: labelForState(this.currentStatus.state) });
-    label.style.fontSize = '12px';
+    this.el.createSpan({
+      text: labelForState(this.currentStatus.state),
+      cls: 'team-vault-status__label',
+    });
     if (this.currentStatus.detail) {
       this.el.setAttr('aria-label', this.currentStatus.detail);
       this.el.setAttr('title', this.currentStatus.detail);

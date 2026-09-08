@@ -33,7 +33,6 @@
     ]
   },
   "dependencies": {
-    "better-sqlite3": "^12.9.0",
     "chokidar": "^5.0.0",
     "diff": "^9.0.0",
     "lib0": "^0.2.117",
@@ -49,7 +48,6 @@
     "@commitlint/cli": "^20.5.3",
     "@commitlint/config-conventional": "^20.5.3",
     "@eslint/js": "^10.0.1",
-    "@types/better-sqlite3": "^7.6.13",
     "@types/diff": "^8.0.0",
     "@types/jest": "^30.0.0",
     "@types/node": "^25.6.2",
@@ -71,12 +69,12 @@
   },
   "pnpm": {
     "onlyBuiltDependencies": [
-      "better-sqlite3",
       "esbuild",
       "unrs-resolver"
     ],
     "overrides": {
-      "ws@>=8.0.0 <8.20.1": "^8.21.0"
+      "ws@>=8.0.0 <8.20.1": "^8.21.0",
+      "socket.io-parser@<4.2.7": "^4.2.7"
     }
   }
 }

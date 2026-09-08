@@ -57,8 +57,11 @@ export default [
     },
   },
   {
-    // Plain Node ESM build/release scripts (no TS, run directly by node).
-    files: ['scripts/**/*.mjs'],
+    // Plain Node ESM build/release scripts + the root config files (no TS,
+    // run directly by node). `pnpm lint` only walks src/tests/scripts, but
+    // lint-staged lints whatever is staged — without this block a staged
+    // `esbuild.config.mjs` failed the pre-commit hook on `no-undef`.
+    files: ['scripts/**/*.mjs', '*.mjs'],
     languageOptions: {
       ecmaVersion: 2022,
       sourceType: 'module',

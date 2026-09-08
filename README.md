@@ -17,9 +17,9 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 - **Binary files** — versioned via REST snapshots. A three-way conflict
   prompt opens when both sides have diverged from the same starting hash
   (keep-server / keep-local / keep-both).
-- **Offline-first** — edits made while disconnected queue in a local SQLite
-  log; the engine drains the queue on reconnect with exponential-backoff
-  reconnect to the server.
+- **Offline-first** — edits made while disconnected queue in a local
+  operation log; the engine drains the queue on reconnect with
+  exponential-backoff reconnect to the server.
 - **External edits** — chokidar watches the filesystem, so changes from CLI
   scripts and AI agents propagate the same way as in-app edits.
 - **Version history** — right-pane view shows every server-side version of
@@ -27,22 +27,48 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 
 ## Stack
 
-- TypeScript 5.9, esbuild → `main.js` (CJS, single bundle)
+- TypeScript 5.9, esbuild → `main.js` (CJS, single bundle — no native
+  modules, nothing to install alongside it)
 - Yjs + y-indexeddb + y-codemirror.next for CRDT
 - socket.io-client for live transport
 - chokidar for the filesystem watcher
-- better-sqlite3 for the local operation log
-- Obsidian API 1.5+ (desktop only — `isDesktopOnly: true`)
-- Jest + ts-jest, 260+ tests
+- Obsidian API 1.5+ (desktop only — `isDesktopOnly: true`, the watcher and
+  the log need Node APIs that mobile doesn't have)
+- Jest + ts-jest, 350+ tests
+
+## Network use and privacy
+
+Team Vault is the client half of a self-hosted setup, so it does talk to a
+server — here is exactly what that means:
+
+- **The only remote host contacted is the server URL you enter yourself.**
+  There is no vendor backend, no default endpoint, no fallback host. Nothing
+  leaves your machine until you add a server and bind a folder.
+- **An account on that server is required**, in the form of an API key you
+  generate in its web UI. The key is stored in the plugin's `data.json`
+  inside your vault.
+- **Synced content is the content of the bound folder** — note text, binary
+  attachments, paths, and their edit history — sent to your server so other
+  devices and teammates can receive it.
+- **No telemetry, no analytics, no crash reporting.** The plugin sends
+  nothing anywhere else, and collects nothing about you.
+- **Logs stay local**, in `.obsidian/plugins/team-vault/sync.log`.
+
+The server is open source and self-hosted:
+[kremdigital/TeamVaultServer](https://github.com/kremdigital/TeamVaultServer).
 
 ## Installation
 
-The plugin is not yet on Obsidian's Community Plugins list. Install manually:
+Install manually until the directory listing lands:
 
-1. Download `main.js` and `manifest.json` from the latest release on GitHub.
+1. Download `main.js`, `manifest.json` and `styles.css` from the latest
+   release on GitHub.
 2. Copy them into `<your-vault>/.obsidian/plugins/team-vault/`.
 3. In Obsidian → **Settings → Community plugins**, enable **"Team Vault"**.
 4. Open the **Team Vault** tab in Settings to add a server.
+
+Those three files are all there is — since 0.3.0 the plugin has no native
+dependencies, so there is no `node_modules` to install next to it.
 
 ## Configuration
 
@@ -152,8 +178,8 @@ edits in `…conflict-<ts>.<ext>`.
 
 ## Limitations (MVP)
 
-- Desktop only (better-sqlite3 + chokidar are native; mobile builds need
-  a different storage layer).
+- Desktop only: the filesystem watcher and the log both use Node APIs that
+  Obsidian mobile doesn't expose.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.
@@ -166,7 +192,7 @@ edits in `…conflict-<ts>.<ext>`.
 ```bash
 pnpm install
 pnpm dev:vault          # esbuild --watch + copy to TEST_VAULT
-pnpm test               # Jest, 260+ tests
+pnpm test               # Jest, 350+ tests
 pnpm typecheck
 pnpm lint
 pnpm build              # production main.js
