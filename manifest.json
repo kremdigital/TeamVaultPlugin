@@ -1,7 +1,7 @@
 {
   "id": "team-vault",
   "name": "Team Vault",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "minAppVersion": "1.5.0",
   "description": "Sync your vault with a self-hosted server and edit notes together in real time.",
   "author": "krem.digital",
