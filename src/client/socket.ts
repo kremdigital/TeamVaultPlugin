@@ -102,6 +102,18 @@ export interface YjsUpdateMessage {
   update: Uint8Array;
 }
 
+/**
+ * `yjs:fetch` ack — one doc's full server state, same encoding as a catch-up
+ * {@link YjsDocSnapshot}. `error: 'timeout'` is synthesized client-side when
+ * the server never answers (servers older than the event ignore it).
+ */
+export type YjsFetchResult =
+  | { ok: true; sync1: number[]; stateVector?: number[] }
+  | { ok: false; error: string };
+
+/** How long {@link SocketClient.fetchYjsDoc} waits for the ack. */
+export const YJS_FETCH_TIMEOUT_MS = 15_000;
+
 // -- Outgoing payloads --------------------------------------------------------
 
 interface BaseEnvelope {
@@ -433,6 +445,31 @@ export class SocketClient {
       projectId: payload.projectId,
       fileId: payload.fileId,
       update: Array.from(payload.update),
+    });
+  }
+
+  /**
+   * Pull one doc's full state (`yjs:fetch`, read-gated on the server). The
+   * engine uses it to hydrate a single note on demand — one the catch-up
+   * skipped because its disk copy already matched — instead of waiting for
+   * the next `project:join`. Never rejects: no socket, a server error and a
+   * missing ack all resolve to `ok: false`.
+   */
+  fetchYjsDoc(
+    projectId: string,
+    fileId: string,
+    timeoutMs = YJS_FETCH_TIMEOUT_MS,
+  ): Promise<YjsFetchResult> {
+    return new Promise<YjsFetchResult>((resolve) => {
+      if (!this.socket) {
+        resolve({ ok: false, error: 'socket_not_connected' });
+        return;
+      }
+      const timer = setTimeout(() => resolve({ ok: false, error: 'timeout' }), timeoutMs);
+      this.socket.emit('yjs:fetch', { projectId, fileId }, (ack: YjsFetchResult) => {
+        clearTimeout(timer);
+        resolve(ack);
+      });
     });
   }
 

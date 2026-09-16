@@ -77,6 +77,17 @@ class MemoryVault implements VaultAdapter {
 class FakeSocket implements SocketLike {
   connected = false;
   emits: Array<{ event: string; args: unknown[] }> = [];
+  /**
+   * `yjs:fetch` requests, kept out of `emits` so `ackOk` / `ackErr` keep
+   * targeting the request under test. Answered right away by
+   * `fetchResponder` — by default the way a server without the event
+   * behaves once the client gives up waiting.
+   */
+  fetches: Array<{ projectId: string; fileId: string }> = [];
+  fetchResponder: (req: { projectId: string; fileId: string }) => unknown = () => ({
+    ok: false,
+    error: 'not_supported',
+  });
   static last: FakeSocket | null = null;
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
@@ -95,6 +106,13 @@ class FakeSocket implements SocketLike {
     return this;
   }
   emit(event: string, ...args: unknown[]): SocketLike {
+    if (event === 'yjs:fetch') {
+      const req = args[0] as { projectId: string; fileId: string };
+      const ack = args[args.length - 1] as (r: unknown) => void;
+      this.fetches.push(req);
+      ack(this.fetchResponder(req));
+      return this;
+    }
     this.emits.push({ event, args });
     return this;
   }
@@ -2671,6 +2689,409 @@ describe('SyncEngine — catch-up пропускает совпадающие д
     await runCatchup(h, text);
 
     expect(h.doc.has('b1', 'note.md')).toBe(true);
+    await h.engine.stop();
+  });
+});
+
+/**
+ * Disk edits and remote edits to the same note must both survive. Until 0.3.2
+ * the engine diffed the doc straight against the disk, and the fold marker
+ * (`contentHash`) went stale after every local save — so the next remote edit
+ * looked like a local deletion: removed from the CRDT, the removal shipped to
+ * the server, the teammate's edit gone everywhere. Separately, a note the
+ * catch-up skipped had no local history, so a live delta for it never
+ * reached the disk until the next reconnect.
+ */
+describe('SyncEngine — disk edits merge with remote edits', () => {
+  const PATH = 'note.md';
+
+  function listNote(h: Harness, contentHash: string): void {
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: PATH,
+            fileType: 'TEXT',
+            contentHash,
+            size: '3',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+  }
+
+  function putDisk(h: Harness, text: string): void {
+    h.vault.files.set(PATH, new TextEncoder().encode(text).buffer as ArrayBuffer);
+  }
+
+  /** A note synced in an earlier session: meta + identical disk + server doc. */
+  async function syncedNote(h: Harness, text: string): Promise<import('yjs').Doc> {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const hash = await sha256Hex(text);
+    listNote(h, hash);
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: PATH,
+      serverFileId: 'f1',
+      contentHash: hash,
+      size: new TextEncoder().encode(text).byteLength,
+      fileType: 'TEXT',
+      lastSyncedAt: 1,
+    });
+    putDisk(h, text);
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, text);
+    return serverDoc;
+  }
+
+  /** Ship everything the client emitted since `from` to the server doc. */
+  async function drainToServer(h: Harness, serverDoc: import('yjs').Doc, from = 0): Promise<void> {
+    const Y = await import('yjs');
+    for (const e of h.socket().emits.slice(from)) {
+      if (e.event !== 'yjs:update') continue;
+      Y.applyUpdate(serverDoc, Uint8Array.from((e.args[0] as { update: number[] }).update));
+    }
+  }
+
+  /** Another device edits a fork of `source`; returns the delta. */
+  async function editOnOtherDevice(
+    source: import('yjs').Doc,
+    edit: (text: import('yjs').Text) => void,
+  ): Promise<Uint8Array> {
+    const Y = await import('yjs');
+    const device = new Y.Doc();
+    Y.applyUpdate(device, Y.encodeStateAsUpdate(source));
+    const before = Y.encodeStateVector(device);
+    edit(device.getText('content'));
+    const delta = Y.encodeStateAsUpdate(device, before);
+    device.destroy();
+    return delta;
+  }
+
+  async function saveLocally(h: Harness, text: string): Promise<void> {
+    putDisk(h, text);
+    await h.engine.handleVaultEvent({
+      type: 'modify',
+      bindingId: 'b1',
+      path: PATH,
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+  }
+
+  it('a remote edit arriving after a local save survives on disk, in the doc and on the server', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+
+    // The doc picks up the shared history (disk already matches — no write).
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await flushAsync(20);
+
+    await saveLocally(h, 'v1\nlocal line\n');
+    await drainToServer(h, serverDoc);
+    expect(serverDoc.getText('content').toString()).toBe('v1\nlocal line\n');
+
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
+    Y.applyUpdate(serverDoc, remote);
+    const emitted = h.socket().emits.length;
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    await flushAsync(40);
+    await drainToServer(h, serverDoc, emitted);
+
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toString()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a local save landing before a remote edit is written out merges three-way', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 30 });
+    const serverDoc = await syncedNote(h, 'first\nsecond\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await new Promise((r) => setTimeout(r, 60));
+
+    // The teammate's edit is in the doc, its snapshot write still debounced…
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    // …when the user's own save lands. A plain doc↔disk diff would delete
+    // "remote" here; the fold must keep both sides.
+    await saveLocally(h, 'first\nsecond\nlocal\n');
+    await new Promise((r) => setTimeout(r, 80));
+    await flushAsync(20);
+    await drainToServer(h, serverDoc);
+
+    const expected = 'remote\nfirst\nsecond\nlocal\n';
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toString()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('keeps the fold marker across a reconnect', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await flushAsync(20);
+    await saveLocally(h, 'v1\nlocal line\n');
+    await drainToServer(h, serverDoc);
+    const folded = await sha256Hex('v1\nlocal line\n');
+    expect(h.log.getFileMeta('b1', PATH)?.foldedHash).toBe(folded);
+
+    // Reconnect: the file index is rebuilt from the server listing.
+    h.socket().disconnect();
+    h.socket().connect();
+    await flushAsync(5);
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+    expect(h.log.getFileMeta('b1', PATH)?.foldedHash).toBe(folded);
+
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
+    Y.applyUpdate(serverDoc, remote);
+    const emitted = h.socket().emits.length;
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    await flushAsync(40);
+    await drainToServer(h, serverDoc, emitted);
+
+    expect(await h.vault.readText(PATH)).toBe('remote line\nv1\nlocal line\n');
+    expect(serverDoc.getText('content').toString()).toBe('remote line\nv1\nlocal line\n');
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  /** Connect with a streamed catch-up that the engine skips (disk == server). */
+  async function connectSkippingNote(h: Harness, serverDoc: import('yjs').Doc): Promise<void> {
+    const Y = await import('yjs');
+    await h.engine.start();
+    h.socket().fetchResponder = () => ({
+      ok: true,
+      sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+      stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+    });
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(20);
+    expect(h.doc.has('b1', PATH)).toBe(false);
+  }
+
+  it('a live delta for a note the catch-up skipped reaches the disk', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await connectSkippingNote(h, serverDoc);
+
+    // The server relays only the delta — useless to a doc with no history.
+    const before = Y.encodeStateVector(serverDoc);
+    serverDoc.getText('content').insert(3, 'remote line\n');
+    const delta = Y.encodeStateAsUpdate(serverDoc, before);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(delta) });
+    await flushAsync(40);
+
+    expect(h.socket().fetches).toEqual([{ projectId: 'p1', fileId: 'f1' }]);
+    expect(await h.vault.readText(PATH)).toBe('v1\nremote line\n');
+    expect(h.doc.getText('b1', PATH)).toBe('v1\nremote line\n');
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a first local save racing a remote edit on a skipped note merges against the version history', async () => {
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    const baseHash = await sha256Hex('v1\n');
+    h.apiResponses.set('GET /api/projects/p1/files/f1/versions', () => ({
+      status: 200,
+      json: {
+        versions: [
+          {
+            id: 'ver-1',
+            versionNumber: 1,
+            contentHash: baseHash,
+            authorId: 'u1',
+            message: null,
+            createdAt: '2026-01-01',
+            author: null,
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.apiResponses.set('GET /api/projects/p1/files/f1/versions/ver-1', () => ({
+      status: 200,
+      json: null,
+      arrayBuffer: new TextEncoder().encode('v1\n').buffer as ArrayBuffer,
+      headers: {},
+      text: '',
+    }));
+    await connectSkippingNote(h, serverDoc);
+
+    // The teammate's edit is already on the server, not yet delivered here,
+    // when the user's first save of the note lands. Neither the disk nor the
+    // fetched doc still holds the base text — only the server's history does.
+    serverDoc.getText('content').insert(0, 'remote line\n');
+    const emitted = h.socket().emits.length;
+    await saveLocally(h, 'v1\nlocal line\n');
+    await flushAsync(40);
+    await drainToServer(h, serverDoc, emitted);
+
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toString()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('an edit to a freshly created note ships once the seed is fetched, without doubling', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    putDisk(h, 'created\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+
+    const create = h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: PATH,
+      source: 'obsidian',
+    });
+    await flushAsync(10);
+    expect(h.socket().emits.at(-1)?.event).toBe('file:create');
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: PATH } });
+    await create;
+
+    // The server seeds its doc from the created bytes; the seed broadcast
+    // hasn't reached this client when the user edits again.
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, 'created\n');
+    h.socket().fetchResponder = () => ({
+      ok: true,
+      sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+      stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+    });
+    const emitted = h.socket().emits.length;
+    await saveLocally(h, 'created\nand edited\n');
+    await drainToServer(h, serverDoc, emitted);
+
+    expect(h.socket().fetches).toHaveLength(1);
+    expect(serverDoc.getText('content').toString()).toBe('created\nand edited\n');
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('never merges against a base this device did not fold (meta from the server listing)', async () => {
+    const Y = await import('yjs');
+    const { sha256Hex } = await import('@/sync/hash');
+    const h = buildHarness({ snapshotMs: 0 });
+    // First bind of a folder that already holds its own copy of the note (say,
+    // from git). The only hash the client has is the server listing's, which
+    // lags behind the server doc and is no ancestor of this disk: both sides
+    // already have line B. Merging against that version would double it.
+    const listed = 'A\n';
+    const listedHash = await sha256Hex(listed);
+    listNote(h, listedHash);
+    h.apiResponses.set('GET /api/projects/p1/files/f1/versions', () => ({
+      status: 200,
+      json: {
+        versions: [
+          {
+            id: 'ver-1',
+            versionNumber: 1,
+            contentHash: listedHash,
+            authorId: 'u1',
+            message: null,
+            createdAt: '2026-01-01',
+            author: null,
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.apiResponses.set('GET /api/projects/p1/files/f1/versions/ver-1', () => ({
+      status: 200,
+      json: null,
+      arrayBuffer: new TextEncoder().encode(listed).buffer as ArrayBuffer,
+      headers: {},
+      text: '',
+    }));
+    const local = 'A\nB\nC\n';
+    putDisk(h, local);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(10);
+    const serverDoc = new Y.Doc();
+    serverDoc.getText('content').insert(0, 'A\nB\n');
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+      done: true,
+    });
+    await flushAsync(40);
+
+    // Same outcome as before 0.3.2 for this case: the disk copy wins, once.
+    expect(h.apiCalls.some((c) => c.url.includes('/versions'))).toBe(false);
+    expect(h.doc.getText('b1', PATH)).toBe(local);
+    expect(await h.vault.readText(PATH)).toBe(local);
+    serverDoc.destroy();
     await h.engine.stop();
   });
 });

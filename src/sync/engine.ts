@@ -10,6 +10,7 @@ import {
 } from '@/client/socket';
 import * as Y from 'yjs';
 import { DocManager } from '@/crdt/doc-manager';
+import { mergeText3 } from '@/crdt/text-merge';
 import { OperationLog, type FileMeta, type OperationType } from './operation-log';
 import { classifyFileType, type FileType } from './file-type';
 import { sha256Hex } from './hash';
@@ -170,11 +171,35 @@ export class SyncEngine {
   private snapshotDebouncers = new Map<string, DebouncedFunction<[]>>();
 
   /**
-   * Per-path tail of the in-flight snapshot chain — `snapshotDocToDisk`
-   * appends to it so two snapshots of the same file never interleave
-   * their read-fold-write sequences.
+   * Per-path tail of the disk↔doc work chain — see {@link withPathLock}. Two
+   * snapshots, or a snapshot and a local-save fold, of the same file never
+   * interleave their read-fold-write sequences.
    */
-  private snapshotChains = new Map<string, Promise<void>>();
+  private pathLocks = new Map<string, Promise<void>>();
+
+  /**
+   * Candidate fold bases, keyed by file id: the text of the last disk content
+   * folded into the doc (`hash` known), or the doc's text captured just before
+   * a remote update landed on it (`hash` computed on first use). Only ever
+   * trusted when its hash equals the file's persisted marker — see
+   * {@link resolveFoldBase}. In memory only; after a restart the base is
+   * recovered from the disk or the doc when either still matches the marker.
+   */
+  private foldBases = new Map<string, { text: string; hash: string | null }>();
+
+  /**
+   * File ids whose catch-up was skipped because the disk already matched the
+   * server — their local `Y.Doc` was never brought up to date this session.
+   * The first time such a doc is needed it is pulled with `yjs:fetch` (see
+   * {@link ensureHydrated}); a stale offline copy must not take part in a fold.
+   */
+  private skippedDocs = new Set<string>();
+
+  /** In-flight {@link ensureHydrated} runs, keyed by file id. */
+  private hydrations = new Map<string, Promise<void>>();
+
+  /** Set when a `yjs:fetch` timed out; cleared on the next connect. */
+  private yjsFetchUnavailable = false;
 
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
@@ -248,7 +273,10 @@ export class SyncEngine {
     this.cleanups = [];
     for (const d of this.snapshotDebouncers.values()) d.cancel();
     this.snapshotDebouncers.clear();
-    this.snapshotChains.clear();
+    this.pathLocks.clear();
+    this.foldBases.clear();
+    this.skippedDocs.clear();
+    this.hydrations.clear();
     this.socket.disconnect();
     this.setStatus('stopped');
   }
@@ -314,6 +342,7 @@ export class SyncEngine {
       // the file index is ready get buffered (see `handleYjsCatchup`).
       this.indexReady = false;
       this.pendingCatchup = [];
+      this.yjsFetchUnavailable = false;
       // Arm the streamed-catch-up completion signal before the join so a fast
       // server stream can't resolve before we're waiting on it.
       const catchupDone = new Promise<void>((resolve) => {
@@ -457,12 +486,23 @@ export class SyncEngine {
       // более новый серверный текст — тихий откат (ловится тестом
       // «catch-up still applies newer server content…»).
       const probe = new Y.Doc();
+      let same: boolean;
       try {
         Y.applyUpdate(probe, Uint8Array.from(snap.sync1));
-        return probe.getText('content').toString() === disk;
+        same = probe.getText('content').toString() === disk;
       } finally {
         probe.destroy();
       }
+      if (same) {
+        // Диск совпал с сервером — это общий предок для следующих правок
+        // диска, фиксируем его отметкой. Сам текст не держим: на большом
+        // вальте это копия всего текста в памяти. Локальный `Y.Doc` при
+        // этом не поднимался и мог отстать от сервера — при первой
+        // надобности его подтянет `ensureHydrated`.
+        this.recordFoldedHash(meta, await sha256Hex(disk));
+        this.skippedDocs.add(meta.fileId);
+      }
+      return same;
     } catch {
       return false;
     }
@@ -485,26 +525,33 @@ export class SyncEngine {
     // push-back diff and snapshots a local-history-less merge over the file
     // on disk — a silent rollback.
     await this.docManager.whenSynced(this.binding.id, meta.relativePath);
+    await this.withPathLock(meta.relativePath, () => this.noteDiskAgreement(meta));
+    this.rememberBaseBeforeRemote(meta);
     const update = Uint8Array.from(snap.sync1);
     this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
+    this.skippedDocs.delete(meta.fileId);
     await this.snapshotDocToDisk(meta.relativePath);
+    this.pushMissingOps(meta, snap.stateVector);
+  }
 
-    if (snap.stateVector && snap.stateVector.length > 0) {
-      const serverVector = Uint8Array.from(snap.stateVector);
-      const missing = this.docManager.encodeStateAsUpdate(
-        this.binding.id,
-        meta.relativePath,
-        serverVector,
-      );
-      // An "empty" Yjs delta is ~2 bytes (zero-struct, zero-delete markers).
-      // A larger buffer means we have local ops the server lacks — push them.
-      if (missing.length > 2) {
-        void this.socket.emitYjsUpdate({
-          projectId: this.binding.projectId,
-          fileId: meta.fileId,
-          update: missing,
-        });
-      }
+  /**
+   * Push back the ops a doc has that the server lacks, given the server's
+   * state vector for it. An "empty" Yjs delta is ~2 bytes (zero-struct,
+   * zero-delete markers); anything larger is local history to ship.
+   */
+  private pushMissingOps(meta: IndexedMeta, serverStateVector: number[] | undefined): void {
+    if (!serverStateVector || serverStateVector.length === 0) return;
+    const missing = this.docManager.encodeStateAsUpdate(
+      this.binding.id,
+      meta.relativePath,
+      Uint8Array.from(serverStateVector),
+    );
+    if (missing.length > 2) {
+      void this.socket.emitYjsUpdate({
+        projectId: this.binding.projectId,
+        fileId: meta.fileId,
+        update: missing,
+      });
     }
   }
 
@@ -644,6 +691,9 @@ export class SyncEngine {
         size: existing?.size ?? f.size,
         fileType: f.fileType,
         lastSyncedAt: existing?.lastSyncedAt ?? Date.now(),
+        // The fold marker is local knowledge the server listing can't restore;
+        // dropping it on reconnect would bring back the reverted-edit bug.
+        ...(existing?.foldedHash !== undefined ? { foldedHash: existing.foldedHash } : {}),
       };
       byPath.set(f.path, meta);
       byId.set(f.id, meta);
@@ -744,6 +794,9 @@ export class SyncEngine {
       size,
       fileType,
       lastSyncedAt: Date.now(),
+      // The server seeds the file's CRDT from exactly these bytes, so they are
+      // already "folded" — the base for the first local edit.
+      ...(fileType === 'TEXT' ? { foldedHash: contentHash } : {}),
     };
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(fileId, meta);
@@ -778,7 +831,7 @@ export class SyncEngine {
       return;
     }
     if (meta.fileType === 'TEXT') {
-      // Text edits flow through Yjs. Read the disk content and diff into
+      // Text edits flow through Yjs. Read the disk content and fold it into
       // the doc — the docManager fan-out will ship a `yjs:update` for us.
       //
       // Two guards against the "doubled content" corruption (2026-06-04:
@@ -793,17 +846,23 @@ export class SyncEngine {
       //     The server holds its own insertion of this content (the
       //     CREATE-time seed), so a local full-content insert is a second
       //     independent copy — Yjs merge keeps both, server-side and then
-      //     on every client. Defer instead: the doc hydrates via the
-      //     catch-up stream or the live seed broadcast, and the next
-      //     snapshot folds the disk edits in as a minimal diff
-      //     (`foldDiskEditsIntoDoc`).
-      await this.docManager.whenSynced(this.binding.id, path);
-      if (!this.docManager.hasState(this.binding.id, path) && meta.size > 0) {
-        this.log.debug('defer text modify until doc hydrates', path);
-        return;
-      }
-      const content = await this.vault.readText(path);
-      this.docManager.setText(this.binding.id, path, content);
+      //     on every client. Pull the doc's state first (`ensureHydrated`);
+      //     if that isn't possible (offline, a server without `yjs:fetch`),
+      //     defer: the doc hydrates via the catch-up stream or the live
+      //     seed broadcast, and that snapshot folds the disk edits in.
+      //
+      // The fold itself is three-way — see `foldDiskEditsIntoDoc` for the
+      // reverted-edit bug a plain doc↔disk diff caused.
+      await this.withPathLock(path, async () => {
+        await this.docManager.whenSynced(this.binding.id, path);
+        await this.ensureHydrated(meta);
+        if (!this.docManager.hasState(this.binding.id, path) && meta.size > 0) {
+          this.log.debug('defer text modify until doc hydrates', path);
+          return;
+        }
+        const content = await this.vault.readText(path);
+        await this.foldDiskEditsIntoDoc(path, content);
+      });
       return;
     }
     const buffer = await this.vault.readBinary(path);
@@ -918,6 +977,7 @@ export class SyncEngine {
         // snapshot and release the doc — the same teardown applyServerDelete does.
         this.snapshotDebouncers.get(path)?.cancel();
         this.snapshotDebouncers.delete(path);
+        this.forgetFoldState(fileId);
         await this.docManager.release(this.binding.id, path);
         this.persistVectorClock();
         return;
@@ -1035,6 +1095,7 @@ export class SyncEngine {
   private handleServerYjsUpdate(msg: YjsUpdateMessage): void {
     const meta = this.fileIndex.byId.get(msg.fileId);
     if (!meta) return;
+    this.rememberBaseBeforeRemote(meta);
     this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, msg.update);
     this.scheduleSnapshotToDisk(meta.relativePath);
   }
@@ -1320,6 +1381,7 @@ export class SyncEngine {
     this.fileIndex.byPath.delete(meta.relativePath);
     this.fileIndex.byId.delete(fileId);
     this.operationLog.deleteFileMeta(this.binding.id, meta.relativePath);
+    this.forgetFoldState(fileId);
     await this.docManager.release(this.binding.id, meta.relativePath);
   }
 
@@ -1369,34 +1431,241 @@ export class SyncEngine {
   }
 
   /**
-   * Fold out-of-band disk edits into the `Y.Doc` before a snapshot
-   * overwrites the file. The doc only learns about local edits through
-   * watcher events (`handleLocalModify` → `setText`); anything written
-   * while the plugin was off — git checkout, an external agent, edits
-   * still inside the watcher's debounce window — exists ONLY on disk.
-   * Snapshotting without this fold rolls the file back to the doc's
-   * (stale) state: the 2026-06-12 mass-rollback incident, where a
-   * catch-up rewrote 56 freshly-edited files with old server content.
+   * Fold disk edits the `Y.Doc` hasn't seen into it — on every local save
+   * (`handleLocalModify`) and before a snapshot overwrites the file. The doc
+   * only learns about local edits through this fold; anything written while
+   * the plugin was off — git checkout, an external agent, edits still inside
+   * the watcher's debounce window — exists ONLY on disk. Snapshotting without
+   * it rolls the file back to the doc's (stale) state: the 2026-06-12
+   * mass-rollback incident, where a catch-up rewrote 56 freshly-edited files
+   * with old server content. The folded ops then ride the local-update
+   * fan-out (live) or the catch-up push-back (reconnect) to the server.
    *
    * `diskText` is the disk content the caller already read (`null` when
    * the file doesn't exist) — one read shared between fold and the
    * write-skip compare keeps the race window minimal.
    *
-   * `meta.contentHash` is the last state the engine itself synced or
-   * wrote. A different disk hash means the bytes on disk are ahead of the
-   * doc, so they're diffed in as local ops — those then ride the normal
-   * local-update fan-out (live) or the catch-up push-back (reconnect) to
-   * the server. When the disk still matches the last-synced hash the doc
-   * is the one that's ahead (an incoming remote edit) and no fold happens.
+   * The fold is three-way. `meta.foldedHash` marks the last disk content
+   * already folded in, so the disk's edits are whatever changed since that
+   * base — while the doc may meanwhile hold remote edits the disk hasn't
+   * received (a teammate's change waiting for its snapshot write). Until
+   * 0.3.2 the doc was diffed straight against the disk, and with a stale
+   * marker every such remote edit looked like a local deletion: it was
+   * removed from the CRDT, the removal shipped to the server, and the
+   * teammate's edit vanished everywhere.
+   *
+   * A base text is trusted only when its hash equals the marker (see
+   * {@link resolveFoldBase}). With none — a log from an older plugin, or both
+   * sides changed while the plugin was off — the disk content wins as it
+   * always did, and that is logged: it drops the doc's unwritten remote edits.
    */
   private async foldDiskEditsIntoDoc(path: string, diskText: string | null): Promise<void> {
     const meta = this.fileIndex.byPath.get(path);
     if (!meta || meta.fileType !== 'TEXT') return;
     if (diskText === null) return;
-    if (diskText === this.docManager.getText(this.binding.id, path)) return;
+    if (diskText === this.docManager.getText(this.binding.id, path)) {
+      await this.markFolded(meta, diskText);
+      return;
+    }
+    const marker = meta.foldedHash;
     const diskHash = await sha256Hex(diskText);
-    if (diskHash === meta.contentHash) return;
-    this.docManager.setText(this.binding.id, path, diskText);
+    // Logs from before 0.3.2 have no marker yet. `contentHash` still answers
+    // "is the disk unchanged since the last sync", as it always did — but it
+    // may come straight from the server listing for a file this device never
+    // wrote, so it must never pick a merge base: a base the disk doesn't
+    // descend from turns divergence into doubled text.
+    if (diskHash === (marker ?? meta.contentHash)) {
+      // Nothing on disk the doc hasn't seen — the doc is the one ahead.
+      if (marker !== undefined) this.foldBases.set(meta.fileId, { text: diskText, hash: diskHash });
+      return;
+    }
+    const base = marker === undefined ? null : await this.resolveFoldBase(meta, marker);
+    // Remote updates keep landing while the awaits above yield, so the doc is
+    // read only now, and everything from here to `setText` is synchronous — a
+    // merge computed against an older doc text would delete what arrived since.
+    const docText = this.docManager.getText(this.binding.id, path);
+    let next = diskText;
+    if (base === null) {
+      if (diskText !== docText) {
+        this.log.info('fold without a verified base, disk content wins', path);
+      }
+    } else if (base !== docText) {
+      next = mergeText3(base, diskText, docText);
+    }
+    this.docManager.setText(this.binding.id, path, next);
+    await this.markFolded(meta, diskText, diskHash);
+  }
+
+  /**
+   * The last folded disk text, if it can be recovered and proven by `marker`:
+   * a cached base or pre-remote capture ({@link foldBases}), the doc itself
+   * when it hasn't moved since, or the server's version history, which
+   * usually holds the folded content (text is versioned once edits settle).
+   * `null` when nothing matches — never a guess: a base missing text both
+   * sides already have would re-insert it (the duplication incidents), one
+   * with extra text would delete it.
+   */
+  private async resolveFoldBase(meta: IndexedMeta, marker: string): Promise<string | null> {
+    const cached = this.foldBases.get(meta.fileId);
+    if (cached) {
+      const hash = cached.hash ?? (await sha256Hex(cached.text));
+      if (hash === marker) return cached.text;
+      this.foldBases.delete(meta.fileId);
+    }
+    const docText = this.docManager.getText(this.binding.id, meta.relativePath);
+    if ((await sha256Hex(docText)) === marker) return docText;
+    return this.loadBaseFromHistory(meta, marker);
+  }
+
+  /** Download the server version whose hash is `marker`, verified. `null` on any miss. */
+  private async loadBaseFromHistory(meta: IndexedMeta, marker: string): Promise<string | null> {
+    try {
+      const versions = await this.api.getFileVersions(this.binding.projectId, meta.fileId);
+      const match = versions.find((v) => v.contentHash === marker);
+      if (!match) return null;
+      const bytes = await this.api.downloadFileVersion(
+        this.binding.projectId,
+        meta.fileId,
+        match.id,
+      );
+      // Keep a BOM as a character so the re-encoded bytes (and hash) match.
+      const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
+      return (await sha256Hex(text)) === marker ? text : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Record `text` — now fully in the doc — as the base for the next fold. */
+  private async markFolded(meta: IndexedMeta, text: string, hash?: string): Promise<void> {
+    const cached = this.foldBases.get(meta.fileId);
+    const folded =
+      hash ??
+      (cached && cached.text === text && cached.hash !== null
+        ? cached.hash
+        : await sha256Hex(text));
+    this.foldBases.set(meta.fileId, { text, hash: folded });
+    this.setFoldedHash(meta, folded);
+  }
+
+  /** Move the fold marker when the base text itself isn't worth keeping in memory. */
+  private recordFoldedHash(meta: IndexedMeta, hash: string): void {
+    if (this.foldBases.get(meta.fileId)?.hash !== hash) this.foldBases.delete(meta.fileId);
+    this.setFoldedHash(meta, hash);
+  }
+
+  /**
+   * Persist the marker on the file's LIVE index entry. Callers get here after
+   * awaits: meanwhile the file may have been deleted (writing its meta back
+   * would resurrect a ghost entry in the log) or the index rebuilt on
+   * reconnect (the object in hand is no longer the one folds will read).
+   */
+  private setFoldedHash(meta: IndexedMeta, hash: string): void {
+    const live = this.fileIndex.byId.get(meta.fileId);
+    if (live !== meta) meta.foldedHash = hash;
+    if (!live || live.foldedHash === hash) return;
+    live.foldedHash = hash;
+    this.operationLog.setFileMeta(live);
+  }
+
+  /**
+   * Capture the doc's text right before remote state lands on it, as a base
+   * candidate for the next fold: until the snapshot writes that remote edit
+   * out, it is the last text disk and doc can have agreed on. Only the first
+   * update after an agreement is captured, and the candidate is checked
+   * against the marker before use — a doc still loading from IndexedDB
+   * (partial text) simply fails the check.
+   */
+  private rememberBaseBeforeRemote(meta: IndexedMeta): void {
+    if (this.foldBases.has(meta.fileId)) return;
+    if (!this.docManager.has(this.binding.id, meta.relativePath)) return;
+    if (!this.docManager.hasState(this.binding.id, meta.relativePath)) return;
+    this.foldBases.set(meta.fileId, {
+      text: this.docManager.getText(this.binding.id, meta.relativePath),
+      hash: null,
+    });
+  }
+
+  /**
+   * A loaded doc and the disk holding the same text is a verified base —
+   * record it before catch-up moves the doc. This is what gives a file last
+   * synced by an older plugin (no `foldedHash` yet) a trustworthy base.
+   */
+  private async noteDiskAgreement(meta: IndexedMeta): Promise<void> {
+    const path = meta.relativePath;
+    if (!this.docManager.hasState(this.binding.id, path)) return;
+    try {
+      if (!(await this.vault.exists(path))) return;
+      const disk = await this.vault.readText(path);
+      if (disk === this.docManager.getText(this.binding.id, path)) {
+        await this.markFolded(meta, disk);
+      }
+    } catch {
+      // Unreadable disk — no agreement to record; the fold copes without.
+    }
+  }
+
+  private forgetFoldState(fileId: string): void {
+    this.foldBases.delete(fileId);
+    this.skippedDocs.delete(fileId);
+    this.hydrations.delete(fileId);
+  }
+
+  /**
+   * Bring a doc up to the server's state with `yjs:fetch` when it can't be
+   * trusted as is: no history for a file that has content, remote updates
+   * parked on a history gap, or a copy the catch-up skipped this session.
+   * Before 0.3.2 such a doc waited for the next reconnect — a teammate's
+   * edit to a note the catch-up had skipped never reached the disk, because
+   * the live delta had nothing to attach to. Best effort: offline, or on a
+   * server without the event, callers keep their existing guards.
+   */
+  private ensureHydrated(meta: IndexedMeta): Promise<void> {
+    if (!this.needsHydration(meta)) return Promise.resolve();
+    const running = this.hydrations.get(meta.fileId);
+    if (running) return running;
+    const run = this.hydrate(meta)
+      .catch((err) => this.log.debug('hydration failed', meta.relativePath, err))
+      .finally(() => {
+        if (this.hydrations.get(meta.fileId) === run) this.hydrations.delete(meta.fileId);
+      });
+    this.hydrations.set(meta.fileId, run);
+    return run;
+  }
+
+  private needsHydration(meta: IndexedMeta): boolean {
+    if (meta.fileType !== 'TEXT') return false;
+    if (this.skippedDocs.has(meta.fileId)) return true;
+    const path = meta.relativePath;
+    if (this.docManager.hasPendingRemoteUpdates(this.binding.id, path)) return true;
+    return meta.size > 0 && !this.docManager.hasState(this.binding.id, path);
+  }
+
+  private async hydrate(meta: IndexedMeta): Promise<void> {
+    if (!this.socket.isConnected() || this.yjsFetchUnavailable) return;
+    const result = await this.socket.fetchYjsDoc(this.binding.projectId, meta.fileId);
+    if (!result.ok) {
+      // A server that predates `yjs:fetch` never answers; don't make every
+      // later save wait out the timeout again before the next connect.
+      if (result.error === 'timeout') this.yjsFetchUnavailable = true;
+      this.log.debug('yjs:fetch failed', meta.relativePath, result.error);
+      return;
+    }
+    // The file may have been deleted or renamed while the request was out.
+    const current = this.fileIndex.byId.get(meta.fileId);
+    if (!current || !this.docManager.has(this.binding.id, current.relativePath)) return;
+    this.rememberBaseBeforeRemote(current);
+    this.docManager.applyRemoteUpdate(
+      this.binding.id,
+      current.relativePath,
+      Uint8Array.from(result.sync1),
+    );
+    this.skippedDocs.delete(current.fileId);
+    this.pushMissingOps(current, result.stateVector);
+    // The fetched state may carry edits the disk hasn't seen; a snapshot that
+    // finds nothing new doesn't touch the file. Not while updates stay parked:
+    // that snapshot would hydrate again, and again.
+    if (!this.needsHydration(current)) this.scheduleSnapshotToDisk(current.relativePath);
   }
 
   /**
@@ -1406,14 +1675,27 @@ export class SyncEngine {
    * and can clobber one side's fold. Chain them instead.
    */
   private snapshotDocToDisk(path: string): Promise<void> {
-    const prev = this.snapshotChains.get(path) ?? Promise.resolve();
-    const next = prev.catch(() => undefined).then(() => this.writeDocSnapshot(path));
-    const chained = next
-      .catch(() => undefined)
-      .then(() => {
-        if (this.snapshotChains.get(path) === chained) this.snapshotChains.delete(path);
-      });
-    this.snapshotChains.set(path, chained);
+    return this.withPathLock(path, () => this.writeDocSnapshot(path));
+  }
+
+  /**
+   * Run `task` exclusively for `path` — every sequence that reads the disk,
+   * folds it into the doc and moves the fold marker goes through here. The
+   * fold awaits (hashing, `yjs:fetch`, version history), so a local-save fold
+   * racing a snapshot of the same file could fold one edit twice or record a
+   * marker for content the disk no longer holds.
+   */
+  private withPathLock<T>(path: string, task: () => Promise<T>): Promise<T> {
+    const prev = this.pathLocks.get(path) ?? Promise.resolve();
+    const next = prev.catch(() => undefined).then(task);
+    const tail = next.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.pathLocks.set(path, tail);
+    void tail.then(() => {
+      if (this.pathLocks.get(path) === tail) this.pathLocks.delete(path);
+    });
     return next;
   }
 
@@ -1423,6 +1705,10 @@ export class SyncEngine {
     // is a partial view and the write would destroy the full copy on disk.
     await this.docManager.whenSynced(this.binding.id, path);
     const meta = this.fileIndex.byPath.get(path);
+    // A doc with a history gap, or one the catch-up skipped, is pulled from
+    // the server first — a live delta for such a note otherwise has nothing
+    // to attach to and never reaches the disk.
+    if (meta) await this.ensureHydrated(meta);
     // Half-applied docs must never reach the disk. Two flavors:
     //  - op-less doc for a file the server has content for — its catch-up
     //    batch / seed broadcast hasn't landed yet; writing now would
@@ -1430,17 +1716,16 @@ export class SyncEngine {
     //  - integrated ops with *pending* remote updates (out-of-order
     //    delivery) — the visible text is a stale subset; writing now is
     //    exactly the "files rolled back to old versions" incident.
-    // Skip — the missing update arrives, fires its own snapshot, and that
-    // one folds + writes the complete state.
+    // Skip when hydration couldn't fix it — the missing update arrives, fires
+    // its own snapshot, and that one folds + writes the complete state.
     if (meta && meta.size > 0 && !this.docManager.hasState(this.binding.id, path)) return;
     if (this.docManager.hasPendingRemoteUpdates(this.binding.id, path)) return;
     const diskText = (await this.vault.exists(path)) ? await this.vault.readText(path) : null;
     await this.foldDiskEditsIntoDoc(path, diskText);
     const text = this.docManager.getText(this.binding.id, path);
     if (meta) {
-      // Update meta BEFORE the write so the watcher echo's hash compare
-      // in `handleLocalModify` short-circuits — same reasoning as in
-      // `applyServerUpdateBinary`.
+      // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
+      // watcher echo of this write must find the file already recorded.
       meta.contentHash = await sha256Hex(text);
       meta.size = new TextEncoder().encode(text).byteLength;
       this.operationLog.setFileMeta(meta);
@@ -1451,7 +1736,10 @@ export class SyncEngine {
     // `*.tmp.<pid>.<hex>` artifacts) and left hundreds of live echo
     // budgets in `recentlyApplied`, where they swallowed genuine external
     // edits arriving in the same window (the silent-rollback incident).
-    if (diskText !== null && diskText === text) return;
+    if (diskText !== null && diskText === text) {
+      if (meta) await this.markFolded(meta, text, meta.contentHash);
+      return;
+    }
     // See `applyServerUpdateBinary` — a single overwrite can fan out into
     // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
     // `unlink` + `add` (atomic-rename split). Budget for the worst case so
@@ -1467,6 +1755,10 @@ export class SyncEngine {
       this.recentlyApplied.mark(path, ECHO_COUNT_CREATE);
       await this.vault.createText(path, text);
     }
+    // Only after the write succeeded: disk and doc now agree on `text`. A base
+    // recorded before a failed write would make the next fold read the old
+    // disk as local deletions of everything this snapshot was bringing in.
+    if (meta) await this.markFolded(meta, text, meta.contentHash);
   }
 
   // -- Pending queue --------------------------------------------------------
@@ -1624,6 +1916,7 @@ export class SyncEngine {
             // can't recreate the deleted file (see handleLocalDelete).
             this.snapshotDebouncers.get(op.filePath)?.cancel();
             this.snapshotDebouncers.delete(op.filePath);
+            this.forgetFoldState(fileId);
             await this.docManager.release(this.binding.id, op.filePath);
           }
           return ackToOutcome(ack);

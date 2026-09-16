@@ -70,6 +70,15 @@ export interface FileMeta {
   size: number;
   fileType: FileType;
   lastSyncedAt: number;
+  /**
+   * Text files only: sha256 of the last disk content whose edits are already
+   * in the local `Y.Doc` — the common ancestor the engine diffs the disk
+   * against when it folds new disk edits in. Kept apart from `contentHash`,
+   * which stays "last synced" for the delete-vs-edit conflict check and may
+   * come from the server listing. Absent in logs written before 0.3.2 until
+   * the file's next sync; meanwhile the engine folds as it used to.
+   */
+  foldedHash?: string;
 }
 
 export interface BindingState {
@@ -435,6 +444,7 @@ export class OperationLog {
           size: meta.size,
           fileType: meta.fileType,
           lastSyncedAt: meta.lastSyncedAt,
+          ...(meta.foldedHash !== undefined ? { foldedHash: meta.foldedHash } : {}),
         })),
         state: bucket.state
           ? {
@@ -538,6 +548,7 @@ function toFileMeta(bindingId: string, raw: unknown): FileMeta | null {
     size: toNumber(raw.size, 0),
     fileType,
     lastSyncedAt: toNumber(raw.lastSyncedAt, 0),
+    ...(typeof raw.foldedHash === 'string' ? { foldedHash: raw.foldedHash } : {}),
   };
 }
 

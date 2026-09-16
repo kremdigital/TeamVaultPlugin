@@ -344,6 +344,21 @@ describe('OperationLog — persistence', () => {
     expect(files.has(PATH)).toBe(true);
   });
 
+  it('round-trips the fold marker, and leaves it absent for older entries', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.setFileMeta(makeMeta({ relativePath: 'folded.md', foldedHash: 'fold-1' }));
+    log.setFileMeta(makeMeta({ relativePath: 'legacy.md' }));
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.getFileMeta('b1', 'folded.md')?.foldedHash).toBe('fold-1');
+    const legacy = reopened.getFileMeta('b1', 'legacy.md');
+    expect(legacy).toEqual(makeMeta({ relativePath: 'legacy.md' }));
+    expect(legacy && 'foldedHash' in legacy).toBe(false);
+  });
+
   it('keeps operation ids climbing after a reload, like AUTOINCREMENT did', async () => {
     // Reusing an id would let a stale `markSent` ack drop a newer operation.
     const { storage } = makeStorage();

@@ -249,6 +249,34 @@ describe('SocketClient — emits', () => {
     });
     expect(socket().emits[1]?.event).toBe('file:move');
   });
+
+  it('fetchYjsDoc sends yjs:fetch and resolves with the doc state', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const promise = client.fetchYjsDoc('p1', 'f1');
+    expect(socket().emits[0]?.event).toBe('yjs:fetch');
+    expect(socket().emits[0]?.args[0]).toEqual({ projectId: 'p1', fileId: 'f1' });
+    socket().ackLast({ ok: true, sync1: [1, 2], stateVector: [3] });
+    await expect(promise).resolves.toEqual({ ok: true, sync1: [1, 2], stateVector: [3] });
+  });
+
+  it('fetchYjsDoc resolves with a timeout error when the server never acks', async () => {
+    const { client } = captureSocket();
+    client.connect();
+    // Servers older than `yjs:fetch` silently drop the event.
+    await expect(client.fetchYjsDoc('p1', 'f1', 5)).resolves.toEqual({
+      ok: false,
+      error: 'timeout',
+    });
+  });
+
+  it('fetchYjsDoc resolves (does not reject) before connect', async () => {
+    const client = new SocketClient({ server, clientId, factory });
+    await expect(client.fetchYjsDoc('p1', 'f1')).resolves.toEqual({
+      ok: false,
+      error: 'socket_not_connected',
+    });
+  });
 });
 
 describe('SocketClient — incoming events', () => {
