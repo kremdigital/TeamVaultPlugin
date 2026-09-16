@@ -239,26 +239,14 @@ export default class ObsidianSyncPlugin extends Plugin {
       }
     }
 
-    // The loop above can only sweep binding ids the operation log still
-    // remembers. A missing or wiped `state.db` (restored from a backup,
-    // deleted by hand mid-incident) names none — and a retired binding's
-    // offline CRDT then sits on disk untouched, ready to be merged back the
-    // next time that id comes up. Enumerating the databases themselves is the
-    // backstop. Skipped when settings look unloaded rather than empty: with
-    // no servers AND no bindings we can't tell «user removed everything»
-    // from «we're reading the wrong data.json», and only one of those should
-    // erase local state.
-    if (this.settings.bindings.length === 0 && this.settings.servers.length === 0) return;
-    try {
-      const databases = (await this.docManager?.purgeUnknownBindings(known)) ?? [];
-      if (databases.length > 0) {
-        this.logger?.info('swept offline CRDT state of unknown bindings', {
-          databases: databases.length,
-        });
-      }
-    } catch (err) {
-      this.logger?.warn('failed to sweep offline CRDT state of unknown bindings', { err });
-    }
+    // Deliberately NO "delete every team-vault database this vault doesn't
+    // recognise" backstop. Obsidian keeps IndexedDB in ONE store shared by
+    // every vault on the machine, and database names are keyed by binding id,
+    // not by vault — so from inside one vault, another vault's live binding
+    // is indistinguishable from an orphan. 0.2.12–0.3.0 shipped exactly that
+    // sweep, and on 2026-09-16 a freshly created test vault deleted 207 of
+    // «Ополченец»'s offline CRDT databases at startup. Only ids this vault's
+    // own operation log names (the loop above) are safe to purge.
   }
 
   /**
