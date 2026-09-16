@@ -59,7 +59,7 @@ const options = {
     // `chokidar` — pure JS, `fs`/`path`/`os` stay external below — is
     // bundled rather than required at runtime.
     //
-    // NOTE: Yjs / y-protocols are NOT external — Obsidian's plugin loader
+    // NOTE: Yjs is NOT external — Obsidian's plugin loader
     // doesn't traverse the plugin-local `node_modules/` for non-native
     // packages, so `require('yjs')` fails at load time. Bundling pays a
     // ~75 KB cost and prints a "Yjs was already imported" warning if

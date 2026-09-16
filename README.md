@@ -1,7 +1,8 @@
 # Team Vault — Plugin
 
-Self-hosted vault synchronization for Obsidian with live collaborative editing
-through Yjs CRDT, offline-first edits, and version history. Companion to the
+Self-hosted vault synchronization for Obsidian: edits to the same note from
+different devices merge through a Yjs CRDT, offline edits catch up on
+reconnect, and every file keeps its version history. Companion to the
 [Team Vault server](https://github.com/kremdigital/TeamVaultServer).
 
 - Plugin (this repo): <https://github.com/kremdigital/TeamVaultPlugin>
@@ -11,9 +12,13 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 
 ## What it does
 
-- **Live collaboration on text files** — edits propagate per-character via
-  Yjs CRDT; concurrent typing on two devices merges cleanly without conflict
-  modals.
+- **Text notes merge instead of overwriting** — when Obsidian saves a note
+  (about two seconds after you type), the plugin folds the change into the
+  note's Yjs CRDT document and sends it to the server; other devices merge it
+  with their own edits and write the result to disk within a few seconds.
+  Edits to the same note from different devices are combined without
+  conflict prompts. Changes travel save by save, not keystroke by keystroke
+  — see Limitations.
 - **Binary files** — versioned via REST snapshots. A three-way conflict
   prompt opens when both sides have diverged from the same starting hash
   (keep-server / keep-local / keep-both).
@@ -29,7 +34,7 @@ through Yjs CRDT, offline-first edits, and version history. Companion to the
 
 - TypeScript 5.9, esbuild → `main.js` (CJS, single bundle — no native
   modules, nothing to install alongside it)
-- Yjs + y-indexeddb + y-codemirror.next for CRDT
+- Yjs + y-indexeddb for CRDT
 - socket.io-client for live transport
 - chokidar for the filesystem watcher
 - Obsidian API 1.5+ (desktop only — `isDesktopOnly: true`, the watcher and
@@ -105,8 +110,9 @@ synchronizing. The status bar shows the aggregate state.
 
 ### 4. Behavior settings
 
-- **Change debounce** (default 500 ms) — how long to wait before pushing a
-  modify upstream. Higher = fewer round-trips but laggier remote view.
+- **Change debounce** (default 500 ms) — how long to wait after a file is
+  saved before pushing the change upstream. Higher = fewer round-trips but
+  laggier remote view.
 - **Sync on startup** — catch up with accumulated changes when the plugin
   loads. Leave on.
 - **Notifications** — toasts for connect / disconnect / sync completion.
@@ -178,6 +184,13 @@ edits in `…conflict-<ts>.<ext>`.
 
 ## Limitations (MVP)
 
+- No live co-editing inside Obsidian's editor: changes travel when Obsidian
+  saves the note, not keystroke by keystroke, and there are no remote
+  cursors. If a teammate's change arrives while you have unsaved typing in
+  that note, Obsidian merges your typing into it and shows a "modified
+  externally" notice; if you both changed the same words, part of your
+  unsaved typing can be lost. To type together in real time, use the web
+  editor of the Team Vault server.
 - Desktop only: the filesystem watcher and the log both use Node APIs that
   Obsidian mobile doesn't expose.
 - Project creation is server-only — the plugin binds to existing projects.
@@ -211,7 +224,7 @@ src/
   client/               # REST + Socket.IO clients
   sync/                 # operation-log, vector-clock, engine, engine-manager,
                         # conflict, reconnect, hash, file-type, vault-adapter
-  crdt/                 # Y.Doc cache, text-diff helper, editor binding
+  crdt/                 # Y.Doc cache, text-diff helper
   watcher/              # ObsidianWatcher + FsWatcher + path utilities
   ui/                   # status bar, commands, notice service, history view,
                         # conflict modal
