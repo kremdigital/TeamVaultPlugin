@@ -12,49 +12,32 @@
 ```bash
 cd D:/DEV/Claude/ObsidianTeams/obsidian-plugin
 pnpm install
-TEST_VAULT="D:/DEV/Claude/ObsidianTeams/test-vault" pnpm build:vault
+TEST_VAULT="D:/DEV/Claude/ObsidianTeams/Vaults/test-vault" pnpm build:vault
 ```
 
 Получишь:
 
 ```
-test-vault/.obsidian/plugins/team-vault/
+Vaults/test-vault/.obsidian/plugins/team-vault/
   main.js
   manifest.json
-  .hotreload
+  styles.css
 ```
 
-### 2. Native dependencies
+Это ровно три файла релиза — то же, что ставит каталог Obsidian.
 
-`better-sqlite3` и `chokidar` — нативные модули, esbuild оставил их
-external. Чтобы Obsidian мог `require()` их, нужно подсунуть
-`node_modules` рядом с `main.js`. На Windows проще всего сделать
-junction (без admin):
+### 2. Зависимостей рядом не нужно
 
-```cmd
-cd /d D:\DEV\Claude\ObsidianTeams\test-vault\.obsidian\plugins\team-vault
-mklink /J node_modules D:\DEV\Claude\ObsidianTeams\obsidian-plugin\node_modules
-```
+С 0.3.0 у плагина **нет нативных модулей**: оплог — JSON (`state.json`),
+chokidar забандлен в `main.js`. Три файла из шага 1 — это вся установка,
+никаких `node_modules`, junction'ов и `@electron/rebuild`.
 
-На Linux/macOS:
+Если в папке плагина остались следы 0.2.x — `node_modules/`, `package.json`,
+`state.db*` — их можно удалить: плагин их не читает.
 
-```bash
-cd D:/DEV/Claude/ObsidianTeams/test-vault/.obsidian/plugins/team-vault
-ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
-```
-
-> ⚠️ **Electron ABI mismatch.** `better-sqlite3` сборка для Node 20 не
-> совпадает с Electron внутри Obsidian. Если при загрузке плагина
-> увидишь `Module did not self-register` или `NODE_MODULE_VERSION`
-> mismatch — нужен `pnpm rebuild --recursive` против Electron headers.
-> Для test-vault'а проще:
->
-> ```bash
-> cd D:/DEV/Claude/ObsidianTeams/obsidian-plugin
-> pnpm dlx @electron/rebuild -m node_modules/better-sqlite3 -v <electron-version>
-> ```
->
-> Версия Electron'а Obsidian'а — Help → About → "Electron".
+> ⚠️ Не держи рядом вторую копию плагина (например, бэкап старой версии)
+> внутри `.obsidian/plugins/`: у неё тот же `id`, и Obsidian может загрузить
+> именно её. Бэкапы — только за пределами `plugins/`.
 
 ### 3. Server side
 
@@ -125,15 +108,17 @@ ln -s D:/DEV/Claude/ObsidianTeams/obsidian-plugin/node_modules node_modules
 
 ### S5 — External agent edit (вне Obsidian)
 
-1. Со включённым плагином и активным синком: в терминале:
+1. Со включённым плагином и активным синком: в терминале (Git Bash, не
+   PowerShell — в Windows PowerShell 5.1 `>>` пишет UTF-16LE, и в заметку
+   попадают NUL-байты; так однажды испортили `note.md` в тестовых вальтах):
    ```bash
-   echo "external addition" >> "D:/DEV/Claude/ObsidianTeams/test-vault/note.md"
+   echo "external addition" >> "D:/DEV/Claude/ObsidianTeams/Vaults/test-vault/note.md"
    ```
 2. Chokidar должен поймать modify (с дебаунсом 1s).
 3. На сервере (или в S2 vault) изменения должны появиться.
 4. Дополнительно: создать новый файл через CLI:
    ```bash
-   echo "fresh" > "D:/DEV/Claude/ObsidianTeams/test-vault/from-shell.md"
+   echo "fresh" > "D:/DEV/Claude/ObsidianTeams/Vaults/test-vault/from-shell.md"
    ```
 
 ### S6 — Binary conflict modal
