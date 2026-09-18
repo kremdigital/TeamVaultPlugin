@@ -13,8 +13,9 @@ import { copyFile } from 'node:fs/promises';
  * Modes:
  *   `node esbuild.config.mjs`           → one-shot production build (minified)
  *   `node esbuild.config.mjs --watch`   → watch mode (no minify, sourcemap inline)
- *   `node esbuild.config.mjs --vault`   → after build, copy main.js + manifest.json
- *                                         into a vault plugin dir (TEST_VAULT env)
+ *   `node esbuild.config.mjs --vault`   → after build, copy the three release files
+ *                                         (main.js, manifest.json, styles.css) into a
+ *                                         vault plugin dir (TEST_VAULT env)
  */
 
 const isWatch = process.argv.includes('--watch');
@@ -75,6 +76,9 @@ const options = {
   },
 };
 
+/** The files a release attaches — and all an install ever gets. */
+const RELEASE_FILES = ['main.js', 'manifest.json', 'styles.css'];
+
 async function copyArtifactsToVault() {
   const vault = process.env.TEST_VAULT;
   if (!vault) {
@@ -82,9 +86,11 @@ async function copyArtifactsToVault() {
     return;
   }
   const dest = `${vault}/.obsidian/plugins/team-vault`;
-  await copyFile('main.js', `${dest}/main.js`);
-  await copyFile('manifest.json', `${dest}/manifest.json`);
-  console.log(`[vault] copied main.js + manifest.json → ${dest}`);
+  // Exactly what a release ships and the directory installs. Leaving
+  // styles.css out (as this did until 0.3.2) gave dev installs a plugin with
+  // no styling at all — every rule lives there since 0.3.0.
+  for (const file of RELEASE_FILES) await copyFile(file, `${dest}/${file}`);
+  console.log(`[vault] copied ${RELEASE_FILES.join(' + ')} → ${dest}`);
 }
 
 if (isWatch) {
