@@ -10,7 +10,7 @@
 ### 1. Build the plugin into the test vault
 
 ```bash
-cd D:/DEV/Claude/ObsidianTeams/obsidian-plugin
+cd D:/DEV/Claude/ObsidianTeams/Project/obsidian-plugin
 pnpm install
 TEST_VAULT="D:/DEV/Claude/ObsidianTeams/Vaults/test-vault" pnpm build:vault
 ```
