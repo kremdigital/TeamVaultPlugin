@@ -1,6 +1,6 @@
 import type { VaultBinding } from '@/settings/settings';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
-import { isAlwaysIgnored, isInBinding } from './path-utils';
+import { DEFAULT_CONFIG_DIR, isAlwaysIgnored, isInBinding } from './path-utils';
 import type { RecentlyApplied } from './recently-applied';
 
 /**
@@ -79,6 +79,8 @@ export interface ObsidianWatcherOptions {
   /** Test seam — defaults to globalThis. */
   setTimeout?: (cb: () => void, ms: number) => unknown;
   clearTimeout?: (handle: unknown) => void;
+  /** Obsidian's config folder (`Vault.configDir`); never synced. Default `.obsidian`. */
+  configDir?: string;
 }
 
 // -- Watcher ------------------------------------------------------------------
@@ -90,6 +92,7 @@ export class ObsidianWatcher {
   private readonly clearT?: ObsidianWatcherOptions['clearTimeout'];
   private readonly recentlyApplied: RecentlyApplied;
   private readonly getBindings: () => VaultBinding[];
+  private readonly configDir: string;
 
   /** Per-`(binding, path)` debounced fan-out. */
   private readonly modifyDebouncers = new Map<string, DebouncedFunction<[string, string]>>();
@@ -102,6 +105,7 @@ export class ObsidianWatcher {
     this.modifyDebounceMs = options.modifyDebounceMs ?? 300;
     this.setT = options.setTimeout;
     this.clearT = options.clearTimeout;
+    this.configDir = options.configDir ?? DEFAULT_CONFIG_DIR;
   }
 
   /** Attach event listeners to the given vault. Idempotent. */
@@ -169,9 +173,18 @@ export class ObsidianWatcher {
     this.recentlyApplied.take(oldPath);
     for (const binding of this.getBindings()) {
       if (!binding.enabled) continue;
-      const inOld = isInBinding(oldPath, binding.localFolder);
-      const inNew = isInBinding(file.path, binding.localFolder);
-      if (isAlwaysIgnored(oldPath) && isAlwaysIgnored(file.path)) continue;
+      // An ignored path counts as "outside the binding", so the usual mapping
+      // below does the right thing: moving a note into Obsidian's trash (that
+      // is what "Move to Obsidian trash" does — a rename into `.trash/`)
+      // becomes a delete, and dragging a note back out becomes a create.
+      // Treating it as a rename used to publish the trashed copy to everyone,
+      // and after the server started refusing `.trash` it would have queued a
+      // NACKed op forever.
+      const oldIgnored = isAlwaysIgnored(oldPath, this.configDir);
+      const newIgnored = isAlwaysIgnored(file.path, this.configDir);
+      if (oldIgnored && newIgnored) continue;
+      const inOld = isInBinding(oldPath, binding.localFolder) && !oldIgnored;
+      const inNew = isInBinding(file.path, binding.localFolder) && !newIgnored;
       if (inOld && inNew) {
         this.fan({
           type: 'rename',
@@ -215,7 +228,7 @@ export class ObsidianWatcher {
   // -- Helpers ------------------------------------------------------------
 
   private dispatchForBindings(path: string, action: (bindingId: string) => void): void {
-    if (isAlwaysIgnored(path)) return;
+    if (isAlwaysIgnored(path, this.configDir)) return;
     for (const binding of this.getBindings()) {
       if (!binding.enabled) continue;
       if (!isInBinding(path, binding.localFolder)) continue;

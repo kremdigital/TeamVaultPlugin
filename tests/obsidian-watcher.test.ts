@@ -68,7 +68,12 @@ function binding(over: Partial<VaultBinding> = {}): VaultBinding {
 
 function buildWatcher(
   bindings: VaultBinding[],
-  options: { recentlyApplied?: RecentlyApplied; clock?: FakeClock; debounceMs?: number } = {},
+  options: {
+    recentlyApplied?: RecentlyApplied;
+    clock?: FakeClock;
+    debounceMs?: number;
+    configDir?: string;
+  } = {},
 ): { vault: FakeVault; watcher: ObsidianWatcher; events: VaultEvent[]; clock: FakeClock } {
   const vault = new FakeVault();
   const events: VaultEvent[] = [];
@@ -79,6 +84,7 @@ function buildWatcher(
     modifyDebounceMs: options.debounceMs ?? 100,
     setTimeout: clock.setTimeout,
     clearTimeout: clock.clearTimeout,
+    ...(options.configDir !== undefined ? { configDir: options.configDir } : {}),
   });
   watcher.onEvent((e) => events.push(e));
   watcher.start(vault.asVault());
@@ -198,6 +204,34 @@ describe('ObsidianWatcher — rename', () => {
         source: 'obsidian',
       },
     ]);
+  });
+
+  it('translates a move into Obsidian trash into a delete', () => {
+    // «Move to Obsidian trash» на уровне ФС — это rename в `.trash/`, но
+    // сам Obsidian (app.js 1.13.7, `trashLocal`) реконсилит только исходный
+    // путь и отдаёт вальту delete. Ветка нужна для остальных источников
+    // такого события: чужих адаптеров и не скрытой папки корзины. Как rename
+    // он публиковал бы корзину всей команде, а после того как сервер начал
+    // отклонять `.trash`, застревал бы в очереди NACK-ом.
+    const { vault, events } = buildWatcher([binding()]);
+    vault.fire('rename', { path: '.trash/old.md', kind: 'file' }, 'old.md');
+    expect(events).toEqual([
+      { type: 'delete', bindingId: 'b1', path: 'old.md', source: 'obsidian' },
+    ]);
+  });
+
+  it('translates a move out of the config folder into a create', () => {
+    const { vault, events } = buildWatcher([binding()], { configDir: '.config-obs' });
+    vault.fire('rename', { path: 'notes/new.md', kind: 'file' }, '.config-obs/old.md');
+    expect(events).toEqual([
+      { type: 'create', bindingId: 'b1', path: 'notes/new.md', source: 'obsidian' },
+    ]);
+  });
+
+  it('drops a rename that stays inside the config folder', () => {
+    const { vault, events } = buildWatcher([binding()], { configDir: '.config-obs' });
+    vault.fire('rename', { path: '.config-obs/b.json', kind: 'file' }, '.config-obs/a.json');
+    expect(events).toEqual([]);
   });
 
   it('translates a rename into the binding into a create', () => {

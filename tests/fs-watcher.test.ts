@@ -83,6 +83,7 @@ function buildWatcher(opts: {
   recentlyApplied?: RecentlyApplied;
   clock?: FakeClock;
   modifyDebounceMs?: number;
+  configDir?: string;
 }): {
   watcher: FsWatcher;
   events: VaultEvent[];
@@ -100,6 +101,7 @@ function buildWatcher(opts: {
     clearTimeout: clock.clearTimeout,
     now: () => clock.now,
     modifyDebounceMs: opts.modifyDebounceMs ?? 100,
+    ...(opts.configDir !== undefined ? { configDir: opts.configDir } : {}),
   });
   watcher.onEvent((e) => events.push(e));
   watcher.start();
@@ -242,5 +244,53 @@ describe('FsWatcher — lifecycle', () => {
     const inst = fakeWatcher();
     await watcher.stop();
     expect(inst.closed).toBe(true);
+  });
+});
+
+/**
+ * Что именно chokidar не должен даже показывать. Предикат `ignored` до
+ * TASK-0027 не проверялся ни одним тестом, а в списке не было ни `.trash`
+ * (заметка, удалённая в корзину, возвращалась на сервер как создание), ни
+ * пользовательской папки конфигурации.
+ */
+describe('FsWatcher — chokidar ignored predicate', () => {
+  function ignoredPredicate(): (p: string) => boolean {
+    const opts = FakeFsWatcher.lastOptions as { ignored: (p: string) => boolean };
+    return opts.ignored;
+  }
+
+  it('hides the config folder, .git and the trash', () => {
+    buildWatcher({ vaultBasePath: '/vault', bindings: [binding()] });
+    const ignored = ignoredPredicate();
+    expect(ignored('/vault/.obsidian/plugins/team-vault/data.json')).toBe(true);
+    expect(ignored('/vault/.git/config')).toBe(true);
+    expect(ignored('/vault/.trash/deleted.md')).toBe(true);
+    expect(ignored('/vault/.OBSIDIAN/workspace.json')).toBe(true);
+  });
+
+  it('hides a custom config folder', () => {
+    buildWatcher({ vaultBasePath: '/vault', bindings: [binding()], configDir: '.config-obs' });
+    expect(ignoredPredicate()('/vault/.config-obs/plugins/team-vault/data.json')).toBe(true);
+  });
+
+  it('keeps ordinary notes and the vault root itself', () => {
+    buildWatcher({ vaultBasePath: '/vault', bindings: [binding()] });
+    const ignored = ignoredPredicate();
+    expect(ignored('/vault/notes/idea.md')).toBe(false);
+    expect(ignored('/vault')).toBe(false);
+  });
+});
+
+describe('FsWatcher — trash and config folder events', () => {
+  it('emits nothing for .trash or a custom config folder', () => {
+    const { events, fakeWatcher } = buildWatcher({
+      vaultBasePath: '/vault',
+      bindings: [binding()],
+      configDir: '.config-obs',
+    });
+    fakeWatcher().fire('add', '/vault/.trash/deleted.md');
+    fakeWatcher().fire('add', '/vault/.config-obs/plugins/team-vault/data.json');
+    fakeWatcher().fire('add', '/vault/notes/idea.md');
+    expect(events.map((e) => (e.type === 'create' ? e.path : ''))).toEqual(['notes/idea.md']);
   });
 });

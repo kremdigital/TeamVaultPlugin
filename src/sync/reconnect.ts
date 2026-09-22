@@ -34,6 +34,8 @@ export interface FlushResult {
   sent: number;
   /** First op the server rejected as non-retryable, if any. */
   dropped: PendingOperation | null;
+  /** How many ops were dropped in this pass (`dropped` is just the first). */
+  droppedCount: number;
   /** First op that failed retryably (we stop and leave the rest queued). */
   haltedOn: PendingOperation | null;
   /** Total ops still in the queue after this drain. */
@@ -57,6 +59,7 @@ export async function flushPendingQueue(
   const pending = log.dequeueOperations(bindingId);
   const sentIds: number[] = [];
   let dropped: PendingOperation | null = null;
+  let droppedCount = 0;
   let haltedOn: PendingOperation | null = null;
 
   for (const op of pending) {
@@ -69,16 +72,17 @@ export async function flushPendingQueue(
       haltedOn = op;
       break;
     }
-    // Non-retryable: drop it and keep going. We track only the first one
-    // for reporting; the rest are still surfaced via `remaining`.
+    // Non-retryable: drop it and keep going.
     sentIds.push(op.id);
+    droppedCount += 1;
     if (!dropped) dropped = op;
   }
 
   if (sentIds.length > 0) log.markSent(sentIds);
   return {
-    sent: sentIds.length - (dropped ? 1 : 0),
+    sent: sentIds.length - droppedCount,
     dropped,
+    droppedCount,
     haltedOn,
     remaining: log.pendingCount(bindingId),
   };

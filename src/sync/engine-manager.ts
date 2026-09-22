@@ -59,6 +59,11 @@ export interface EngineManagerDeps {
    * own `bindingId`). When omitted, engines fall back to a silent logger.
    */
   logger?: Logger | undefined;
+  /**
+   * Obsidian's config folder (`Vault.configDir`), forwarded to every engine:
+   * nothing the server sends may be written inside it. Default `.obsidian`.
+   */
+  configDir?: string | undefined;
   /** Test seam — defaults to `new SyncEngine(deps)`. */
   engineFactory?: (deps: SyncEngineDeps) => SyncEngine;
   /**
@@ -229,6 +234,7 @@ export class EngineManager {
       ...(socketClient ? { socketClient } : {}),
       ...(this.deps.conflictResolver ? { conflictResolver: this.deps.conflictResolver } : {}),
       ...(this.deps.logger ? { logger: this.deps.logger } : {}),
+      ...(this.deps.configDir ? { configDir: this.deps.configDir } : {}),
     };
     const engine = this.deps.engineFactory
       ? this.deps.engineFactory(engineDeps)

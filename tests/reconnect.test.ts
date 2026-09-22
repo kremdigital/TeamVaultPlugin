@@ -72,6 +72,28 @@ describe('flushPendingQueue', () => {
     const result = await flushPendingQueue('b1', log, emit);
     expect(result.sent).toBe(2); // a + c, b dropped
     expect(result.dropped?.filePath).toBe('b.md');
+    expect(result.droppedCount).toBe(1);
+    expect(result.remaining).toBe(0);
+  });
+
+  it('counts every dropped op, not just the first', async () => {
+    // `sent` is what actually reached the server; with only a boolean for
+    // "something was dropped" it over-reported by one op per pass, and the
+    // log line said "dropped 1" for a queue that lost three.
+    const log = buildLog([
+      { opType: 'CREATE', filePath: 'a.md' },
+      { opType: 'CREATE', filePath: 'b.md' },
+      { opType: 'CREATE', filePath: 'c.md' },
+    ]);
+    const emit: PendingEmitter = async () => ({
+      ok: false,
+      retryable: false,
+      error: 'invalid_path',
+    });
+    const result = await flushPendingQueue('b1', log, emit);
+    expect(result.sent).toBe(0);
+    expect(result.droppedCount).toBe(3);
+    expect(result.dropped?.filePath).toBe('a.md');
     expect(result.remaining).toBe(0);
   });
 
@@ -90,7 +112,13 @@ describe('flushPendingQueue', () => {
     const log = new OperationLog();
     const emit: PendingEmitter = async () => ({ ok: true });
     const result = await flushPendingQueue('b1', log, emit);
-    expect(result).toEqual({ sent: 0, dropped: null, haltedOn: null, remaining: 0 });
+    expect(result).toEqual({
+      sent: 0,
+      dropped: null,
+      droppedCount: 0,
+      haltedOn: null,
+      remaining: 0,
+    });
   });
 
   it('handles long-offline scenario — 50 queued ops drain in a single call', async () => {

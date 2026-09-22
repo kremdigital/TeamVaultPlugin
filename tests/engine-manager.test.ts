@@ -439,3 +439,27 @@ describe('EngineManager — vault event fan-out', () => {
     expect(fake.handleVaultEvent).toHaveBeenCalledTimes(1);
   });
 });
+
+/**
+ * Проводка папки конфигурации из Obsidian (TASK-0027). Все тесты гейта
+ * задают `configDir` прямо в `SyncEngineDeps`, поэтому без этой проверки
+ * цепочка `main.ts (app.vault.configDir) → EngineManager → SyncEngine` могла
+ * бы молча порваться при зелёных тестах.
+ */
+describe('EngineManager — проводка configDir', () => {
+  it('передаёт configDir в каждый движок', async () => {
+    const seen: (string | undefined)[] = [];
+    const manager = new EngineManager(
+      makeDeps([server], [makeBinding({ id: 'a' })], {
+        configDir: '.config-obs',
+        engineFactory: (deps) => {
+          seen.push(deps.configDir);
+          return new FakeEngine(deps.binding.id) as unknown as SyncEngine;
+        },
+      }),
+    );
+    await manager.start();
+    expect(seen).toEqual(['.config-obs']);
+    await manager.stop();
+  });
+});

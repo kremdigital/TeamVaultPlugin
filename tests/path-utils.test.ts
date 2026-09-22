@@ -1,6 +1,8 @@
 import {
   absoluteToVault,
+  checkVaultPath,
   isAlwaysIgnored,
+  isIgnoredAbsolutePath,
   isInBinding,
   isOrphanedAtomicTmp,
   normalizeSeparators,
@@ -96,5 +98,164 @@ describe('isOrphanedAtomicTmp', () => {
   it('never matches regular files', () => {
     expect(isOrphanedAtomicTmp('wiki/index.md', 999)).toBe(false);
     expect(isOrphanedAtomicTmp('notes/data.tmp.md', 999)).toBe(false);
+  });
+});
+
+/**
+ * The gate added after the 2026-09-19 pre-flight audit (TASK-0027). Three
+ * holes: the config folder was hard-coded as `.obsidian` (a custom
+ * `Vault.configDir` synced the whole folder, API key included), segment
+ * matching was case-sensitive (`.OBSIDIAN/` walked straight through), and
+ * `.trash` was missing (a note deleted into the trash came back as a create).
+ */
+describe('ignored folders — config dir, trash, case, unicode', () => {
+  it('drops the default config folder and Obsidian trash', () => {
+    expect(isAlwaysIgnored('.obsidian/plugins/team-vault/data.json')).toBe(true);
+    expect(isAlwaysIgnored('.trash/deleted.md')).toBe(true);
+  });
+
+  it('drops the folders the server reserves for itself', () => {
+    // The server refuses these by its own list (`RESERVED_STORAGE_NAMES`), so
+    // uploading such a path would retry for ever.
+    expect(isAlwaysIgnored('.versions/f1/1.md')).toBe(true);
+    expect(isAlwaysIgnored('.staging/abc123')).toBe(true);
+  });
+
+  it('matches folder names regardless of case', () => {
+    expect(isAlwaysIgnored('.OBSIDIAN/plugins/team-vault/data.json')).toBe(true);
+    expect(isAlwaysIgnored('.Obsidian/workspace.json')).toBe(true);
+    expect(isAlwaysIgnored('.Trash/note.md')).toBe(true);
+  });
+
+  it('drops a custom config folder passed by the caller', () => {
+    expect(isAlwaysIgnored('.config-obs/plugins/team-vault/data.json', '.config-obs')).toBe(true);
+    expect(isAlwaysIgnored('notes/ok.md', '.config-obs')).toBe(false);
+  });
+
+  it('still drops a literal .obsidian when the config folder is elsewhere', () => {
+    // In that vault `.obsidian` belongs to another Obsidian setup — never ours to sync.
+    expect(isAlwaysIgnored('.obsidian/app.json', '.config-obs')).toBe(true);
+  });
+
+  it('drops a multi-segment config folder as a prefix', () => {
+    // Obsidian's own `Vault.configDir` is always a single dotted segment, so
+    // this covers an arbitrary value coming from settings rather than a real
+    // Obsidian layout. The name is NOT in the always-ignored list, otherwise
+    // the test would pass without the prefix branch at all.
+    expect(isAlwaysIgnored('work/cfg/app.json', 'work/cfg')).toBe(true);
+    expect(isAlwaysIgnored('other/cfg/app.json', 'work/cfg')).toBe(false);
+    expect(isAlwaysIgnored('work/notes.md', 'work/cfg')).toBe(false);
+  });
+
+  it('matches the config folder at the vault root only, not as a nested name', () => {
+    // `.obsidian-work` is the config folder at the root; a folder of the same
+    // name inside the notes (a downloaded vault, a backup of someone's config)
+    // is ordinary content.
+    expect(isAlwaysIgnored('.obsidian-work/app.json', '.obsidian-work')).toBe(true);
+    expect(isAlwaysIgnored('Архив/.obsidian-work/app.json', '.obsidian-work')).toBe(false);
+  });
+
+  it('matches a non-ASCII config folder in either unicode normalization', () => {
+    // macOS hands out NFD, the server stores NFC — on APFS both open the same
+    // folder. `ё` decomposes into `е` + U+0308, so the two forms really do
+    // differ; a name without decomposable letters would make this test empty.
+    const dir = '.ёжик';
+    expect(dir.normalize('NFC')).not.toBe(dir.normalize('NFD'));
+    const path = `${dir}/plugins/team-vault/data.json`;
+    expect(isAlwaysIgnored(path.normalize('NFC'), dir.normalize('NFD'))).toBe(true);
+    expect(isAlwaysIgnored(path.normalize('NFD'), dir.normalize('NFC'))).toBe(true);
+  });
+
+  it('keeps notes whose name merely starts like a config folder', () => {
+    expect(isAlwaysIgnored('.obsidian-notes/idea.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/.trashed-ideas.md')).toBe(false);
+  });
+});
+
+describe('checkVaultPath', () => {
+  it('allows a normal note inside the binding', () => {
+    expect(checkVaultPath('notes/idea.md', { bindingFolder: 'notes' })).toBeNull();
+    expect(checkVaultPath('any/where.md', { bindingFolder: '/' })).toBeNull();
+  });
+
+  it('refuses an empty path', () => {
+    expect(checkVaultPath('', { bindingFolder: '/' })).toBe('empty');
+    expect(checkVaultPath('   ', { bindingFolder: '/' })).toBe('empty');
+  });
+
+  it('refuses absolute paths — they would resolve outside the vault', () => {
+    expect(checkVaultPath('/etc/passwd', { bindingFolder: '/' })).toBe('absolute');
+    expect(checkVaultPath('C:/Windows/system.ini', { bindingFolder: '/' })).toBe('absolute');
+    expect(checkVaultPath('C:\\Windows\\system.ini', { bindingFolder: '/' })).toBe('absolute');
+  });
+
+  it('refuses traversal and empty segments', () => {
+    expect(checkVaultPath('notes/../.obsidian/data.json', { bindingFolder: '/' })).toBe(
+      'traversal',
+    );
+    expect(checkVaultPath('notes\\..\\.obsidian\\data.json', { bindingFolder: '/' })).toBe(
+      'traversal',
+    );
+    expect(checkVaultPath('a//b.md', { bindingFolder: '/' })).toBe('traversal');
+    expect(checkVaultPath('./a.md', { bindingFolder: '/' })).toBe('traversal');
+  });
+
+  it('refuses the config folder even for a root binding', () => {
+    expect(checkVaultPath('.obsidian/plugins/team-vault/data.json', { bindingFolder: '/' })).toBe(
+      'ignored',
+    );
+    expect(checkVaultPath('.OBSIDIAN/plugins/team-vault/data.json', { bindingFolder: '/' })).toBe(
+      'ignored',
+    );
+    expect(
+      checkVaultPath('.config-obs/plugins/team-vault/data.json', {
+        bindingFolder: '/',
+        configDir: '.config-obs',
+      }),
+    ).toBe('ignored');
+  });
+
+  it('refuses Obsidian trash', () => {
+    expect(checkVaultPath('.trash/deleted.md', { bindingFolder: '/' })).toBe('ignored');
+  });
+
+  it('refuses paths outside the binding folder', () => {
+    expect(checkVaultPath('other/secret.md', { bindingFolder: 'notes' })).toBe('outside-binding');
+    expect(checkVaultPath('notes-other/secret.md', { bindingFolder: 'notes' })).toBe(
+      'outside-binding',
+    );
+  });
+
+  it('skips the binding check when no folder is given', () => {
+    expect(checkVaultPath('anywhere/file.md')).toBeNull();
+  });
+});
+
+describe('isIgnoredAbsolutePath', () => {
+  it('matches config folder and trash inside the vault', () => {
+    expect(isIgnoredAbsolutePath('D:/vault/.obsidian/plugins/x/data.json', 'D:/vault')).toBe(true);
+    expect(isIgnoredAbsolutePath('D:\\vault\\.obsidian\\workspace.json', 'D:\\vault')).toBe(true);
+    expect(isIgnoredAbsolutePath('/home/u/vault/.trash/note.md', '/home/u/vault')).toBe(true);
+    expect(isIgnoredAbsolutePath('/home/u/vault/.OBSIDIAN/app.json', '/home/u/vault')).toBe(true);
+  });
+
+  it('matches a custom config folder', () => {
+    expect(isIgnoredAbsolutePath('/vault/.config-obs/app.json', '/vault', '.config-obs')).toBe(
+      true,
+    );
+  });
+
+  it('ignores folder names ABOVE the vault root', () => {
+    // A vault stored inside someone's repository, or under a folder named
+    // `.trash`: matching the whole OS path would filter out every file in it.
+    expect(isIgnoredAbsolutePath('/home/u/.git/vault/notes/idea.md', '/home/u/.git/vault')).toBe(
+      false,
+    );
+    expect(isIgnoredAbsolutePath('D:/.trash/vault/note.md', 'D:/.trash/vault')).toBe(false);
+  });
+
+  it('keeps regular files and the vault root itself', () => {
+    expect(isIgnoredAbsolutePath('/home/u/vault/notes/idea.md', '/home/u/vault')).toBe(false);
+    expect(isIgnoredAbsolutePath('/home/u/vault', '/home/u/vault')).toBe(false);
   });
 });

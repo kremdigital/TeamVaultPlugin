@@ -177,7 +177,16 @@ interface Harness {
   apiResponses: Map<string, () => RequestUrlResponse>;
 }
 
-function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harness {
+function buildHarness(
+  opts: {
+    logger?: Logger;
+    snapshotMs?: number;
+    /** Bind to a subfolder instead of the vault root. */
+    localFolder?: string;
+    /** Obsidian's config folder, when the test needs a non-default one. */
+    configDir?: string;
+  } = {},
+): Harness {
   const vault = new MemoryVault();
   const log = new OperationLog();
   const doc = new DocManager();
@@ -219,7 +228,8 @@ function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harn
 
   const socket = new SocketClient({ server, clientId: 'device-1', factory });
   const deps: SyncEngineDeps = {
-    binding,
+    binding:
+      opts.localFolder === undefined ? binding : { ...binding, localFolder: opts.localFolder },
     server,
     clientId: 'device-1',
     vault,
@@ -230,6 +240,7 @@ function buildHarness(opts: { logger?: Logger; snapshotMs?: number } = {}): Harn
     socketClient: socket,
     ...(opts.logger ? { logger: opts.logger } : {}),
     ...(opts.snapshotMs !== undefined ? { diskSnapshotDebounceMs: opts.snapshotMs } : {}),
+    ...(opts.configDir !== undefined ? { configDir: opts.configDir } : {}),
   };
   const engine = new SyncEngine(deps);
 
@@ -1437,7 +1448,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     await engine.stop();
   });
 
-  it('applyServerRename drops the stale source when the destination already exists', async () => {
+  it('applyServerRename parks a differing local destination aside instead of dropping data', async () => {
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', () => ({
       status: 200,
@@ -1464,6 +1475,10 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     // Both the rename source AND destination exist on disk — the situation
     // the initial-push race used to create. `adapter.rename` would throw
     // "Destination file already exists" and crash the engine to `error`.
+    //
+    // Until TASK-0027 the answer was to delete the source, which is a silent
+    // local data loss chosen by whoever controls the server. Contents differ
+    // here, so the local destination must survive under a `.conflict-` name.
     h.vault.files.set('old.md', new TextEncoder().encode('a').buffer as ArrayBuffer);
     h.vault.files.set('new.md', new TextEncoder().encode('b').buffer as ArrayBuffer);
 
@@ -1480,10 +1495,69 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     });
     await flushAsync(20);
 
-    // No crash to `error`; the stale source is gone, the destination stays.
+    // No crash to `error`; the rename landed and nothing was destroyed.
     expect(seen).not.toContain('error');
     expect(await h.vault.exists('old.md')).toBe(false);
-    expect(await h.vault.exists('new.md')).toBe(true);
+    expect(await h.vault.readText('new.md')).toBe('a');
+    const aside = [...h.vault.files.keys()].filter((p) => /^new\.conflict-\d+\.md$/.test(p));
+    expect(aside).toHaveLength(1);
+    expect(await h.vault.readText(aside[0] as string)).toBe('b');
+    // `new.md` участвует в ДВУХ переименованиях (как источник отставки и как
+    // приёмник), значит и бюджетов эха ему нужно два комплекта: иначе
+    // отставший `unlink` дойдёт до handleLocalDelete по пути, который только
+    // что стал живым файлом — инцидент 2026-08-06.
+    expect(h.ra.take('new.md')).toBe(true);
+    expect(h.ra.take('new.md')).toBe(true);
+    expect(h.ra.take('new.md')).toBe(true);
+    expect(h.ra.take('new.md')).toBe(true);
+    expect(h.ra.take('new.md')).toBe(false);
+    await h.engine.stop();
+  });
+
+  it('applyServerRename still drops the source when the destination is identical', async () => {
+    // The benign half of the same branch: a partially-applied rename or an
+    // initial-push race leaves two copies of the same bytes. Parking one
+    // aside would litter the vault with `.conflict-` files on every reconnect.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: {
+        files: [
+          {
+            id: 'f1',
+            path: 'old.md',
+            fileType: 'TEXT',
+            contentHash: 'h',
+            size: '1',
+            mimeType: 'text/markdown',
+            deletedAt: null,
+            createdAt: '2026-01-01',
+            updatedAt: '2026-01-01',
+            lastModifiedById: 'u1',
+          },
+        ],
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.vault.files.set('old.md', new TextEncoder().encode('same').buffer as ArrayBuffer);
+    h.vault.files.set('new.md', new TextEncoder().encode('same').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: 'new.md',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    expect(await h.vault.exists('old.md')).toBe(false);
+    expect(await h.vault.readText('new.md')).toBe('same');
+    expect([...h.vault.files.keys()].filter((p) => p.includes('.conflict-'))).toHaveLength(0);
     await h.engine.stop();
   });
 
@@ -3092,6 +3166,481 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     expect(h.doc.getText('b1', PATH)).toBe(local);
     expect(await h.vault.readText(PATH)).toBe(local);
     serverDoc.destroy();
+    await h.engine.stop();
+  });
+});
+
+/**
+ * Гейт путей, пришедших от сервера (TASK-0027, аудит перед подачей в каталог
+ * 2026-09-19). Сервер не имеет права называть локальный путь: участник
+ * проекта мог переименовать свой файл в `.obsidian/plugins/team-vault/
+ * data.json`, и клиент коллеги перенацеливал на него метаданные, после чего
+ * «восстановить на сервере» выгружало чужой data.json вместе с API-ключом.
+ * Сюда же — `.trash` (удалённая заметка возвращалась на сервер) и сравнение
+ * сегментов без учёта регистра (`.OBSIDIAN/` проходил мимо фильтра).
+ */
+describe('SyncEngine — гейт путей от сервера', () => {
+  function listing(files: { id: string; path: string }[]) {
+    return () => ({
+      status: 200,
+      json: {
+        files: files.map((f) => mkFile({ id: f.id, path: f.path, fileType: 'TEXT' })),
+      },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    });
+  }
+
+  it('не индексирует из листинга то, что старый фильтр пропускал: другой регистр, корзина, своя папка конфигурации', async () => {
+    const h = buildHarness({ configDir: '.config-obs' });
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'note.md' },
+        { id: 'f2', path: '.OBSIDIAN/plugins/team-vault/data.json' },
+        { id: 'f3', path: '.trash/deleted.md' },
+        { id: 'f4', path: '.config-obs/plugins/team-vault/data.json' },
+      ]),
+    );
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
+    expect(h.engine.getFileIdForPath('.OBSIDIAN/plugins/team-vault/data.json')).toBeNull();
+    expect(h.engine.getFileIdForPath('.trash/deleted.md')).toBeNull();
+    expect(h.engine.getFileIdForPath('.config-obs/plugins/team-vault/data.json')).toBeNull();
+    await h.engine.stop();
+  });
+
+  it('файл вне папки привязки не попадает ни в индекс, ни в state.json, ни на диск', async () => {
+    // Он остаётся известен движку по id (теневой реестр), чтобы перенос
+    // обратно в папку привязки не выглядел как файл из ниоткуда, — но
+    // catch-up не поднимает его документ, а state.json не растёт чужими
+    // путями.
+    const h = buildHarness({ localFolder: 'notes' });
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'notes/a.md' },
+        { id: 'f2', path: 'archive/b.md' },
+      ]),
+    );
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    expect(h.engine.getFileIdForPath('notes/a.md')).toBe('f1');
+    expect(h.engine.getFileIdForPath('archive/b.md')).toBeNull();
+    expect(h.log.getFileMeta('b1', 'archive/b.md')).toBeNull();
+    expect(await h.vault.exists('archive/b.md')).toBe(false);
+    await h.engine.stop();
+  });
+
+  it('устаревшая запись state.json по отклонённому пути вычищается при обновлении индекса', async () => {
+    const h = buildHarness();
+    // Так выглядел бы state.json, записанный сборкой без гейта.
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: '.trash/deleted.md',
+      serverFileId: 'f9',
+      contentHash: 'h',
+      size: 1,
+      fileType: 'TEXT',
+      lastSyncedAt: 0,
+    });
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'note.md' },
+        { id: 'f9', path: '.trash/deleted.md' },
+      ]),
+    );
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    expect(h.log.getFileMeta('b1', '.trash/deleted.md')).toBeNull();
+    await h.engine.stop();
+  });
+
+  it('не качает байты и не пишет на диск по метаданным вне папки привязки', async () => {
+    // Такая запись в индексе достижима штатно: файл проекта лежит вне папки
+    // привязки, индексируется (чтобы его не залили повторно), но писать его
+    // нельзя. Гейт стоит и на метаданных, а не только на свежей строке от
+    // сервера — запись могла прийти и из state.json старой сборки.
+    const h = buildHarness({ localFolder: 'notes' });
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'notes/a.md' },
+        { id: 'f2', path: 'archive/b.md' },
+      ]),
+    );
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:updated-binary', { fileId: 'f2' });
+    await flushAsync(10);
+    expect(h.apiCalls.filter((c) => /\/files\/f2$/.test(c.url))).toHaveLength(0);
+    expect(await h.vault.exists('archive/b.md')).toBe(false);
+
+    // И удаление по такому пути тоже не выполняется: файл на диске цел.
+    h.vault.files.set('archive/b.md', new TextEncoder().encode('чужое').buffer as ArrayBuffer);
+    h.socket().fire('file:deleted', { fileId: 'f2' });
+    await flushAsync(10);
+    expect(await h.vault.readText('archive/b.md')).toBe('чужое');
+    await h.engine.stop();
+  });
+
+  it('не материализует живой file:created в папке конфигурации и не качает байты', async () => {
+    const entries: LogEntry[] = [];
+    const logger = new Logger('debug', {
+      write: (e) => {
+        entries.push(e);
+      },
+    });
+    const h = buildHarness({ logger });
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const seen: EngineStatus[] = [];
+    h.engine.onStatus((s) => seen.push(s));
+    // Регистр другой — фильтр обязан сработать всё равно.
+    h.socket().fire('file:created', {
+      result: { outcome: { fileId: 'f9', path: '.OBSIDIAN/plugins/team-vault/data.json' } },
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(10);
+
+    expect(await h.vault.exists('.OBSIDIAN/plugins/team-vault/data.json')).toBe(false);
+    expect(h.engine.getFileIdForPath('.OBSIDIAN/plugins/team-vault/data.json')).toBeNull();
+    expect(h.apiCalls.filter((c) => c.url.endsWith('/files/f9'))).toHaveLength(0);
+    expect(seen).not.toContain('error');
+    const refused = entries.filter((e) => e.message === 'refused a path supplied by the server');
+    expect(refused).toHaveLength(1);
+    expect(refused[0]?.context).toMatchObject({ component: 'engine', bindingId: 'b1' });
+    expect(refused[0]?.args[0]).toMatchObject({
+      reason: 'ignored',
+      context: 'create',
+      path: '.OBSIDIAN/plugins/team-vault/data.json',
+    });
+    await h.engine.stop();
+  });
+
+  it('не материализует файл в корзине Obsidian', async () => {
+    const h = buildHarness();
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:created', {
+      result: { outcome: { fileId: 'f8', path: '.trash/удалённая.png' } },
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(10);
+
+    // Бинарное расширение выбрано намеренно: без гейта здесь были бы и
+    // скачивание байтов, и запись на диск, поэтому тест реально нагружен.
+    expect(await h.vault.exists('.trash/удалённая.png')).toBe(false);
+    expect(h.apiCalls.filter((c) => c.url.endsWith('/files/f8'))).toHaveLength(0);
+    expect(h.engine.getFileIdForPath('.trash/удалённая.png')).toBeNull();
+    await h.engine.stop();
+  });
+
+  it('переименование в папку конфигурации не трогает файл и не перенацеливает метаданные', async () => {
+    // Полный сценарий утечки: сервер переименовывает известный нам файл в
+    // data.json. До фикса meta.relativePath уезжал на этот путь, и дальше
+    // любая выгрузка отправляла на сервер содержимое настроек.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'note.md' }]));
+    h.vault.files.set('note.md', new TextEncoder().encode('моя заметка').buffer as ArrayBuffer);
+    h.vault.files.set(
+      '.obsidian/plugins/team-vault/data.json',
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+    );
+
+    const seen: EngineStatus[] = [];
+    h.engine.onStatus((s) => seen.push(s));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: '.obsidian/plugins/team-vault/data.json',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    expect(seen).not.toContain('error');
+    expect(await h.vault.readText('note.md')).toBe('моя заметка');
+    expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
+    expect(h.engine.getFileIdForPath('.obsidian/plugins/team-vault/data.json')).toBeNull();
+    // Чужой файл не тронут и не «отставлен в сторону».
+    expect(await h.vault.readText('.obsidian/plugins/team-vault/data.json')).toBe(
+      '{"apiKey":"osync_secret"}',
+    );
+    expect([...h.vault.files.keys()].filter((p) => p.includes('.conflict-'))).toHaveLength(0);
+    await h.engine.stop();
+  });
+
+  it('переименование по пути с ../ не выводит запись за пределы вальта', async () => {
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'note.md' }]));
+    h.vault.files.set('note.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: '../outside.md',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    expect(await h.vault.exists('note.md')).toBe(true);
+    expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
+    expect([...h.vault.files.keys()]).not.toContain('../outside.md');
+    await h.engine.stop();
+  });
+
+  it('начальная выгрузка не отправляет файлы из корзины и папки конфигурации', async () => {
+    const h = buildHarness();
+    // Игнорируемые — ПЕРВЫМИ в списке: MemoryVault отдаёт пути в порядке
+    // вставки, а initialPush ждёт ack на каждый файл. Если бы первым шёл
+    // обычный файл, цикл встал бы на нём и до остальных не дошёл — тест был
+    // бы зелёным независимо от гейта.
+    h.vault.files.set('.trash/deleted.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    h.vault.files.set(
+      '.obsidian/plugins/team-vault/data.json',
+      new TextEncoder().encode('{}').buffer as ArrayBuffer,
+    );
+    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+    // Подтверждаем единственный ожидаемый file:create, чтобы цикл дошёл до
+    // конца списка.
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'note.md' } });
+    await flushAsync(20);
+
+    const created = h
+      .socket()
+      .emits.filter((e) => e.event === 'file:create')
+      .map((e) => (e.args[0] as { filePath: string }).filePath);
+    expect(created).toEqual(['note.md']);
+    await h.engine.stop();
+  });
+});
+
+/**
+ * Исходящая половина того же гейта (вторая итерация TASK-0027 после
+ * состязательной проверки). Сервер — не единственный источник плохого пути:
+ * очередь офлайн-операций живёт в `state.json` и переживает обновление
+ * плагина, поэтому сборка, у которой папка конфигурации была зашита как
+ * `.obsidian`, могла оставить в ней выгрузку `data.json` пользователя с
+ * настройкой «Override config folder».
+ */
+describe('SyncEngine — гейт исходящих путей', () => {
+  it('локальное событие по игнорируемому пути не уходит на сервер', async () => {
+    const h = buildHarness({ configDir: '.config-obs' });
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    h.vault.files.set(
+      '.config-obs/plugins/team-vault/data.json',
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+    );
+    await h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: '.config-obs/plugins/team-vault/data.json',
+      source: 'fs',
+    });
+    await flushAsync(10);
+
+    expect(h.socket().emits.slice(before)).toHaveLength(0);
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+
+  it('локальное переименование в игнорируемую папку и удаление в ней не уходят', async () => {
+    const h = buildHarness({ configDir: '.config-obs' });
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    const before = h.socket().emits.length;
+    await h.engine.handleVaultEvent({
+      type: 'rename',
+      bindingId: 'b1',
+      oldPath: 'note.md',
+      newPath: '.config-obs/note.md',
+      source: 'fs',
+    });
+    await h.engine.handleVaultEvent({
+      type: 'delete',
+      bindingId: 'b1',
+      path: '.config-obs/plugins/team-vault/data.json',
+      source: 'fs',
+    });
+    await flushAsync(10);
+
+    expect(h.socket().emits.slice(before)).toHaveLength(0);
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+
+  it('операция из очереди старой сборки выбрасывается, а не выгружается', async () => {
+    const h = buildHarness({ configDir: '.config-obs' });
+    // Ровно то, что осталось бы в state.json от сборки без гейта.
+    h.log.enqueueOperation('b1', {
+      opType: 'CREATE',
+      filePath: '.config-obs/plugins/team-vault/data.json',
+      payload: { contentHash: 'h', size: 25, fileType: 'TEXT' },
+    });
+    h.vault.files.set(
+      '.config-obs/plugins/team-vault/data.json',
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+    );
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    expect(h.socket().emits.filter((e) => e.event === 'file:create')).toHaveLength(0);
+    // Выброшена из очереди, а не оставлена блокировать все следующие правки.
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+
+  it('очередь с переименованием в корзину превращается в удаление, а не теряется', async () => {
+    // Так выглядел офлайновый «перенос в корзину» у сборки без гейта. Если
+    // просто выбросить операцию, заметка воскреснет: на сервере она жива, и
+    // ближайший catch-up запишет её обратно на диск.
+    const h = buildHarness();
+    h.apiResponses.set('GET /api/projects/p1/files', () => ({
+      status: 200,
+      json: { files: [mkFile({ id: 'f1', path: 'note.md', fileType: 'TEXT' })] },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    }));
+    h.log.enqueueOperation('b1', {
+      opType: 'RENAME',
+      filePath: 'note.md',
+      newPath: '.trash/note.md',
+      payload: { fileId: 'f1' },
+    });
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    const emitted = h.socket().emits.map((e) => e.event);
+    expect(emitted).toContain('file:delete');
+    expect(emitted).not.toContain('file:rename');
+    await h.engine.stop();
+  });
+
+  it('отказ сервера invalid_path выбрасывает операцию, а не оставляет её в очереди', async () => {
+    // Сервер выкатывается раньше релиза плагина (так и предписано ранбуком):
+    // он уже отклоняет путь, который старая сборка успела поставить в очередь.
+    // Если счесть такой отказ временным, drain будет упираться в эту операцию
+    // на каждом реконнекте, и все следующие правки не уйдут никогда.
+    const h = buildHarness();
+    h.log.enqueueOperation('b1', {
+      opType: 'CREATE',
+      filePath: 'note.md',
+      payload: { contentHash: 'h', size: 2, fileType: 'TEXT' },
+    });
+    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    expect(h.socket().emits.some((e) => e.event === 'file:create')).toBe(true);
+    h.socket().ackErr('invalid_path');
+    await flushAsync(20);
+
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+});
+
+/**
+ * Область привязки при переносах (третий заход TASK-0027). Первая версия
+ * гейта отклоняла перенос за пределы папки привязки и оставляла локальную
+ * копию на месте — а `initialPush` не находил её в индексе и заливал на
+ * сервер ещё раз: дубликат заметки у всей команды. Перенос ВНУТРЬ привязки
+ * при этом переставал работать вовсе.
+ */
+describe('SyncEngine — переносы через границу папки привязки', () => {
+  function listing(files: { id: string; path: string }[]) {
+    return () => ({
+      status: 200,
+      json: { files: files.map((f) => mkFile({ id: f.id, path: f.path, fileType: 'TEXT' })) },
+      arrayBuffer: new ArrayBuffer(0),
+      headers: {},
+      text: '',
+    });
+  }
+
+  it('перенос ИЗ привязки двигает файл и не создаёт дубликат на сервере', async () => {
+    const h = buildHarness({ localFolder: 'notes' });
+    h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'notes/b.md' }]));
+    h.vault.files.set('notes/b.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: 'archive/b.md',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    // Файл уехал по указанному сервером пути, копии в папке привязки нет —
+    // значит initialPush не увидит её и не зальёт повторно.
+    expect(await h.vault.exists('notes/b.md')).toBe(false);
+    expect(await h.vault.readText('archive/b.md')).toBe('текст');
+    expect(h.socket().emits.filter((e) => e.event === 'file:create')).toHaveLength(0);
+    // Из индекса файл ушёл: он больше не в нашей папке.
+    expect(h.engine.getFileIdForPath('archive/b.md')).toBeNull();
+    expect(h.log.getFileMeta('b1', 'notes/b.md')).toBeNull();
+    await h.engine.stop();
+  });
+
+  it('перенос В привязку материализует файл, о котором мы раньше не знали', async () => {
+    const h = buildHarness({ localFolder: 'notes' });
+    h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f2', path: 'archive/c.md' }]));
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync();
+
+    // До переноса файл вне привязки: в индексе его нет.
+    expect(h.engine.getFileIdForPath('archive/c.md')).toBeNull();
+
+    h.socket().fire('file:renamed', {
+      fileId: 'f2',
+      newPath: 'notes/c.md',
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    // Теперь файл наш: он в индексе и его документ заведён.
+    expect(h.engine.getFileIdForPath('notes/c.md')).toBe('f2');
     await h.engine.stop();
   });
 });

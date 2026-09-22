@@ -50,8 +50,10 @@ server — here is exactly what that means:
   There is no vendor backend, no default endpoint, no fallback host. Nothing
   leaves your machine until you add a server and bind a folder.
 - **An account on that server is required**, in the form of an API key you
-  generate in its web UI. The key is stored in the plugin's `data.json`
-  inside your vault.
+  generate in its web UI. The key is stored in plain text in the plugin's
+  `data.json`, inside your vault's config folder — keep that folder out of
+  git and out of other sync tools. Team Vault never syncs the config folder
+  itself, whatever the server asks for.
 - **Synced content is the content of the bound folder** — note text, binary
   attachments, paths, and their edit history — sent to your server so other
   devices and teammates can receive it.

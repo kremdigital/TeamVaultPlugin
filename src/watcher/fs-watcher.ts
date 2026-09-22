@@ -3,11 +3,11 @@ import type { ChokidarOptions, FSWatcher } from 'chokidar';
 import type { VaultBinding } from '@/settings/settings';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import {
-  ALWAYS_IGNORED_SEGMENTS,
+  DEFAULT_CONFIG_DIR,
   absoluteToVault,
   isAlwaysIgnored,
+  isIgnoredAbsolutePath,
   isInBinding,
-  normalizeSeparators,
 } from './path-utils';
 import type { RecentlyApplied } from './recently-applied';
 import type { VaultEvent, VaultEventHandler } from './obsidian-events';
@@ -61,6 +61,9 @@ export interface FsWatcherOptions {
   clearTimeout?: (handle: unknown) => void;
   /** Test seam — defaults to Date.now. */
   now?: () => number;
+  /** Obsidian's config folder (`Vault.configDir`). Never synced, and the
+   *  name is user-configurable — see `path-utils`. Default `.obsidian`. */
+  configDir?: string;
 }
 
 export class FsWatcher {
@@ -73,6 +76,7 @@ export class FsWatcher {
   private readonly setT?: FsWatcherOptions['setTimeout'];
   private readonly clearT?: FsWatcherOptions['clearTimeout'];
   private readonly now: () => number;
+  private readonly configDir: string;
 
   private watcher: FSWatcher | null = null;
   private readonly handlers = new Set<VaultEventHandler>();
@@ -89,6 +93,7 @@ export class FsWatcher {
     this.setT = options.setTimeout;
     this.clearT = options.clearTimeout;
     this.now = options.now ?? Date.now;
+    this.configDir = options.configDir ?? DEFAULT_CONFIG_DIR;
   }
 
   start(): void {
@@ -131,17 +136,13 @@ export class FsWatcher {
   // -- Internals ----------------------------------------------------------
 
   private shouldIgnoreAbsolute(absolutePath: string): boolean {
-    const normalized = normalizeSeparators(absolutePath);
-    for (const seg of ALWAYS_IGNORED_SEGMENTS) {
-      if (normalized.includes(`/${seg}/`) || normalized.endsWith(`/${seg}`)) return true;
-    }
-    return false;
+    return isIgnoredAbsolutePath(absolutePath, this.vaultBasePath, this.configDir);
   }
 
   private handle(type: 'create' | 'modify' | 'delete', absolutePath: string): void {
     const vaultPath = absoluteToVault(absolutePath, this.vaultBasePath);
     if (vaultPath === null || vaultPath === '') return;
-    if (isAlwaysIgnored(vaultPath)) return;
+    if (isAlwaysIgnored(vaultPath, this.configDir)) return;
     if (this.recentlyApplied.take(vaultPath)) return;
     if (this.takeObsidianDedupe(type, vaultPath)) return;
 

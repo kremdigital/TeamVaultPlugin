@@ -32,7 +32,12 @@ import {
 } from './conflict';
 import type { VaultEvent } from '@/watcher/obsidian-events';
 import type { RecentlyApplied } from '@/watcher/recently-applied';
-import { isAlwaysIgnored, isInBinding } from '@/watcher/path-utils';
+import {
+  DEFAULT_CONFIG_DIR,
+  checkVaultPath,
+  isAlwaysIgnored,
+  isInBinding,
+} from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
 
@@ -87,6 +92,12 @@ export interface SyncEngineDeps {
   conflictResolver?: ConflictResolver;
   /** Test seam — `Date.now` substitute. Used for `buildConflictPath`. */
   now?: () => number;
+  /**
+   * Obsidian's config folder (`Vault.configDir`). Paths inside it are never
+   * written, whatever the server says — that folder holds our own
+   * `data.json` with the API key. Default `.obsidian`.
+   */
+  configDir?: string;
   /**
    * Logger for status transitions — errors at `error`, the rest at `debug`.
    * Defaults to a silent logger; the `EngineManager` injects the real one
@@ -149,6 +160,17 @@ export class SyncEngine {
   private readonly now: () => number;
   /** Binding-scoped logger — carries `component=engine bindingId=…` context. */
   private readonly log: Logger;
+  private readonly configDir: string;
+  /**
+   * Project files that live OUTSIDE this binding's folder: id → path.
+   *
+   * In memory only, rebuilt on every `refreshFileIndex`. They are not in
+   * `fileIndex` (so catch-up never hydrates hundreds of foreign docs and
+   * `state.json` stays about our folder) and never reach the disk — but the
+   * engine still has to recognise them, otherwise a file moved back INTO the
+   * folder would arrive as a rename for a file we know nothing about.
+   */
+  private outOfScope = new Map<string, { path: string; fileType: FileType }>();
 
   /** Local vector clock for the binding — bumped before each outgoing op. */
   private vectorClock: VectorClock;
@@ -230,6 +252,7 @@ export class SyncEngine {
     this.diskSnapshotDebounceMs = deps.diskSnapshotDebounceMs ?? 500;
     this.conflictResolver = deps.conflictResolver ?? defaultConflictResolver;
     this.now = deps.now ?? Date.now;
+    this.configDir = deps.configDir ?? DEFAULT_CONFIG_DIR;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -316,6 +339,19 @@ export class SyncEngine {
   async handleVaultEvent(event: VaultEvent): Promise<void> {
     if (event.bindingId !== this.binding.id) return;
     if (!this.binding.enabled) return;
+    // Outgoing side of the same gate. The watchers filter too, but events also
+    // arrive from the offline queue and from re-queued NACKs, and a build that
+    // predates the gate could have recorded a path we must never upload — the
+    // config folder holds `data.json` with the API key.
+    const paths = event.type === 'rename' ? [event.oldPath, event.newPath] : [event.path];
+    if (paths.some((p) => this.isIgnoredLocalPath(p))) {
+      this.log.warn('refused to sync an ignored local path', {
+        context: `local ${event.type}`,
+        paths,
+        configDir: this.configDir,
+      });
+      return;
+    }
     switch (event.type) {
       case 'create':
         await this.handleLocalCreate(event.path);
@@ -630,7 +666,7 @@ export class SyncEngine {
       // Watcher events are filtered upstream, but this pass walks the raw
       // vault listing — without the same filter it uploads throw-away
       // artifacts (e.g. Obsidian's orphaned `*.tmp.<pid>.<hex>` files).
-      if (isAlwaysIgnored(path)) continue;
+      if (this.isIgnoredLocalPath(path)) continue;
       if (this.fileIndex.byPath.has(path)) continue;
       if (pending.has(path)) continue;
       if (tombstoned.has(path)) {
@@ -666,13 +702,27 @@ export class SyncEngine {
 
   private async refreshFileIndex(): Promise<void> {
     const files = await this.api.getProjectFiles(this.binding.projectId);
+    this.outOfScope.clear();
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
     for (const f of files) {
       // Throw-away artifacts that an older client uploaded (e.g. Obsidian's
       // `*.tmp.<pid>.<hex>` atomic-write leftovers) must stay invisible —
-      // indexing them would let server events materialise them on disk.
-      if (isAlwaysIgnored(f.path)) continue;
+      // indexing them would let server events materialise them on disk. The
+      // binding itself is checked separately, just below.
+      if (!this.allowServerPath(f.path, 'file index', { requireBinding: false })) {
+        // Drop the stale mirror as well: a path we now refuse was written to
+        // `state.json` by an older build and would otherwise linger there.
+        this.operationLog.deleteFileMeta(this.binding.id, f.path);
+        continue;
+      }
+      if (!isInBinding(f.path, this.binding.localFolder)) {
+        // Someone else's folder inside the same project. Remembered by id
+        // only — see `outOfScope`.
+        this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
+        this.operationLog.deleteFileMeta(this.binding.id, f.path);
+        continue;
+      }
       // Preserve the client's last-known `contentHash` (the "common
       // ancestor" from the engine's perspective) for files we've synced
       // before — overwriting it with the server's current hash would
@@ -785,6 +835,11 @@ export class SyncEngine {
     contentHash: string,
     size: number,
   ): void {
+    // The path comes back from the server's ack and may differ from the one
+    // we sent (conflict rename). From here it flows into `fileIndex` and
+    // `state.json`, which every later disk write reads — so it passes the
+    // same gate.
+    if (!this.allowServerPath(path, 'create ack')) return;
     const meta: FileMeta & { fileId: string } = {
       bindingId: this.binding.id,
       relativePath: path,
@@ -1050,6 +1105,58 @@ export class SyncEngine {
     this.cleanups.push(off);
   }
 
+  // -- Path gate ------------------------------------------------------------
+
+  /**
+   * Gate for every path that arrives from the server: the file index, the
+   * catch-up operations and the live socket events all funnel through here
+   * before anything is written, downloaded or recorded.
+   *
+   * The server is not trusted to name a local path. A project member could
+   * rename their file to `.obsidian/plugins/team-vault/data.json`; every
+   * other client used to retarget its metadata onto its own settings file,
+   * and the next "restore on server" uploaded that file — API key included
+   * (TASK-0027). The same gate keeps writes inside the binding folder and
+   * out of `.trash`.
+   *
+   * Refusal is never fatal: it logs and returns `false`, because the caller
+   * chain of `handleServerFileEvent` turns a throw into engine status
+   * `error`.
+   */
+  private allowServerPath(
+    path: string,
+    context: string,
+    opts: { requireBinding?: boolean } = {},
+  ): boolean {
+    const rejection = checkVaultPath(path, {
+      ...(opts.requireBinding === false ? {} : { bindingFolder: this.binding.localFolder }),
+      configDir: this.configDir,
+    });
+    if (rejection === null) return true;
+    this.log.warn('refused a path supplied by the server', {
+      context,
+      path,
+      reason: rejection,
+      configDir: this.configDir,
+    });
+    return false;
+  }
+
+  /** Local counterpart: throw-away artifacts and never-synced folders. */
+  private isIgnoredLocalPath(path: string): boolean {
+    return isAlwaysIgnored(path, this.configDir);
+  }
+
+  /** Content hash of a vault file, or `null` when it can't be read. */
+  private async hashFile(path: string): Promise<string | null> {
+    try {
+      if (!(await this.vault.exists(path))) return null;
+      return await sha256Hex(await this.vault.readBinary(path));
+    } catch {
+      return null;
+    }
+  }
+
   // -- Server → Local -------------------------------------------------------
 
   private async handleServerFileEvent(event: SocketFileEvent): Promise<void> {
@@ -1180,7 +1287,7 @@ export class SyncEngine {
   }): Promise<void> {
     // Mirror of the refreshFileIndex filter for live events: never
     // materialise a throw-away artifact another client uploaded.
-    if (isAlwaysIgnored(payload.path)) return;
+    if (!this.allowServerPath(payload.path, 'create')) return;
     // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
     // (the stale-CREATE guard requires it). Reuse that entry — resetting
     // its contentHash/size to zero would break every downstream three-way
@@ -1227,6 +1334,10 @@ export class SyncEngine {
   private async applyServerUpdateBinary(fileId: string): Promise<void> {
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
+    // Before the download: a refused path shouldn't cost a multi-megabyte
+    // transfer. An entry can predate the gate — it comes back from
+    // `state.json` written by an older build.
+    if (!this.allowServerPath(meta.relativePath, 'update')) return;
     const newBuf = await this.api.downloadFile(this.binding.projectId, fileId);
     const newHash = await sha256Hex(newBuf);
 
@@ -1328,6 +1439,9 @@ export class SyncEngine {
   private async applyServerDelete(fileId: string): Promise<void> {
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
+    // Deleting is a write too: a stale index entry naming the config folder
+    // must not let the server erase files there.
+    if (!this.allowServerPath(meta.relativePath, 'delete')) return;
 
     // Delete-vs-update guard: if the local file still exists and has
     // uncommitted edits, ask the user before clobbering them.
@@ -1386,34 +1500,115 @@ export class SyncEngine {
   }
 
   private async applyServerRename(fileId: string, newPath: string): Promise<void> {
+    // Hard checks first — they hold wherever the file ends up. The binding is
+    // NOT one of them: a rename is the server telling us a file we already
+    // sync has moved, and refusing it would leave our copy behind for
+    // `initialPush` to upload again as a brand-new file (a duplicate for the
+    // whole team).
+    if (!this.allowServerPath(newPath, 'rename', { requireBinding: false })) return;
     const meta = this.fileIndex.byId.get(fileId);
-    if (!meta) return;
+    if (!meta) {
+      await this.adoptRenamedFile(fileId, newPath);
+      return;
+    }
     const oldPath = meta.relativePath;
     if (oldPath === newPath) return;
-    // Rename fires Obsidian onRename + chokidar `unlink` (old) + `add`
-    // (new). Each path needs its own echo budget — see the keep-both
-    // branch above for the same reasoning.
-    this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
-    this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
+    // The source is metadata rather than a fresh server string, but metadata
+    // can come from `state.json` written by a build without the gate.
+    if (!this.allowServerPath(oldPath, 'rename source', { requireBinding: false })) return;
+
     if (await this.vault.exists(oldPath)) {
       if (await this.vault.exists(newPath)) {
         // Destination already materialised locally — e.g. an initial-push
         // pass created it, or this rename was partially applied before.
         // `adapter.rename` throws "Destination file already exists" here,
-        // which would otherwise crash the engine to `error` status. The
-        // server is authoritative and `newPath` is the canonical name, so
-        // drop the stale source instead of colliding into it.
-        await this.vault.delete(oldPath);
+        // which would otherwise crash the engine to `error` status.
+        //
+        // Dropping the source used to be the answer, but that is a silent
+        // local data loss driven by a remote event: whoever controls the
+        // server picks the file to destroy (TASK-0027). Identical content is
+        // the benign case and stays a delete; differing content parks the
+        // local destination aside, the way `keep-both` does for binary
+        // conflicts, so nothing disappears.
+        const sourceHash = await this.hashFile(oldPath);
+        const destHash = sourceHash === null ? null : await this.hashFile(newPath);
+        if (sourceHash === null || destHash === null) {
+          // Couldn't read one of them (locked file, antivirus, dropped network
+          // drive). Guessing here either deletes a file we never read or parks
+          // a file that is in fact identical — leave both alone, and leave the
+          // index untouched so the next reconnect retries from the listing.
+          this.log.warn('server rename: could not compare the local files', { oldPath, newPath });
+          return;
+        }
+        // Echo budgets are claimed only once the disk is actually about to
+        // change: every early return above would otherwise leave a live budget
+        // behind that swallows a genuine external edit.
+        this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
+        this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
+        if (sourceHash === destHash) {
+          await this.vault.delete(oldPath);
+        } else {
+          const aside = buildConflictPath(newPath, this.now());
+          this.log.warn('server rename collided with a different local file', {
+            oldPath,
+            newPath,
+            aside,
+          });
+          // `newPath` takes part in TWO renames here (as the source of the
+          // park-aside and as the destination of the real rename), so it needs
+          // a second echo budget — `mark` adds to what is left. Without it the
+          // leftover `unlink` reaches `handleLocalDelete` for a path that has
+          // just become a live file: the 2026-08-06 incident.
+          this.recentlyApplied.mark(aside, ECHO_COUNT_RENAME);
+          this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
+          await this.vault.ensureParentFolder(aside);
+          await this.vault.rename(newPath, aside);
+          await this.vault.ensureParentFolder(newPath);
+          await this.vault.rename(oldPath, newPath);
+        }
       } else {
+        this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
+        this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
         await this.vault.ensureParentFolder(newPath);
         await this.vault.rename(oldPath, newPath);
       }
     }
+
     this.operationLog.deleteFileMeta(this.binding.id, oldPath);
+    this.fileIndex.byPath.delete(oldPath);
+    if (!isInBinding(newPath, this.binding.localFolder)) {
+      // The file left our folder. It stays on disk where the server says it
+      // is, but it is no longer ours to track: keeping it in `fileIndex` would
+      // mirror a foreign path into `state.json`, and forgetting it entirely
+      // would make a later move back in look like an unknown file.
+      this.fileIndex.byId.delete(fileId);
+      this.outOfScope.set(fileId, { path: newPath, fileType: meta.fileType });
+      await this.docManager.release(this.binding.id, oldPath);
+      this.forgetFoldState(fileId);
+      this.log.info('file moved out of the binding folder', { oldPath, newPath });
+      return;
+    }
     meta.relativePath = newPath;
     this.operationLog.setFileMeta(meta);
-    this.fileIndex.byPath.delete(oldPath);
     this.fileIndex.byPath.set(newPath, meta);
+  }
+
+  /**
+   * A rename for a file we don't track: it lives outside the binding folder
+   * (see `outOfScope`). Moving into our folder makes it ours — materialise it
+   * exactly like a fresh CREATE; moving elsewhere just updates the shadow
+   * entry. Anything else is not our file and is ignored.
+   */
+  private async adoptRenamedFile(fileId: string, newPath: string): Promise<void> {
+    const known = this.outOfScope.get(fileId);
+    if (!known) return;
+    if (!isInBinding(newPath, this.binding.localFolder)) {
+      this.outOfScope.set(fileId, { ...known, path: newPath });
+      return;
+    }
+    this.outOfScope.delete(fileId);
+    this.log.info('file moved into the binding folder', { fileId, newPath });
+    await this.applyServerCreate({ id: fileId, path: newPath, fileType: known.fileType });
   }
 
   // -- Yjs disk snapshotting ------------------------------------------------
@@ -1701,6 +1896,10 @@ export class SyncEngine {
 
   private async writeDocSnapshot(path: string): Promise<void> {
     if (!this.docManager.has(this.binding.id, path)) return;
+    // Last line of defence for text content: catch-up, live `yjs:update` and
+    // hydration all end up here. Before `ensureHydrated`, so a refused path
+    // doesn't even trigger a `yjs:fetch`.
+    if (!this.allowServerPath(path, 'snapshot')) return;
     // Never snapshot a doc whose offline store is still loading — its text
     // is a partial view and the write would destroy the full copy on disk.
     await this.docManager.whenSynced(this.binding.id, path);
@@ -1785,7 +1984,24 @@ export class SyncEngine {
    */
   private async flushPendingOperations(): Promise<void> {
     const emit: PendingEmitter = (op) => this.replayPending(op);
-    await flushPendingQueue(this.binding.id, this.operationLog, emit);
+    const result = await flushPendingQueue(this.binding.id, this.operationLog, emit);
+    // A halted drain used to be invisible: the queue simply stopped moving and
+    // nothing said so. Surface it — one stuck operation holds back every edit
+    // queued behind it.
+    if (result.dropped) {
+      this.log.warn('dropped a rejected queued operation', {
+        opType: result.dropped.opType,
+        path: result.dropped.filePath,
+        remaining: result.remaining,
+      });
+    }
+    if (result.haltedOn) {
+      this.log.warn('offline queue drain halted', {
+        opType: result.haltedOn.opType,
+        path: result.haltedOn.filePath,
+        remaining: result.remaining,
+      });
+    }
   }
 
   private async replayPending(op: {
@@ -1794,6 +2010,31 @@ export class SyncEngine {
     newPath: string | null;
     payload: Record<string, unknown>;
   }): Promise<ReplayOutcome> {
+    // A queued op outlives the build that queued it: `state.json` survives the
+    // upgrade. Anything the gate refuses today is handled here rather than
+    // retried forever — that is how a `data.json` enqueued by an older build
+    // would otherwise still reach the server (TASK-0027).
+    if (this.isIgnoredLocalPath(op.filePath)) {
+      this.log.warn('dropped a queued operation for an ignored path', {
+        opType: op.opType,
+        path: op.filePath,
+        configDir: this.configDir,
+      });
+      return { ok: false, retryable: false, error: 'ignored_path' };
+    }
+    if (op.newPath !== null && this.isIgnoredLocalPath(op.newPath)) {
+      // A queued rename INTO an ignored folder is what "move to Obsidian
+      // trash" looked like to a build without the gate. Dropping it would
+      // resurrect the note: the server still holds it, and the next catch-up
+      // writes it back to disk. Send the delete the user actually meant.
+      this.log.warn('queued rename into an ignored folder — sending a delete instead', {
+        opType: op.opType,
+        path: op.filePath,
+        newPath: op.newPath,
+      });
+      await this.handleLocalDelete(op.filePath);
+      return { ok: true };
+    }
     try {
       switch (op.opType) {
         case 'CREATE': {
@@ -2049,6 +2290,16 @@ function mergeClocks(a: VectorClock, b: VectorClock): VectorClock {
 function ackToOutcome(ack: { ok: true } | { ok: false; error: string }): ReplayOutcome {
   if (ack.ok) return { ok: true };
   const error = ack.error;
-  const retryable = !error.endsWith('_not_found') && error !== 'forbidden';
+  // Domain refusals the server states with a machine code: a retry cannot
+  // change the answer. `invalid_path` is the path itself being refused
+  // (reserved folder, traversal, absolute), `path_is_directory` is a folder
+  // sitting where the file should go. Treating either as retryable halted the
+  // whole offline queue on every reconnect, silently.
+  const permanent =
+    error.endsWith('_not_found') ||
+    error === 'forbidden' ||
+    error === 'invalid_path' ||
+    error === 'path_is_directory';
+  const retryable = !permanent;
   return { ok: false, retryable, error };
 }

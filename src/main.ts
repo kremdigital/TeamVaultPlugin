@@ -136,7 +136,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     const storage = new ObsidianLogStorage(this.app.vault);
     this.fileLogSink = new FileLogSink({
       storage,
-      filePath: `.obsidian/plugins/${this.manifest.id}/sync.log`,
+      filePath: `${this.app.vault.configDir}/plugins/${this.manifest.id}/sync.log`,
     });
     const sinks =
       this.settings.logLevel === 'debug'
@@ -154,7 +154,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     // `sync/operation-log.ts`.
     this.operationLog = new OperationLog({
       storage: new ObsidianLogStorage(this.app.vault),
-      filePath: `.obsidian/plugins/${this.manifest.id}/state.json`,
+      filePath: `${this.app.vault.configDir}/plugins/${this.manifest.id}/state.json`,
       onError: (err) => this.logger?.warn('operation log persistence failed', { err }),
     });
     await this.operationLog.load();
@@ -191,7 +191,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     }
     if (duplicates.length === 0) return false;
 
-    const loaded = this.manifest.dir ?? `.obsidian/plugins/${this.manifest.id}`;
+    const loaded = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
     this.logger?.error('duplicate plugin folders share this plugin id', {
       pluginId: this.manifest.id,
       loaded,
@@ -285,6 +285,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       recentlyApplied: this.recentlyApplied,
       clientId: this.settings.clientId,
       conflictResolver,
+      configDir: this.app.vault.configDir,
       logger: this.logger ?? undefined,
       onBindingSynced: (bindingId, at) => {
         const binding = this.settings.bindings.find((b) => b.id === bindingId);
@@ -302,6 +303,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       bindings: () => this.settings.bindings,
       recentlyApplied: this.recentlyApplied,
       modifyDebounceMs: this.settings.debounceMs,
+      configDir: this.app.vault.configDir,
     });
     const watchableVault = new ObsidianWatchableVault(this.app.vault);
     this.obsidianWatcher.start(watchableVault);
@@ -312,6 +314,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       vaultBasePath: basePath,
       bindings: () => this.settings.bindings,
       recentlyApplied: this.recentlyApplied,
+      configDir: this.app.vault.configDir,
     });
     this.fsWatcher.start();
 
