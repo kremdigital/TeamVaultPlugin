@@ -3,17 +3,19 @@ import { t } from '@/i18n';
 import { ApiClient, ApiError, type ApiProject } from '@/client/api';
 import { uuid } from '@/utils/id';
 import type { ServerConfig, VaultBinding } from '../settings';
-import { FolderSuggestModal } from './folder-suggest-modal';
-import { isFolderInUse, normalizeFolderPath } from '../folder-utils';
+import { canAddBinding, VAULT_ROOT } from '../folder-utils';
 
 /**
- * Modal for binding a vault folder to a server-side project.
+ * Modal for binding the vault to a server-side project.
  *
  * Flow:
  *   1. Pick a server (dropdown).
  *   2. After server pick — fetch projects, render as a dropdown.
- *   3. Pick a project + a local folder (via FolderSuggestModal).
- *   4. Validate folder is not already bound, then save.
+ *   3. Pick a project, then save.
+ *
+ * There is no folder to pick: the binding is the whole vault (`VAULT_ROOT`).
+ * Picking a folder used to be a required extra step — the modal refused to
+ * save without it — while the folder the user means is the vault root.
  */
 export class AddBindingModal extends Modal {
   private serverId = '';
@@ -21,7 +23,6 @@ export class AddBindingModal extends Modal {
   private projectId = '';
   private projectsLoading = false;
   private projectsError: string | null = null;
-  private localFolder = '';
 
   constructor(
     app: App,
@@ -87,17 +88,10 @@ export class AddBindingModal extends Modal {
       });
     }
 
-    new Setting(contentEl)
-      .setName(t('modal.addBinding.localFolder.label'))
-      .setDesc(this.localFolder || t('modal.addBinding.localFolder.root'))
-      .addButton((btn) =>
-        btn.setButtonText(t('modal.addBinding.chooseFolder')).onClick(() => {
-          new FolderSuggestModal(this.app, (path) => {
-            this.localFolder = path;
-            this.render();
-          }).open();
-        }),
-      );
+    // The folder picker used to be the only hint of what gets synced. Without
+    // it, say so plainly: binding uploads everything in the vault to the
+    // project, and its members will see it.
+    new Setting(contentEl).setDesc(t('modal.addBinding.scope'));
 
     new Setting(contentEl)
       .addButton((btn) =>
@@ -107,10 +101,10 @@ export class AddBindingModal extends Modal {
           .onClick(async () => {
             if (!this.serverId) return new Notice(t('modal.addBinding.errors.serverRequired'));
             if (!this.projectId) return new Notice(t('modal.addBinding.errors.projectRequired'));
-            if (!this.localFolder) return new Notice(t('modal.addBinding.errors.folderRequired'));
-            const folder = normalizeFolderPath(this.localFolder);
-            if (isFolderInUse(this.existingBindings, folder)) {
-              return new Notice(t('modal.addBinding.errors.folderInUse'));
+            // The settings tab disables "Add" once a binding exists; this is
+            // the backstop for a modal opened before that.
+            if (!canAddBinding(this.existingBindings)) {
+              return new Notice(t('modal.addBinding.errors.alreadyBound'));
             }
             const project = this.projects.find((p) => p.id === this.projectId);
             const binding: VaultBinding = {
@@ -118,7 +112,7 @@ export class AddBindingModal extends Modal {
               serverId: this.serverId,
               projectId: this.projectId,
               projectName: project?.name ?? this.projectId,
-              localFolder: folder,
+              localFolder: VAULT_ROOT,
               enabled: true,
               lastSyncedAt: 0,
               lastVectorClock: {},

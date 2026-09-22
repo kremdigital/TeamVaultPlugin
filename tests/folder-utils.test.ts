@@ -1,4 +1,4 @@
-import { isFolderInUse, normalizeFolderPath } from '@/settings/folder-utils';
+import { canAddBinding, isFolderInUse, normalizeFolderPath } from '@/settings/folder-utils';
 import type { VaultBinding } from '@/settings/settings';
 
 function makeBinding(localFolder: string): VaultBinding {
@@ -53,5 +53,31 @@ describe('isFolderInUse', () => {
   it('does not collide for sibling folders', () => {
     expect(isFolderInUse([makeBinding('notes')], 'work')).toBe(false);
     expect(isFolderInUse([makeBinding('notes/a')], 'notes/b')).toBe(false);
+  });
+});
+
+/**
+ * One binding per vault (2026-09-22). The binding modal no longer offers a
+ * folder: every new binding is the vault root, and the root overlaps any other
+ * folder — so once a vault is bound, "Add" is disabled until the binding is
+ * removed. A legacy binding to a subfolder counts too: a root binding would
+ * swallow it.
+ */
+describe('canAddBinding', () => {
+  it('allows the first binding', () => {
+    expect(canAddBinding([])).toBe(true);
+  });
+
+  it('refuses a second binding once the vault is bound', () => {
+    expect(canAddBinding([makeBinding('/')])).toBe(false);
+    expect(canAddBinding([makeBinding('')])).toBe(false);
+  });
+
+  it('refuses while a legacy subfolder binding exists', () => {
+    expect(canAddBinding([makeBinding('notes')])).toBe(false);
+  });
+
+  it('counts a disabled binding as well', () => {
+    expect(canAddBinding([{ ...makeBinding('/'), enabled: false }])).toBe(false);
   });
 });

@@ -34,3 +34,20 @@ export function isFolderInUse(bindings: VaultBinding[], candidate: string): bool
   }
   return false;
 }
+
+/**
+ * The vault root. A new binding always syncs the whole vault: Obsidian opens a
+ * vault as its root folder, so that is the folder the user means. Bindings
+ * made by older versions to a subfolder keep working — `localFolder` is still
+ * honoured everywhere downstream.
+ */
+export const VAULT_ROOT = '/';
+
+/**
+ * True when a new (root) binding can be added. The root overlaps every other
+ * folder, so a vault holds one binding at most — including a legacy binding
+ * to a subfolder, which a root binding would swallow.
+ */
+export function canAddBinding(bindings: VaultBinding[]): boolean {
+  return !isFolderInUse(bindings, VAULT_ROOT);
+}

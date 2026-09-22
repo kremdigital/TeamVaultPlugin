@@ -48,15 +48,16 @@ server — here is exactly what that means:
 
 - **The only remote host contacted is the server URL you enter yourself.**
   There is no vendor backend, no default endpoint, no fallback host. Nothing
-  leaves your machine until you add a server and bind a folder.
+  leaves your machine until you add a server and bind the vault.
 - **An account on that server is required**, in the form of an API key you
   generate in its web UI. The key is stored in plain text in the plugin's
   `data.json`, inside your vault's config folder — keep that folder out of
   git and out of other sync tools. Team Vault never syncs the config folder
   itself, whatever the server asks for.
-- **Synced content is the content of the bound folder** — note text, binary
+- **Synced content is the content of the bound vault** — note text, binary
   attachments, paths, and their edit history — sent to your server so other
-  devices and teammates can receive it.
+  devices and teammates can receive it. The config folder, `.trash` and
+  `.git` are never synced.
 - **No telemetry, no analytics, no crash reporting.** The plugin sends
   nothing anywhere else, and collects nothing about you.
 - **Logs stay local**, in `.obsidian/plugins/team-vault/sync.log`.
@@ -98,14 +99,20 @@ In Obsidian → **Settings → Team Vault → Servers**:
    `GET /api/auth/me` and prints the matching email on success.
 4. Click **Save**.
 
-### 3. Bind a vault folder to a project
+### 3. Bind the vault to a project
 
 1. Make sure the project exists on the server (create it via the web UI;
    the plugin doesn't create projects).
 2. In **Team Vault → Vaults**, click **Add binding**.
-3. Pick the server, the project, and the local folder. **`/` (root) means
-   the entire vault.**
+3. Pick the server and the project. The whole vault is synced — the folder
+   Obsidian opens is the one you mean, so there is nothing else to choose.
 4. Click **Bind**.
+
+A vault holds one binding. To sync it with a different project, remove the
+current binding first. Bindings made by older versions to a subfolder keep
+working as they are — but once removed, a subfolder can't be bound again:
+the new binding covers the whole vault and uploads everything in it to the
+project.
 
 The plugin connects to the server, pulls the file list, and starts
 synchronizing. The status bar shows the aggregate state.
@@ -170,14 +177,16 @@ headers cleanly, the socket can't establish. Check Caddy / nginx logs.
 **Files don't sync** — open the log via Settings → Behavior → "Open log".
 Look for `[error]` lines. Common causes:
 
-- The binding's local folder doesn't exist in the vault.
-- The folder is the same as another binding's (the plugin disallows
-  overlapping bindings; the modal warns at bind time).
+- The binding is switched off (toggle in **Team Vault → Vaults**).
+- A binding made by an older version points to a subfolder that no longer
+  exists — remove it and bind the vault again. Note that the new binding
+  covers the whole vault, so every note in it goes to the project.
 
 **External agent edits don't propagate** — the FS watcher uses chokidar
-on the vault root and respects the same `.obsidian` / `.git` /
-`.versions` ignore list. Files outside any binding's local folder are
-correctly ignored.
+on the vault root and respects the same ignore list: the config folder,
+`.trash`, `.git`, and the server's own `.versions` / `.staging`. For a
+binding made to a subfolder by an older version, files outside that folder
+are correctly ignored.
 
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the

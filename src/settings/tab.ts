@@ -6,11 +6,13 @@ import type { LogLevel, ServerConfig, VaultBinding } from './settings';
 import { AddServerModal } from './modals/server-modal';
 import { AddBindingModal } from './modals/binding-modal';
 import { LogViewerModal } from '@/ui/modals/log-viewer-modal';
+import { canAddBinding, normalizeFolderPath } from './folder-utils';
 
 /**
  * Top-level settings UI. Three sections, in order:
  *   1. Servers       — per-server entry with "test" and "remove" buttons.
- *   2. Bindings      — vault folder ↔ project links.
+ *   2. Bindings      — vault ↔ project link (one per vault; bindings made by
+ *                      older versions may point to a subfolder).
  *   3. Behavior      — global toggles (debounce, startup sync, …).
  *
  * The tab itself owns no state; it always re-reads from `plugin.settings`
@@ -119,11 +121,15 @@ export class SyncSettingsTab extends PluginSettingTab {
       }
     }
 
-    new Setting(parent).addButton((btn) =>
+    // A binding covers the whole vault, so it overlaps any other: one per vault.
+    const alreadyBound = !canAddBinding(this.plugin.settings.bindings);
+    const addSetting = new Setting(parent);
+    if (alreadyBound) addSetting.setDesc(t('settings.bindings.onlyOne'));
+    addSetting.addButton((btn) =>
       btn
         .setButtonText(t('settings.bindings.add'))
         .setCta()
-        .setDisabled(this.plugin.settings.servers.length === 0)
+        .setDisabled(this.plugin.settings.servers.length === 0 || alreadyBound)
         .onClick(() => {
           new AddBindingModal(
             this.app,
@@ -141,9 +147,11 @@ export class SyncSettingsTab extends PluginSettingTab {
 
   private renderBindingRow(parent: HTMLElement, binding: VaultBinding): void {
     const server = this.plugin.settings.servers.find((s) => s.id === binding.serverId);
-    const desc = server
-      ? `${server.name} · ${binding.localFolder || '/'}`
-      : `${t('settings.bindings.serverMissing')} · ${binding.localFolder || '/'}`;
+    const serverName = server ? server.name : t('settings.bindings.serverMissing');
+    // New bindings are always the vault root, which needs no caption; a folder
+    // is shown only for a binding made earlier to a subfolder.
+    const folder = normalizeFolderPath(binding.localFolder);
+    const desc = folder === '/' ? serverName : `${serverName} · ${folder}`;
 
     new Setting(parent)
       .setName(binding.projectName || binding.projectId)
