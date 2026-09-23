@@ -90,11 +90,11 @@ export class HistoryView extends ItemView {
     for (const v of versions) {
       const item = list.createEl('li', { cls: 'team-vault-history-item' });
 
-      const head = item.createEl('div', { cls: 'team-vault-history-item__head' });
+      const head = item.createDiv({ cls: 'team-vault-history-item__head' });
       head.createEl('strong', { text: `v${v.versionNumber}` });
-      head.createEl('span', { text: new Date(v.createdAt).toLocaleString() });
+      head.createSpan({ text: new Date(v.createdAt).toLocaleString() });
 
-      item.createEl('div', {
+      item.createDiv({
         cls: 'team-vault-history-item__author',
         text: v.author
           ? t('history.byUser', { name: v.author.name ?? '—', email: v.author.email })
@@ -102,7 +102,7 @@ export class HistoryView extends ItemView {
       });
 
       if (v.message) {
-        item.createEl('div', { cls: 'team-vault-history-item__message', text: v.message });
+        item.createDiv({ cls: 'team-vault-history-item__message', text: v.message });
       }
     }
   }

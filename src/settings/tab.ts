@@ -2,10 +2,16 @@ import { type App, Notice, PluginSettingTab, Setting } from 'obsidian';
 import type ObsidianSyncPlugin from '@/main';
 import { t } from '@/i18n';
 import { ApiClient, ApiError } from '@/client/api';
-import type { LogLevel, ServerConfig, VaultBinding } from './settings';
+import {
+  parseLanguageSetting,
+  type LogLevel,
+  type ServerConfig,
+  type VaultBinding,
+} from './settings';
 import { AddServerModal } from './modals/server-modal';
 import { AddBindingModal } from './modals/binding-modal';
 import { LogViewerModal } from '@/ui/modals/log-viewer-modal';
+import { confirmAction } from '@/ui/modals/confirm-modal';
 import { canAddBinding, normalizeFolderPath } from './folder-utils';
 
 /**
@@ -13,11 +19,17 @@ import { canAddBinding, normalizeFolderPath } from './folder-utils';
  *   1. Servers       — per-server entry with "test" and "remove" buttons.
  *   2. Bindings      — vault ↔ project link (one per vault; bindings made by
  *                      older versions may point to a subfolder).
- *   3. Behavior      — global toggles (debounce, startup sync, …).
+ *   3. Behavior      — global options (language, debounce, notices, log).
  *
  * The tab itself owns no state; it always re-reads from `plugin.settings`
  * and re-renders on every `display()` call. Modals trigger a re-render
  * via the `onChanged` callback they receive.
+ *
+ * No `getSettingDefinitions()` (the declarative settings API, Obsidian 1.13)
+ * — the directory's linter warns about it (prefer-setting-definitions). The
+ * API is opt-in and needs 1.13, far above our minAppVersion; below it the
+ * migration guide says to leave `display()` as it is. The cost: these
+ * settings don't show up in 1.13's settings search.
  */
 export class SyncSettingsTab extends PluginSettingTab {
   constructor(
@@ -89,9 +101,11 @@ export class SyncSettingsTab extends PluginSettingTab {
           .setButtonText(t('settings.servers.remove'))
           .setWarning()
           .onClick(async () => {
-            const confirmed = window.confirm(
-              t('settings.servers.removeConfirm', { name: server.name }),
-            );
+            const confirmed = await confirmAction(this.app, {
+              title: t('settings.servers.removeTitle'),
+              message: t('settings.servers.removeConfirm', { name: server.name }),
+              confirmText: t('modal.confirm.remove'),
+            });
             if (!confirmed) return;
             this.plugin.settings.servers = this.plugin.settings.servers.filter(
               (s) => s.id !== server.id,
@@ -167,9 +181,11 @@ export class SyncSettingsTab extends PluginSettingTab {
           .setButtonText(t('settings.bindings.remove'))
           .setWarning()
           .onClick(async () => {
-            const confirmed = window.confirm(
-              t('settings.bindings.removeConfirm', { project: binding.projectName }),
-            );
+            const confirmed = await confirmAction(this.app, {
+              title: t('settings.bindings.removeTitle'),
+              message: t('settings.bindings.removeConfirm', { project: binding.projectName }),
+              confirmText: t('modal.confirm.remove'),
+            });
             if (!confirmed) return;
             this.plugin.settings.bindings = this.plugin.settings.bindings.filter(
               (b) => b.id !== binding.id,
@@ -186,6 +202,24 @@ export class SyncSettingsTab extends PluginSettingTab {
     new Setting(parent).setName(t('settings.behavior.heading')).setHeading();
 
     new Setting(parent)
+      .setName(t('settings.behavior.language.name'))
+      .setDesc(t('settings.behavior.language.desc'))
+      .addDropdown((dd) =>
+        dd
+          .addOption('auto', t('settings.behavior.language.auto'))
+          .addOption('ru', t('settings.behavior.language.ru'))
+          .addOption('en', t('settings.behavior.language.en'))
+          .setValue(this.plugin.settings.language)
+          .onChange(async (value) => {
+            this.plugin.settings.language = parseLanguageSetting(value);
+            // saveSettings switches the catalog; redraw so this tab is in
+            // the new language at once.
+            await this.plugin.saveSettings();
+            this.display();
+          }),
+      );
+
+    new Setting(parent)
       .setName(t('settings.behavior.debounce.name'))
       .setDesc(t('settings.behavior.debounce.desc'))
       .addText((text) =>
@@ -195,16 +229,6 @@ export class SyncSettingsTab extends PluginSettingTab {
             this.plugin.settings.debounceMs = Math.floor(n);
             await this.plugin.saveSettings();
           }
-        }),
-      );
-
-    new Setting(parent)
-      .setName(t('settings.behavior.syncOnStartup.name'))
-      .setDesc(t('settings.behavior.syncOnStartup.desc'))
-      .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.syncOnStartup).onChange(async (value) => {
-          this.plugin.settings.syncOnStartup = value;
-          await this.plugin.saveSettings();
         }),
       );
 

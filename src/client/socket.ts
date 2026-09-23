@@ -190,8 +190,7 @@ export interface SocketFactoryOptions {
 
 export type SocketFactory = (url: string, options: SocketFactoryOptions) => SocketLike;
 
-const defaultFactory: SocketFactory = (url, options) =>
-  ioFactory(url, options) as unknown as SocketLike;
+const defaultFactory: SocketFactory = (url, options) => ioFactory(url, options);
 
 // -- Reconnect knobs ----------------------------------------------------------
 
@@ -286,7 +285,10 @@ export class SocketClient {
       for (const cb of this.disconnectCbs) cb(r);
     });
     socket.on('connect_error', (err: unknown) => {
-      const e = err instanceof Error ? err : new Error(String(err ?? 'connect_error'));
+      // socket.io hands over an Error; anything else keeps a readable message
+      // instead of the "[object Object]" String() used to produce.
+      const e =
+        err instanceof Error ? err : new Error(typeof err === 'string' ? err : 'connect_error');
       for (const cb of this.errorCbs) cb(e);
     });
 
@@ -465,9 +467,9 @@ export class SocketClient {
         resolve({ ok: false, error: 'socket_not_connected' });
         return;
       }
-      const timer = setTimeout(() => resolve({ ok: false, error: 'timeout' }), timeoutMs);
+      const timer = window.setTimeout(() => resolve({ ok: false, error: 'timeout' }), timeoutMs);
       this.socket.emit('yjs:fetch', { projectId, fileId }, (ack: YjsFetchResult) => {
-        clearTimeout(timer);
+        window.clearTimeout(timer);
         resolve(ack);
       });
     });

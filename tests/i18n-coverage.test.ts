@@ -2,8 +2,8 @@
  * Catalog coverage check.
  *
  * Walks every `.ts` file under `src/` and extracts every `t('...')`
- * literal call. Asserts each extracted key exists in `ru.json` (the
- * source-of-truth catalog).
+ * literal call. Asserts each extracted key exists in both catalogs — `ru.json`
+ * and `en.json`, the fallback — and that the two carry the same keys.
  *
  * Limitations: only matches static string literals — `t(\`prefix.${var}\`)`
  * isn't checked. We don't use dynamic keys anywhere yet; if a future
@@ -12,6 +12,7 @@
 
 import { readFileSync, readdirSync, statSync } from 'node:fs';
 import { join } from 'node:path';
+import en from '@/i18n/en.json';
 import ru from '@/i18n/ru.json';
 
 const SRC = join(__dirname, '..', 'src');
@@ -48,13 +49,25 @@ function collectUsedKeys(): Set<string> {
   return keys;
 }
 
+function missingKeys(dict: Record<string, string>, keys: Iterable<string>): string[] {
+  const missing: string[] = [];
+  for (const key of keys) {
+    if (!Object.prototype.hasOwnProperty.call(dict, key)) missing.push(key);
+  }
+  return missing;
+}
+
 describe('i18n catalog coverage', () => {
   it('every t() key used in src has a translation in ru.json', () => {
-    const dict = ru as Record<string, string>;
-    const missing: string[] = [];
-    for (const key of collectUsedKeys()) {
-      if (!Object.prototype.hasOwnProperty.call(dict, key)) missing.push(key);
-    }
-    expect(missing).toEqual([]);
+    expect(missingKeys(ru, collectUsedKeys())).toEqual([]);
+  });
+
+  it('every t() key used in src has a translation in en.json', () => {
+    expect(missingKeys(en, collectUsedKeys())).toEqual([]);
+  });
+
+  it('ru.json and en.json carry the same keys', () => {
+    expect(missingKeys(en, Object.keys(ru))).toEqual([]);
+    expect(missingKeys(ru, Object.keys(en))).toEqual([]);
   });
 });

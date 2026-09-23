@@ -1,7 +1,7 @@
 /**
- * SHA-256 hex digest used as the canonical content hash for files. Both
- * Electron and Node 20+ expose `crypto.subtle` on `globalThis`, so no
- * polyfill is needed.
+ * SHA-256 hex digest used as the canonical content hash for files. Electron
+ * exposes `crypto.subtle` on `window`; under Node (Jest, the CLI emulator)
+ * `window` is aliased to `globalThis`, which has had `crypto` since Node 19.
  */
 
 export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promise<string> {
@@ -12,7 +12,7 @@ export async function sha256Hex(data: ArrayBuffer | Uint8Array | string): Promis
     view = data;
   }
   // crypto.subtle.digest accepts BufferSource; both Uint8Array and ArrayBuffer work.
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', view as BufferSource);
+  const digest = await window.crypto.subtle.digest('SHA-256', view as BufferSource);
   return toHex(new Uint8Array(digest));
 }
 

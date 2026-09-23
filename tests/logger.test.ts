@@ -1,6 +1,7 @@
 import { Logger, formatLogEntry, type LogEntry, type LogSink } from '@/utils/logger';
 import { ConsoleLogSink } from '@/utils/console-log-sink';
 import { CompositeLogSink } from '@/utils/composite-log-sink';
+import { GatedLogSink } from '@/utils/gated-log-sink';
 
 class RecordingSink implements LogSink {
   entries: LogEntry[] = [];
@@ -63,17 +64,23 @@ describe('Logger — child', () => {
     expect(sink.entries[0]?.context).toEqual({ run: 2 });
   });
 
-  it('shares the level (initial value) but is independent of later setLevel', () => {
-    // Stage 12 design: child snapshots level at construction time. A
-    // future change might switch to live propagation; this test pins the
-    // current behavior.
+  it('follows a later setLevel on the parent', () => {
+    // The engines log through children of the plugin's root logger, made
+    // when they start. Changing the Log level setting calls setLevel on the
+    // root only — it has to reach them without a plugin reload.
     const sink = new RecordingSink();
     const parent = new Logger('error', sink, {}, { now: fixedNow });
-    const child = parent.child({});
+    const child = parent.child({ component: 'engine' });
+    const grandchild = child.child({ bindingId: 'b1' });
     parent.setLevel('debug');
     parent.debug('p');
-    child.debug('c'); // dropped — child still at 'error'
-    expect(sink.entries.map((e) => e.message)).toEqual(['p']);
+    child.debug('c');
+    grandchild.debug('g');
+    parent.setLevel('warn');
+    child.info('dropped');
+    grandchild.warn('w');
+    expect(sink.entries.map((e) => e.message)).toEqual(['p', 'c', 'g', 'w']);
+    expect(child.getLevel()).toBe('warn');
   });
 });
 
@@ -120,6 +127,36 @@ describe('formatLogEntry', () => {
       args: [{ port: 3000 }],
     };
     expect(formatLogEntry(entry)).toBe('T [info] cfg {"port":3000}');
+  });
+
+  it('falls back to the type tag for values JSON cannot serialize', () => {
+    const cyclic: Record<string, unknown> = {};
+    cyclic['self'] = cyclic;
+    // No prototype, so no toString either: String() used to throw on it.
+    const bare = Object.create(null) as Record<string, unknown>;
+    bare['self'] = bare;
+    const entry: LogEntry = {
+      level: 'warn',
+      timestamp: 'T',
+      message: 'm',
+      context: { state: bare },
+      args: [cyclic, [1n]],
+    };
+    expect(formatLogEntry(entry)).toBe('T [warn] [state=[object Object]] m [object Object] 1');
+  });
+
+  it('does not throw on a circular array holding a null-prototype object', () => {
+    const bare = Object.create(null) as Record<string, unknown>;
+    const list: unknown[] = [bare];
+    list.push(list);
+    const entry: LogEntry = {
+      level: 'warn',
+      timestamp: 'T',
+      message: 'm',
+      context: {},
+      args: [list],
+    };
+    expect(formatLogEntry(entry)).toBe('T [warn] m [object Array]');
   });
 });
 
@@ -217,5 +254,36 @@ describe('CompositeLogSink', () => {
     // Allow the broken promise to settle without blowing up.
     await new Promise((r) => setTimeout(r, 0));
     expect(ok.entries).toHaveLength(1);
+  });
+});
+
+describe('GatedLogSink', () => {
+  const entry = (message: string): LogEntry => ({
+    level: 'debug',
+    timestamp: 'T',
+    message,
+    context: {},
+    args: [],
+  });
+
+  it('passes entries through only while the gate is open, checked per entry', () => {
+    // The DevTools mirror is gated on the Log level setting this way, so
+    // picking Debug starts it (and leaving Debug stops it) with no reload.
+    const inner = new RecordingSink();
+    let open = false;
+    const gated = new GatedLogSink(inner, () => open);
+    void gated.write(entry('closed'));
+    open = true;
+    void gated.write(entry('open'));
+    open = false;
+    void gated.write(entry('closed again'));
+    expect(inner.entries.map((e) => e.message)).toEqual(['open']);
+  });
+
+  it('hands back the inner sink’s promise so a composite can swallow its rejection', async () => {
+    const failure = Promise.reject(new Error('async fail'));
+    failure.catch(() => undefined);
+    const gated = new GatedLogSink({ write: () => failure }, () => true);
+    await expect(gated.write(entry('x'))).rejects.toThrow('async fail');
   });
 });

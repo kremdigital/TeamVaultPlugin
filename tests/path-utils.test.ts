@@ -102,7 +102,7 @@ describe('isOrphanedAtomicTmp', () => {
 });
 
 /**
- * The gate added after the 2026-09-19 pre-flight audit (TASK-0027). Three
+ * The gate added in 0.3.3 after the 2026-09-19 pre-flight audit. Three
  * holes: the config folder was hard-coded as `.obsidian` (a custom
  * `Vault.configDir` synced the whole folder, API key included), segment
  * matching was case-sensitive (`.OBSIDIAN/` walked straight through), and

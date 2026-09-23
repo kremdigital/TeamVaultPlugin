@@ -195,6 +195,59 @@ describe('EngineManager — roster lifecycle', () => {
     await m.refreshFromSettings();
     expect(FakeEngine.lastFor('b')).toBeUndefined();
   });
+
+  it('spawns nothing after stop(), whatever calls in later', async () => {
+    // Obsidian does not await onunload: a settings save or a resume can still
+    // arrive after the plugin stopped the manager, and nothing would ever
+    // stop the engines they spawned.
+    const bindings = [makeBinding({ id: 'a' })];
+    const m = new EngineManager(makeDeps([server], bindings));
+    await m.start();
+    await m.stop();
+    FakeEngine.instances.clear();
+
+    bindings.push(makeBinding({ id: 'b' }));
+    await m.refreshFromSettings();
+    await m.resume();
+    expect(FakeEngine.lastFor('a')).toBeUndefined();
+    expect(FakeEngine.lastFor('b')).toBeUndefined();
+
+    // A deliberate start() brings it back.
+    await m.start();
+    expect(FakeEngine.lastFor('b')?.startCalls).toBe(1);
+    await m.stop();
+  });
+
+  it('stops an engine that was still starting when stop() ran', async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class SlowEngine extends FakeEngine {
+      override async start(): Promise<void> {
+        this.startCalls++;
+        await gate;
+        this.setStatus('connecting');
+      }
+    }
+    const m = new EngineManager(
+      makeDeps([server], [makeBinding({ id: 'a' })], {
+        engineFactory: (deps) => new SlowEngine(deps.binding.id) as unknown as SyncEngine,
+      }),
+    );
+    const starting = m.start();
+    for (let i = 0; i < 20 && !FakeEngine.lastFor('a')?.startCalls; i++) {
+      await Promise.resolve();
+    }
+    const engine = FakeEngine.lastFor('a');
+    expect(engine?.startCalls).toBe(1);
+
+    await m.stop();
+    release();
+    await starting;
+    expect(engine?.status).toBe('stopped');
+    expect(engine?.stopCalls).toBe(2);
+  });
 });
 
 describe('EngineManager — aggregate status', () => {
@@ -441,7 +494,7 @@ describe('EngineManager — vault event fan-out', () => {
 });
 
 /**
- * Проводка папки конфигурации из Obsidian (TASK-0027). Все тесты гейта
+ * Проводка папки конфигурации из Obsidian (гейт путей, 0.3.3). Все тесты гейта
  * задают `configDir` прямо в `SyncEngineDeps`, поэтому без этой проверки
  * цепочка `main.ts (app.vault.configDir) → EngineManager → SyncEngine` могла
  * бы молча порваться при зелёных тестах.

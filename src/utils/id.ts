@@ -2,9 +2,10 @@
  * UUID v4 helper. Wraps the platform's `crypto.randomUUID` so call sites
  * stay short and tests can mock the indirection if they ever need to.
  *
- * Both Electron (Obsidian's runtime) and Node 19+ (Jest) ship `crypto.randomUUID`
- * on `globalThis`, so this needs no polyfill.
+ * Electron (Obsidian's runtime) ships `crypto.randomUUID` on `window`; under
+ * Node (Jest, the CLI emulator) `window` is aliased to `globalThis`, which has
+ * had it since Node 19. No polyfill needed.
  */
 export function uuid(): string {
-  return globalThis.crypto.randomUUID();
+  return window.crypto.randomUUID();
 }

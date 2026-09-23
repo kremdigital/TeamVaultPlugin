@@ -7,6 +7,7 @@ import {
   type IdbRegistry,
   type PersistenceFactory,
 } from '@/crdt/doc-manager';
+import { stubWindow } from './window-stub';
 
 class FakePersistence implements DocPersistence {
   static instances: FakePersistence[] = [];
@@ -82,6 +83,27 @@ describe('DocManager — whenSynced', () => {
     resolveLoad?.();
     await wait;
     expect(synced).toBe(true);
+  });
+
+  it('gives up on a wedged backend through window.setTimeout', async () => {
+    const win = stubWindow();
+    try {
+      const factory: PersistenceFactory = (name, doc) => {
+        const p = new FakePersistence(name, doc);
+        p.whenSynced = new Promise<void>(() => undefined); // never loads
+        return p;
+      };
+      const dm = new DocManager({ persistenceFactory: factory });
+      const wait = dm.whenSynced('b1', 'note.md');
+
+      const [giveUp, ms] = win.setTimeout.mock.calls[0] ?? [];
+      expect(ms).toBe(10_000);
+      giveUp?.();
+      await expect(wait).resolves.toBeUndefined();
+      expect(win.clearTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      win.restore();
+    }
   });
 });
 
@@ -228,14 +250,14 @@ describe('DocManager — remote update intake', () => {
 describe('DocManager — onLocalUpdate', () => {
   it('fires for direct Y.Text edits', () => {
     const dm = new DocManager();
-    const cb = jest.fn();
+    const cb = jest.fn<void, [Uint8Array]>();
     dm.onLocalUpdate('b1', 'note.md', cb);
     const { ytext } = dm.get('b1', 'note.md');
     ytext.insert(0, 'hi');
     expect(cb).toHaveBeenCalledTimes(1);
-    const arg = cb.mock.calls[0]?.[0] as Uint8Array;
+    const arg = cb.mock.calls[0]?.[0];
     expect(arg).toBeInstanceOf(Uint8Array);
-    expect(arg.byteLength).toBeGreaterThan(0);
+    expect(arg?.byteLength).toBeGreaterThan(0);
   });
 
   it('fires for setText (DISK origin is treated as local for fan-out)', () => {
@@ -389,7 +411,7 @@ describe('DocManager — encodeStateAsUpdate', () => {
 
     const target = new Y.Doc();
     Y.applyUpdate(target, snapshot);
-    expect(target.getText('content').toString()).toBe('hello world');
+    expect(target.getText('content').toJSON()).toBe('hello world');
   });
 
   it('with a target state vector returns only the ops the target is missing', () => {
@@ -408,7 +430,7 @@ describe('DocManager — encodeStateAsUpdate', () => {
     const twin = new Y.Doc();
     Y.applyUpdate(twin, initial);
     Y.applyUpdate(twin, delta);
-    expect(twin.getText('content').toString()).toBe('first second');
+    expect(twin.getText('content').toJSON()).toBe('first second');
     twin.destroy();
   });
 

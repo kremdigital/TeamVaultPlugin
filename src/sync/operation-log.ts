@@ -119,6 +119,14 @@ export interface OperationLogOptions {
   flushDelayMs?: number;
   /** Persistence failures are reported here instead of throwing at call sites. */
   onError?: (err: unknown) => void;
+  /**
+   * Whether this instance may still write the file. After a reload or an
+   * update, the next instance of the plugin takes `state.json` over while this
+   * one may still be settling requests it had in flight; from then on this
+   * returns false, and those late changes stay in memory instead of
+   * overwriting the newer file with an older snapshot. Default: always.
+   */
+  ownsFile?: () => boolean;
 }
 
 /** Everything the log knows about one binding. */
@@ -134,13 +142,14 @@ export class OperationLog {
   private readonly filePath: string | null;
   private readonly flushDelayMs: number;
   private readonly onError: (err: unknown) => void;
+  private readonly ownsFile: () => boolean;
 
   private readonly bindings = new Map<string, BindingBucket>();
   /** Mirrors SQLite AUTOINCREMENT: ids keep climbing across deletes. */
   private nextOpId = 1;
 
   private dirty = false;
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: number | null = null;
   /** Serializes writes so two flushes can't interleave on the same file. */
   private chain: Promise<void> = Promise.resolve();
   private closed = false;
@@ -151,6 +160,7 @@ export class OperationLog {
     this.filePath = options.filePath ?? null;
     this.flushDelayMs = options.flushDelayMs ?? DEFAULT_FLUSH_DELAY_MS;
     this.onError = options.onError ?? ((): void => undefined);
+    this.ownsFile = options.ownsFile ?? ((): boolean => true);
   }
 
   /** True when this instance has somewhere to persist to. */
@@ -174,8 +184,20 @@ export class OperationLog {
     const path = this.filePath!;
     let raw: string;
     try {
-      if (!(await storage.exists(path))) return;
-      raw = await storage.read(path);
+      // The write replaces the file in three steps (write `.tmp`, remove the
+      // file, rename). A load that lands between the last two — another copy
+      // of the plugin starting while this one is still shutting down, or a
+      // crash — finds only the `.tmp`, which is the newest complete state.
+      const tmp = `${path}.tmp`;
+      if (await storage.exists(path)) raw = await storage.read(path);
+      else if (await storage.exists(tmp)) {
+        try {
+          raw = await storage.read(tmp);
+        } catch {
+          // The rename landed between the two calls: the file is back.
+          raw = await storage.read(path);
+        }
+      } else return;
     } catch (err) {
       this.onError(err);
       return;
@@ -197,8 +219,8 @@ export class OperationLog {
   /** Flush pending changes and stop the background timer. Idempotent. */
   async close(): Promise<void> {
     this.closed = true;
-    if (this.timer) {
-      clearTimeout(this.timer);
+    if (this.timer !== null) {
+      window.clearTimeout(this.timer);
       this.timer = null;
     }
     await this.flush();
@@ -368,21 +390,29 @@ export class OperationLog {
    * schedule the write themselves.
    */
   async flush(): Promise<void> {
-    if (!this.persistent || !this.dirty) return;
-    this.chain = this.chain.then(() => this.writeOnce());
+    if (!this.persistent) return;
+    // Wait for a write already under way even when nothing new is dirty:
+    // `writeOnce` clears the flag before its first await, and `close()` must
+    // not return — letting the next instance of the plugin read the file —
+    // while the last change is still on its way to disk.
+    if (this.dirty) this.chain = this.chain.then(() => this.writeOnce());
     await this.chain;
   }
 
   /** Mark the document dirty and schedule (or force) a write. */
   private touch(opts: { immediate?: boolean } = {}): void {
-    if (!this.persistent || this.closed) return;
+    if (!this.persistent) return;
     this.dirty = true;
-    if (opts.immediate) {
+    // After `close()` there is no timer to wait for — but Obsidian does not
+    // await `onunload`, so work an engine had already started (a catch-up, a
+    // queued edit) can still mutate the log. Dropping those mutations lost the
+    // offline queue; write them straight away instead.
+    if (opts.immediate || this.closed) {
       void this.flush().catch((err: unknown) => this.onError(err));
       return;
     }
-    if (this.timer) return;
-    this.timer = setTimeout(() => {
+    if (this.timer !== null) return;
+    this.timer = window.setTimeout(() => {
       this.timer = null;
       void this.flush().catch((err: unknown) => this.onError(err));
     }, this.flushDelayMs);
@@ -398,6 +428,11 @@ export class OperationLog {
    */
   private async writeOnce(): Promise<void> {
     if (!this.persistent || !this.dirty) return;
+    if (!this.ownsFile()) {
+      // A newer instance of the plugin has the file now (see `ownsFile`).
+      this.dirty = false;
+      return;
+    }
     const storage = this.storage!;
     const path = this.filePath!;
     const payload = JSON.stringify(this.serialize());
@@ -419,6 +454,14 @@ export class OperationLog {
         this.onError(fallbackErr);
         // Keep the change queued for the next attempt.
         this.dirty = true;
+        return;
+      }
+      // A temp file left behind would outlive the file it was meant to
+      // replace: `load` reads it when `state.json` is gone.
+      try {
+        if (await storage.exists(tmp)) await storage.remove(tmp);
+      } catch (cleanupErr) {
+        this.onError(cleanupErr);
       }
     }
   }

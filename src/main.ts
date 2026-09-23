@@ -1,7 +1,8 @@
 import { Notice, Plugin, WorkspaceLeaf } from 'obsidian';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import { DEFAULT_SETTINGS, mergeWithDefaults, type PluginSettings } from '@/settings/settings';
-import { setLanguage, t } from '@/i18n';
+import { getLanguage, setLanguage, t } from '@/i18n';
+import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
 import { SyncSettingsTab } from '@/settings/tab';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager, type IdbRegistry, type PersistenceFactory } from '@/crdt/doc-manager';
@@ -10,11 +11,19 @@ import { RecentlyApplied } from '@/watcher/recently-applied';
 import { ObsidianWatcher, type VaultEvent } from '@/watcher/obsidian-events';
 import { FsWatcher } from '@/watcher/fs-watcher';
 import { isInBinding, isOrphanedAtomicTmp } from '@/watcher/path-utils';
-import { Logger, type LogLevel } from '@/utils/logger';
+import { Logger } from '@/utils/logger';
 import { ConsoleLogSink } from '@/utils/console-log-sink';
 import { CompositeLogSink } from '@/utils/composite-log-sink';
+import { GatedLogSink } from '@/utils/gated-log-sink';
 import { FileLogSink } from '@/utils/file-log-sink';
 import { findDuplicatePluginFolders } from '@/integration/plugin-folders';
+import {
+  awaitPreviousTeardown,
+  claimStateFile,
+  handOffTeardown,
+  teardownPlugin,
+  TEARDOWN_HANDOFF_TIMEOUT_MS,
+} from '@/integration/plugin-teardown';
 import { ObsidianVaultAdapter } from '@/integration/obsidian-vault-adapter';
 import { ObsidianLogStorage } from '@/integration/obsidian-log-storage';
 import { ObsidianWatchableVault } from '@/integration/obsidian-watchable-vault';
@@ -39,8 +48,11 @@ import { uuid } from '@/utils/id';
  *   4. Construct the engine manager, register the settings tab, status
  *      bar, history view, and command palette entries.
  *
- * `onunload()` tears everything down in reverse order — disconnects
- * sockets, flushes the operation log, kills chokidar, removes UI hooks.
+ * `onunload()` detaches the watchers, the UI hooks and the sockets at once
+ * and leaves the rest — flushing the operation log, closing the offline docs
+ * — to finish in the background (see `integration/plugin-teardown`). The next
+ * instance's `onload()` waits for that background part before it reads
+ * `state.json`.
  */
 export default class ObsidianSyncPlugin extends Plugin {
   settings: PluginSettings = { ...DEFAULT_SETTINGS };
@@ -55,19 +67,42 @@ export default class ObsidianSyncPlugin extends Plugin {
   private fsWatcher: FsWatcher | null = null;
   private statusBar: StatusBar | null = null;
   private notices: NoticeService | null = null;
+  private unsubscribeAggregate: (() => void) | null = null;
+  /**
+   * Set by `onunload`. A request an engine had in flight can settle after
+   * the plugin is gone; its callbacks must not write `data.json`, which by
+   * then may belong to the next instance of the plugin.
+   */
+  private unloaded = false;
 
   override async onload(): Promise<void> {
+    // Obsidian can unload the plugin while this is still running — it does
+    // not wait for `onload` either. Hence the `unloaded` checks after every
+    // await below: past one of them, whatever this goes on to build (the
+    // engines, the settings tab, the view, the commands) would never be torn
+    // down, and a second instance would register the same view type.
     await this.loadSettings();
-    setLanguage(this.settings.language);
+    if (this.unloaded) return;
+    this.applyLanguage();
 
     // Make sure we have a stable client id; persist once on first run.
     if (!this.settings.clientId) {
       this.settings.clientId = uuid();
       await this.saveSettings();
+      if (this.unloaded) return;
     }
 
     this.bootstrapLogger();
+    // Disabling and enabling the plugin, or an update, starts this instance
+    // while the previous one may still be flushing `state.json`.
+    if (!(await awaitPreviousTeardown(window, this.manifest.id, TEARDOWN_HANDOFF_TIMEOUT_MS))) {
+      this.logger?.warn('previous instance is still shutting down; loading anyway', {
+        waitedMs: TEARDOWN_HANDOFF_TIMEOUT_MS,
+      });
+    }
+    if (this.unloaded) return;
     await this.bootstrapState();
+    if (this.unloaded) return;
     // A duplicate plugin folder means the settings we just loaded may not be
     // the user's (see `integration/plugin-folders`). Everything below the
     // sweeps is read-mostly, but the sweeps themselves delete local state
@@ -77,6 +112,7 @@ export default class ObsidianSyncPlugin extends Plugin {
       await this.sweepOrphanedBindingState();
       await this.sweepOrphanedTmpArtifacts();
     }
+    if (this.unloaded) return;
     this.bootstrapManager();
     // Watchers attach only after the workspace layout is ready: while the
     // vault index loads, Obsidian fires `vault.on('create')` for EVERY
@@ -97,15 +133,25 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.logger?.info('plugin loaded');
   }
 
-  override async onunload(): Promise<void> {
+  override onunload(): void {
     this.logger?.info('plugin unloading');
-    await this.engineManager?.stop().catch(() => undefined);
-    this.statusBar?.destroy();
-    await this.fsWatcher?.stop().catch(() => undefined);
-    this.obsidianWatcher?.stop();
-    await this.docManager?.destroy().catch(() => undefined);
-    // Flushes whatever the debounce still holds — the pending queue above all.
-    await this.operationLog?.close().catch(() => undefined);
+    this.unloaded = true;
+    // Synchronous on purpose: Obsidian does not await onunload. Listeners,
+    // watchers, the status bar and the sockets are gone when this returns;
+    // the rest — the engines settling, the operation log flushing its
+    // pending queue, the offline docs closing — finishes in the background
+    // and logs its failures. The next instance's onload waits for it.
+    const done = teardownPlugin({
+      unsubscribes: [this.unsubscribeAggregate],
+      obsidianWatcher: this.obsidianWatcher,
+      fsWatcher: this.fsWatcher,
+      statusBar: this.statusBar,
+      engineManager: this.engineManager,
+      docManager: this.docManager,
+      operationLog: this.operationLog,
+      logger: this.logger,
+    });
+    handOffTeardown(window, this.manifest.id, done);
   }
 
   async loadSettings(): Promise<void> {
@@ -114,11 +160,25 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   async saveSettings(): Promise<void> {
+    if (this.unloaded) return;
     await this.saveData(this.settings);
-    setLanguage(this.settings.language);
-    if (this.logger) this.logger.setLevel(this.settings.logLevel as LogLevel);
+    this.applyLanguage();
+    if (this.logger) this.logger.setLevel(this.settings.logLevel);
     // Settings changes can add / remove bindings; reconcile.
     await this.engineManager?.refreshFromSettings();
+  }
+
+  /**
+   * Resolve the language setting (`auto` → Obsidian's own language) and, on
+   * a change, re-render the status bar. The settings tab re-renders itself;
+   * command names were read when they were registered and switch on the
+   * next load, as the setting's description says.
+   */
+  private applyLanguage(): void {
+    const language = resolveLanguage(this.settings.language, readObsidianLanguage);
+    if (language === getLanguage()) return;
+    setLanguage(language);
+    this.statusBar?.render();
   }
 
   /** Exposed for the settings UI ("Open log" / "Clear log" buttons). */
@@ -138,10 +198,12 @@ export default class ObsidianSyncPlugin extends Plugin {
       storage,
       filePath: `${this.app.vault.configDir}/plugins/${this.manifest.id}/sync.log`,
     });
-    const sinks =
-      this.settings.logLevel === 'debug'
-        ? new CompositeLogSink([this.fileLogSink, new ConsoleLogSink()])
-        : this.fileLogSink;
+    const sinks = new CompositeLogSink([
+      this.fileLogSink,
+      // The DevTools mirror follows the Log level setting entry by entry, so
+      // picking Debug starts it (and leaving Debug stops it) with no reload.
+      new GatedLogSink(new ConsoleLogSink(), () => this.settings.logLevel === 'debug'),
+    ]);
     this.logger = new Logger(this.settings.logLevel, sinks, { plugin: this.manifest.id });
   }
 
@@ -156,6 +218,8 @@ export default class ObsidianSyncPlugin extends Plugin {
       storage: new ObsidianLogStorage(this.app.vault),
       filePath: `${this.app.vault.configDir}/plugins/${this.manifest.id}/state.json`,
       onError: (err) => this.logger?.warn('operation log persistence failed', { err }),
+      // From here on the previous instance, if any, stops writing the file.
+      ownsFile: claimStateFile(window, this.manifest.id),
     });
     await this.operationLog.load();
 
@@ -244,9 +308,9 @@ export default class ObsidianSyncPlugin extends Plugin {
     // every vault on the machine, and database names are keyed by binding id,
     // not by vault — so from inside one vault, another vault's live binding
     // is indistinguishable from an orphan. 0.2.12–0.3.0 shipped exactly that
-    // sweep, and on 2026-09-16 a freshly created test vault deleted 207 of
-    // «Ополченец»'s offline CRDT databases at startup. Only ids this vault's
-    // own operation log names (the loop above) are safe to purge.
+    // sweep, and on 2026-09-16 a freshly created test vault deleted 207 of a
+    // large production vault's offline CRDT databases at startup. Only ids
+    // this vault's own operation log names (the loop above) are safe to purge.
   }
 
   /**
@@ -297,7 +361,9 @@ export default class ObsidianSyncPlugin extends Plugin {
   }
 
   private bootstrapWatchers(): void {
-    if (!this.engineManager || !this.recentlyApplied) return;
+    // `onLayoutReady` can fire after an unload that came first: nothing
+    // would ever stop watchers attached then.
+    if (this.unloaded || !this.engineManager || !this.recentlyApplied) return;
 
     this.obsidianWatcher = new ObsidianWatcher({
       bindings: () => this.settings.bindings,
@@ -365,7 +431,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     // sync would spam the user. We track the last announced state and
     // only react when it changes.
     let lastAnnounced: string | null = null;
-    this.engineManager.onAggregateStatus((status) => {
+    this.unsubscribeAggregate = this.engineManager.onAggregateStatus((status) => {
       if (status.state === lastAnnounced) return;
       const previous = lastAnnounced;
       lastAnnounced = status.state;
@@ -432,7 +498,8 @@ export default class ObsidianSyncPlugin extends Plugin {
     const leaf = this.app.workspace.getRightLeaf(false);
     if (!leaf) return;
     await leaf.setViewState({ type: HISTORY_VIEW_TYPE, active: true });
-    this.app.workspace.revealLeaf(leaf);
+    // A Promise since 1.7.2 (deferred views) — the manifest's minAppVersion.
+    await this.app.workspace.revealLeaf(leaf);
   }
 }
 

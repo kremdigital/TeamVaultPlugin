@@ -245,11 +245,21 @@ describe('FsWatcher — lifecycle', () => {
     await watcher.stop();
     expect(inst.closed).toBe(true);
   });
+
+  it('stop() drops a pending modify at once, without waiting for chokidar to close', () => {
+    // Obsidian does not await onunload: the debounce must be gone as soon as
+    // stop() is called, not after close() resolves.
+    const { watcher, events, fakeWatcher, clock } = buildWatcher({ bindings: [binding()] });
+    fakeWatcher().fire('change', '/vault/a.md');
+    void watcher.stop();
+    clock.advance(100);
+    expect(events).toEqual([]);
+  });
 });
 
 /**
  * Что именно chokidar не должен даже показывать. Предикат `ignored` до
- * TASK-0027 не проверялся ни одним тестом, а в списке не было ни `.trash`
+ * 0.3.3 не проверялся ни одним тестом, а в списке не было ни `.trash`
  * (заметка, удалённая в корзину, возвращалась на сервер как создание), ни
  * пользовательской папки конфигурации.
  */

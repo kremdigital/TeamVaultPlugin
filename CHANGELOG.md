@@ -4,273 +4,392 @@ All notable changes to the Team Vault plugin land here. Format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 uses [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+## [0.3.5] — 2026-09-23
+
+### Added
+
+- **Interface language setting.** A new "Interface language" option under
+  Behavior: Same as Obsidian, Русский or English. Same as Obsidian — the
+  default for new installs — shows the plugin in Russian when Obsidian runs in
+  Russian and in English otherwise. English is now also the fallback for any
+  missing translation (it was Russian). Installs upgraded from 0.3.4 or
+  earlier keep the Russian they had saved. The settings tab and the status bar
+  switch at once; command names switch after the plugin is reloaded.
+- **Bundled license notices.** `main.js` now ends with the name, version and
+  full license text of every third-party package bundled into it (yjs, lib0,
+  y-indexeddb, socket.io-client and its dependencies engine.io-client,
+  engine.io-parser, socket.io-parser and @socket.io/component-emitter,
+  chokidar, readdirp, diff). Until now only chokidar's notice survived
+  bundling, which fell short of diff's BSD-3-Clause terms.
+- Releases now carry a signed build provenance attestation for `main.js`,
+  `manifest.json` and `styles.css` (`actions/attest`, as in Obsidian's
+  official release workflow).
+- `SECURITY.md` — how to report a vulnerability privately — and
+  `CONTRIBUTING.md` — setup, gates, tests and commit conventions.
+
+### Changed
+
+- **Command names no longer repeat the plugin name.** The command palette
+  showed "Team Vault: Team Vault: sync now", now "Team Vault: Sync now"
+  ("Pause sync", "Resume sync", "Toggle active file history", "Open
+  settings"). Command ids are unchanged, so existing hotkeys keep working.
+- **Removing a server or a binding asks in an Obsidian dialog** instead of
+  the system `confirm()` box. Enter confirms; Escape, the close button or a
+  click outside cancels.
+- **Disabling, reloading or updating the plugin shuts it down in order.**
+  Vault listeners and the file watcher are detached at once; the vault
+  listeners used to stay attached until the file watcher had closed. The rest
+  of the shutdown (flushing the offline queue to `state.json`, closing
+  offline documents) finishes in the background and logs its failures to
+  `sync.log`, and the plugin's next start waits for it, up to 5 seconds,
+  before it reads `state.json`. Disabling the plugin no longer pops a
+  "connection lost" notice.
+- **Log level changes apply at once.** Debug starts mirroring every entry to
+  the DevTools console without a plugin reload (and leaving Debug stops it),
+  and the sync engines' own log lines follow the new level immediately
+  instead of keeping the level they started with until a reload.
+- Minimum Obsidian version is now 1.7.2: the History view awaits
+  `workspace.revealLeaf`, which returns a promise since 1.7.2.
+- Timers, `crypto` and the clipboard now go through `window` /
+  `activeWindow`, as the Obsidian plugin guidelines ask for popout-window
+  compatibility. The History view uses `createDiv` / `createSpan`.
+- The GitHub release body is now just that version's CHANGELOG section
+  instead of the whole file. The release workflow fails if the section is
+  missing or empty (`node scripts/release-notes.mjs X.Y.Z` prints it).
+- README: the Behavior settings, Commands and status bar sections now match
+  the plugin. Open log shows `sync.log` in a window with Copy and Clear log
+  and writes nothing into the vault.
+- This changelog is now entirely in English: the entries for 0.2.10–0.3.4
+  were written in Russian.
+- Development: `pnpm lint` now runs `eslint-plugin-obsidianmd` 0.4.2 (its
+  recommended config, the same rules as the community directory's automated
+  review) over the whole repository, including `manifest.json` and
+  `package.json`, and refuses to run outside the plugin root.
+- Build: dropped the `builtin-modules` dev dependency in favour of Node's own
+  `node:module` `builtinModules`. The bundle's code is byte-for-byte
+  unchanged.
+- The release workflow runs on Node 22 instead of 20; ESLint 10 needs Node
+  20.19+, 22.13+ or 24+.
+
+### Removed
+
+- The "Sync on startup" switch: it never did anything, since every binding
+  catches up with the server whenever it connects. A `data.json` that still
+  has the field loads as before.
+
+### Fixed
+
+- A queued offline operation whose `fileId` in `state.json` is not a string
+  is dropped instead of being sent to the server as "[object Object]".
+- A `connect_error` that is not an `Error` keeps a readable message.
+- The log no longer throws on a circular object without a prototype, or on a
+  circular array holding one.
+- **Offline changes recorded after the plugin was disabled are kept.** A
+  request that was in flight when the plugin was disabled can still settle
+  and update the offline queue; the operation log dropped every change made
+  after it had closed. It now writes such a change to `state.json` at once —
+  until a newer instance of the plugin takes the file over after a reload or
+  an update, so an older snapshot never overwrites the newer file.
+- Shutting down waits for a `state.json` write already under way. The next
+  instance could read the file just before the last queued operation reached
+  it, and then overwrite that operation with its own next write.
+- Disabling the plugin while it is still starting stops the start where it
+  is: no sync engines, settings tab, view, commands or startup clean-up after
+  that point (they were never torn down, and the next start failed to
+  register its view). A settings change that arrives after the plugin was
+  disabled no longer starts an engine, and the old instance no longer writes
+  `data.json`, which by then may belong to the next one.
+- A `state.json` caught mid-replacement (only `state.json.tmp` on disk, after
+  a crash or a reload during a write) is read from the temporary file instead
+  of starting with an empty offline queue. When the log has to fall back to
+  writing `state.json` in place, it now removes the temporary file, which
+  would otherwise come back as the log once `state.json` is deleted by hand.
+- Development: `pnpm dev:vault` copies every rebuild into the test vault. It
+  used to copy once, before the first build had even finished. The license
+  notice collector no longer skips a package that esbuild reports by an
+  absolute path (a dependency on another drive on Windows) and fails the
+  build rather than leave a notice out.
+
 ## [0.3.4] — 2026-09-22
 
 ### Changed
 
-- **Выбор папки при привязке убран — привязывается весь вальт.** Obsidian
-  открывает вальт как его корень, это и есть нужная папка; поле «Локальная
-  папка» было лишним обязательным шагом (без выбора привязку не давали
-  сохранить). В окне привязки теперь прямо сказано, что в проект уйдёт всё
-  содержимое вальта. Раз привязка покрывает весь вальт, она пересекается с
-  любой другой: в вальте может быть одна привязка, и кнопка «Привязать
-  хранилище» при существующей неактивна с пояснением. Привязки к подпапкам,
-  сделанные раньше, продолжают работать как есть, но после удаления подпапку
-  снова привязать нельзя — новая привязка охватит весь вальт.
+- **Folder selection is gone from binding — the whole vault is bound.**
+  Obsidian opens a vault as its root, and that is the folder you mean; the
+  "Local folder" field was a redundant mandatory step (a binding couldn't be
+  saved without picking one). The binding window now says outright that
+  everything in the vault goes to the project. Since a binding covers the
+  whole vault, it overlaps any other: a vault can hold one binding, and while
+  it exists the "Add binding" button is disabled, with an explanation.
+  Bindings to subfolders made earlier keep working as they are, but once
+  removed, a subfolder can't be bound again — the new binding covers the whole
+  vault.
 
 ## [0.3.3] — 2026-09-22
 
 ### Security
 
-- **Сервер больше не может назвать любой локальный путь.** Всё, что приходит
-  от сервера — список файлов, операции догона, живые события create, rename и
-  move, снапшоты текста, — проходит единый гейт (`checkVaultPath`). Он
-  отклоняет пути в папке конфигурации Obsidian, в `.trash`, `.git`, вне папки
-  привязки, а также абсолютные пути и `..`; отказ пишется в `sync.log`
-  уровнем `warn` и не останавливает синхронизацию остальных файлов.
+- **The server can no longer name an arbitrary local path.** Everything that
+  comes from the server — the file list, catch-up operations, live create,
+  rename and move events, text snapshots — passes a single gate
+  (`checkVaultPath`). It rejects paths in Obsidian's config folder, in
+  `.trash` and `.git`, outside the binding folder, as well as absolute paths
+  and `..`; a rejection is written to `sync.log` at `warn` level and doesn't
+  stop the other files from syncing.
 
-  Раньше проверок не было вовсе у переименования: участник проекта с правом
-  записи мог переименовать свой файл в
-  `.obsidian/plugins/team-vault/data.json`, и клиент коллеги перенацеливал на
-  него метаданные. Дальше «восстановить на сервере» выгружало этот файл — с
-  API-ключом внутри.
+  Before, rename had no checks at all: a project member with write access
+  could rename their file to `.obsidian/plugins/team-vault/data.json`, and a
+  teammate's client retargeted its metadata onto that file. From there,
+  "Restore on server" uploaded the file — with the API key inside.
 
 ### Fixed
 
-- **Папка конфигурации больше не зашита как `.obsidian`.** Её имя берётся из
-  `Vault.configDir`. При нестандартной папке (настройка «Override config
-  folder») вся конфигурация вальта, включая `data.json` с ключом, уходила на
-  сервер и ко всем участникам проекта.
-- **Корзина Obsidian (`.trash`) не синхронизируется.** Заметка, удалённая в
-  корзину, возвращалась на сервер как новый файл.
-- **Переименование на занятый путь больше не удаляет локальный файл молча.**
-  Если содержимое совпадает, лишняя копия удаляется, как раньше; если
-  различается, локальный файл отъезжает в `<имя>.conflict-<метка>.<ext>`.
-- Сравнение служебных папок стало нечувствительным к регистру: путь вида
-  `.OBSIDIAN/…` проходил мимо фильтров; неASCII-имена сравниваются в единой
-  юникод-нормализации (macOS отдаёт NFD, сервер хранит NFC).
-- **Исходящая сторона тоже под гейтом.** Локальные события и операции из
-  офлайн-очереди проверяются тем же предикатом: очередь живёт в `state.json` и
-  переживает обновление, поэтому выгрузка `data.json`, поставленная в очередь
-  старой сборкой, больше не уходит на сервер, а выбрасывается.
-- **Удаление заметки в корзину Obsidian уходит как удаление.** Раньше это
-  переименование публиковало корзину всей команде.
-- Отказ сервера `invalid_path` считается окончательным: операция выбрасывается
-  из очереди. Прежде такой отказ выглядел временным, и одна застрявшая операция
-  молча блокировала отправку всех накопленных правок.
-- Папка конфигурации сопоставляется как папка в корне вальта, а не как имя где
-  угодно: `Архив/.obsidian-work/` снова синхронизируется как обычные заметки.
-  Фильтр chokidar перестал учитывать каталоги выше корня вальта — вальт внутри
-  папки с именем `.git` или `.trash` больше не отсекается целиком.
-- **Перенос файла за пределы папки привязки больше не плодит дубликат.** Файл
-  переезжает туда, куда указал сервер, и уходит из индекса; раньше отказ
-  оставлял локальную копию, а начальная выгрузка отправляла её на сервер как
-  новый файл — вторая копия заметки у всей команды. Перенос обратно в папку
-  привязки снова работает: такой файл материализуется как новый.
-- **Отложенное переименование в корзину превращается в удаление.** Операция из
-  очереди старой сборки раньше просто выбрасывалась, и заметка воскресала:
-  на сервере она жива, а ближайший catch-up записывал её обратно на диск.
-- `.staging` (служебная папка сервера) добавлена в список игнорируемых: её
-  выгрузка отклонялась бы сервером вечно. Отказ `path_is_directory` тоже
-  считается окончательным.
-- Без пути к корню вальта файловый вотчер больше не запускается: он следил бы
-  за рабочим каталогом процесса, где фильтры путей бессмысленны.
+- **The config folder is no longer hardcoded as `.obsidian`.** Its name comes
+  from `Vault.configDir`. With a non-standard folder (the "Override config
+  folder" setting), the vault's entire configuration, `data.json` with the key
+  included, was uploaded to the server and to every project member.
+- **Obsidian's trash (`.trash`) is not synced.** A note deleted to the trash
+  came back to the server as a new file.
+- **A rename onto an occupied path no longer silently deletes the local
+  file.** If the contents match, the extra copy is deleted, as before; if they
+  differ, the local file moves aside to `<name>.conflict-<stamp>.<ext>`.
+- Service-folder matching is now case-insensitive: a path like `.OBSIDIAN/…`
+  slipped past the filters. Non-ASCII names are compared in a single Unicode
+  normalization form (macOS reports NFD, the server stores NFC).
+- **The outgoing side is gated too.** Local events and operations from the
+  offline queue are checked by the same predicate: the queue lives in
+  `state.json` and survives an update, so an upload of `data.json` queued by
+  an old build is now dropped instead of going to the server.
+- **Deleting a note to Obsidian's trash is sent as a delete.** Before, this
+  rename published the trash to the whole team.
+- A server rejection with `invalid_path` is final: the operation is dropped
+  from the queue. Previously such a rejection looked transient, and one stuck
+  operation silently blocked sending all the edits piled up behind it.
+- The config folder is matched as a folder at the vault root, not as a name
+  anywhere: `Архив/.obsidian-work/` syncs as ordinary notes again. The
+  chokidar filter no longer looks at directories above the vault root — a
+  vault inside a folder named `.git` or `.trash` is no longer cut off
+  entirely.
+- **Moving a file outside the binding folder no longer spawns a duplicate.**
+  The file moves to where the server said and leaves the index; before, the
+  rejection left a local copy, and the initial upload sent it to the server
+  as a new file — a second copy of the note for the whole team. Moving back
+  into the binding folder works again: such a file materializes as new.
+- **A deferred rename into the trash turns into a delete.** Such an operation
+  from an old build's queue used to be simply dropped, and the note came back
+  to life: it is alive on the server, and the next catch-up wrote it back to
+  disk.
+- `.staging` (the server's service folder) is added to the ignore list: its
+  upload would be rejected by the server forever. A `path_is_directory`
+  rejection is also final.
+- Without a path to the vault root the filesystem watcher no longer starts:
+  it would watch the process's working directory, where path filters make no
+  sense.
 
 ## [0.3.2] — 2026-09-18
 
 ### Fixed
 
-- **Правка с другого устройства удалялась после вашего сохранения — везде.**
-  Движок вливал текст с диска в CRDT двусторонним диффом «документ против
-  файла», а отметка «это содержимое диска уже учтено» (`contentHash`)
-  обновлялась только при записи снапшота, но не при локальном сохранении.
-  Стоило сохранить заметку, и следующая пришедшая в неё чужая правка
-  выглядела как ваше удаление: вырезалась из CRDT, удаление уходило на сервер
-  и оттуда — на устройство автора. Так же пропадали правки из веб-редактора и
-  от агентов через MCP/REST.
+- **An edit from another device was deleted after you saved — everywhere.**
+  The engine folded disk text into the CRDT with a two-way "document vs file"
+  diff, while the "this disk content is already accounted for" mark
+  (`contentHash`) was only updated when a snapshot was written, not on a local
+  save. Once you saved a note, the next edit someone else made to it looked
+  like your deletion: it was cut from the CRDT, and the deletion went to the
+  server and from there to the author's device. Edits from the web editor and
+  from agents via MCP/REST disappeared the same way.
 
-  Теперь слияние трёхстороннее. У текстовых файлов своя отметка `foldedHash`
-  (последнее содержимое диска, уже влитое в CRDT; `contentHash` остался для
-  проверки «удаление против правки»). Правки диска считаются от этой базы, а
-  чужие правки, ещё не записанные на диск, сохраняются. Базовый текст
-  используется, только если его хэш совпал с отметкой: из памяти, из самого
-  документа или из истории версий сервера. Если подтвердить базу нечем
-  (логи старых версий, обе стороны менялись при выключенном плагине),
-  побеждает диск, как раньше, и это пишется в лог. Локальное сохранение и
-  запись снапшота одного файла больше не пересекаются.
+  The merge is now three-way. Text files get their own mark, `foldedHash`
+  (the last disk content already folded into the CRDT; `contentHash` stays
+  for the "delete vs edit" check). Disk edits are computed against this base,
+  and other people's edits not yet written to disk are kept. The base text is
+  used only if its hash matches the mark — whether it comes from memory, from
+  the document itself or from the server's version history. If nothing can
+  confirm the base (logs written by older versions, both sides changed while
+  the plugin was off), the disk wins, as before, and this is logged. A local
+  save and a snapshot write of the same file no longer overlap.
 
-- **Правка с другого устройства не доходила до заметки, пропущенной на
-  catch-up.** С 0.2.11 catch-up не поднимает документ, если файл на диске
-  совпадает с сервером. Истории у такого документа нет, и пришедший
-  `yjs:update` (сервер шлёт только дельту) не к чему было применить: правка
-  ждала переподключения, а локальная правка в ту же заметку откладывалась.
-  Теперь документ подтягивается с сервера точечно через `yjs:fetch` в момент,
-  когда он понадобился. С сервером без `yjs:fetch` — прежнее поведение.
+- **An edit from another device didn't reach a note skipped during
+  catch-up.** Since 0.2.11 catch-up doesn't load a document if the file on
+  disk matches the server. Such a document has no history, and an incoming
+  `yjs:update` (the server sends only the delta) had nothing to apply to: the
+  edit waited for a reconnect, and a local edit to the same note was
+  deferred. Now the document is fetched from the server on demand via
+  `yjs:fetch` at the moment it is needed. Against a server without
+  `yjs:fetch`, the previous behavior.
 
 ### Removed
 
-- **`src/crdt/editor-binding.ts` и зависимости `y-codemirror.next`,
-  `y-protocols`.** Привязка `yCollab` к редактору нигде не подключалась, и
-  esbuild выбрасывал её из бандла — удаление `main.js` не меняет (сверено
-  хэшем сборки).
+- **`src/crdt/editor-binding.ts` and the `y-codemirror.next`, `y-protocols`
+  dependencies.** The `yCollab` editor binding was never wired up, and
+  esbuild dropped it from the bundle — the removal doesn't change `main.js`
+  (verified against the build hash).
 
 ### Changed
 
-- **README и описание в каталоге больше не обещают посимвольную
-  синхронизацию.** Там было «edits propagate per-character» и «edit notes
-  together in real time», а правки уходят, когда Obsidian сохраняет заметку.
-  Теперь описано как есть, с разделом ограничений; живое совместное
-  редактирование — в веб-редакторе сервера.
+- **The README and the directory description no longer promise
+  per-character sync.** They said "edits propagate per-character" and "edit
+  notes together in real time", while edits go out when Obsidian saves the
+  note. Now it is described as it is, with a limitations section; live
+  co-editing is in the server's web editor.
 
 ## [0.3.1] — 2026-09-16
 
 ### Fixed
 
-- **Плагин удалял оффлайн-CRDT других вальтов.** Бэкстоп
-  `DocManager.purgeUnknownBindings`, добавленный в 0.2.12, при старте
-  перебирал базы `y-indexeddb` по префиксу `team-vault-` и сносил все, что не
-  принадлежат привязкам **этого** вальта. Но Obsidian держит IndexedDB в
-  **одном хранилище на все вальты машины**, а имена баз привязаны к id
-  привязки, не к вальту — изнутри одного вальта живая привязка соседнего
-  неотличима от сироты. Найдено на проверке чистой установки 0.3.0: свежий
-  тестовый вальт при втором запуске удалил **207 баз** рабочего вальта.
+- **The plugin deleted other vaults' offline CRDT.** The
+  `DocManager.purgeUnknownBindings` backstop, added in 0.2.12, went through
+  the `y-indexeddb` databases with the `team-vault-` prefix at startup and
+  removed every one that didn't belong to a binding of **this** vault. But
+  Obsidian keeps IndexedDB in **one store shared by every vault on the
+  machine**, and database names are tied to the binding id, not to the vault
+  — from inside one vault, a live binding of another vault is
+  indistinguishable from an orphan. Found while checking a clean install of
+  0.3.0: a fresh test vault deleted **207 databases** of a working vault on
+  its second launch.
 
-  Затронут любой, у кого на одной машине Team Vault стоит в двух и более
-  вальтах. Последствия — пересинхронизация пострадавшего вальта с сервера и
-  потеря **ещё не отправленных** оффлайн-правок в нём; сам контент на диске и
-  на сервере не трогался. Бэкстоп удалён целиком: безопасно чистить можно
-  только привязки, которые называет собственный оплог вальта, — это и
-  осталось.
+  Anyone with Team Vault in two or more vaults on one machine is affected.
+  The consequences: a re-sync of the affected vault from the server and the
+  loss of offline edits in it that had **not yet been sent**; the content
+  itself, on disk and on the server, was not touched. The backstop is removed
+  entirely: the only bindings safe to clean up are those named by the vault's
+  own operation log — and that is what remains.
 
 ## [0.3.0] — 2026-09-08
 
-Подготовка к публикации в каталоге Obsidian Community. Главное — плагин
-наконец **работает на чистой установке**.
+Preparation for publishing in the Obsidian Community directory. The main
+thing: the plugin finally **works on a clean install**.
 
 ### Fixed
 
-- **Плагин не грузился нигде, кроме собранных вручную установок.**
-  `better-sqlite3` и `chokidar` были объявлены `external` и подгружались в
-  рантайме из `<папка плагина>/node_modules/`. В релиз (и в каталог) уезжают
-  только `main.js`, `manifest.json` и `styles.css` — `node_modules` взяться
-  неоткуда, поэтому `loadNative('better-sqlite3')` бросал, `onload` падал, и
-  плагин не поднимался вообще. Работал только наш собственный вальт, где 21 МБ
-  зависимостей лежали руками. Теперь:
-  - **оплог больше не SQLite** — состояние живёт в памяти и персистится в
-    `.obsidian/plugins/team-vault/state.json` через тот же адаптер, что и
-    `sync.log`. Публичный API класса остался **синхронным** (движок читает лог
-    на горячих путях), добавились только `load()` на старте и `close()` на
-    выгрузке. Запись идёт через временный файл с переименованием, дебаунс
-    500 мс, а очередь операций флашится сразу — её сервер восстановить не
-    может;
-  - **chokidar забандлен** в `main.js` (чистый JS, внешними остаются только
-    встроенные модули Node);
-  - `src/utils/native-loader.ts` удалён за ненадобностью.
+- **The plugin loaded nowhere but on hand-built installs.** `better-sqlite3`
+  and `chokidar` were declared `external` and loaded at runtime from
+  `<plugin folder>/node_modules/`. A release (and the directory) carries only
+  `main.js`, `manifest.json` and `styles.css` — there is nowhere for
+  `node_modules` to come from, so `loadNative('better-sqlite3')` threw,
+  `onload` failed, and the plugin didn't come up at all. Only our own vault
+  worked, where 21 MB of dependencies had been put in place by hand. Now:
+  - **the operation log is no longer SQLite** — the state lives in memory and
+    is persisted to `.obsidian/plugins/team-vault/state.json` through the
+    same adapter as `sync.log`. The class's public API stayed **synchronous**
+    (the engine reads the log on hot paths); only `load()` at startup and
+    `close()` at unload were added. Writes go through a temporary file and a
+    rename, debounced by 500 ms, while the operation queue is flushed at once
+    — the server can't restore it;
+  - **chokidar is bundled** into `main.js` (pure JS; only Node's built-in
+    modules stay external);
+  - `src/utils/native-loader.ts` is removed as no longer needed.
 
-  Миграция не нужна: оплог — кэш, `file_meta` восстанавливается на догоне.
-  Старый `state.db` можно удалить руками.
+  No migration needed: the operation log is a cache, and `file_meta` is
+  restored on catch-up. The old `state.db` can be deleted by hand.
 
-- **Закрыта высокая уязвимость в зависимостях** — `socket.io-parser` < 4.2.7
-  (GHSA-2m8v-j782-fhvr, исчерпание памяти). Добавлен `pnpm.overrides`.
+- **Closed a high-severity vulnerability in dependencies** —
+  `socket.io-parser` < 4.2.7 (GHSA-2m8v-j782-fhvr, memory exhaustion). Added
+  a `pnpm.overrides` entry.
 
 ### Changed
 
-- **Id команд больше не дублируют id плагина.** Было
-  `team-vault:team-vault-sync-now`, стало `team-vault:sync-now` — требование
-  каталога. Если у тебя были назначены хоткеи на команды Team Vault, их
-  нужно назначить заново.
-- **Стили переехали в `styles.css`.** 22 присваивания `el.style.*` заменены
-  классами; файл теперь версионируется, а не создаётся заглушкой в CI. Тема
-  и пользовательские сниппеты наконец могут их переопределить.
-- **Заголовки — средствами Obsidian.** Секции настроек через
-  `Setting.setHeading()`, заголовки модалок через `titleEl`; дублирующий
-  заголовок «Team Vault» в настройках убран (Obsidian и так называет вкладку).
-- Описание в `manifest.json` приведено к требованиям каталога.
-- README: добавлен раздел о сетевом взаимодействии и приватности (какой хост
-  дёргается, что уходит, что телеметрии нет) — обязательное раскрытие по
-  Developer policies.
-- Из настроек убран лишний вывод в консоль.
+- **Command ids no longer duplicate the plugin id.** It was
+  `team-vault:team-vault-sync-now`, now it is `team-vault:sync-now` — a
+  directory requirement. If you had hotkeys assigned to Team Vault commands,
+  they need to be assigned again.
+- **Styles moved to `styles.css`.** 22 `el.style.*` assignments were replaced
+  with classes; the file is now versioned instead of being created as a stub
+  in CI. Themes and user snippets can finally override them.
+- **Headings the Obsidian way.** Settings sections use `Setting.setHeading()`,
+  modal titles use `titleEl`; the duplicate "Team Vault" heading in the
+  settings is removed (Obsidian already names the tab).
+- The description in `manifest.json` now meets the directory's requirements.
+- README: added a section on network use and privacy (which host is
+  contacted, what is sent, that there is no telemetry) — a mandatory
+  disclosure under the Developer policies.
+- Removed stray console output from the settings.
 
 ## [0.2.12] — 2026-09-05
 
 ### Fixed
 
-- **Две папки плагина с одним `id` больше не ломают синхронизацию молча.**
-  Obsidian различает плагины по `id` из `manifest.json`, а не по имени папки,
-  поэтому копия рядом с рабочей (`team-vault-backup-0.2.9`, распакованный
-  релиз, дев-сборка) заставляет его загрузить **одну из двух** — и выбор не за
-  пользователем. Дальше состояние расходится: `data.json` читается из
-  **загруженной** папки (у копии его обычно нет — плагин создаёт пустой, и в
-  строке состояния висит «Нет активных хранилищ»), а `state.db` и `sync.log`
-  живут в папке `{manifest.id}`, то есть в **канонической**. Устаревшая копия
-  при этом правит настоящий оплог, включая подчистку осиротевших привязок:
-  с пустыми настройками ей все привязки кажутся снятыми, и она сносит
-  оффлайн-CRDT живого хранилища. Теперь плагин при загрузке сверяет папки в
-  `.obsidian/plugins`, показывает **несъезжающее** уведомление с именем лишней
-  папки и **пропускает подчистки**, пока установка не приведена в порядок.
+- **Two plugin folders with one `id` no longer break sync silently.** Obsidian
+  tells plugins apart by the `id` in `manifest.json`, not by folder name, so
+  a copy next to the working one (`team-vault-backup-0.2.9`, an unpacked
+  release, a dev build) makes it load **one of the two** — and the choice
+  isn't the user's. From there the state diverges: `data.json` is read from
+  the **loaded** folder (a copy usually has none — the plugin creates an empty
+  one, and the status bar sits at "No active vaults"), while `state.db` and
+  `sync.log` live in the `{manifest.id}` folder, i.e. the **canonical** one.
+  Meanwhile the stale copy edits the real operation log, orphaned-binding
+  cleanup included: with empty settings every binding looks removed to it,
+  and it wipes the offline CRDT of the live vault. Now the plugin checks the
+  folders in `.obsidian/plugins` on load, shows a **persistent** notice with
+  the name of the extra folder, and **skips the cleanups** until the install
+  is put in order.
 
-- ~~**Подчистка оффлайн-CRDT больше не зависит от `state.db`.**~~ **Отозвано в
-  0.3.1** — бэкстоп удалял базы других вальтов, см. выше. Стартовая
-  подчистка брала список привязок из оплога; если `state.db` удалён или
-  восстановлен из бэкапа, он не называет ни одной привязки — и базы
-  `y-indexeddb` снятой привязки оставались на диске, чтобы при следующем
-  использовании того же id влиться обратно. Добавлен бэкстоп
-  `DocManager.purgeUnknownBindings`: перечисляет наши базы по префиксу
-  `team-vault-` и удаляет те, что не принадлежат ни одной привязке из
-  настроек. Базы других плагинов не трогаются; подчистка пропускается, если
-  настройки выглядят незагруженными (ни серверов, ни привязок).
+- ~~**Offline CRDT cleanup no longer depends on `state.db`.**~~ **Revoked in
+  0.3.1** — the backstop deleted other vaults' databases, see above. The
+  startup cleanup took the list of bindings from the operation log; if
+  `state.db` was deleted or restored from a backup, it named no bindings — and
+  the `y-indexeddb` databases of a removed binding stayed on disk, only to
+  merge back in the next time the same id was used. Added the
+  `DocManager.purgeUnknownBindings` backstop: it lists our databases by the
+  `team-vault-` prefix and deletes those that belong to no binding in the
+  settings. Other plugins' databases are not touched; the cleanup is skipped
+  if the settings look unloaded (no servers, no bindings).
 
 ## [0.2.11] — 2026-08-06
 
 ### Fixed
 
-- **Obsidian зависал на больших вальтах при каждом подключении.** После
-  `project:join` плагин безусловно проходил по всем текстовым файлам проекта и
-  подписывался на локальные правки, а подписка внутри создаёт `Y.Doc` и
-  **отдельную базу `y-indexeddb` на каждый файл**. На вальте в 1062 заметки это
-  занимало поток интерфейса на десятки секунд, даже если ни одна заметка не
-  открыта. Дальше — самоподдерживающийся цикл: поток занят → пропущен
-  heartbeat → сервер рвёт соединение → переподключение → всё сначала.
-  Замеренные фазы синхронизации: 46 с → 30 с → **174 с** → 94 с, 796 с CPU.
+- **Obsidian froze on large vaults on every connect.** After `project:join`
+  the plugin unconditionally went through every text file of the project and
+  subscribed to local edits, and the subscription creates a `Y.Doc` and a
+  **separate `y-indexeddb` database for each file** under the hood. On a
+  vault of 1062 notes this held the UI thread for tens of seconds, even with
+  no note open. Then came a self-sustaining loop: thread busy → missed
+  heartbeat → the server drops the connection → reconnect → all over again.
+  Measured sync phases: 46 s → 30 s → **174 s** → 94 s, 796 s of CPU.
 
-  Теперь подписка навешивается **лениво** — на документ в момент, когда он
-  действительно понадобился (открытие заметки, правка, серверный апдейт).
-  В `DocManager` для этого добавлен `onDocAcquired`.
+  Now the subscription is attached **lazily** — to a document at the moment
+  it is actually needed (opening a note, an edit, a server update).
+  `DocManager` got `onDocAcquired` for this.
 
-  Вдобавок catch-up **пропускает документы, уже совпадающие с диском**: снимок
-  разворачивается в одноразовый `Y.Doc` без IndexedDB и без записи на диск, и
-  при совпадении текста документ не поднимается вовсе.
+  On top of that, catch-up **skips documents that already match the disk**:
+  the snapshot is unpacked into a throwaway `Y.Doc` without IndexedDB and
+  without a disk write, and if the text matches, the document isn't loaded at
+  all.
 
-  Замер после правки на том же вальте: фаза синхронизации **8.7 с**, 21.7 с CPU,
-  ноль разрывов.
+  Measured after the fix on the same vault: sync phase **8.7 s**, 21.7 s of
+  CPU, zero disconnects.
 
-  > Сравнение идёт по содержимому, а НЕ по `contentHash` из списка файлов: тот
-  > может отставать от состояния Yjs-документа, и пропуск по хэшу отбрасывал бы
-  > более новый серверный текст (тихий откат).
+  > The comparison is by content, NOT by the `contentHash` from the file list:
+  > that one can lag behind the state of the Yjs document, and skipping by
+  > hash would throw away newer server text (a silent rollback).
 
 ## [0.2.10] — 2026-08-06
 
 ### Fixed
 
-- **Переименование или перемещение заметки удаляло её** — и с сервера, и с
-  диска. Одно действие в интерфейсе порождает три события: собственное
-  `vault.on('rename')` Obsidian и пару от файлового сторожа (`unlink` старого
-  пути, `add` нового). Обработчик локального переименования не помечал пути в
-  `recentlyApplied`, поэтому пара доходила до движка: `unlink` попадал в
-  обработку удаления **раньше**, чем возвращалось подтверждение переименования,
-  находил ещё не обновлённый `fileId` — и вслед за `RENAME` на сервер уходил
-  `DELETE`, убивавший только что переименованный файл.
+- **Renaming or moving a note deleted it** — both from the server and from
+  disk. One action in the UI produces three events: Obsidian's own
+  `vault.on('rename')` and a pair from the filesystem watcher (`unlink` of the
+  old path, `add` of the new one). The local rename handler didn't mark the
+  paths in `recentlyApplied`, so the pair reached the engine: the `unlink`
+  got into delete handling **before** the rename acknowledgement came back,
+  found the not-yet-updated `fileId` — and right after the `RENAME` a
+  `DELETE` went to the server, killing the just-renamed file.
 
-  Окно гонки тем шире, чем дольше идёт ответ сервера, поэтому на локальном
-  сервере баг не воспроизводится, а на удалённом — стабильно.
+  The race window grows with the server's response time, so the bug doesn't
+  reproduce against a local server but does, consistently, against a remote
+  one.
 
 ### Added
 
-- Тесты на правки **внешним процессом** (агент, скрипт, сторонний редактор),
-  работающим с вальтом параллельно с открытым Obsidian: создание, удаление и
-  перемещение файла помимо интерфейса. Отдельно закреплено, что внешний `mv`
-  приходит парой `unlink`+`add` (то есть на сервере это создание + удаление, а
-  не переименование) и не теряет содержимое.
+- Tests for edits by an **external process** (an agent, a script, a
+  third-party editor) working on the vault alongside a running Obsidian:
+  creating, deleting and moving a file outside the UI. Separately pinned down:
+  an external `mv` arrives as an `unlink`+`add` pair (so on the server it
+  is a create + delete, not a rename) and doesn't lose content.
 
 ## [0.2.9] — 2026-07-15
 

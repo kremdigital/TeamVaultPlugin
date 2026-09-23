@@ -1,3 +1,4 @@
+import { setLanguage } from '@/i18n';
 import { NoticeService } from '@/ui/notices';
 
 function build(opts: { enabled: boolean; show?: jest.Mock<void, [string, number]> }): {
@@ -13,6 +14,10 @@ function build(opts: { enabled: boolean; show?: jest.Mock<void, [string, number]
 }
 
 describe('NoticeService', () => {
+  // The catalog is English until something picks one; the texts below are
+  // asserted in Russian.
+  beforeEach(() => setLanguage('ru'));
+
   it('shows informational notices when enabled', () => {
     const { svc, show } = build({ enabled: true });
     svc.connected('Local');

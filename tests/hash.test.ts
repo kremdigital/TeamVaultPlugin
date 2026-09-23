@@ -1,4 +1,5 @@
 import { sha256Hex } from '@/sync/hash';
+import { stubWindow } from './window-stub';
 
 describe('sha256Hex', () => {
   it('matches the canonical empty-input digest', async () => {
@@ -28,5 +29,18 @@ describe('sha256Hex', () => {
   it('returns lowercase hex of length 64', async () => {
     const digest = await sha256Hex('test');
     expect(digest).toMatch(/^[0-9a-f]{64}$/);
+  });
+});
+
+describe('sha256Hex — platform crypto', () => {
+  it('digests through window.crypto', async () => {
+    const digest = jest.fn(() => Promise.resolve(new Uint8Array([0xab, 0x01]).buffer));
+    const win = stubWindow({ crypto: { subtle: { digest } } });
+    try {
+      await expect(sha256Hex('x')).resolves.toBe('ab01');
+      expect(digest).toHaveBeenCalledWith('SHA-256', expect.anything());
+    } finally {
+      win.restore();
+    }
   });
 });

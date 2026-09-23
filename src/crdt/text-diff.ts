@@ -17,7 +17,8 @@ import * as Y from 'yjs';
  * doc manager) can distinguish disk-driven mutations from editor input.
  */
 export function applyTextDiff(ytext: Y.Text, newContent: string, origin?: unknown): void {
-  const oldContent = ytext.toString();
+  // `toJSON()` is `toString()` under a name the typings declare.
+  const oldContent = ytext.toJSON();
   if (oldContent === newContent) return;
 
   const parts = diffChars(oldContent, newContent);

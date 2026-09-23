@@ -13,8 +13,8 @@ export class CompositeLogSink implements LogSink {
       try {
         const result = sink.write(entry);
         // Swallow rejected promises too — the logger is fire-and-forget.
-        if (result && typeof (result as Promise<void>).catch === 'function') {
-          void (result as Promise<void>).catch(() => undefined);
+        if (result && typeof result.catch === 'function') {
+          void result.catch(() => undefined);
         }
       } catch {
         // ignore

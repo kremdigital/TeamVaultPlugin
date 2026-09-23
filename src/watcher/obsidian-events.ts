@@ -76,7 +76,7 @@ export interface ObsidianWatcherOptions {
   recentlyApplied: RecentlyApplied;
   /** Debounce window for modify (ms). Default 300. */
   modifyDebounceMs?: number;
-  /** Test seam — defaults to globalThis. */
+  /** Test seam — defaults to `window.setTimeout` / `window.clearTimeout`. */
   setTimeout?: (cb: () => void, ms: number) => unknown;
   clearTimeout?: (handle: unknown) => void;
   /** Obsidian's config folder (`Vault.configDir`); never synced. Default `.obsidian`. */

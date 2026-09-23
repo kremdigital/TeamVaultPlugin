@@ -181,7 +181,8 @@ export class DocManager {
   /** Read the document contents synchronously. */
   getText(bindingId: string, filePath: string): string {
     const entry = this.acquire(bindingId, filePath);
-    return entry.ytext.toString();
+    // `toJSON()` is `toString()` under a name the typings declare.
+    return entry.ytext.toJSON();
   }
 
   /**
@@ -222,16 +223,16 @@ export class DocManager {
   async whenSynced(bindingId: string, filePath: string): Promise<void> {
     const entry = this.acquire(bindingId, filePath);
     if (!entry.persistence) return;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: number | undefined;
     try {
       await Promise.race([
         entry.persistence.whenSynced,
         new Promise<void>((resolve) => {
-          timer = setTimeout(resolve, WHEN_SYNCED_TIMEOUT_MS);
+          timer = window.setTimeout(resolve, WHEN_SYNCED_TIMEOUT_MS);
         }),
       ]);
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      if (timer !== undefined) window.clearTimeout(timer);
     }
   }
 

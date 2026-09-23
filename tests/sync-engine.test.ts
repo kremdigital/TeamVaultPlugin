@@ -12,6 +12,7 @@ import {
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import { Logger, formatLogEntry, type LogEntry, type LogSink } from '@/utils/logger';
+import { stubWindow } from './window-stub';
 
 /**
  * In-memory vault adapter — file map keyed by vault path. Binary is stored
@@ -36,10 +37,10 @@ class MemoryVault implements VaultAdapter {
   }
   async createText(path: string, content: string): Promise<void> {
     if (this.files.has(path)) throw new Error('exists');
-    this.files.set(path, new TextEncoder().encode(content).buffer as ArrayBuffer);
+    this.files.set(path, new TextEncoder().encode(content).buffer);
   }
   async writeText(path: string, content: string): Promise<void> {
-    this.files.set(path, new TextEncoder().encode(content).buffer as ArrayBuffer);
+    this.files.set(path, new TextEncoder().encode(content).buffer);
   }
   async createBinary(path: string, content: ArrayBuffer): Promise<void> {
     if (this.files.has(path)) throw new Error('exists');
@@ -292,7 +293,7 @@ describe('SyncEngine — lifecycle', () => {
 describe('SyncEngine — local create', () => {
   it('emits file:create for an unseen file and serializes the buffer as number[]', async () => {
     const h = buildHarness();
-    h.vault.files.set('note.md', new TextEncoder().encode('hello').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('hello').buffer);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
@@ -469,7 +470,7 @@ describe('SyncEngine — delete durability', () => {
   it('initialPush does not resurrect a server-tombstoned path still on disk', async () => {
     const h = buildHarness();
     // On disk locally...
-    h.vault.files.set('gone.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    h.vault.files.set('gone.md', new TextEncoder().encode('x').buffer);
     // ...but the server holds it as a tombstone.
     h.apiResponses.set('GET /api/projects/p1/files?includeDeleted=true', () => ({
       status: 200,
@@ -490,7 +491,7 @@ describe('SyncEngine — delete durability', () => {
 
   it('initialPush defers (uploads nothing) when the tombstone lookup fails', async () => {
     const h = buildHarness();
-    h.vault.files.set('new.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    h.vault.files.set('new.md', new TextEncoder().encode('x').buffer);
     // Live listing works (empty), but the includeDeleted lookup throws.
     h.apiResponses.set('GET /api/projects/p1/files?includeDeleted=true', () => {
       throw new Error('boom');
@@ -509,7 +510,7 @@ describe('SyncEngine — delete durability', () => {
 describe('SyncEngine — offline queue', () => {
   it('queues a CREATE in pending_operations when the socket is disconnected', async () => {
     const h = buildHarness();
-    h.vault.files.set('note.md', new TextEncoder().encode('hi').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('hi').buffer);
     // Don't start — socket is still disconnected.
     await h.engine.handleVaultEvent({
       type: 'create',
@@ -525,7 +526,7 @@ describe('SyncEngine — offline queue', () => {
 
   it('drains the queue on reconnect', async () => {
     const h = buildHarness();
-    h.vault.files.set('note.md', new TextEncoder().encode('hi').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('hi').buffer);
     await h.engine.handleVaultEvent({
       type: 'create',
       bindingId: 'b1',
@@ -635,7 +636,7 @@ describe('SyncEngine — vector clock persistence', () => {
     await flushAsync();
     // Place the file AFTER start so the initial-push pass doesn't find it
     // and the only CREATE that bumps the clock is the watcher event below.
-    h.vault.files.set('a.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    h.vault.files.set('a.md', new TextEncoder().encode('x').buffer);
 
     const promise = h.engine.handleVaultEvent({
       type: 'create',
@@ -879,7 +880,7 @@ describe('SyncEngine — delete conflict resolver', () => {
 describe('SyncEngine — S4 offline drain → reconnect', () => {
   it('does not re-upload a queued CREATE during the post-drain initial-push pass', async () => {
     const h = buildHarness();
-    h.vault.files.set('note.md', new TextEncoder().encode('offline edit').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('offline edit').buffer);
 
     // Queue a CREATE while offline (socket not started yet).
     await h.engine.handleVaultEvent({
@@ -911,19 +912,37 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     expect(h.log.pendingCount('b1')).toBe(0);
   });
 
+  it('drops a queued DELETE whose fileId is not a string instead of sending "[object Object]"', async () => {
+    const h = buildHarness();
+    // The queue is parsed back from state.json: a damaged entry can hold any shape.
+    h.log.enqueueOperation('b1', {
+      opType: 'DELETE',
+      filePath: 'gone.md',
+      payload: { fileId: { id: 'f1' } },
+    });
+
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(20);
+
+    expect(h.socket().emits.filter((e) => e.event === 'file:delete')).toHaveLength(0);
+    expect(h.log.pendingCount('b1')).toBe(0);
+    await h.engine.stop();
+  });
+
   it('collapses duplicate offline CREATEs for one path into one CREATE + a modify', async () => {
     const Y = await import('yjs');
     const h = buildHarness();
     // Simulate create-then-edit while offline: the content captured at
     // enqueue time differs from the content on disk at replay time.
-    h.vault.files.set('draft.md', new TextEncoder().encode('v1').buffer as ArrayBuffer);
+    h.vault.files.set('draft.md', new TextEncoder().encode('v1').buffer);
     await h.engine.handleVaultEvent({
       type: 'create',
       bindingId: 'b1',
       path: 'draft.md',
       source: 'obsidian',
     });
-    h.vault.files.set('draft.md', new TextEncoder().encode('v2 edited').buffer as ArrayBuffer);
+    h.vault.files.set('draft.md', new TextEncoder().encode('v2 edited').buffer);
     // A modify with no server record yet promotes to a second queued CREATE.
     await h.engine.handleVaultEvent({
       type: 'modify',
@@ -1025,7 +1044,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     // exact offline content.
     const target = new Y.Doc();
     Y.applyUpdate(target, Uint8Array.from(payload.update));
-    expect(target.getText('content').toString()).toBe('offline-only edits');
+    expect(target.getText('content').toJSON()).toBe('offline-only edits');
     target.destroy();
     await h.engine.stop();
   });
@@ -1086,9 +1105,30 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     expect(payload.fileId).toBe('f1');
     const target = new Y.Doc();
     Y.applyUpdate(target, Uint8Array.from(payload.update));
-    expect(target.getText('content').toString()).toBe('offline-only edits');
+    expect(target.getText('content').toJSON()).toBe('offline-only edits');
     target.destroy();
     await h.engine.stop();
+  });
+
+  it('gives up on a stalled catch-up stream through window.setTimeout', async () => {
+    const win = stubWindow();
+    try {
+      const h = buildHarness();
+      await h.engine.start();
+      h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
+      await flushAsync(10);
+      expect(h.engine.getStatus()).not.toBe('connected');
+
+      // The stream never sends `done`: the five-minute guard lets connect finish.
+      const guard = win.setTimeout.mock.calls.find(([, ms]) => ms === 5 * 60 * 1000);
+      expect(guard).toBeDefined();
+      guard?.[0]();
+      await flushAsync(10);
+      expect(h.engine.getStatus()).toBe('connected');
+      await h.engine.stop();
+    } finally {
+      win.restore();
+    }
   });
 
   it('ignores streamed catch-up batches for a different project', async () => {
@@ -1236,8 +1276,8 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     // runs again → another disk write → another echo → infinite loop.
     // The fix updates meta BEFORE the disk write so the echo sees the new
     // hash and short-circuits.
-    const initialBytes = new TextEncoder().encode('initial-bytes').buffer as ArrayBuffer;
-    const newBytes = new TextEncoder().encode('server-updated-bytes').buffer as ArrayBuffer;
+    const initialBytes = new TextEncoder().encode('initial-bytes').buffer;
+    const newBytes = new TextEncoder().encode('server-updated-bytes').buffer;
     const sha256 = (await import('@/sync/hash')).sha256Hex;
     const initialHash = await sha256(initialBytes);
     const newHash = await sha256(newBytes);
@@ -1353,7 +1393,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       headers: {},
       text: '',
     }));
-    h.vault.files.set('live-test.md', new TextEncoder().encode('local').buffer as ArrayBuffer);
+    h.vault.files.set('live-test.md', new TextEncoder().encode('local').buffer);
 
     // Spy on the resolver — it MUST NOT be called for this stale op.
     const resolver = {
@@ -1406,10 +1446,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     };
     const api = new ApiClient(server, respond, respond);
     const vault = new MemoryVault();
-    vault.files.set(
-      'live-test.md',
-      new TextEncoder().encode('local-divergent').buffer as ArrayBuffer,
-    );
+    vault.files.set('live-test.md', new TextEncoder().encode('local-divergent').buffer);
     const engine = new SyncEngine({
       binding,
       server,
@@ -1476,11 +1513,11 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     // the initial-push race used to create. `adapter.rename` would throw
     // "Destination file already exists" and crash the engine to `error`.
     //
-    // Until TASK-0027 the answer was to delete the source, which is a silent
+    // Until 0.3.3 the answer was to delete the source, which is a silent
     // local data loss chosen by whoever controls the server. Contents differ
     // here, so the local destination must survive under a `.conflict-` name.
-    h.vault.files.set('old.md', new TextEncoder().encode('a').buffer as ArrayBuffer);
-    h.vault.files.set('new.md', new TextEncoder().encode('b').buffer as ArrayBuffer);
+    h.vault.files.set('old.md', new TextEncoder().encode('a').buffer);
+    h.vault.files.set('new.md', new TextEncoder().encode('b').buffer);
 
     const seen: EngineStatus[] = [];
     h.engine.onStatus((s) => seen.push(s));
@@ -1541,8 +1578,8 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       headers: {},
       text: '',
     }));
-    h.vault.files.set('old.md', new TextEncoder().encode('same').buffer as ArrayBuffer);
-    h.vault.files.set('new.md', new TextEncoder().encode('same').buffer as ArrayBuffer);
+    h.vault.files.set('old.md', new TextEncoder().encode('same').buffer);
+    h.vault.files.set('new.md', new TextEncoder().encode('same').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -1599,10 +1636,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     }));
     // The file is already on disk — both vaults were in-sync before the
     // other side's reload.
-    h.vault.files.set(
-      'from-shell-2.md',
-      new TextEncoder().encode('synced content').buffer as ArrayBuffer,
-    );
+    h.vault.files.set('from-shell-2.md', new TextEncoder().encode('synced content').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -1868,7 +1902,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       headers: {},
       text: '',
     }));
-    h.vault.files.set('note.md', new TextEncoder().encode('hello').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('hello').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -2027,7 +2061,7 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
   }
 
   function putDisk(h: Harness, text: string): void {
-    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer);
   }
 
   it('catch-up must not roll back a file edited on disk while the plugin was off', async () => {
@@ -2073,7 +2107,7 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     expect(emits.length).toBeGreaterThanOrEqual(1);
     const payload = emits[0]?.args[0] as { update: number[] };
     Y.applyUpdate(serverDoc, Uint8Array.from(payload.update));
-    expect(serverDoc.getText('content').toString()).toBe(newText);
+    expect(serverDoc.getText('content').toJSON()).toBe(newText);
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -2201,7 +2235,7 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     for (const u of updates) {
       Y.applyUpdate(serverDoc, Uint8Array.from((u.args[0] as { update: number[] }).update));
     }
-    expect(serverDoc.getText('content').toString()).toBe(newText);
+    expect(serverDoc.getText('content').toJSON()).toBe(newText);
     serverDoc.destroy();
     expect(h.log.pendingCount('b1')).toBe(0);
     await h.engine.stop();
@@ -2312,7 +2346,7 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     // The incident signature was the whole content repeated under itself
     // (two `# ` headings per file) — the converged server doc must hold
     // the edited text exactly once.
-    expect(serverDoc.getText('content').toString()).toBe(editedText);
+    expect(serverDoc.getText('content').toJSON()).toBe(editedText);
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -2426,11 +2460,8 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     const h = buildHarness();
     // Map iteration order = insertion order: the artifact comes first, so a
     // missing filter would upload it before the real note.
-    h.vault.files.set(
-      'note.md.tmp.14424.02a1a4a4e56e',
-      new TextEncoder().encode('garbage').buffer as ArrayBuffer,
-    );
-    h.vault.files.set('real.md', new TextEncoder().encode('content').buffer as ArrayBuffer);
+    h.vault.files.set('note.md.tmp.14424.02a1a4a4e56e', new TextEncoder().encode('garbage').buffer);
+    h.vault.files.set('real.md', new TextEncoder().encode('content').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -2453,14 +2484,14 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
  * своими `vault.on(...)` НЕ видит — их ловит только сторож, и события приходят
  * с `source: 'fs'`.
  *
- * Проверено вживую 2026-08-06 на вальте, привязанном к `S1Test2`: создание,
- * правка (вставка и удаление), перемещение и удаление файла внешним процессом
- * доходят до сервера. Эти тесты закрепляют поведение.
+ * Проверено вживую 2026-08-06 на вальте, привязанном к тестовому проекту:
+ * создание, правка (вставка и удаление), перемещение и удаление файла внешним
+ * процессом доходят до сервера. Эти тесты закрепляют поведение.
  */
 describe('SyncEngine — правки внешним агентом (source: fs)', () => {
   it('создание файла агентом уходит как file:create с содержимым', async () => {
     const h = buildHarness();
-    h.vault.files.set('агент/заметка.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    h.vault.files.set('агент/заметка.md', new TextEncoder().encode('текст').buffer);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
@@ -2532,7 +2563,7 @@ describe('SyncEngine — правки внешним агентом (source: fs)
 
     // Агент выполнил mv: старого пути нет, новый появился с тем же текстом.
     h.vault.files.delete('было.md');
-    h.vault.files.set('папка/стало.md', new TextEncoder().encode('перенос').buffer as ArrayBuffer);
+    h.vault.files.set('папка/стало.md', new TextEncoder().encode('перенос').buffer);
 
     const before = h.socket().emits.length;
     const del = h.engine.handleVaultEvent({
@@ -2589,7 +2620,7 @@ describe('SyncEngine — переименование из интерфейса 
       headers: {},
       text: '',
     }));
-    h.vault.files.set(path, new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    h.vault.files.set(path, new TextEncoder().encode('текст').buffer);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
@@ -2660,7 +2691,7 @@ describe('SyncEngine — переименование из интерфейса 
  *
  * Раньше `project:join` прогонял ВСЕ документы проекта: на каждый создавался
  * `Y.Doc` со своей базой IndexedDB (одна на файл) и делалась запись на диск.
- * На вальте «Ополченец» (1062 файла) это блокировало поток интерфейса на
+ * На большом рабочем вальте (1062 файла) это блокировало поток интерфейса на
  * десятки секунд — Obsidian висел, пропускал heartbeat, получал разрыв и
  * переподключался, запуская полный catch-up заново. Замеренные фазы `syncing`:
  * 46 с → 30 с → 174 с → 94 с, 796 с CPU (инцидент 2026-08-06).
@@ -2722,7 +2753,7 @@ describe('SyncEngine — catch-up пропускает совпадающие д
     const text = 'одинаковый текст\n';
     const h = buildHarness();
     listOneFile(h, await sha256Hex(text));
-    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer);
 
     await runCatchup(h, text);
 
@@ -2741,7 +2772,7 @@ describe('SyncEngine — catch-up пропускает совпадающие д
     const serverText = 'серверная версия\n';
     const h = buildHarness();
     listOneFile(h, await sha256Hex(diskText));
-    h.vault.files.set('note.md', new TextEncoder().encode(diskText).buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode(diskText).buffer);
 
     await runCatchup(h, serverText);
 
@@ -2755,7 +2786,7 @@ describe('SyncEngine — catch-up пропускает совпадающие д
     const text = 'одинаковый текст\n';
     const h = buildHarness();
     listOneFile(h, await sha256Hex(text));
-    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode(text).buffer);
     // Заметка открыта в редакторе — у её документа может быть история,
     // которой сервер не видел, поэтому пропускать нельзя.
     h.doc.get('b1', 'note.md');
@@ -2805,7 +2836,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
   }
 
   function putDisk(h: Harness, text: string): void {
-    h.vault.files.set(PATH, new TextEncoder().encode(text).buffer as ArrayBuffer);
+    h.vault.files.set(PATH, new TextEncoder().encode(text).buffer);
   }
 
   /** A note synced in an earlier session: meta + identical disk + server doc. */
@@ -2881,7 +2912,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
 
     await saveLocally(h, 'v1\nlocal line\n');
     await drainToServer(h, serverDoc);
-    expect(serverDoc.getText('content').toString()).toBe('v1\nlocal line\n');
+    expect(serverDoc.getText('content').toJSON()).toBe('v1\nlocal line\n');
 
     const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
     Y.applyUpdate(serverDoc, remote);
@@ -2893,7 +2924,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const expected = 'remote line\nv1\nlocal line\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
-    expect(serverDoc.getText('content').toString()).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -2925,7 +2956,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const expected = 'remote\nfirst\nsecond\nlocal\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
-    expect(serverDoc.getText('content').toString()).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -2964,7 +2995,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     await drainToServer(h, serverDoc, emitted);
 
     expect(await h.vault.readText(PATH)).toBe('remote line\nv1\nlocal line\n');
-    expect(serverDoc.getText('content').toString()).toBe('remote line\nv1\nlocal line\n');
+    expect(serverDoc.getText('content').toJSON()).toBe('remote line\nv1\nlocal line\n');
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -3042,7 +3073,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     h.apiResponses.set('GET /api/projects/p1/files/f1/versions/ver-1', () => ({
       status: 200,
       json: null,
-      arrayBuffer: new TextEncoder().encode('v1\n').buffer as ArrayBuffer,
+      arrayBuffer: new TextEncoder().encode('v1\n').buffer,
       headers: {},
       text: '',
     }));
@@ -3060,7 +3091,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const expected = 'remote line\nv1\nlocal line\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
-    expect(serverDoc.getText('content').toString()).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -3098,7 +3129,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     await drainToServer(h, serverDoc, emitted);
 
     expect(h.socket().fetches).toHaveLength(1);
-    expect(serverDoc.getText('content').toString()).toBe('created\nand edited\n');
+    expect(serverDoc.getText('content').toJSON()).toBe('created\nand edited\n');
     serverDoc.destroy();
     await h.engine.stop();
   });
@@ -3136,7 +3167,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     h.apiResponses.set('GET /api/projects/p1/files/f1/versions/ver-1', () => ({
       status: 200,
       json: null,
-      arrayBuffer: new TextEncoder().encode(listed).buffer as ArrayBuffer,
+      arrayBuffer: new TextEncoder().encode(listed).buffer,
       headers: {},
       text: '',
     }));
@@ -3171,7 +3202,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
 });
 
 /**
- * Гейт путей, пришедших от сервера (TASK-0027, аудит перед подачей в каталог
+ * Гейт путей, пришедших от сервера (0.3.3, аудит перед подачей в каталог
  * 2026-09-19). Сервер не имеет права называть локальный путь: участник
  * проекта мог переименовать свой файл в `.obsidian/plugins/team-vault/
  * data.json`, и клиент коллеги перенацеливал на него метаданные, после чего
@@ -3288,7 +3319,7 @@ describe('SyncEngine — гейт путей от сервера', () => {
     expect(await h.vault.exists('archive/b.md')).toBe(false);
 
     // И удаление по такому пути тоже не выполняется: файл на диске цел.
-    h.vault.files.set('archive/b.md', new TextEncoder().encode('чужое').buffer as ArrayBuffer);
+    h.vault.files.set('archive/b.md', new TextEncoder().encode('чужое').buffer);
     h.socket().fire('file:deleted', { fileId: 'f2' });
     await flushAsync(10);
     expect(await h.vault.readText('archive/b.md')).toBe('чужое');
@@ -3357,10 +3388,10 @@ describe('SyncEngine — гейт путей от сервера', () => {
     // любая выгрузка отправляла на сервер содержимое настроек.
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'note.md' }]));
-    h.vault.files.set('note.md', new TextEncoder().encode('моя заметка').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('моя заметка').buffer);
     h.vault.files.set(
       '.obsidian/plugins/team-vault/data.json',
-      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer,
     );
 
     const seen: EngineStatus[] = [];
@@ -3391,7 +3422,7 @@ describe('SyncEngine — гейт путей от сервера', () => {
   it('переименование по пути с ../ не выводит запись за пределы вальта', async () => {
     const h = buildHarness();
     h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'note.md' }]));
-    h.vault.files.set('note.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('текст').buffer);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
@@ -3415,12 +3446,12 @@ describe('SyncEngine — гейт путей от сервера', () => {
     // вставки, а initialPush ждёт ack на каждый файл. Если бы первым шёл
     // обычный файл, цикл встал бы на нём и до остальных не дошёл — тест был
     // бы зелёным независимо от гейта.
-    h.vault.files.set('.trash/deleted.md', new TextEncoder().encode('x').buffer as ArrayBuffer);
+    h.vault.files.set('.trash/deleted.md', new TextEncoder().encode('x').buffer);
     h.vault.files.set(
       '.obsidian/plugins/team-vault/data.json',
-      new TextEncoder().encode('{}').buffer as ArrayBuffer,
+      new TextEncoder().encode('{}').buffer,
     );
-    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -3440,7 +3471,7 @@ describe('SyncEngine — гейт путей от сервера', () => {
 });
 
 /**
- * Исходящая половина того же гейта (вторая итерация TASK-0027 после
+ * Исходящая половина того же гейта (вторая итерация гейта в 0.3.3 после
  * состязательной проверки). Сервер — не единственный источник плохого пути:
  * очередь офлайн-операций живёт в `state.json` и переживает обновление
  * плагина, поэтому сборка, у которой папка конфигурации была зашита как
@@ -3457,7 +3488,7 @@ describe('SyncEngine — гейт исходящих путей', () => {
     const before = h.socket().emits.length;
     h.vault.files.set(
       '.config-obs/plugins/team-vault/data.json',
-      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer,
     );
     await h.engine.handleVaultEvent({
       type: 'create',
@@ -3509,7 +3540,7 @@ describe('SyncEngine — гейт исходящих путей', () => {
     });
     h.vault.files.set(
       '.config-obs/plugins/team-vault/data.json',
-      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer as ArrayBuffer,
+      new TextEncoder().encode('{"apiKey":"osync_secret"}').buffer,
     );
 
     await h.engine.start();
@@ -3562,7 +3593,7 @@ describe('SyncEngine — гейт исходящих путей', () => {
       filePath: 'note.md',
       payload: { contentHash: 'h', size: 2, fileType: 'TEXT' },
     });
-    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer as ArrayBuffer);
+    h.vault.files.set('note.md', new TextEncoder().encode('ok').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
@@ -3578,7 +3609,7 @@ describe('SyncEngine — гейт исходящих путей', () => {
 });
 
 /**
- * Область привязки при переносах (третий заход TASK-0027). Первая версия
+ * Область привязки при переносах (третий заход гейта в 0.3.3). Первая версия
  * гейта отклоняла перенос за пределы папки привязки и оставляла локальную
  * копию на месте — а `initialPush` не находил её в индексе и заливал на
  * сервер ещё раз: дубликат заметки у всей команды. Перенос ВНУТРЬ привязки
@@ -3598,7 +3629,7 @@ describe('SyncEngine — переносы через границу папки �
   it('перенос ИЗ привязки двигает файл и не создаёт дубликат на сервере', async () => {
     const h = buildHarness({ localFolder: 'notes' });
     h.apiResponses.set('GET /api/projects/p1/files', listing([{ id: 'f1', path: 'notes/b.md' }]));
-    h.vault.files.set('notes/b.md', new TextEncoder().encode('текст').buffer as ArrayBuffer);
+    h.vault.files.set('notes/b.md', new TextEncoder().encode('текст').buffer);
 
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });

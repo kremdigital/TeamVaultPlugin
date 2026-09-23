@@ -1,4 +1,4 @@
-import { DEFAULT_SETTINGS, mergeWithDefaults } from '@/settings/settings';
+import { DEFAULT_SETTINGS, mergeWithDefaults, parseLanguageSetting } from '@/settings/settings';
 
 describe('mergeWithDefaults', () => {
   it('returns defaults for empty input', () => {
@@ -14,8 +14,37 @@ describe('mergeWithDefaults', () => {
     });
     expect(merged.debounceMs).toBe(1500);
     expect(merged.logLevel).toBe('debug');
-    expect(merged.syncOnStartup).toBe(DEFAULT_SETTINGS.syncOnStartup);
+    expect(merged.showSyncNotifications).toBe(DEFAULT_SETTINGS.showSyncNotifications);
     expect(merged.servers).toEqual([]);
+  });
+
+  it('follows Obsidian’s language by default', () => {
+    expect(DEFAULT_SETTINGS.language).toBe('auto');
+    expect(mergeWithDefaults({}).language).toBe('auto');
+    expect(mergeWithDefaults({ language: 'auto' }).language).toBe('auto');
+  });
+
+  it('keeps an explicit ru / en saved by earlier versions', () => {
+    expect(mergeWithDefaults({ language: 'ru' }).language).toBe('ru');
+    expect(mergeWithDefaults({ language: 'en' }).language).toBe('en');
+  });
+
+  it('loads a data.json that still carries the removed syncOnStartup, and drops it', () => {
+    // 0.3.4 and earlier saved `syncOnStartup` (a switch that did nothing).
+    const saved = {
+      servers: [],
+      bindings: [],
+      debounceMs: 500,
+      syncOnStartup: false,
+      showSyncNotifications: true,
+      logLevel: 'info',
+      language: 'ru',
+      clientId: 'c1',
+    };
+    const merged = mergeWithDefaults(saved);
+    expect(merged).not.toHaveProperty('syncOnStartup');
+    expect(merged).toEqual({ ...DEFAULT_SETTINGS, language: 'ru', clientId: 'c1' });
+    expect(DEFAULT_SETTINGS).not.toHaveProperty('syncOnStartup');
   });
 
   it('rejects unknown enum values and uses defaults', () => {
@@ -67,5 +96,21 @@ describe('mergeWithDefaults', () => {
       ],
     });
     expect(merged.bindings[0]?.lastVectorClock).toEqual({ node1: 5 });
+  });
+});
+
+describe('parseLanguageSetting', () => {
+  it('accepts the three choices of the settings dropdown', () => {
+    expect(parseLanguageSetting('auto')).toBe('auto');
+    expect(parseLanguageSetting('ru')).toBe('ru');
+    expect(parseLanguageSetting('en')).toBe('en');
+  });
+
+  it('turns anything else into auto', () => {
+    expect(parseLanguageSetting('fr')).toBe('auto');
+    expect(parseLanguageSetting('RU')).toBe('auto');
+    expect(parseLanguageSetting('')).toBe('auto');
+    expect(parseLanguageSetting(null)).toBe('auto');
+    expect(parseLanguageSetting(1)).toBe('auto');
   });
 });

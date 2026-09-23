@@ -121,6 +121,9 @@ const defaultBinaryRequest: BinaryRequestFn = async (params) => {
     headers: params.headers,
     ...(params.body !== undefined ? { body: params.body } : {}),
   };
+  // The directory's linter asks for `requestUrl` here (no-restricted-globals,
+  // a warning its config won't let us disable). Kept on purpose — see above:
+  // `requestUrl` cannot carry these bodies. JSON calls do use `requestUrl`.
   const res = await fetch(params.url, init);
 
   const buf = await res.arrayBuffer();
@@ -425,7 +428,7 @@ function buildMultipartUpload(
   content: ArrayBuffer,
   mimeType?: string,
 ): { body: ArrayBuffer; contentType: string } {
-  const boundary = `----osync-${globalThis.crypto.randomUUID()}`;
+  const boundary = `----osync-${window.crypto.randomUUID()}`;
   const encoder = new TextEncoder();
 
   // Field 1: path

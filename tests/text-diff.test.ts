@@ -20,28 +20,28 @@ describe('applyTextDiff', () => {
   it('inserts new content into an empty doc', () => {
     const { ytext } = newDoc();
     applyTextDiff(ytext, 'hello world');
-    expect(ytext.toString()).toBe('hello world');
+    expect(ytext.toJSON()).toBe('hello world');
   });
 
   it('replaces middle of the text minimally', () => {
     const { ytext } = newDoc();
     ytext.insert(0, 'the quick brown fox');
     applyTextDiff(ytext, 'the quick green fox');
-    expect(ytext.toString()).toBe('the quick green fox');
+    expect(ytext.toJSON()).toBe('the quick green fox');
   });
 
   it('removes content', () => {
     const { ytext } = newDoc();
     ytext.insert(0, 'hello world');
     applyTextDiff(ytext, 'hello');
-    expect(ytext.toString()).toBe('hello');
+    expect(ytext.toJSON()).toBe('hello');
   });
 
   it('handles full replacement', () => {
     const { ytext } = newDoc();
     ytext.insert(0, 'foo');
     applyTextDiff(ytext, 'bar');
-    expect(ytext.toString()).toBe('bar');
+    expect(ytext.toJSON()).toBe('bar');
   });
 
   it('forwards origin to the transact() call', () => {
@@ -69,6 +69,6 @@ describe('applyTextDiff', () => {
     const { ytext } = newDoc();
     ytext.insert(0, 'привет');
     applyTextDiff(ytext, 'привет, мир');
-    expect(ytext.toString()).toBe('привет, мир');
+    expect(ytext.toJSON()).toBe('привет, мир');
   });
 });

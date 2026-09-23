@@ -33,9 +33,9 @@ export class LogViewerModal extends Modal {
           .setButtonText(t('modal.log.copy'))
           .setCta()
           .onClick(async () => {
-            await (
-              globalThis as { navigator: { clipboard: { writeText(s: string): Promise<void> } } }
-            ).navigator.clipboard.writeText(this.content);
+            // The window the modal is in: clipboard writes need a focused
+            // document, and in a popout that is not the main window's.
+            await activeWindow.navigator.clipboard.writeText(this.content);
             new Notice(t('modal.log.copiedNotice'));
           }),
       )

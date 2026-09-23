@@ -16,7 +16,7 @@
  *     mutates the real op-log, orphan sweeps included. With empty settings
  *     every binding looks retired, and the sweep wipes the offline CRDT.
  *
- * That pair cost the «Ополченец» vault a full re-sync on 2026-09-04: the
+ * That pair cost a large production vault a full re-sync on 2026-09-04: the
  * manager showed 0.2.9 while 0.2.11 sat unused in the folder next to it.
  * Detection is a directory listing, so we run it on every load, tell the
  * user which folder to remove, and skip the destructive sweeps until they do.

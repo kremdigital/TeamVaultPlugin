@@ -1,5 +1,6 @@
 import { OperationLog, type FileMeta } from '@/sync/operation-log';
 import type { LogStorage } from '@/utils/file-log-sink';
+import { stubWindow } from './window-stub';
 
 let clock = 1_000_000;
 const now = (): number => ++clock;
@@ -374,6 +375,24 @@ describe('OperationLog — persistence', () => {
     expect(second.id).toBeGreaterThan(first.id);
   });
 
+  it('schedules the background write on window.setTimeout and cancels it on close', async () => {
+    const win = stubWindow();
+    try {
+      const { storage, files } = makeStorage();
+      const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 250 });
+      log.setFileMeta(makeMeta());
+      log.setFileMeta(makeMeta({ relativePath: 'b.md' }));
+
+      // One timer for the burst, not one per change.
+      expect(win.setTimeout.mock.calls.map(([, ms]) => ms)).toEqual([250]);
+      await log.close();
+      expect(win.clearTimeout).toHaveBeenCalledTimes(1);
+      expect(files.has(PATH)).toBe(true);
+    } finally {
+      win.restore();
+    }
+  });
+
   it('writes through a temp file and renames over the target', async () => {
     // `write` truncates first, so a crash mid-write would leave a half
     // document — and the queue inside it is what the server can't rebuild.
@@ -387,6 +406,163 @@ describe('OperationLog — persistence', () => {
     expect(calls.indexOf(`write ${PATH}.tmp`)).toBeLessThan(
       calls.indexOf(`rename ${PATH}.tmp ${PATH}`),
     );
+  });
+
+  it('still writes changes that land after close()', async () => {
+    // Obsidian does not await onunload: a request an engine had in flight
+    // settles after the log is closed. The queue it touches is what the
+    // server can't rebuild, and it used to be dropped here.
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    await log.close();
+
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'late.md' });
+    log.setFileMeta(makeMeta({ relativePath: 'late.md' }));
+    await log.flush();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.dequeueOperations('b1').map((o) => o.filePath)).toEqual(['late.md']);
+    expect(reopened.getFileMeta('b1', 'late.md')).toEqual(makeMeta({ relativePath: 'late.md' }));
+  });
+
+  it('loads the temp file when it finds the log between remove and rename', async () => {
+    // The write ends with: remove the file, rename the temp over it. A copy
+    // of the plugin that loads in between must not start from nothing.
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await log.close();
+    files.set(`${PATH}.tmp`, files.get(PATH)!);
+    files.delete(PATH);
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.pendingCount('b1')).toBe(1);
+  });
+
+  it('prefers the log itself over a leftover temp file', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await log.close();
+    files.set(`${PATH}.tmp`, '{ half-written');
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.pendingCount('b1')).toBe(1);
+  });
+
+  it('close() waits for a write that is already under way', async () => {
+    // `writeOnce` clears the dirty flag before its first await, so a close
+    // right after an immediate write found nothing to do and returned — and
+    // the next instance of the plugin read the file without that operation.
+    const { storage, files } = makeStorage();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const slow: LogStorage = {
+      ...storage,
+      write: async (p, data) => {
+        await gate;
+        await storage.write(p, data);
+      },
+    };
+    const log = new OperationLog({ storage: slow, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+
+    let closed = false;
+    const closing = log.close().then(() => {
+      closed = true;
+    });
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    expect(closed).toBe(false);
+
+    release();
+    await closing;
+    expect(files.has(PATH)).toBe(true);
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.pendingCount('b1')).toBe(1);
+  });
+
+  it('stops writing once a newer instance has taken the file over', async () => {
+    // A request the old instance had in flight settles after the new one
+    // loaded: its snapshot must not overwrite the newer file.
+    const { storage } = makeStorage();
+    let owner = 'old';
+    const old = new OperationLog({ storage, filePath: PATH, now, ownsFile: () => owner === 'old' });
+    old.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await old.close();
+
+    owner = 'new';
+    const next = new OperationLog({
+      storage,
+      filePath: PATH,
+      now,
+      ownsFile: () => owner === 'new',
+    });
+    await next.load();
+    next.markSent(next.dequeueOperations('b1').map((o) => o.id));
+    await next.flush();
+
+    old.enqueueOperation('b1', { opType: 'UPDATE', filePath: 'late.md' });
+    await old.flush();
+
+    const reread = new OperationLog({ storage, filePath: PATH, now });
+    await reread.load();
+    expect(reread.pendingCount('b1')).toBe(0);
+  });
+
+  it('reads the log itself when the rename lands between the checks and the read', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await log.close();
+    const doc = files.get(PATH)!;
+
+    // `state.json` is missing and the temp file is there when checked, but
+    // renamed over the file by the time it is read.
+    let renamed = false;
+    const racing: LogStorage = {
+      ...storage,
+      exists: (p) => Promise.resolve(renamed ? p === PATH : p === `${PATH}.tmp`),
+      read: (p) => {
+        if (p === `${PATH}.tmp`) {
+          renamed = true;
+          return Promise.reject(new Error('ENOENT'));
+        }
+        return Promise.resolve(doc);
+      },
+    };
+    const errors: unknown[] = [];
+    const reopened = new OperationLog({
+      storage: racing,
+      filePath: PATH,
+      now,
+      onError: (err) => errors.push(err),
+    });
+    await reopened.load();
+    expect(reopened.pendingCount('b1')).toBe(1);
+    expect(errors).toEqual([]);
+  });
+
+  it('removes the temp file after falling back to writing the log in place', async () => {
+    // Left behind, it would come back as the log once `state.json` is
+    // deleted by hand to reset the plugin's state.
+    const { storage, files } = makeStorage();
+    const failingRename: LogStorage = {
+      ...storage,
+      rename: () => Promise.reject(new Error('EPERM')),
+    };
+    const log = new OperationLog({ storage: failingRename, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await log.close();
+
+    expect(files.has(PATH)).toBe(true);
+    expect(files.has(`${PATH}.tmp`)).toBe(false);
   });
 
   it('starts empty — and does not throw — on a corrupt document', async () => {

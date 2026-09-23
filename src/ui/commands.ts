@@ -9,12 +9,12 @@ import { HISTORY_VIEW_TYPE } from './views/history-view';
  * function so `main.ts` (Stage 13) calls `registerCommands(plugin, ...)`
  * once during `onload`.
  *
- * Commands:
- *   - "Team Vault: Sync now"     — runDeepSync on every active engine.
- *   - "Team Vault: Pause"        — manager.pause().
- *   - "Team Vault: Resume"       — manager.resume().
- *   - "Team Vault: Show history" — open the right-pane History view.
- *   - "Team Vault: Settings"     — focus the plugin's settings tab.
+ * Commands (English names; the palette shows them as "Team Vault: …"):
+ *   - "Sync now"                   — runDeepSync on every active engine.
+ *   - "Pause sync"                 — manager.pause().
+ *   - "Resume sync"                — manager.resume().
+ *   - "Toggle active file history" — open / close the right-pane History view.
+ *   - "Open settings"              — focus the plugin's settings tab.
  */
 
 export interface CommandsDeps {
@@ -30,7 +30,10 @@ export interface CommandsDeps {
  * Command ids are bare — Obsidian prefixes them with the plugin id itself,
  * so `sync-now` is exposed as `team-vault:sync-now`. Repeating the prefix
  * here (as 0.2.x did) produced `team-vault:team-vault-sync-now`, which the
- * submission requirements call out explicitly.
+ * submission requirements call out explicitly. Names likewise: Obsidian
+ * shows them as "<plugin name>: <name>", so the catalogs carry the bare
+ * name (up to 0.3.4 the palette read "Team Vault: Team Vault: sync now").
+ * They are read once, here — a language switch reaches them on reload.
  */
 export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   plugin.addCommand({

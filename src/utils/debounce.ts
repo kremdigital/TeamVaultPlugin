@@ -30,15 +30,19 @@ export function debounce<Args extends unknown[]>(
   waitMs: number,
   options: DebounceOptions = {},
 ): DebouncedFunction<Args> {
-  const setT = options.setTimeout ?? globalThis.setTimeout;
-  const clearT = options.clearTimeout ?? globalThis.clearTimeout;
+  // `window.*` rather than the bare globals, as the directory's guidelines ask
+  // (popout-window compatibility). Resolved on each call, not captured once.
+  const setT =
+    options.setTimeout ?? ((cb: () => void, ms: number): unknown => window.setTimeout(cb, ms));
+  const clearT =
+    options.clearTimeout ?? ((handle: unknown): void => window.clearTimeout(handle as number));
 
   let handle: unknown = null;
   let lastArgs: Args | null = null;
 
   const debounced = ((...args: Args): void => {
     lastArgs = args;
-    if (handle !== null) clearT(handle as never);
+    if (handle !== null) clearT(handle);
     handle = setT(() => {
       handle = null;
       const a = lastArgs;
@@ -48,14 +52,14 @@ export function debounce<Args extends unknown[]>(
   }) as DebouncedFunction<Args>;
 
   debounced.cancel = (): void => {
-    if (handle !== null) clearT(handle as never);
+    if (handle !== null) clearT(handle);
     handle = null;
     lastArgs = null;
   };
 
   debounced.flush = (): void => {
     if (handle === null) return;
-    clearT(handle as never);
+    clearT(handle);
     handle = null;
     const a = lastArgs;
     lastArgs = null;

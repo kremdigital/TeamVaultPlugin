@@ -13,6 +13,8 @@
  *   - **Child loggers** carry a context object (`{ binding: 'b1' }`,
  *     `{ component: 'engine' }`, …) that's merged into every entry —
  *     keeps grep useful without every call site spelling its own prefix.
+ *     They share their parent's level: `setLevel` anywhere in the family
+ *     moves all of it.
  *
  * Usage:
  *
@@ -59,7 +61,14 @@ export interface LoggerOptions {
 }
 
 export class Logger {
-  private level: LogLevel;
+  /**
+   * Boxed so a logger and every child made from it read one level. The
+   * engines log through children of the plugin's root logger, made when they
+   * start; the Log level setting calls `setLevel` on the root. When children
+   * snapshotted the level, switching to Debug reached engine logs only after
+   * the plugin reloaded.
+   */
+  private levelBox: { current: LogLevel };
   private readonly sink: LogSink;
   private readonly context: Record<string, unknown>;
   private readonly now: () => Date;
@@ -70,26 +79,33 @@ export class Logger {
     context: Record<string, unknown> = {},
     options: LoggerOptions = {},
   ) {
-    this.level = level;
+    this.levelBox = { current: level };
     this.sink = sink;
     this.context = context;
     this.now = options.now ?? (() => new Date());
   }
 
   setLevel(level: LogLevel): void {
-    this.level = level;
+    this.levelBox.current = level;
   }
 
   getLevel(): LogLevel {
-    return this.level;
+    return this.levelBox.current;
   }
 
   /**
    * Build a logger that adds extra context to every entry. Cheap — the
-   * sink is shared, only the local context object is copied.
+   * sink and the level are shared, only the local context object is copied.
    */
   child(context: Record<string, unknown>): Logger {
-    return new Logger(this.level, this.sink, { ...this.context, ...context }, { now: this.now });
+    const child = new Logger(
+      this.levelBox.current,
+      this.sink,
+      { ...this.context, ...context },
+      { now: this.now },
+    );
+    child.levelBox = this.levelBox;
+    return child;
   }
 
   error(message: string, ...args: unknown[]): void {
@@ -106,7 +122,7 @@ export class Logger {
   }
 
   private emit(level: LogLevel, message: string, args: unknown[]): void {
-    if (LEVEL_ORDER[level] > LEVEL_ORDER[this.level]) return;
+    if (LEVEL_ORDER[level] > LEVEL_ORDER[this.levelBox.current]) return;
     const entry: LogEntry = {
       level,
       timestamp: this.now().toISOString(),
@@ -145,6 +161,18 @@ function formatValue(v: unknown): string {
   try {
     return JSON.stringify(v);
   } catch {
-    return String(v);
+    // Circular or BigInt-bearing values. Arrays keep their own toString (the
+    // elements, comma-joined) where it works. For anything else `String()`
+    // only ever printed "[object Object]" — and threw on a null-prototype
+    // object, or an array holding one, taking the log line down with it. The
+    // type tag is the same text, minus the throw.
+    if (Array.isArray(v)) {
+      try {
+        return String(v);
+      } catch {
+        // An element without a toString — fall back to the tag.
+      }
+    }
+    return Object.prototype.toString.call(v);
   }
 }

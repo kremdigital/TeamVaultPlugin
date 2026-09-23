@@ -52,7 +52,8 @@ export function normalizeSeparators(p: string): string {
  * hard-coded the whole config folder (including our own `data.json` with the
  * API key) synced to the server. Every filter below therefore takes the
  * config dir as a parameter; this constant is only the fallback for call
- * sites without an `App` at hand.
+ * sites without an `App` at hand. (The directory's linter flags the literal —
+ * hardcoded-config-path; the plugin itself always passes `Vault.configDir`.)
  */
 export const DEFAULT_CONFIG_DIR = '.obsidian';
 
@@ -61,6 +62,8 @@ export const DEFAULT_CONFIG_DIR = '.obsidian';
  * covers:
  *   - `.obsidian` — a config folder. Kept even when `configDir` differs: in
  *     that vault it belongs to *another* Obsidian setup, not to this one.
+ *     The directory's linter flags the literal (hardcoded-config-path); here
+ *     it is on purpose — `Vault.configDir` is filtered separately, below.
  *   - `.git` — a repository.
  *   - `.versions`, `.staging` — the server's own storage layout. It refuses
  *     them outright, so uploading one would retry for ever.
@@ -161,7 +164,7 @@ export type PathRejection = 'empty' | 'absolute' | 'traversal' | 'ignored' | 'ou
  * The server is not trusted to name a local path: before this gate existed a
  * project member could rename a file to `.obsidian/plugins/team-vault/
  * data.json` and every other client would retarget its metadata onto its own
- * settings file, API key included (TASK-0027).
+ * settings file, API key included (fixed in 0.3.3).
  *
  * Returns `null` when the path may be used, otherwise the reason to log.
  */

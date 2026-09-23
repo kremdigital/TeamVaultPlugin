@@ -11,7 +11,14 @@
  */
 
 export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
+/** A UI catalog the plugin ships. */
 export type Language = 'ru' | 'en';
+/**
+ * The interface-language setting: a catalog, or `auto` — whatever language
+ * Obsidian itself runs in (`i18n/language.ts` resolves it). Versions up to
+ * 0.3.4 always saved `ru`, so their `data.json` keeps an explicit Russian.
+ */
+export type LanguageSetting = 'auto' | Language;
 
 export interface ServerConfig {
   /** Locally generated UUID — stable across renames. */
@@ -45,10 +52,13 @@ export interface PluginSettings {
   bindings: VaultBinding[];
   /** Debounce window (ms) before pushing a `modify` upstream. */
   debounceMs: number;
-  syncOnStartup: boolean;
+  // No `syncOnStartup`: up to 0.3.4 the settings carried a switch by that
+  // name that nothing read — the engines always catch up when they connect.
+  // A `data.json` that still has it loads fine; the field is dropped on the
+  // next save.
   showSyncNotifications: boolean;
   logLevel: LogLevel;
-  language: Language;
+  language: LanguageSetting;
   /** Stable per-device id used as the vector clock key. Generated on first
    *  load (see `main.ts`) and persisted; never re-rolled — would break
    *  causality across reconnects. Empty string means "not yet generated";
@@ -60,15 +70,14 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   servers: [],
   bindings: [],
   debounceMs: 500,
-  syncOnStartup: true,
   showSyncNotifications: true,
   logLevel: 'info',
-  language: 'ru',
+  language: 'auto',
   clientId: '',
 };
 
 const LOG_LEVELS: readonly LogLevel[] = ['error', 'warn', 'info', 'debug'];
-const LANGUAGES: readonly Language[] = ['ru', 'en'];
+const LANGUAGE_SETTINGS: readonly LanguageSetting[] = ['auto', 'ru', 'en'];
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
@@ -88,6 +97,11 @@ function asBoolean(value: unknown, fallback: boolean): boolean {
 
 function asEnum<T extends string>(value: unknown, allowed: readonly T[], fallback: T): T {
   return allowed.includes(value as T) ? (value as T) : fallback;
+}
+
+/** Read a language setting — from `data.json` or the settings dropdown. */
+export function parseLanguageSetting(value: unknown): LanguageSetting {
+  return asEnum(value, LANGUAGE_SETTINGS, DEFAULT_SETTINGS.language);
 }
 
 function asVectorClock(value: unknown): Record<string, number> {
@@ -148,13 +162,12 @@ export function mergeWithDefaults(raw: unknown): PluginSettings {
     servers,
     bindings,
     debounceMs: Math.max(0, asNumber(raw.debounceMs, DEFAULT_SETTINGS.debounceMs)),
-    syncOnStartup: asBoolean(raw.syncOnStartup, DEFAULT_SETTINGS.syncOnStartup),
     showSyncNotifications: asBoolean(
       raw.showSyncNotifications,
       DEFAULT_SETTINGS.showSyncNotifications,
     ),
     logLevel: asEnum(raw.logLevel, LOG_LEVELS, DEFAULT_SETTINGS.logLevel),
-    language: asEnum(raw.language, LANGUAGES, DEFAULT_SETTINGS.language),
+    language: parseLanguageSetting(raw.language),
     clientId: asString(raw.clientId, DEFAULT_SETTINGS.clientId),
   };
 }

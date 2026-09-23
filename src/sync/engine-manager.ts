@@ -88,6 +88,14 @@ export class EngineManager {
   private readonly statuses = new Map<string, EngineStatus>();
   private listeners = new Set<AggregateListener>();
   private paused = false;
+  /**
+   * Set by `stop()` (plugin unload) and cleared by `start()`. Obsidian does not
+   * wait for `onunload`, so a `saveSettings()` already in flight — the one
+   * `onBindingSynced` fires on every connect — could call
+   * `refreshFromSettings()` after the teardown and spawn a fresh engine that
+   * nobody would ever stop: a socket and vault writes from an unloaded plugin.
+   */
+  private stopped = false;
   /** Latest detail string emitted by any engine — surfaced as
    *  `AggregateStatus.detail`. Cleared when the aggregate transitions
    *  to a non-error state. */
@@ -99,12 +107,17 @@ export class EngineManager {
 
   /** Bring up an engine for every enabled binding in the current settings. */
   async start(): Promise<void> {
+    this.stopped = false;
     this.paused = false;
     await this.refreshFromSettings();
   }
 
-  /** Tear everything down. Engines stay registered (we just disconnect). */
+  /**
+   * Tear everything down for good (plugin unload): no engine is spawned
+   * afterwards until `start()` is called again. Pausing is `pause()`.
+   */
   async stop(): Promise<void> {
+    this.stopped = true;
     const stops: Array<Promise<void>> = [];
     for (const engine of this.engines.values()) stops.push(engine.stop());
     for (const off of this.subs.values()) off();
@@ -122,7 +135,7 @@ export class EngineManager {
    *   - everything else → leave alone.
    */
   async refreshFromSettings(): Promise<void> {
-    if (this.paused) return;
+    if (this.paused || this.stopped) return;
     const { servers, bindings } = this.deps.getSettings();
     const serverById = new Map(servers.map((s) => [s.id, s]));
     const desired = new Set<string>();
@@ -160,6 +173,7 @@ export class EngineManager {
   }
 
   async resume(): Promise<void> {
+    if (this.stopped) return;
     this.paused = false;
     await this.refreshFromSettings();
   }
@@ -218,6 +232,9 @@ export class EngineManager {
   // -- Internals ------------------------------------------------------------
 
   private async spawn(binding: VaultBinding, server: ServerConfig): Promise<void> {
+    // `refreshFromSettings` awaits between bindings, so `stop()` can land in
+    // the middle of its loop.
+    if (this.stopped || this.paused) return;
     const apiClient = this.deps.apiClient ? this.deps.apiClient(server) : undefined;
     const socketClient = this.deps.socketClient
       ? this.deps.socketClient(server, this.deps.clientId)
@@ -256,6 +273,9 @@ export class EngineManager {
     this.subs.set(binding.id, off);
 
     await engine.start();
+    // `stop()` ran while this engine was still starting: it was stopped along
+    // with the rest, but `start()` may have connected after that.
+    if (this.stopped && this.engines.get(binding.id) !== engine) await engine.stop();
   }
 
   /**

@@ -4,6 +4,7 @@ import {
   type SocketFactoryOptions,
   type SocketLike,
 } from '@/client/socket';
+import { stubWindow } from './window-stub';
 
 /**
  * Minimal socket.io-client stand-in. Just enough surface to drive the plugin
@@ -165,6 +166,23 @@ describe('SocketClient — lifecycle subscriptions', () => {
     expect(client.isConnected()).toBe(false);
   });
 
+  it('wraps a connect_error payload that is not an Error', () => {
+    const { client, socket } = captureSocket();
+    const errored = jest.fn<void, [Error]>();
+    client.onError(errored);
+    client.connect();
+
+    socket().fire('connect_error', 'xhr poll error');
+    socket().fire('connect_error', { description: 401 });
+    socket().fire('connect_error');
+
+    expect(errored.mock.calls.map(([e]) => e.message)).toEqual([
+      'xhr poll error',
+      'connect_error',
+      'connect_error',
+    ]);
+  });
+
   it('lets callers unsubscribe', () => {
     const { client, socket } = captureSocket();
     const cb = jest.fn();
@@ -270,6 +288,21 @@ describe('SocketClient — emits', () => {
     });
   });
 
+  it('fetchYjsDoc times out on window.setTimeout and clears it on the ack', async () => {
+    const win = stubWindow();
+    try {
+      const { client, socket } = captureSocket();
+      client.connect();
+      const promise = client.fetchYjsDoc('p1', 'f1', 60_000);
+      expect(win.setTimeout).toHaveBeenCalledWith(expect.any(Function), 60_000);
+      socket().ackLast({ ok: true, sync1: [], stateVector: [] });
+      await promise;
+      expect(win.clearTimeout).toHaveBeenCalledTimes(1);
+    } finally {
+      win.restore();
+    }
+  });
+
   it('fetchYjsDoc resolves (does not reject) before connect', async () => {
     const client = new SocketClient({ server, clientId, factory });
     await expect(client.fetchYjsDoc('p1', 'f1')).resolves.toEqual({
@@ -331,15 +364,15 @@ describe('SocketClient — incoming events', () => {
 
   it('decodes yjs:update payload back to a Uint8Array', () => {
     const { client, socket } = captureSocket();
-    const yjsCb = jest.fn();
+    const yjsCb = jest.fn<void, [{ fileId: string; update: Uint8Array }]>();
     client.onYjsUpdate(yjsCb);
     client.connect();
     socket().fire('yjs:update', { fileId: 'f1', update: [1, 2, 3] });
     expect(yjsCb).toHaveBeenCalledTimes(1);
-    const arg = yjsCb.mock.calls[0]?.[0] as { fileId: string; update: Uint8Array };
-    expect(arg.fileId).toBe('f1');
-    expect(arg.update).toBeInstanceOf(Uint8Array);
-    expect(Array.from(arg.update)).toEqual([1, 2, 3]);
+    const arg = yjsCb.mock.calls[0]?.[0];
+    expect(arg?.fileId).toBe('f1');
+    expect(arg?.update).toBeInstanceOf(Uint8Array);
+    expect(Array.from(arg?.update ?? [])).toEqual([1, 2, 3]);
   });
 
   it('swallows errors thrown by individual listeners', () => {

@@ -37,9 +37,9 @@ reconnect, and every file keeps its version history. Companion to the
 - Yjs + y-indexeddb for CRDT
 - socket.io-client for live transport
 - chokidar for the filesystem watcher
-- Obsidian API 1.5+ (desktop only — `isDesktopOnly: true`, the watcher and
+- Obsidian 1.7.2+ (desktop only — `isDesktopOnly: true`, the watcher and
   the log need Node APIs that mobile doesn't have)
-- Jest + ts-jest, 350+ tests
+- Jest + ts-jest, 500+ tests
 
 ## Network use and privacy
 
@@ -119,29 +119,46 @@ synchronizing. The status bar shows the aggregate state.
 
 ### 4. Behavior settings
 
+- **Interface language** (default **Same as Obsidian**) — the plugin's
+  settings, notices and status bar follow Obsidian's own language: Russian
+  when Obsidian runs in Russian, English otherwise. **Русский** or
+  **English** pins one. The settings tab switches at once; command names in
+  the command palette follow after the plugin is reloaded (turn it off and on
+  in **Community plugins**, or restart Obsidian).
 - **Change debounce** (default 500 ms) — how long to wait after a file is
   saved before pushing the change upstream. Higher = fewer round-trips but
   laggier remote view.
-- **Sync on startup** — catch up with accumulated changes when the plugin
-  loads. Leave on.
 - **Notifications** — toasts for connect / disconnect / sync completion.
   Errors and conflict notices always fire regardless.
-- **Log level** — `error` / `warn` / `info` / `debug`. Debug also mirrors
-  every entry to DevTools.
-- **Open log / Clear log** — copy `sync.log` into the vault as a markdown
-  fence so you can read it without leaving Obsidian.
+- **Log level** — **Errors only**, **Warnings**, **Info** (default) or
+  **Debug**: what goes into `sync.log`. At **Debug** every entry is also
+  mirrored to the DevTools console (`Ctrl+Shift+I`). A change applies at
+  once, no reload needed.
+- **Event log** — **Open log** shows `sync.log` in a window, with **Copy**
+  (to the clipboard) and **Clear log** buttons; **Clear log** next to it
+  empties the log without opening it. Nothing is written into the vault: the
+  log lives in the plugin's own folder and is never synced.
+
+There is no "sync on startup" switch: every binding catches up with the
+server whenever it connects, including at startup.
 
 ## Commands
 
-Available from the command palette (`Ctrl/Cmd-P`):
+Available from the command palette (`Ctrl/Cmd-P`), where Obsidian lists
+them under the plugin's name:
 
 - **Team Vault: Sync now** — runs a deep diff against every active
   binding (catches files that drifted while the plugin was offline).
-- **Team Vault: Pause** — disconnects every engine until you resume.
-- **Team Vault: Resume** — reconnect after a manual pause.
-- **Team Vault: Active file history** — opens the right-pane history
-  view for the file currently in focus.
+- **Team Vault: Pause sync** — disconnects every engine until you resume.
+  Shown only while sync runs.
+- **Team Vault: Resume sync** — reconnect after a manual pause. Shown only
+  while paused.
+- **Team Vault: Toggle active file history** — opens the right-pane history
+  view for the file currently in focus, or closes it if it is open.
 - **Team Vault: Open settings** — focuses the plugin's settings tab.
+
+With the interface in Russian the names are Russian too, e.g.
+**Team Vault: Синхронизировать сейчас**.
 
 ## Status bar
 
@@ -158,8 +175,8 @@ binding:
 | `alert-circle` | `error`      | One or more bindings hit an error (see log). |
 | `circle`       | `idle`       | No active bindings yet.                      |
 
-Click the widget for an action menu (Sync now / Pause-or-Resume / History
-/ Settings).
+Click the widget for an action menu: **Sync now** and **Pause** — or only
+**Resume** while paused — then **Active file history** and **Open settings**.
 
 ## Troubleshooting
 
@@ -174,7 +191,8 @@ machine. Try `curl -H "X-API-Key: osk_…" https://your-server/api/auth/me`.
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`
 headers cleanly, the socket can't establish. Check Caddy / nginx logs.
 
-**Files don't sync** — open the log via Settings → Behavior → "Open log".
+**Files don't sync** — open the log via Settings → Team Vault → Behavior →
+**Open log**.
 Look for `[error]` lines. Common causes:
 
 - The binding is switched off (toggle in **Team Vault → Vaults**).
@@ -214,17 +232,25 @@ edits in `…conflict-<ts>.<ext>`.
 ## Development
 
 ```bash
-pnpm install
-pnpm dev:vault          # esbuild --watch + copy to TEST_VAULT
-pnpm test               # Jest, 350+ tests
+CI=1 pnpm install --frozen-lockfile
+pnpm build:vault        # production main.js + copy the release files to TEST_VAULT
+pnpm dev                # esbuild --watch, unminified, inline sourcemap
+pnpm test               # Jest, 500+ tests
 pnpm typecheck
-pnpm lint
+pnpm lint               # ESLint + eslint-plugin-obsidianmd, the directory's review rules
 pnpm build              # production main.js
 pnpm cli help           # protocol-debug CLI emulator
 ```
 
-`pnpm dev:vault` requires `TEST_VAULT` to point at a vault folder; copy
-`.env.example` to `.env` and edit.
+`pnpm build:vault` copies `main.js`, `manifest.json` and `styles.css` into
+`$TEST_VAULT/.obsidian/plugins/team-vault/`, so `TEST_VAULT` must be set to
+the root of a test vault and that plugin folder must exist. The build reads
+the variable from the environment only — it doesn't load `.env` files. Set it
+in the shell (`TEST_VAULT="/path/to/vault" pnpm build:vault`) or pass a
+`.env` to Node yourself; [`.env.example`](./.env.example) shows both.
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) for the gates a change has to pass
+and the commit conventions.
 
 ## Layout
 
@@ -241,13 +267,27 @@ src/
                         # conflict modal
   integration/          # concrete Obsidian adapters (vault, log storage,
                         # watchable vault)
-  i18n/                 # ru / en catalogs + tiny `t()` helper
+  i18n/                 # ru / en catalogs, tiny `t()` helper, language pick
   utils/                # logger, debounce, hash, uuid
 scripts/
   cli-emulator.ts       # CLI-based protocol debugger
+  version-bump.mjs      # `pnpm version` hook: manifest.json + versions.json
+  release-notes.mjs     # one version's CHANGELOG section → GitHub release body
+  bundle-licenses.mjs   # license notices of bundled packages → end of main.js
 tests/                  # Jest, organized 1:1 with src
 ```
+
+## Security
+
+Found a vulnerability? Please report it privately — see
+[SECURITY.md](./SECURITY.md) — rather than in a public issue.
 
 ## License
 
 MIT — see [LICENSE](./LICENSE).
+
+`main.js` bundles third-party packages — Yjs, lib0, y-indexeddb,
+socket.io-client, chokidar, diff and their dependencies — under their own
+licenses (MIT, BSD-3-Clause). The build appends each one's name, version and
+full license text to the end of `main.js`, so the notices ship with every
+install.

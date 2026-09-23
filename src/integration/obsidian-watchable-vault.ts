@@ -20,7 +20,7 @@ export class ObsidianWatchableVault implements WatchableVault {
     const vaultOn = (this.vault as unknown as { on: (n: string, h: unknown) => unknown }).on;
     if (name === 'rename') {
       return vaultOn.call(this.vault, name, (file: { path: string } | TFolder, oldPath: string) => {
-        (cb as (f: WatchableFile, oldPath: string) => void)(toWatchable(file), oldPath);
+        cb(toWatchable(file), oldPath);
       });
     }
     return vaultOn.call(this.vault, name, (file: { path: string } | TFolder) => {

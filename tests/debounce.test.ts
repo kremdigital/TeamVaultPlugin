@@ -1,4 +1,5 @@
 import { debounce } from '@/utils/debounce';
+import { stubWindow } from './window-stub';
 
 /** Hand-rolled deterministic timer queue — easier to reason about than
  *  jest.useFakeTimers when the test only needs explicit "advance to N". */
@@ -94,5 +95,24 @@ describe('debounce', () => {
     });
     d.flush();
     expect(fn).not.toHaveBeenCalled();
+  });
+});
+
+describe('debounce — default timers', () => {
+  it('schedules on window.setTimeout when no clock is injected', () => {
+    // Popout-window compatibility: window.*, not the bare globals.
+    const win = stubWindow();
+    try {
+      const fn = jest.fn();
+      const d = debounce(fn, 100);
+      d('a');
+      d('b');
+      expect(win.setTimeout.mock.calls.map(([, ms]) => ms)).toEqual([100, 100]);
+      expect(win.clearTimeout).toHaveBeenCalledTimes(1);
+      d.cancel();
+      expect(win.clearTimeout).toHaveBeenCalledTimes(2);
+    } finally {
+      win.restore();
+    }
   });
 });

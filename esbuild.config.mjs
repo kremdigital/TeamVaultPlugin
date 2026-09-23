@@ -1,7 +1,10 @@
 import esbuild from 'esbuild';
 import process from 'node:process';
-import builtins from 'builtin-modules';
-import { copyFile } from 'node:fs/promises';
+import { builtinModules } from 'node:module';
+import { Buffer } from 'node:buffer';
+import { copyFile, writeFile } from 'node:fs/promises';
+import { resolve } from 'node:path';
+import { collectBundledLicenses, formatLicenseComment } from './scripts/bundle-licenses.mjs';
 
 /**
  * Build the Obsidian plugin to `main.js` (CommonJS, single bundle).
@@ -13,7 +16,8 @@ import { copyFile } from 'node:fs/promises';
  * Modes:
  *   `node esbuild.config.mjs`           → one-shot production build (minified)
  *   `node esbuild.config.mjs --watch`   → watch mode (no minify, sourcemap inline)
- *   `node esbuild.config.mjs --vault`   → after build, copy the three release files
+ *   `node esbuild.config.mjs --vault`   → after every build (each rebuild with
+ *                                         `--watch`), copy the three release files
  *                                         (main.js, manifest.json, styles.css) into a
  *                                         vault plugin dir (TEST_VAULT env)
  */
@@ -21,6 +25,58 @@ import { copyFile } from 'node:fs/promises';
 const isWatch = process.argv.includes('--watch');
 const copyToVault = process.argv.includes('--vault');
 const isProd = !isWatch;
+
+// Node built-ins stay external in both spellings: the bundle requires
+// `node:fs`, `node:path`, … and a dependency importing bare `fs` must not
+// get it bundled either. `builtinModules` lists bare names only, except the
+// few modules that exist solely behind the prefix (`node:sqlite`,
+// `node:test`, …), which it already lists with it. This replaced the
+// `builtin-modules` package, which the directory's lint flags as a
+// dependency with a native replacement.
+const nodeBuiltins = builtinModules.flatMap((name) =>
+  name.startsWith('node:') ? [name] : [name, `node:${name}`],
+);
+
+const OUTFILE = 'main.js';
+
+/**
+ * Writes the build output itself (esbuild runs with `write: false`) so the
+ * license notices of the bundled packages land at the end of `main.js` in
+ * every mode — one-shot, `--watch`, `--vault`. The directory ships `main.js`
+ * alone, so the notices can't live in a separate file. See
+ * `scripts/bundle-licenses.mjs`.
+ *
+ * @type {import('esbuild').Plugin}
+ */
+const writeWithLicenses = {
+  name: 'write-with-licenses',
+  setup(build) {
+    build.onEnd(async (result) => {
+      if (result.errors.length > 0 || !result.metafile || !result.outputFiles) return;
+      const packages = collectBundledLicenses(result.metafile, OUTFILE, process.cwd());
+      const notice = formatLicenseComment(packages);
+      const bundlePath = resolve(OUTFILE);
+      for (const file of result.outputFiles) {
+        const isBundle = resolve(file.path) === bundlePath;
+        await writeFile(file.path, isBundle ? `${file.text}${notice}` : file.contents);
+      }
+      // esbuild's own size line is printed before the notices are appended.
+      const kb = (Buffer.byteLength(notice) / 1024).toFixed(1);
+      console.log(`[licenses] ${packages.length} bundled packages, +${kb}kb of notices`);
+      // Here and not after `ctx.watch()`: that returns before the first
+      // build has written anything, so the vault used to get the previous
+      // `main.js` and never the rebuilds.
+      if (copyToVault) {
+        try {
+          await copyArtifactsToVault();
+        } catch (err) {
+          console.error('[vault]', err);
+          if (!isWatch) process.exitCode = 1;
+        }
+      }
+    });
+  },
+};
 
 const banner = `/*
  * Team Vault — built bundle.
@@ -31,7 +87,11 @@ const banner = `/*
 const options = {
   entryPoints: ['src/main.ts'],
   bundle: true,
-  outfile: 'main.js',
+  outfile: OUTFILE,
+  // The plugin above writes the output, appending the license notices.
+  write: false,
+  metafile: true,
+  plugins: [writeWithLicenses],
   format: 'cjs',
   platform: 'browser',
   target: 'es2022',
@@ -67,7 +127,7 @@ const options = {
     // Obsidian's CodeMirror collab integration happens to import Yjs —
     // the warning is non-fatal and we never cross the instance boundary
     // (Yjs documents only flow within the plugin).
-    ...builtins,
+    ...nodeBuiltins,
   ],
   sourcemap: isWatch ? 'inline' : false,
   minify: isProd,
@@ -97,16 +157,7 @@ if (isWatch) {
   const ctx = await esbuild.context(options);
   await ctx.watch();
   console.log('esbuild: watching for changes…');
-  if (copyToVault) {
-    // Initial copy after first build settles. esbuild fires onEnd after each
-    // rebuild, but for simplicity we just do a one-shot copy here; users with
-    // a more involved live-reload flow can wire onEnd themselves.
-    await copyArtifactsToVault().catch((err) => console.error('[vault]', err));
-  }
 } else {
   await esbuild.build(options);
-  if (copyToVault) {
-    await copyArtifactsToVault();
-  }
   console.log('esbuild: build complete');
 }

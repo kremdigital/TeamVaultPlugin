@@ -496,7 +496,7 @@ export class SyncEngine {
    * На вальте в 1062 файла это блокировало поток интерфейса на десятки секунд —
    * Obsidian «висел», пропускал heartbeat, получал разрыв и переподключался,
    * запуская полный catch-up заново. Лайвлок: замеренные фазы `syncing` —
-   * 46 с → 30 с → 174 с → 94 с, 796 с CPU (инцидент 2026-08-06 на «Ополченце»).
+   * 46 с → 30 с → 174 с → 94 с, 796 с CPU (инцидент 2026-08-06).
    *
    * Работа не нужна, когда файл на диске уже побайтово равен серверной версии:
    * гидратировать нечего, локальных операций для отправки нет. Пропускаем
@@ -525,7 +525,7 @@ export class SyncEngine {
       let same: boolean;
       try {
         Y.applyUpdate(probe, Uint8Array.from(snap.sync1));
-        same = probe.getText('content').toString() === disk;
+        same = probe.getText('content').toJSON() === disk;
       } finally {
         probe.destroy();
       }
@@ -602,11 +602,11 @@ export class SyncEngine {
       const finish = (): void => {
         if (settled) return;
         settled = true;
-        clearTimeout(timer);
+        window.clearTimeout(timer);
         this.catchupResolve = null;
         resolve();
       };
-      const timer = setTimeout(finish, CATCHUP_TIMEOUT_MS);
+      const timer = window.setTimeout(finish, CATCHUP_TIMEOUT_MS);
       void done.then(finish);
     });
   }
@@ -1116,7 +1116,7 @@ export class SyncEngine {
    * rename their file to `.obsidian/plugins/team-vault/data.json`; every
    * other client used to retarget its metadata onto its own settings file,
    * and the next "restore on server" uploaded that file — API key included
-   * (TASK-0027). The same gate keeps writes inside the binding folder and
+   * (fixed in 0.3.3). The same gate keeps writes inside the binding folder and
    * out of `.trash`.
    *
    * Refusal is never fatal: it logs and returns `false`, because the caller
@@ -1526,7 +1526,7 @@ export class SyncEngine {
         //
         // Dropping the source used to be the answer, but that is a silent
         // local data loss driven by a remote event: whoever controls the
-        // server picks the file to destroy (TASK-0027). Identical content is
+        // server picks the file to destroy (fixed in 0.3.3). Identical content is
         // the benign case and stays a delete; differing content parks the
         // local destination aside, the way `keep-both` does for binary
         // conflicts, so nothing disappears.
@@ -2013,7 +2013,7 @@ export class SyncEngine {
     // A queued op outlives the build that queued it: `state.json` survives the
     // upgrade. Anything the gate refuses today is handled here rather than
     // retried forever — that is how a `data.json` enqueued by an older build
-    // would otherwise still reach the server (TASK-0027).
+    // would otherwise still reach the server (fixed in 0.3.3).
     if (this.isIgnoredLocalPath(op.filePath)) {
       this.log.warn('dropped a queued operation for an ignored path', {
         opType: op.opType,
@@ -2099,7 +2099,7 @@ export class SyncEngine {
           return ackToOutcome(ack);
         }
         case 'UPDATE': {
-          const fileId = String(op.payload['fileId'] ?? '');
+          const fileId = queuedFileId(op.payload);
           if (!fileId) return { ok: false, retryable: false, error: 'no_file_id' };
           const data = await this.vault.readBinary(op.filePath);
           // Hash the bytes being sent, not the stale enqueue-time snapshot
@@ -2129,7 +2129,7 @@ export class SyncEngine {
           return ackToOutcome(ack);
         }
         case 'DELETE': {
-          let fileId = String(op.payload['fileId'] ?? '');
+          let fileId = queuedFileId(op.payload);
           // A queued DELETE can carry an empty fileId (the path wasn't indexed
           // when it was enqueued). Resolve it from the now-refreshed index
           // before giving up, and log the drop rather than losing it silently.
@@ -2164,21 +2164,23 @@ export class SyncEngine {
         }
         case 'RENAME':
         case 'MOVE': {
-          const fileId = String(op.payload['fileId'] ?? '');
+          const fileId = queuedFileId(op.payload);
           if (!fileId || !op.newPath) {
             return { ok: false, retryable: false, error: 'missing_target' };
           }
           const newPath = op.newPath;
-          const event =
-            op.opType === 'RENAME' ? this.socket.emitFileRename : this.socket.emitFileMove;
-          const ack = await event.call(this.socket, {
+          const payload = {
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
             fileId,
             filePath: op.filePath,
             newPath,
-          });
+          };
+          const ack =
+            op.opType === 'RENAME'
+              ? await this.socket.emitFileRename(payload)
+              : await this.socket.emitFileMove(payload);
           if (ack.ok) {
             // Move the index entry so the post-drain initial-push pass
             // recognises the file at its new path instead of re-uploading
@@ -2257,6 +2259,16 @@ export class SyncEngine {
 }
 
 // -- Local helpers ------------------------------------------------------------
+
+/**
+ * The `fileId` a queued operation carries. The queue is parsed back from
+ * `state.json`, so the field is trusted only as a string: anything else used
+ * to go out as `String(value)` — `"[object Object]"` for an object.
+ */
+function queuedFileId(payload: Record<string, unknown>): string {
+  const value = payload['fileId'];
+  return typeof value === 'string' ? value : '';
+}
 
 /**
  * Render an error into a diagnostic `detail` string for the status bar and

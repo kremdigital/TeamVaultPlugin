@@ -6,7 +6,9 @@
 # Builds `main.js` from source and publishes a GitHub release with the
 # three Obsidian-required artifacts: `main.js`, `manifest.json`,
 # `styles.css` (versioned since 0.3.0 — the plugin's own styling lives
-# there rather than in inline `el.style` assignments).
+# there rather than in inline `el.style` assignments). The three files get
+# a signed build provenance attestation, and the release body is the
+# tag's section of CHANGELOG.md.
 #
 # Bump `manifest.json#version` + `versions.json` on `main`, commit, then:
 #   git tag 0.1.0 && git push origin 0.1.0
@@ -22,19 +24,23 @@ on:
       # equals `manifest.json#version`. Don't push the `v` tag.
       - '[0-9]+.[0-9]+.[0-9]+'
 
-permissions:
-  contents: write
-
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      # Create the release and upload its assets.
+      contents: write
+      # Sign the build provenance attestation (Sigstore via the OIDC token)
+      # and store it — the directory recommends attested release assets.
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: '22'
 
       - name: Set up pnpm
         uses: pnpm/action-setup@v4
@@ -70,13 +76,30 @@ jobs:
             exit 1
           fi
 
+      # Only this version's section, not the whole file: through 0.3.4 every
+      # release page repeated the project's entire history. Fails when
+      # CHANGELOG.md has no section for the tag.
+      - name: Extract release notes from CHANGELOG.md
+        run: node scripts/release-notes.mjs "${GITHUB_REF#refs/tags/}" > "$RUNNER_TEMP/release-notes.md"
+
+      # Official Obsidian template ("Release your plugin with GitHub
+      # Actions"): after every check, so a release that fails validation
+      # leaves no attestation behind.
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-path: |
+            main.js
+            manifest.json
+            styles.css
+
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
           # Use the exact tag as the release name — no "Team Vault"
           # prefix — so it reads cleanly in the catalogue listing.
           name: ${{ github.ref_name }}
-          body_path: CHANGELOG.md
+          body_path: ${{ runner.temp }}/release-notes.md
           files: |
             main.js
             manifest.json

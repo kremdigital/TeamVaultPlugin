@@ -113,14 +113,20 @@ export class FsWatcher {
     this.watcher = watcher;
   }
 
+  /**
+   * Everything that can still emit is cut off before the first `await`:
+   * chokidar's `close()` drops its listeners synchronously, and the pending
+   * modify debounces are cancelled here. Obsidian does not wait for
+   * `onunload`, so a debounce firing while chokidar finishes closing would
+   * reach an engine that is already shutting down.
+   */
   async stop(): Promise<void> {
-    if (this.watcher) {
-      await this.watcher.close();
-      this.watcher = null;
-    }
     for (const d of this.modifyDebouncers.values()) d.cancel();
     this.modifyDebouncers.clear();
     this.recentObsidian.clear();
+    const watcher = this.watcher;
+    this.watcher = null;
+    if (watcher) await watcher.close();
   }
 
   /** Register an Obsidian event so the FS watcher can dedupe shortly after. */

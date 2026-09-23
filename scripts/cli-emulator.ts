@@ -16,6 +16,17 @@ import { ApiClient, ApiError, type ApiFile, type RequestFn } from '@/client/api'
 import { SocketClient } from '@/client/socket';
 import { classifyFileType } from '@/sync/file-type';
 
+// The plugin modules reach timers and `crypto` through `window`, as the
+// Obsidian directory's guidelines ask. Node has no `window`: alias it to the
+// global object, which carries both (the Jest setup does the same).
+if (typeof window === 'undefined') {
+  Object.defineProperty(globalThis, 'window', {
+    value: globalThis,
+    writable: true,
+    configurable: true,
+  });
+}
+
 async function main(): Promise<void> {
   let args: CliArgs;
   try {
@@ -95,10 +106,7 @@ async function push(api: ApiClient, projectId: string, folder: string): Promise<
   for await (const absolute of walkFiles(root)) {
     const rel = toForwardSlash(relative(root, absolute));
     const data = await readFile(absolute);
-    const arrayBuf = data.buffer.slice(
-      data.byteOffset,
-      data.byteOffset + data.byteLength,
-    ) as ArrayBuffer;
+    const arrayBuf = data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     const existingFile = existing.get(rel);
     try {
       if (existingFile) {
