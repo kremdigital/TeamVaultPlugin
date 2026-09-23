@@ -89,6 +89,15 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   clientId: '',
 };
 
+/**
+ * A fresh copy of the defaults. `{ ...DEFAULT_SETTINGS }` alone would share
+ * its `servers` and `bindings` arrays, and the first server added on a fresh
+ * install would be pushed into `DEFAULT_SETTINGS` itself.
+ */
+export function defaultSettings(): PluginSettings {
+  return { ...DEFAULT_SETTINGS, servers: [], bindings: [] };
+}
+
 const LOG_LEVELS: readonly LogLevel[] = ['error', 'warn', 'info', 'debug'];
 const LANGUAGE_SETTINGS: readonly LanguageSetting[] = ['auto', 'ru', 'en'];
 
@@ -164,7 +173,7 @@ function normalizeBinding(raw: unknown): VaultBinding | null {
  * Unknown / malformed fields fall back to defaults — never throw.
  */
 export function mergeWithDefaults(raw: unknown): PluginSettings {
-  if (!isObject(raw)) return { ...DEFAULT_SETTINGS };
+  if (!isObject(raw)) return defaultSettings();
   const servers = Array.isArray(raw.servers)
     ? raw.servers.map(normalizeServer).filter((s): s is ServerConfig => s !== null)
     : [];

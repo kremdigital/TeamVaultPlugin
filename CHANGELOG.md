@@ -6,6 +6,27 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.7] — 2026-09-23
+
+### Fixed
+
+- **A `data.json` the plugin can't read no longer wipes the plugin's data.**
+  A settings file with a stray comma after a hand edit, or one held for a
+  moment by an antivirus or a cloud-sync client, was taken for a first run:
+  the plugin saved empty settings over it (servers, API keys and bindings
+  gone, a new device id) and then deleted every binding's offline queue and
+  offline documents as orphaned. Now only a file that isn't there, on two
+  looks a quarter of a second apart, counts as a first run. A file that can't
+  be read or parsed is retried for about two seconds; if that doesn't help,
+  the plugin doesn't start: it writes nothing, cleans nothing up, logs the
+  reason (with the parser's error) to `sync.log` and shows a notice that
+  stays until dismissed, saying whether the file is damaged or held by
+  another program.
+- A `data.json` saved as UTF-8 with a byte order mark (PowerShell 5.1, some
+  editors) is read instead of being rejected.
+- A first run no longer cleans up local state it finds from earlier bindings;
+  the next start does, once the settings are known.
+
 ## [0.3.6] — 2026-09-23
 
 ### Changed

@@ -206,6 +206,19 @@ on the vault root and respects the same ignore list: the config folder,
 binding made to a subfolder by an older version, files outside that folder
 are correctly ignored.
 
+**"The plugin settings file is damaged" notice** — the plugin's `data.json`
+(in `.obsidian/plugins/team-vault/`) isn't valid JSON any more, usually
+after a hand edit. The plugin doesn't start rather than overwrite it. Fix the
+file (a stray comma is the usual culprit; `sync.log` has the parser's error
+with its position) or restore it from a backup, then turn the plugin off and
+on in Settings → Community plugins. Don't delete the file: that resets the
+plugin — servers, keys and bindings — and its unsent offline changes are
+dropped.
+
+**"Could not open the plugin settings file" notice** — another program (an
+antivirus, a cloud-sync client) kept `data.json` locked while the plugin
+started. Close it or wait a moment, then turn the plugin off and on.
+
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the
 server's copy, "Keep local" to push yours, or "Keep both" to keep your

@@ -99,6 +99,8 @@
   "notice.conflict": "Conflict in \"{file}\".",
   "notice.error": "Error: {error}",
   "notice.duplicatePluginFolder": "Team Vault: several folders in .obsidian/plugins share one plugin id. Loaded \"{loaded}\"; extra: {duplicates}. Sync may be running on the wrong settings — remove the extra folders and restart Obsidian.",
+  "notice.settingsCorrupt": "Team Vault: the plugin settings file is damaged ({path}). The plugin did not start, so as not to overwrite your servers, bindings and unsent changes. Fix the file (usually a stray comma) or restore it from a backup, then turn the plugin off and on in Settings → Community plugins. Don't delete the file: that resets the plugin and drops its unsent offline changes.",
+  "notice.settingsLocked": "Team Vault: could not open the plugin settings file ({path}) — another program (an antivirus, a cloud-sync client) seems to be holding it. The plugin did not start, so as not to overwrite your settings. Close that program or wait a moment, then turn the plugin off and on in Settings → Community plugins.",
   "history.title": "Version history",
   "history.empty": "Open a file to see its history.",
   "history.loading": "Loading history…",

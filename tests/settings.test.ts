@@ -1,5 +1,6 @@
 import {
   DEFAULT_SETTINGS,
+  defaultSettings,
   mergeWithDefaults,
   parseLanguageSetting,
   SETTINGS_VERSION,
@@ -136,5 +137,25 @@ describe('parseLanguageSetting', () => {
     expect(parseLanguageSetting('')).toBe('auto');
     expect(parseLanguageSetting(null)).toBe('auto');
     expect(parseLanguageSetting(1)).toBe('auto');
+  });
+});
+
+describe('defaultSettings', () => {
+  it('hands out fresh arrays, never the ones in DEFAULT_SETTINGS', () => {
+    const fresh = defaultSettings();
+    fresh.servers.push({ id: 's', name: 'n', url: 'https://x', apiKey: 'k', addedAt: 0 });
+    mergeWithDefaults(undefined).bindings.push({
+      id: 'b',
+      serverId: 's',
+      projectId: 'p',
+      projectName: 'P',
+      localFolder: '/',
+      enabled: true,
+      lastSyncedAt: 0,
+      lastVectorClock: {},
+    });
+    expect(DEFAULT_SETTINGS.servers).toEqual([]);
+    expect(DEFAULT_SETTINGS.bindings).toEqual([]);
+    expect(defaultSettings()).toEqual(DEFAULT_SETTINGS);
   });
 });

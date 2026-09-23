@@ -6,6 +6,21 @@
  * `import 'obsidian'` to it.
  */
 
+interface MockAdapter {
+  read(path: string): Promise<string>;
+  write(path: string, data: string): Promise<void>;
+}
+
+function pluginAdapter(plugin: Plugin): MockAdapter | null {
+  const app = plugin.app as { vault?: { adapter?: MockAdapter } } | null;
+  return app?.vault?.adapter ?? null;
+}
+
+function pluginDataPath(plugin: Plugin): string {
+  const manifest = plugin.manifest as { dir?: string; id?: string } | null;
+  return `${manifest?.dir ?? `.obsidian/plugins/${manifest?.id ?? ''}`}/data.json`;
+}
+
 export class Plugin {
   app: unknown;
   manifest: unknown;
@@ -15,10 +30,24 @@ export class Plugin {
   }
   async onload(): Promise<void> {}
   async onunload(): Promise<void> {}
+  /**
+   * Like Obsidian's `Vault.readJson` (app.js 1.13.7) when the app carries a
+   * vault adapter: `null` for a missing `data.json`, `undefined` for any
+   * other failure, a parse error included. `null` without an adapter.
+   */
   async loadData(): Promise<unknown> {
-    return null;
+    const adapter = pluginAdapter(this);
+    if (!adapter) return null;
+    try {
+      return JSON.parse(await adapter.read(pluginDataPath(this)));
+    } catch (err) {
+      return (err as { code?: string } | null)?.code === 'ENOENT' ? null : undefined;
+    }
   }
-  async saveData(_data: unknown): Promise<void> {}
+  async saveData(data: unknown): Promise<void> {
+    const adapter = pluginAdapter(this);
+    if (adapter) await adapter.write(pluginDataPath(this), JSON.stringify(data, undefined, 2));
+  }
   addCommand(_command: unknown): unknown {
     return _command;
   }
@@ -133,7 +162,11 @@ export class Setting {
 }
 
 export class Notice {
-  constructor(_message: string, _timeout?: number) {}
+  /** Every notice shown, in order — for tests to assert on. */
+  static shown: Array<{ message: string; timeout: number | undefined }> = [];
+  constructor(message: string, timeout?: number) {
+    Notice.shown.push({ message, timeout });
+  }
 }
 
 export class TFile {

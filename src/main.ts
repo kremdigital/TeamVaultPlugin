@@ -1,6 +1,7 @@
 import { Notice, Plugin, WorkspaceLeaf } from 'obsidian';
 import { IndexeddbPersistence } from 'y-indexeddb';
-import { DEFAULT_SETTINGS, mergeWithDefaults, type PluginSettings } from '@/settings/settings';
+import { defaultSettings, mergeWithDefaults, type PluginSettings } from '@/settings/settings';
+import { readSettingsFile, type SettingsFileRead } from '@/settings/settings-file';
 import { getLanguage, setLanguage, t } from '@/i18n';
 import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
 import { SyncSettingsTab } from '@/settings/tab';
@@ -55,7 +56,7 @@ import { uuid } from '@/utils/id';
  * `state.json`.
  */
 export default class ObsidianSyncPlugin extends Plugin {
-  settings: PluginSettings = { ...DEFAULT_SETTINGS };
+  settings: PluginSettings = defaultSettings();
 
   private logger: Logger | null = null;
   private fileLogSink: FileLogSink | null = null;
@@ -74,6 +75,14 @@ export default class ObsidianSyncPlugin extends Plugin {
    * then may belong to the next instance of the plugin.
    */
   private unloaded = false;
+  /**
+   * Set by `loadSettings` when `data.json` exists but can't be read. The
+   * defaults in `settings` then stand in for settings we don't know, so
+   * nothing may be written or cleaned up on their strength.
+   */
+  private unreadableSettings: Extract<SettingsFileRead, { kind: 'unreadable' }> | null = null;
+  /** Set by `loadSettings` when there was no `data.json`: a first run. */
+  private firstRun = false;
 
   override async onload(): Promise<void> {
     // Obsidian can unload the plugin while this is still running — it does
@@ -84,6 +93,13 @@ export default class ObsidianSyncPlugin extends Plugin {
     await this.loadSettings();
     if (this.unloaded) return;
     this.applyLanguage();
+    // Settings we could not read are not a first run: starting on the
+    // defaults would save them over the file and sweep every binding's local
+    // state as orphaned. Stop here until the user fixes or removes the file.
+    if (this.unreadableSettings) {
+      this.reportUnreadableSettings(this.unreadableSettings);
+      return;
+    }
 
     // Make sure we have a stable client id; persist once on first run.
     if (!this.settings.clientId) {
@@ -108,7 +124,12 @@ export default class ObsidianSyncPlugin extends Plugin {
     // sweeps is read-mostly, but the sweeps themselves delete local state
     // keyed on those settings — so warn and skip them until the install is
     // untangled, rather than wiping a live binding's offline CRDT.
-    if (!(await this.warnOnDuplicatePluginFolders())) {
+    //
+    // A first run skips them too: it has no bindings of its own yet, so every
+    // binding's local state would look orphaned — and a data.json that was
+    // missing a moment ago may just be one a sync client is replacing. The
+    // next start cleans up whatever is really left over.
+    if (!(await this.warnOnDuplicatePluginFolders()) && !this.firstRun) {
       await this.sweepOrphanedBindingState();
       await this.sweepOrphanedTmpArtifacts();
     }
@@ -154,13 +175,58 @@ export default class ObsidianSyncPlugin extends Plugin {
     handOffTeardown(window, this.manifest.id, done);
   }
 
+  /**
+   * Read `data.json` ourselves rather than through `loadData()`, which
+   * answers `undefined` both for a file it could not parse and for one it
+   * could not open — see `settings/settings-file`.
+   */
   async loadSettings(): Promise<void> {
-    const raw = (await this.loadData()) as unknown;
-    this.settings = mergeWithDefaults(raw);
+    const path = this.settingsFilePath();
+    const adapter = this.app.vault.adapter;
+    const result = await readSettingsFile({
+      // The desktop adapter's read is `fs.promises.readFile`: a missing file
+      // rejects with `code: 'ENOENT'`, which is what tells a first run apart.
+      read: () => adapter.read(path),
+      sleep: (ms) => new Promise((resolve) => window.setTimeout(resolve, ms)),
+    });
+    this.firstRun = result.kind === 'missing';
+    if (result.kind === 'unreadable') {
+      this.unreadableSettings = result;
+      this.settings = defaultSettings();
+      return;
+    }
+    this.unreadableSettings = null;
+    this.settings = mergeWithDefaults(result.kind === 'ok' ? result.data : null);
+  }
+
+  private settingsFilePath(): string {
+    const dir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
+    return `${dir}/data.json`;
+  }
+
+  /** Log why the plugin did not start, and say so where it can't be missed. */
+  private reportUnreadableSettings(
+    failure: Extract<SettingsFileRead, { kind: 'unreadable' }>,
+  ): void {
+    const path = this.settingsFilePath();
+    this.bootstrapLogger();
+    // The error as an argument of its own: the log prints an Error as
+    // "SyntaxError: … at position 812" — where the stray comma is — while
+    // inside the context object it would come out as `{}`.
+    this.logger?.error(
+      'settings file unreadable; plugin not started',
+      { path, reason: failure.reason },
+      failure.error,
+    );
+    // Sticky (timeout 0), like the duplicate-folder warning: nothing syncs
+    // until the user acts.
+    const key = failure.reason === 'corrupt' ? 'notice.settingsCorrupt' : 'notice.settingsLocked';
+    new Notice(t(key, { path }), 0);
   }
 
   async saveSettings(): Promise<void> {
-    if (this.unloaded) return;
+    // Never over settings we could not read — see `unreadableSettings`.
+    if (this.unloaded || this.unreadableSettings) return;
     await this.saveData(this.settings);
     this.applyLanguage();
     if (this.logger) this.logger.setLevel(this.settings.logLevel);
