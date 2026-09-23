@@ -1,6 +1,6 @@
 {
   "name": "team-vault-plugin",
-  "version": "0.3.4",
+  "version": "0.3.5",
   "description": "Self-hosted Obsidian vault synchronization with CRDT merging of note edits.",
   "main": "main.js",
   "private": true,
