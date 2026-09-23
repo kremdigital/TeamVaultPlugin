@@ -6,6 +6,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.6] — 2026-09-23
+
+### Changed
+
+- **A Russian saved by 0.3.5 or earlier now loads as Same as Obsidian.** It
+  was never a choice: up to 0.3.4 the plugin had no language setting and
+  always saved Russian, and 0.3.5 kept that as if it had been picked, so an
+  English Obsidian showed a Russian plugin. A saved English stays English.
+  `data.json` gains a `settingsVersion` field, so a language picked from now
+  on is kept as picked (a Russian picked explicitly in 0.3.5 has to be picked
+  once more).
+
 ## [0.3.5] — 2026-09-23
 
 ### Added

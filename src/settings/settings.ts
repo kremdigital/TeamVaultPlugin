@@ -15,10 +15,20 @@ export type LogLevel = 'error' | 'warn' | 'info' | 'debug';
 export type Language = 'ru' | 'en';
 /**
  * The interface-language setting: a catalog, or `auto` — whatever language
- * Obsidian itself runs in (`i18n/language.ts` resolves it). Versions up to
- * 0.3.4 always saved `ru`, so their `data.json` keeps an explicit Russian.
+ * Obsidian itself runs in (`i18n/language.ts` resolves it).
  */
 export type LanguageSetting = 'auto' | Language;
+
+/**
+ * Version of the `data.json` shape, saved with it. Absent up to 0.3.5.
+ *
+ * 2 — `language` is the user's choice. Before it, a saved `ru` was not: up to
+ * 0.3.4 the plugin had no language setting and always saved Russian, and
+ * 0.3.5 carried that value over as if it had been picked. So a `ru` without a
+ * version loads as `auto`, the default: Russian where Obsidian runs in
+ * Russian, English elsewhere.
+ */
+export const SETTINGS_VERSION = 2;
 
 export interface ServerConfig {
   /** Locally generated UUID — stable across renames. */
@@ -48,6 +58,8 @@ export interface VaultBinding {
 }
 
 export interface PluginSettings {
+  /** See {@link SETTINGS_VERSION}. */
+  settingsVersion: number;
   servers: ServerConfig[];
   bindings: VaultBinding[];
   /** Debounce window (ms) before pushing a `modify` upstream. */
@@ -67,6 +79,7 @@ export interface PluginSettings {
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
+  settingsVersion: SETTINGS_VERSION,
   servers: [],
   bindings: [],
   debounceMs: 500,
@@ -158,7 +171,11 @@ export function mergeWithDefaults(raw: unknown): PluginSettings {
   const bindings = Array.isArray(raw.bindings)
     ? raw.bindings.map(normalizeBinding).filter((b): b is VaultBinding => b !== null)
     : [];
+  // A `ru` saved before the language setting existed is the old default, not
+  // a choice (see SETTINGS_VERSION).
+  const legacyLanguage = raw.settingsVersion === undefined && raw.language === 'ru';
   return {
+    settingsVersion: SETTINGS_VERSION,
     servers,
     bindings,
     debounceMs: Math.max(0, asNumber(raw.debounceMs, DEFAULT_SETTINGS.debounceMs)),
@@ -167,7 +184,7 @@ export function mergeWithDefaults(raw: unknown): PluginSettings {
       DEFAULT_SETTINGS.showSyncNotifications,
     ),
     logLevel: asEnum(raw.logLevel, LOG_LEVELS, DEFAULT_SETTINGS.logLevel),
-    language: parseLanguageSetting(raw.language),
+    language: legacyLanguage ? 'auto' : parseLanguageSetting(raw.language),
     clientId: asString(raw.clientId, DEFAULT_SETTINGS.clientId),
   };
 }

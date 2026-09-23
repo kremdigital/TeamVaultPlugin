@@ -1,4 +1,9 @@
-import { DEFAULT_SETTINGS, mergeWithDefaults, parseLanguageSetting } from '@/settings/settings';
+import {
+  DEFAULT_SETTINGS,
+  mergeWithDefaults,
+  parseLanguageSetting,
+  SETTINGS_VERSION,
+} from '@/settings/settings';
 
 describe('mergeWithDefaults', () => {
   it('returns defaults for empty input', () => {
@@ -24,9 +29,28 @@ describe('mergeWithDefaults', () => {
     expect(mergeWithDefaults({ language: 'auto' }).language).toBe('auto');
   });
 
-  it('keeps an explicit ru / en saved by earlier versions', () => {
-    expect(mergeWithDefaults({ language: 'ru' }).language).toBe('ru');
+  it('keeps the language the user picked', () => {
+    expect(mergeWithDefaults({ settingsVersion: 2, language: 'ru' }).language).toBe('ru');
+    expect(mergeWithDefaults({ settingsVersion: 2, language: 'en' }).language).toBe('en');
+    expect(mergeWithDefaults({ settingsVersion: 2, language: 'auto' }).language).toBe('auto');
+  });
+
+  it('follows Obsidian where a Russian was saved before the language setting existed', () => {
+    // Up to 0.3.4 the plugin always saved `ru`, and 0.3.5 kept it as if it
+    // had been picked: an English Obsidian got a Russian plugin.
+    expect(mergeWithDefaults({ language: 'ru' }).language).toBe('auto');
+    // `en` could only be written by hand — that one was a choice.
     expect(mergeWithDefaults({ language: 'en' }).language).toBe('en');
+  });
+
+  it('saves the settings version, so a choice made from now on is kept', () => {
+    const upgraded = mergeWithDefaults({ language: 'ru' });
+    expect(upgraded.settingsVersion).toBe(SETTINGS_VERSION);
+    // What saveSettings writes back, then reads on the next start.
+    expect(
+      mergeWithDefaults(JSON.parse(JSON.stringify({ ...upgraded, language: 'ru' }))).language,
+    ).toBe('ru');
+    expect(DEFAULT_SETTINGS.settingsVersion).toBe(SETTINGS_VERSION);
   });
 
   it('loads a data.json that still carries the removed syncOnStartup, and drops it', () => {
@@ -43,7 +67,7 @@ describe('mergeWithDefaults', () => {
     };
     const merged = mergeWithDefaults(saved);
     expect(merged).not.toHaveProperty('syncOnStartup');
-    expect(merged).toEqual({ ...DEFAULT_SETTINGS, language: 'ru', clientId: 'c1' });
+    expect(merged).toEqual({ ...DEFAULT_SETTINGS, language: 'auto', clientId: 'c1' });
     expect(DEFAULT_SETTINGS).not.toHaveProperty('syncOnStartup');
   });
 
