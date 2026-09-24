@@ -362,3 +362,193 @@ describe('plugin lifecycle — a data.json it cannot read', () => {
     expect(app.files.get(`${dir}/state.json`)).toContain('"note.md"');
   });
 });
+
+describe('plugin lifecycle — a data.json with entries it cannot read', () => {
+  /** A `state.json` with one operation queued for each of these bindings. */
+  function queued(...bindingIds: string[]): string {
+    const bindings: Record<string, unknown> = {};
+    bindingIds.forEach((bindingId, i) => {
+      bindings[bindingId] = {
+        pending: [
+          {
+            id: i + 1,
+            bindingId,
+            opType: 'UPDATE',
+            filePath: `${bindingId}.md`,
+            newPath: null,
+            payload: {},
+            createdAt: 1,
+          },
+        ],
+        files: [],
+        state: null,
+      };
+    });
+    return JSON.stringify({ version: 1, nextOpId: bindingIds.length + 1, bindings });
+  }
+  const server = {
+    id: 's1',
+    name: 'Work',
+    url: 'https://sync.example.com',
+    apiKey: 'osk_1',
+    addedAt: 1,
+  };
+  /** A binding as the plugin saves it. */
+  const binding = (id: string): Record<string, unknown> => ({
+    id,
+    serverId: 's1',
+    projectId: `project-${id}`,
+    projectName: 'Notes',
+    localFolder: `/${id}`,
+    enabled: true,
+    lastSyncedAt: 1,
+    lastVectorClock: {},
+  });
+  /** The same, after a hand edit lost its project id. */
+  const withoutProject = (id: string): Record<string, unknown> => {
+    const { projectId: _projectId, ...rest } = binding(id);
+    return rest;
+  };
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+    Notice.shown = [];
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  /**
+   * Run `onload` up to the duplicate-folder scan, unload, and let it finish:
+   * the orphan sweep still runs, but no engine ever starts against a server.
+   */
+  async function loadThroughSweeps(seed: Record<string, string>, dir: string, id: string) {
+    const scan = deferred();
+    const app = fakeApp({ seed, listGate: scan.promise });
+    const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    const loading = plugin.onload();
+    await jest.advanceTimersByTimeAsync(5000);
+    expect(app.listed).toHaveBeenCalled();
+    plugin.onunload();
+    scan.resolve();
+    await jest.advanceTimersByTimeAsync(100);
+    await loading;
+    return { app, plugin };
+  }
+
+  it('keeps the offline queue of a binding it could not read', async () => {
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [withoutProject('binding-1')],
+      clientId: 'client-1',
+    });
+    const state = queued('binding-1');
+
+    const { app, plugin } = await loadThroughSweeps(
+      { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state },
+      dir,
+      id,
+    );
+
+    expect(plugin.settings.bindings).toEqual([]);
+    // Not swept as orphaned: the queued edit is still there to send.
+    expect(app.files.get(`${dir}/state.json`)).toBe(state);
+    expect(app.files.get(`${dir}/data.json`)).toBe(data);
+    const log = app.files.get(`${dir}/sync.log`) ?? '';
+    expect(log).toContain('[warn]');
+    expect(log).toContain('orphaned-state sweep skipped');
+    expect(log).toContain('"bindings":[{"index":0,"id":"binding-1","invalid":["projectId"]}]');
+    expect(log).not.toContain('swept orphaned');
+    // The binding doesn't sync, and nothing else in the UI would say so.
+    expect(Notice.shown).toHaveLength(1);
+    expect(Notice.shown[0]?.timeout).toBe(0);
+    expect(Notice.shown[0]?.message).toContain(`${dir}/data.json`);
+    expect(Notice.shown[0]?.message).toContain('bindings: 1');
+  });
+
+  it('keeps such an entry in data.json when it saves, in its place', async () => {
+    // No client id yet: the plugin mints one and saves at once.
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const brokenServer = { id: 's2', name: 'Home', url: 'https://home.example.com' };
+    const data = JSON.stringify({
+      servers: [brokenServer, server],
+      bindings: [binding('binding-0'), withoutProject('binding-1'), binding('binding-2')],
+    });
+    const state = queued('binding-1');
+
+    const { app, plugin } = await loadThroughSweeps(
+      { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state },
+      dir,
+      id,
+    );
+
+    const saved = JSON.parse(app.files.get(`${dir}/data.json`) ?? '{}') as Record<string, unknown>;
+    expect(saved.clientId).toBe(plugin.settings.clientId);
+    expect(plugin.settings.clientId).not.toBe('');
+    expect(saved.servers).toEqual([brokenServer, server]);
+    expect(saved.bindings).toEqual([
+      binding('binding-0'),
+      withoutProject('binding-1'),
+      binding('binding-2'),
+    ]);
+    expect(app.files.get(`${dir}/state.json`)).toBe(state);
+    // The server entry's API key — had it one — never reaches the log.
+    const log = app.files.get(`${dir}/sync.log`) ?? '';
+    expect(log).toContain('"servers":[{"index":0,"id":"s2","invalid":["apiKey"]}]');
+    expect(log).not.toContain('home.example.com');
+    expect(Notice.shown[0]?.message).toContain('bindings: 1, servers: 1');
+  });
+
+  it('keeps local state when a list in data.json is not a list at all', async () => {
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      servers: 'oops',
+      bindings: { 'binding-1': binding('binding-1') },
+      clientId: 'client-1',
+    });
+    const state = queued('binding-1');
+
+    const { app, plugin } = await loadThroughSweeps(
+      { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state },
+      dir,
+      id,
+    );
+
+    expect(plugin.settings.servers).toEqual([]);
+    expect(plugin.settings.bindings).toEqual([]);
+    expect(app.files.get(`${dir}/state.json`)).toBe(state);
+    expect(app.files.get(`${dir}/data.json`)).toBe(data);
+    const log = app.files.get(`${dir}/sync.log`) ?? '';
+    expect(log).toContain('"servers":"not a list (string)"');
+    expect(log).toContain('"bindings":"not a list (object)"');
+    expect(Notice.shown[0]?.message).toContain('the binding list, the server list');
+  });
+
+  it('still sweeps a binding that is gone from a data.json it read in full', async () => {
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [binding('binding-1')],
+      clientId: 'client-1',
+    });
+
+    const { app } = await loadThroughSweeps(
+      { [`${dir}/data.json`]: data, [`${dir}/state.json`]: queued('binding-1', 'binding-gone') },
+      dir,
+      id,
+    );
+
+    const state = app.files.get(`${dir}/state.json`) ?? '';
+    expect(state).toContain('binding-1.md');
+    expect(state).not.toContain('binding-gone');
+    expect(app.files.get(`${dir}/sync.log`)).toContain('swept orphaned binding state');
+    expect(Notice.shown).toEqual([]);
+  });
+});

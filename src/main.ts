@@ -1,6 +1,13 @@
 import { Notice, Plugin, WorkspaceLeaf } from 'obsidian';
 import { IndexeddbPersistence } from 'y-indexeddb';
-import { defaultSettings, mergeWithDefaults, type PluginSettings } from '@/settings/settings';
+import {
+  defaultSettings,
+  describeSkipped,
+  parseSettings,
+  settingsToSave,
+  type PluginSettings,
+  type SkippedSettings,
+} from '@/settings/settings';
 import { readSettingsFile, type SettingsFileRead } from '@/settings/settings-file';
 import { getLanguage, setLanguage, t } from '@/i18n';
 import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
@@ -83,6 +90,13 @@ export default class ObsidianSyncPlugin extends Plugin {
   private unreadableSettings: Extract<SettingsFileRead, { kind: 'unreadable' }> | null = null;
   /** Set by `loadSettings` when there was no `data.json`: a first run. */
   private firstRun = false;
+  /**
+   * Set by `loadSettings`: the servers and bindings of `data.json` it could
+   * not use (see `parseSettings`). `settings` then does not name every
+   * binding this vault has, so the orphan sweep is off, and every save puts
+   * these back into the file.
+   */
+  private skippedSettings: SkippedSettings | null = null;
 
   override async onload(): Promise<void> {
     // Obsidian can unload the plugin while this is still running — it does
@@ -109,6 +123,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     }
 
     this.bootstrapLogger();
+    if (this.skippedSettings) this.reportSkippedSettings(this.skippedSettings);
     // Disabling and enabling the plugin, or an update, starts this instance
     // while the previous one may still be flushing `state.json`.
     if (!(await awaitPreviousTeardown(window, this.manifest.id, TEARDOWN_HANDOFF_TIMEOUT_MS))) {
@@ -130,7 +145,10 @@ export default class ObsidianSyncPlugin extends Plugin {
     // missing a moment ago may just be one a sync client is replacing. The
     // next start cleans up whatever is really left over.
     if (!(await this.warnOnDuplicatePluginFolders()) && !this.firstRun) {
-      await this.sweepOrphanedBindingState();
+      // A binding data.json has but the plugin could not read is not in
+      // `settings`, yet it is no orphan: its unsent changes are still queued.
+      // The tmp sweep stays — it only ever looks inside known bindings.
+      if (!this.skippedSettings) await this.sweepOrphanedBindingState();
       await this.sweepOrphanedTmpArtifacts();
     }
     if (this.unloaded) return;
@@ -192,11 +210,14 @@ export default class ObsidianSyncPlugin extends Plugin {
     this.firstRun = result.kind === 'missing';
     if (result.kind === 'unreadable') {
       this.unreadableSettings = result;
+      this.skippedSettings = null;
       this.settings = defaultSettings();
       return;
     }
     this.unreadableSettings = null;
-    this.settings = mergeWithDefaults(result.kind === 'ok' ? result.data : null);
+    const parsed = parseSettings(result.kind === 'ok' ? result.data : null);
+    this.settings = parsed.settings;
+    this.skippedSettings = parsed.skipped;
   }
 
   private settingsFilePath(): string {
@@ -224,10 +245,45 @@ export default class ObsidianSyncPlugin extends Plugin {
     new Notice(t(key, { path }), 0);
   }
 
+  /**
+   * Say which servers and bindings of `data.json` are skipped, and that the
+   * orphan sweep is off until they are fixed. The log gets positions, ids and
+   * the fields at fault; the notice, how many.
+   */
+  private reportSkippedSettings(skipped: SkippedSettings): void {
+    const path = this.settingsFilePath();
+    this.logger?.warn(
+      'settings entries unreadable; kept in the file, orphaned-state sweep skipped',
+      {
+        path,
+        ...describeSkipped(skipped),
+      },
+    );
+    const parts: string[] = [];
+    const { bindings, servers } = skipped;
+    if (bindings) {
+      parts.push(
+        bindings.kind === 'not-a-list'
+          ? t('notice.settingsSkipped.bindingList')
+          : t('notice.settingsSkipped.bindings', { count: bindings.entries.length }),
+      );
+    }
+    if (servers) {
+      parts.push(
+        servers.kind === 'not-a-list'
+          ? t('notice.settingsSkipped.serverList')
+          : t('notice.settingsSkipped.servers', { count: servers.entries.length }),
+      );
+    }
+    // Sticky, like the other settings-file notices: a skipped binding does
+    // not sync, and nothing else in the UI says so.
+    new Notice(t('notice.settingsSkipped', { path, what: parts.join(', ') }), 0);
+  }
+
   async saveSettings(): Promise<void> {
     // Never over settings we could not read — see `unreadableSettings`.
     if (this.unloaded || this.unreadableSettings) return;
-    await this.saveData(this.settings);
+    await this.saveData(settingsToSave(this.settings, this.skippedSettings));
     this.applyLanguage();
     if (this.logger) this.logger.setLevel(this.settings.logLevel);
     // Settings changes can add / remove bindings; reconcile.
@@ -343,7 +399,9 @@ export default class ObsidianSyncPlugin extends Plugin {
    * stores (y-indexeddb databases) leaked likewise. From now on the
    * `EngineManager` purges both at delete time; this sweep mops up the backlog
    * and anything a crash left behind. A merely-disabled binding is still in
-   * settings, so its state is preserved.
+   * settings, so its state is preserved. `onload` doesn't run this while
+   * `data.json` holds entries it could not read (`skippedSettings`): a binding
+   * among them would look orphaned here.
    */
   private async sweepOrphanedBindingState(): Promise<void> {
     if (!this.operationLog) return;

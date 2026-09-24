@@ -219,6 +219,16 @@ dropped.
 antivirus, a cloud-sync client) kept `data.json` locked while the plugin
 started. Close it or wait a moment, then turn the plugin off and on.
 
+**"Part of the plugin settings file could not be read" notice** — `data.json`
+is valid JSON, but a server or a binding in it lacks a field the plugin needs
+(a binding's `id`, `serverId` or `projectId`; a server's `id`, `url` or
+`apiKey`) or isn't the right shape, usually after a hand edit. The plugin
+starts with the rest. The skipped entries don't sync, but they stay in the
+file as they are, and their unsent offline changes are kept: the start-up
+cleanup of leftover local state is off until they are fixed. `sync.log` names
+each one — its position in the list, its id and the fields at fault. Fix or
+remove them, then turn the plugin off and on.
+
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the
 server's copy, "Keep local" to push yours, or "Keep both" to keep your
