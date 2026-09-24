@@ -16,6 +16,37 @@ uses [Semantic Versioning](https://semver.org/).
   doesn't allow one either) and any name shaped like a Windows short name —
   up to 8 characters ending in `~` and digits, with an optional extension of
   up to 3 — is now never synced, in either direction and on every system.
+- **Server paths spelled so that a Mac opens a folder the plugin refuses are
+  now refused.** The path gate compared names by lower case only. A
+  case-insensitive Mac disk (APFS, the macOS default) also treats `ſ` (long s)
+  as `s`, `ß` and `ẞ` as `ss`, and ligatures such as `ﬁ` as their letters, and
+  older Mac disks (HFS+) skip some invisible characters when they compare
+  names. So a project member could name a file
+  `.obſidian/plugins/team-vault/data.json`: the gate let it through, and on a
+  Mac that path led to the plugin's own settings file, API key included. Names
+  are now compared the way these disks compare them, and fullwidth look-alikes
+  such as `．obsidian` count too. This covers the config folder, `.trash`,
+  `.git` and every other name on the built-in list, in both directions.
+  Ordinary note names sync as before.
+
+### Changed
+
+- **More names that Windows can't keep as spelled no longer sync, on any
+  system.** This extends the entry above about `:` and short names. A name
+  that ends in a dot or a space (`Notes.`, `Notes `) is now refused, and so is
+  a name with `*`, `?`, `<`, `>`, `"`, `|` or a control character (`Why?.md`).
+  Obsidian allows these on macOS and Linux, but a Windows teammate's disk
+  can't hold them: a `Why?.md` from a Mac stopped that teammate's sync, and
+  deleting a synced folder `Notes.` from Obsidian on Windows sent the folder
+  `Notes` next to it to the Recycle Bin, a delete that went on to the whole
+  team. When you create, edit or rename such a note in Obsidian, a notice now
+  names it and says what is wrong with the name — once per name while the
+  plugin runs, even with notifications off — and `sync.log` gets a `warn`
+  line. Renaming a synced note to such a name works like deleting it for your
+  teammates. A note an older version already synced under such a name stays
+  on the server; to sync it again, rename it in the project's web interface
+  or through MCP (renaming it in Obsidian uploads it as a new note and leaves
+  the old one on the server).
 
 ### Fixed
 
@@ -27,8 +58,10 @@ uses [Semantic Versioning](https://semver.org/).
   state and triggered further requests. Now large file transfers in progress
   are cancelled, and an edit whose upload or acknowledgement was cut short is
   queued and sent when sync resumes. A server rename, delete or file download
-  that had already started on disk is finished first, so no stray copy is
-  left behind to be uploaded as a new file. Queued offline edits the server
+  that had already started on disk is finished first, and so is writing a
+  teammate's edit into a note, so no stray copy is left behind to be uploaded
+  as a new file and a teammate's edit that arrives during that write is
+  neither lost nor duplicated when sync resumes. Queued offline edits the server
   has already acknowledged are no longer sent twice; at most the one in
   flight at the moment of stopping goes out again.
 - A queued offline edit to an attachment that no longer exists at its path
@@ -37,7 +70,8 @@ uses [Semantic Versioning](https://semver.org/).
 - **A save that lands while Team Vault is writing a teammate's edit into the
   same note is no longer overwritten.** The note is re-read right before the
   write and the save is merged in. A note deleted at that moment is no longer
-  written back.
+  written back, and a note deleted at the very moment it is re-read no longer
+  makes the connect-time sync fail.
 - A teammate's edit is no longer deleted when you save a note while that edit
   is being written to disk and the note has no merge base yet (for example,
   right after upgrading from 0.3.1 or earlier, or after Obsidian's local
@@ -53,9 +87,9 @@ uses [Semantic Versioning](https://semver.org/).
   offline documents as orphaned, and the next settings save erased the entry
   from `data.json`. Now such entries are skipped but kept: every save writes
   them back in their place, and the cleanup of leftover local state is off
-  while they are there. `sync.log` gets a warning naming each one by its
-  position, id and the fields at fault — never the entry itself, which may
-  hold an API key. A notice that stays until dismissed says how many entries
+  while they are there. `sync.log` names each one by its position, id and the
+  fields at fault, whatever the log level (Errors only included) — never the
+  entry itself, which may hold an API key. A notice that stays until dismissed says how many entries
   were skipped and asks you to turn the plugin off (or quit Obsidian) before
   fixing the file. While a binding is skipped, **Add binding** is disabled.
 - **Service files of the OS, editors and other sync tools no longer sync.**
@@ -74,9 +108,30 @@ uses [Semantic Versioning](https://semver.org/).
 - A folder named like a temporary file (`drafts~`, `old.tmp`) is now skipped
   with everything in it. Before, the filesystem watcher skipped the folder
   while the Obsidian watcher and the first upload synced the notes inside.
-- A path from the server that the plugin refuses is logged at `warn` once
-  while the plugin runs and at `debug` after that, instead of on every
-  reconnect.
+- A path from the server that the plugin refuses is logged at `warn` once per
+  path while the plugin runs and at `debug` after that, instead of on every
+  reconnect. Pausing and resuming sync, or switching the binding off and on,
+  doesn't report it again. With Log level at Errors only the line isn't
+  written; once the level is raised, it shows at the next reconnect or after
+  Pause sync and Resume sync.
+- **A file a teammate renamed or moved while your Obsidian was closed no
+  longer comes back under its old name.** Your copy stayed on disk under the
+  old name and the next start uploaded it as a new file, so every teammate got
+  a duplicate. It is now moved to the new name when sync starts, together with
+  any edits you made to it in the meantime — including names swapped between
+  two files, a new file created under the old name, and a rename that only
+  changes letter case on a Windows or Mac disk.
+- An attachment that was added and then renamed while you were offline is now
+  saved under its current name. It used to be written under the name it was
+  created with: the current name was missing (broken embeds) and the old name
+  was uploaded again as a new file.
+- **A file a teammate renames to a name that never syncs** (with an older
+  plugin version, the MCP server or the API) **is now removed from your vault,
+  as if it had been deleted.** If your copy has changes the server doesn't,
+  you are asked first, and **Restore on server** moves the file back to its
+  name. Before, your copy stayed under the old name and was uploaded again as
+  a new file on the next connect. If the file is later renamed back to a name
+  that syncs, it returns.
 
 ## [0.3.7] — 2026-09-23
 
