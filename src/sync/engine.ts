@@ -11,7 +11,12 @@ import {
 import * as Y from 'yjs';
 import { DocManager } from '@/crdt/doc-manager';
 import { mergeText3 } from '@/crdt/text-merge';
-import { OperationLog, type FileMeta, type OperationType } from './operation-log';
+import {
+  OperationLog,
+  type FileMeta,
+  type OperationType,
+  type PendingOperationInput,
+} from './operation-log';
 import { classifyFileType, type FileType } from './file-type';
 import { sha256Hex } from './hash';
 import { increment, type VectorClock } from './vector-clock';
@@ -82,6 +87,17 @@ const MAX_REPORTED_REFUSALS = 1000;
  * Every dependency is held through a stop fence (see `stop-fence.ts`), so the
  * check after each `await` is built in: a flow that wakes up after `stop()`
  * refuses on its next call and unwinds.
+ *
+ * Two things are not cut off, because cutting them loses data:
+ *
+ *   - A local change the engine took on and has not settled yet (sent and
+ *     acknowledged, queued, or found to be a no-op) is handed to the offline
+ *     queue by `stop()` itself, before the fence closes — see
+ *     {@link SyncEngine.hold}. The next engine replays it.
+ *   - A server change whose disk part has begun is finished: the whole local
+ *     phase runs through {@link SyncEngine.commitLocal}, and `stop()` waits
+ *     for it. A rename stopped between its disk steps would leave the old
+ *     path behind for the next engine to upload as a new file.
  */
 
 export interface SyncEngineDeps {
@@ -124,6 +140,33 @@ export type StatusListener = (status: EngineStatus, detail?: string) => void;
 
 type IndexedMeta = FileMeta & { fileId: string };
 
+/**
+ * A local change the engine has taken on but not settled yet — the offline
+ * queue entry `stop()` writes for it. Mutable: a handler fills the payload in
+ * as it learns more (a binary edit's hash, say). The replay reads the disk
+ * again anyway, so an entry handed over early is still correct.
+ */
+type HeldChange = Required<PendingOperationInput>;
+
+/**
+ * Where a local change comes from. A `queue` replay is held by the offline
+ * queue itself — its entry stays until the drain marks it sent — so the
+ * handler must not hold it a second time.
+ */
+type LocalSource = 'watcher' | 'queue';
+
+/**
+ * The engine's local state without the stop fence. Only a
+ * {@link SyncEngine.commitLocal} block gets it: that block runs to the end
+ * even when `stop()` lands in the middle.
+ */
+interface LocalIO {
+  vault: VaultAdapter;
+  log: OperationLog;
+  echo: RecentlyApplied;
+  docs: DocManager;
+}
+
 interface FileMetaIndex {
   byPath: Map<string, IndexedMeta>;
   byId: Map<string, IndexedMeta>;
@@ -156,6 +199,13 @@ const ECHO_COUNT_RENAME = 2;
 /** Safety cap on waiting for a streamed Yjs catch-up before proceeding. */
 const CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;
 
+/**
+ * Payload flag of a queued DELETE that `stop()` handed over before the
+ * stale-delete check had run: the replay runs that check first. Local to the
+ * queue — the replay never sends it to the server.
+ */
+const RECHECK_DELETE = 'recheck';
+
 export class SyncEngine {
   private readonly binding: VaultBinding;
   private readonly server: ServerConfig;
@@ -177,6 +227,12 @@ export class SyncEngine {
    * still in flight.
    */
   private readonly lifetime = new AbortController();
+  /** The dependencies without the fence — for {@link commitLocal} blocks only. */
+  private readonly local: LocalIO;
+  /** Local changes taken on and not settled yet — see {@link hold}. */
+  private readonly held = new Set<HeldChange>();
+  /** Local phases still running — see {@link commitLocal}. `stop()` waits for them. */
+  private readonly localCommits = new Set<Promise<unknown>>();
   private readonly diskSnapshotDebounceMs: number;
   private readonly conflictResolver: ConflictResolver;
   private readonly now: () => number;
@@ -271,6 +327,12 @@ export class SyncEngine {
     // vault, log, docs and echo set (a paused engine's successor uses the same
     // ones), the network, and the conflict modal.
     const { signal } = this.lifetime;
+    this.local = {
+      vault: deps.vault,
+      log: deps.operationLog,
+      echo: deps.recentlyApplied,
+      docs: deps.docManager,
+    };
     this.vault = fence(deps.vault, signal);
     this.operationLog = fence(deps.operationLog, signal);
     this.docManager = fence(deps.docManager, signal);
@@ -337,15 +399,22 @@ export class SyncEngine {
    * up, so a late answer is dropped without writing the vault, the operation
    * log or a Y.Doc and without another request.
    *
-   * The one operation the drain had in flight stays queued, and the next
-   * engine sends it again. The server absorbs that: a CREATE for a path it
-   * holds with the same hash is a replay (no conflict copy) — and the drain
-   * routes a path it already knows through modify anyway — a DELETE of a
-   * tombstone and a RENAME to the current path are no-ops, a binary UPDATE
-   * rewrites the same bytes.
+   * Two exceptions keep that from losing data (see the class comment). Local
+   * changes still held go to the offline queue first — synchronously, before
+   * the fence closes, so it is the engine's last write rather than a write
+   * after stop. And a local phase already running is waited for. Once the
+   * returned promise settles, the engine has written for the last time.
+   *
+   * The operation the drain had in flight stays queued, and a held change the
+   * server had in fact already applied is queued as well: the next engine
+   * sends both again. When that is a no-op on the server and when it is not:
+   * {@link replayPending}.
    */
   async stop(): Promise<void> {
-    this.lifetime.abort(new EngineStoppedError());
+    if (!this.hasStopped) {
+      this.handOverHeldChanges();
+      this.lifetime.abort(new EngineStoppedError());
+    }
     for (const cb of this.cleanups) cb();
     this.cleanups = [];
     for (const d of this.snapshotDebouncers.values()) d.cancel();
@@ -356,6 +425,10 @@ export class SyncEngine {
     this.hydrations.clear();
     this.socketLink.disconnect();
     this.setStatus('stopped');
+    // Local only (see `commitLocal`), so this wait is short. The plugin's
+    // teardown closes the operation log once every engine has stopped, and
+    // the phase may still be writing file meta.
+    await Promise.allSettled([...this.localCommits]);
   }
 
   /** Subscribe to status transitions. Returns an unsubscribe handle. */
@@ -846,22 +919,37 @@ export class SyncEngine {
 
   // -- Local → Server -------------------------------------------------------
 
-  private async handleLocalCreate(path: string): Promise<void> {
+  private async handleLocalCreate(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     if (this.fileIndex.byPath.has(path)) {
       // The server already knows about this — treat as a modify.
-      await this.handleLocalModify(path);
+      await this.handleLocalModify(path, from);
       return;
     }
+    const fileType = classifyFileType(path);
+    const change = this.hold(from, 'CREATE', path, null, { fileType });
+    try {
+      await this.sendLocalCreate(path, fileType, change);
+    } finally {
+      this.settle(change);
+    }
+  }
+
+  private async sendLocalCreate(
+    path: string,
+    fileType: FileType,
+    change: HeldChange | null,
+  ): Promise<void> {
     // Stale-create guard: if the file isn't actually on disk anymore,
     // this event is leftover from an atomic-rename write (chokidar saw
     // the intermediate `add` but the file moved away again before we got
     // here). Emitting would upload empty bytes and tip the server into a
     // conflict-rename round-trip.
     if (!(await this.vault.exists(path))) return;
-    const fileType = classifyFileType(path);
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
+    const payload = { fileType, contentHash: hash, size: buffer.byteLength };
+    if (change) change.payload = payload;
 
     // Join-window guard: between socket connect and the fileIndex refresh
     // the index can't tell a NEW file from a server-known one — emitting
@@ -907,11 +995,7 @@ export class SyncEngine {
       }
     }
     // Offline (or NACK) — queue and bail; the engine will replay on reconnect.
-    this.queue('CREATE', path, null, {
-      fileType,
-      contentHash: hash,
-      size: buffer.byteLength,
-    });
+    this.queue('CREATE', path, null, payload);
   }
 
   /**
@@ -985,12 +1069,12 @@ export class SyncEngine {
     });
   }
 
-  private async handleLocalModify(path: string): Promise<void> {
+  private async handleLocalModify(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     const meta = this.fileIndex.byPath.get(path);
     if (!meta) {
       // No server record yet — promote to a CREATE.
-      await this.handleLocalCreate(path);
+      await this.handleLocalCreate(path, from);
       return;
     }
     if (meta.fileType === 'TEXT') {
@@ -1028,9 +1112,26 @@ export class SyncEngine {
       });
       return;
     }
+    // Text needs no holding: an edit the fold did not reach stays on disk,
+    // and the next fold (the catch-up's, at the latest) takes it in.
+    const change = this.hold(from, 'UPDATE', path, null, { fileId: meta.fileId });
+    try {
+      await this.sendLocalBinaryUpdate(path, meta, change);
+    } finally {
+      this.settle(change);
+    }
+  }
+
+  private async sendLocalBinaryUpdate(
+    path: string,
+    meta: IndexedMeta,
+    change: HeldChange | null,
+  ): Promise<void> {
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
     if (hash === meta.contentHash) return; // nothing changed
+    const payload = { fileId: meta.fileId, contentHash: hash, size: buffer.byteLength };
+    if (change) change.payload = payload;
 
     if (this.socket.isConnected()) {
       try {
@@ -1058,11 +1159,7 @@ export class SyncEngine {
         this.log.debug('binary update staging/emit failed; queueing', path);
       }
     }
-    this.queue('UPDATE', path, null, {
-      fileId: meta.fileId,
-      contentHash: hash,
-      size: buffer.byteLength,
-    });
+    this.queue('UPDATE', path, null, payload);
   }
 
   /**
@@ -1080,13 +1177,22 @@ export class SyncEngine {
     }
     if (children.length === 0) return;
     this.log.debug('folder delete → expanding', folderPath, `(${children.length} files)`);
-    for (const path of children) {
-      // Obsidian delivered one event (the folder); the per-child unlinks come
-      // from chokidar, and the FS-watcher's Obsidian-dedupe only registered the
-      // folder path. Pre-mark each child so its chokidar `unlink` echo is
-      // swallowed instead of dispatching a second, racing handleLocalDelete.
-      this.recentlyApplied.mark(path);
-      await this.handleLocalDelete(path);
+    // Hold every child's delete up front. They go out one ack at a time, and
+    // a `stop()` halfway through must queue the ones not sent yet — the next
+    // catch-up would otherwise write them back to disk. Checked already: the
+    // folder is gone, so none of them can still be on disk.
+    const held = children.map((path) => this.holdLocalDelete(path, { checked: true }));
+    try {
+      for (const change of held) {
+        // Obsidian delivered one event (the folder); the per-child unlinks come
+        // from chokidar, and the FS-watcher's Obsidian-dedupe only registered the
+        // folder path. Pre-mark each child so its chokidar `unlink` echo is
+        // swallowed instead of dispatching a second, racing handleLocalDelete.
+        this.recentlyApplied.mark(change.filePath);
+        await this.handleLocalDelete(change.filePath, change);
+      }
+    } finally {
+      for (const change of held) this.settle(change);
     }
   }
 
@@ -1106,8 +1212,55 @@ export class SyncEngine {
     }
   }
 
-  private async handleLocalDelete(path: string): Promise<void> {
+  /**
+   * `from` is where the delete comes from, or the change a folder delete
+   * already holds for this path.
+   */
+  private async handleLocalDelete(
+    path: string,
+    from: LocalSource | HeldChange = 'watcher',
+  ): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
+    // Held before the stale-delete check below: that is a disk read `stop()`
+    // can land on. Until the check passes, the held entry asks the replay to
+    // repeat it (see `holdLocalDelete`).
+    const change =
+      from === 'queue'
+        ? null
+        : from === 'watcher'
+          ? this.holdLocalDelete(path, { checked: false })
+          : from;
+    try {
+      await this.sendLocalDelete(path, change);
+    } finally {
+      this.settle(change);
+    }
+  }
+
+  /**
+   * Hold a local delete. `checked: false` while the stale-delete check has not
+   * passed yet: handed over in that state, the entry carries
+   * {@link RECHECK_DELETE}, and the replay drops it if the file is on disk.
+   * Only then — a plain queued DELETE goes out whatever the disk holds.
+   *
+   * The recheck errs on the safe side. The catch-up that runs before the drain
+   * writes a text file the server still holds back to disk, so a real delete
+   * handed over during that one disk read brings the note back instead of
+   * going out. The other way round, a stray `unlink` sent as a delete would
+   * erase the file for the whole team.
+   */
+  private holdLocalDelete(path: string, opts: { checked: boolean }): HeldChange {
+    const fileId = this.fileIndex.byPath.get(path)?.fileId ?? '';
+    return this.hold(
+      'watcher',
+      'DELETE',
+      path,
+      null,
+      opts.checked ? { fileId } : { fileId, [RECHECK_DELETE]: true },
+    );
+  }
+
+  private async sendLocalDelete(path: string, change: HeldChange | null): Promise<void> {
     // Stale-delete guard: if the file is still on disk, the watcher
     // event is almost certainly a stray chokidar `unlink` from an
     // atomic-rename overwrite (the matching `add` lands a beat later).
@@ -1118,6 +1271,8 @@ export class SyncEngine {
     if (await this.vault.exists(path)) return;
     const meta = this.fileIndex.byPath.get(path);
     let fileId = meta?.fileId ?? '';
+    // Checked: from here on `stop()` hands it over as a plain DELETE.
+    if (change) change.payload = { fileId };
     // The path may be absent from the local index (a folder-delete child, or
     // a stale index). Resolve the id from the server's live file list before
     // giving up — otherwise the DELETE is queued with an empty fileId and is
@@ -1126,6 +1281,7 @@ export class SyncEngine {
       fileId = await this.resolveServerFileId(path);
       this.throwIfStopped();
     }
+    if (change) change.payload = { fileId };
     if (this.socket.isConnected() && fileId) {
       const ack = await this.socket.emitFileDelete({
         projectId: this.binding.projectId,
@@ -1182,29 +1338,37 @@ export class SyncEngine {
 
     const meta = this.fileIndex.byPath.get(oldPath);
     const fileId = meta?.fileId ?? '';
-    if (this.socket.isConnected() && fileId) {
-      const ack = await this.socket.emitFileRename({
-        projectId: this.binding.projectId,
-        clientId: this.clientId,
-        vectorClock: this.bumpClock(),
-        fileId,
-        filePath: oldPath,
-        newPath,
-      });
-      this.throwIfStopped();
-      if (ack.ok) {
-        if (meta) {
-          this.operationLog.deleteFileMeta(this.binding.id, oldPath);
-          meta.relativePath = newPath;
-          this.operationLog.setFileMeta(meta);
-          this.fileIndex.byPath.delete(oldPath);
-          this.fileIndex.byPath.set(newPath, meta);
+    // A disconnected socket never answers the ack: without holding it, a
+    // rename sent just before `stop()` would be lost, and the next engine
+    // would upload the new path as a second file.
+    const change = this.hold('watcher', 'RENAME', oldPath, newPath, { fileId });
+    try {
+      if (this.socket.isConnected() && fileId) {
+        const ack = await this.socket.emitFileRename({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          vectorClock: this.bumpClock(),
+          fileId,
+          filePath: oldPath,
+          newPath,
+        });
+        this.throwIfStopped();
+        if (ack.ok) {
+          if (meta) {
+            this.operationLog.deleteFileMeta(this.binding.id, oldPath);
+            meta.relativePath = newPath;
+            this.operationLog.setFileMeta(meta);
+            this.fileIndex.byPath.delete(oldPath);
+            this.fileIndex.byPath.set(newPath, meta);
+          }
+          this.persistVectorClock();
+          return;
         }
-        this.persistVectorClock();
-        return;
       }
+      this.queue('RENAME', oldPath, newPath, { fileId });
+    } finally {
+      this.settle(change);
     }
-    this.queue('RENAME', oldPath, newPath, { fileId });
   }
 
   /** Wire a text file's Yjs doc to the socket so future edits stream upstream. */
@@ -1272,13 +1436,15 @@ export class SyncEngine {
     return isAlwaysIgnored(path, this.configDir);
   }
 
-  /** Content hash of a vault file, or `null` when it can't be read. */
-  private async hashFile(path: string): Promise<string | null> {
+  /**
+   * Content hash of a vault file, or `null` when it can't be read. Takes the
+   * vault it reads: inside a {@link commitLocal} block that is the unfenced one.
+   */
+  private async hashFile(vault: VaultAdapter, path: string): Promise<string | null> {
     try {
-      if (!(await this.vault.exists(path))) return null;
-      return await sha256Hex(await this.vault.readBinary(path));
+      if (!(await vault.exists(path))) return null;
+      return await sha256Hex(await vault.readBinary(path));
     } catch {
-      this.throwIfStopped();
       return null;
     }
   }
@@ -1448,16 +1614,21 @@ export class SyncEngine {
       if (await this.vault.exists(payload.path)) return;
       const buf = await this.downloadFile(payload.id);
       this.throwIfStopped();
-      // Same ordering as `applyServerUpdateBinary` — meta first, then the
-      // disk write, so the watcher echo's hash compare short-circuits.
-      meta.size = buf.byteLength;
-      meta.contentHash = await sha256Hex(buf);
-      this.operationLog.setFileMeta(meta);
-      // One createBinary fires Obsidian onCreate + chokidar 'add' — two
-      // echoes that both need consuming.
-      this.recentlyApplied.mark(payload.path, ECHO_COUNT_CREATE);
-      await this.vault.ensureParentFolder(payload.path);
-      await this.vault.createBinary(payload.path, buf);
+      const hash = await sha256Hex(buf);
+      // Meta and file go together — a meta recorded for a file that never
+      // reached the disk would look like a synced copy.
+      await this.commitLocal(async (io) => {
+        // Same ordering as `applyServerUpdateBinary` — meta first, then the
+        // disk write, so the watcher echo's hash compare short-circuits.
+        meta.size = buf.byteLength;
+        meta.contentHash = hash;
+        io.log.setFileMeta(meta);
+        // One createBinary fires Obsidian onCreate + chokidar 'add' — two
+        // echoes that both need consuming.
+        io.echo.mark(payload.path, ECHO_COUNT_CREATE);
+        await io.vault.ensureParentFolder(payload.path);
+        await io.vault.createBinary(payload.path, buf);
+      });
     }
   }
 
@@ -1471,8 +1642,12 @@ export class SyncEngine {
     const newBuf = await this.downloadFile(fileId);
     this.throwIfStopped();
     const newHash = await sha256Hex(newBuf);
+    /** Where `keep-both` parks the local edits. */
+    let aside: string | null = null;
 
     // Conflict detection — only triggers when the user has uncommitted edits.
+    // Stopped anywhere up to the write below, nothing has changed yet: the
+    // next catch-up replays this UPDATE and starts over.
     if (await this.vault.exists(meta.relativePath)) {
       const localBuf = await this.vault.readBinary(meta.relativePath);
       const localHash = await sha256Hex(localBuf);
@@ -1522,54 +1697,64 @@ export class SyncEngine {
         }
         if (resolution === 'keep-both') {
           // Move the local edits aside, then write the server's version.
-          const aside = buildConflictPath(meta.relativePath, this.now());
-          // A rename fires Obsidian onRename + chokidar 'unlink' (old) +
-          // 'add' (new) — both paths need their own echo budgets, or the
-          // engine's own handlers will turn the echo into a real
-          // file:delete / file:create round-trip to the server.
-          this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_RENAME);
-          this.recentlyApplied.mark(aside, ECHO_COUNT_RENAME);
-          await this.vault.ensureParentFolder(aside);
-          await this.vault.rename(meta.relativePath, aside);
-          // Note: the renamed file is NOT auto-uploaded — the user can
-          // decide what to do with it; if they keep it, the next vault
-          // event picks it up as a fresh CREATE.
+          aside = buildConflictPath(meta.relativePath, this.now());
         }
         // 'keep-server' falls through to the standard apply path below.
       }
     }
 
-    // Update `meta` BEFORE the disk write. The watcher echo loop is
-    // unavoidable — chokidar + Obsidian's `vault.on('modify')` BOTH fire
-    // for the same write, and `recentlyApplied.take` consumes only one of
-    // them. The second fires through to `handleLocalModify`, which uses
-    // `hash === meta.contentHash` as its short-circuit. If meta is still
-    // the *old* hash at that moment, the echo emits an UPDATE → server
-    // applies → broadcasts → `applyServerUpdateBinary` runs again → write
-    // → another echo → ... infinite loop. Setting meta first means the
-    // echo's hash compare matches and the short-circuit fires.
-    meta.size = newBuf.byteLength;
-    meta.contentHash = newHash;
-    this.operationLog.setFileMeta(meta);
-    // Overwrite writes can split into chokidar `unlink` + `add` (the
-    // atomic-rename pattern some editors and OS-level write paths use),
-    // so the writeBinary branch budgets for one Obsidian echo plus up to
-    // two chokidar echoes. A stray `unlink` falling through would dispatch
-    // a real `file:delete` and clear the path from `fileIndex`, which is
-    // exactly how a phantom `file:create` round-trip starts (the next
-    // watcher event finds an empty fileIndex and treats the path as
-    // brand-new). The createBinary branch only fires create-style echoes
-    // (Obsidian onCreate + chokidar `add`), so the smaller CREATE budget
-    // is exact — using WRITE there would leave a stale mark that could
-    // suppress a genuine next-second edit.
-    if (await this.vault.exists(meta.relativePath)) {
-      this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_WRITE);
-      await this.vault.writeBinary(meta.relativePath, newBuf);
-    } else {
-      await this.vault.ensureParentFolder(meta.relativePath);
-      this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_CREATE);
-      await this.vault.createBinary(meta.relativePath, newBuf);
-    }
+    // One local phase: the park-aside, the meta and the write. Stopped after
+    // the meta, the log would claim bytes the disk never got, and the next
+    // local edit would upload the old ones over the server's version.
+    const parkAt = aside;
+    await this.commitLocal(async (io) => {
+      const path = meta.relativePath;
+      if (parkAt !== null) {
+        // A rename fires Obsidian onRename + chokidar 'unlink' (old) +
+        // 'add' (new) — both paths need their own echo budgets, or the
+        // engine's own handlers will turn the echo into a real
+        // file:delete / file:create round-trip to the server.
+        io.echo.mark(path, ECHO_COUNT_RENAME);
+        io.echo.mark(parkAt, ECHO_COUNT_RENAME);
+        await io.vault.ensureParentFolder(parkAt);
+        await io.vault.rename(path, parkAt);
+        // Note: the renamed file is NOT auto-uploaded — the user can
+        // decide what to do with it; if they keep it, the next vault
+        // event picks it up as a fresh CREATE.
+      }
+
+      // Update `meta` BEFORE the disk write. The watcher echo loop is
+      // unavoidable — chokidar + Obsidian's `vault.on('modify')` BOTH fire
+      // for the same write, and `recentlyApplied.take` consumes only one of
+      // them. The second fires through to `handleLocalModify`, which uses
+      // `hash === meta.contentHash` as its short-circuit. If meta is still
+      // the *old* hash at that moment, the echo emits an UPDATE → server
+      // applies → broadcasts → `applyServerUpdateBinary` runs again → write
+      // → another echo → ... infinite loop. Setting meta first means the
+      // echo's hash compare matches and the short-circuit fires.
+      meta.size = newBuf.byteLength;
+      meta.contentHash = newHash;
+      io.log.setFileMeta(meta);
+      // Overwrite writes can split into chokidar `unlink` + `add` (the
+      // atomic-rename pattern some editors and OS-level write paths use),
+      // so the writeBinary branch budgets for one Obsidian echo plus up to
+      // two chokidar echoes. A stray `unlink` falling through would dispatch
+      // a real `file:delete` and clear the path from `fileIndex`, which is
+      // exactly how a phantom `file:create` round-trip starts (the next
+      // watcher event finds an empty fileIndex and treats the path as
+      // brand-new). The createBinary branch only fires create-style echoes
+      // (Obsidian onCreate + chokidar `add`), so the smaller CREATE budget
+      // is exact — using WRITE there would leave a stale mark that could
+      // suppress a genuine next-second edit.
+      if (await io.vault.exists(path)) {
+        io.echo.mark(path, ECHO_COUNT_WRITE);
+        await io.vault.writeBinary(path, newBuf);
+      } else {
+        await io.vault.ensureParentFolder(path);
+        io.echo.mark(path, ECHO_COUNT_CREATE);
+        await io.vault.createBinary(path, newBuf);
+      }
+    });
   }
 
   private async applyServerDelete(fileId: string): Promise<void> {
@@ -1579,63 +1764,74 @@ export class SyncEngine {
     // must not let the server erase files there.
     if (!this.allowServerPath(meta.relativePath, 'delete')) return;
 
-    // Delete-vs-update guard: if the local file still exists and has
-    // uncommitted edits, ask the user before clobbering them.
-    if (await this.vault.exists(meta.relativePath)) {
-      const localBuf = await this.vault.readBinary(meta.relativePath);
-      const localHash = await sha256Hex(localBuf);
-      const conflict = detectDeleteConflict({
-        storedHash: meta.contentHash,
-        localHash,
-      });
-      if (conflict) {
-        const resolution = await this.conflictResolver.resolveDeleteConflict({
-          filePath: meta.relativePath,
-          localSize: localBuf.byteLength,
-        });
-        this.throwIfStopped();
-        if (resolution === 'restore-server') {
-          // Push the local content as a fresh CREATE so the server
-          // un-deletes it. The recipient broadcast will reset our state.
-          if (this.socket.isConnected()) {
-            try {
-              const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
-              this.throwIfStopped();
-              await this.socket.emitFileCreate({
-                projectId: this.binding.projectId,
-                clientId: this.clientId,
-                vectorClock: this.bumpClock(),
-                filePath: meta.relativePath,
-                fileType: meta.fileType,
-                contentHash: localHash,
-                size: localBuf.byteLength,
-                ...(data !== undefined ? { data } : {}),
-              });
-            } catch {
-              this.throwIfStopped();
-              this.log.debug(
-                'restore-server push failed; reconcile on reconnect',
-                meta.relativePath,
-              );
-            }
-          }
-          // Don't drop local state — we want the file to stay.
-          return;
+    // One local phase, from the check to the delete. A delete stopped before
+    // it reaches the disk is not replayed: the next catch-up no longer finds
+    // the file in the listing and has nothing to apply it to, so the local
+    // copy would stay behind, never synced again. Only a conflict leaves the
+    // phase — to ask the user, which can take any time.
+    const conflict = await this.commitLocal(async (io) => {
+      // Delete-vs-update guard: if the local file still exists and has
+      // uncommitted edits, ask the user before clobbering them.
+      if (await io.vault.exists(meta.relativePath)) {
+        const localBuf = await io.vault.readBinary(meta.relativePath);
+        const localHash = await sha256Hex(localBuf);
+        if (detectDeleteConflict({ storedHash: meta.contentHash, localHash })) {
+          return { localBuf, localHash };
         }
-        // 'delete-local' falls through.
       }
-    }
+      await this.removeLocalCopy(io, meta);
+      return null;
+    });
+    if (!conflict) return;
 
-    // One delete fires Obsidian onDelete + chokidar `unlink`.
-    this.recentlyApplied.mark(meta.relativePath, ECHO_COUNT_DELETE);
-    if (await this.vault.exists(meta.relativePath)) {
-      await this.vault.delete(meta.relativePath);
+    const { localBuf, localHash } = conflict;
+    const resolution = await this.conflictResolver.resolveDeleteConflict({
+      filePath: meta.relativePath,
+      localSize: localBuf.byteLength,
+    });
+    this.throwIfStopped();
+    if (resolution === 'restore-server') {
+      // Push the local content as a fresh CREATE so the server
+      // un-deletes it. The recipient broadcast will reset our state.
+      if (this.socket.isConnected()) {
+        try {
+          const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
+          this.throwIfStopped();
+          await this.socket.emitFileCreate({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            vectorClock: this.bumpClock(),
+            filePath: meta.relativePath,
+            fileType: meta.fileType,
+            contentHash: localHash,
+            size: localBuf.byteLength,
+            ...(data !== undefined ? { data } : {}),
+          });
+        } catch {
+          this.throwIfStopped();
+          this.log.debug('restore-server push failed; reconcile on reconnect', meta.relativePath);
+        }
+      }
+      // Don't drop local state — we want the file to stay.
+      return;
     }
-    this.fileIndex.byPath.delete(meta.relativePath);
-    this.fileIndex.byId.delete(fileId);
-    this.operationLog.deleteFileMeta(this.binding.id, meta.relativePath);
-    this.forgetFoldState(fileId);
-    await this.docManager.release(this.binding.id, meta.relativePath);
+    // 'delete-local'.
+    await this.commitLocal((io) => this.removeLocalCopy(io, meta));
+  }
+
+  /** Delete the local copy of a file the server deleted, bookkeeping included. */
+  private async removeLocalCopy(io: LocalIO, meta: IndexedMeta): Promise<void> {
+    const path = meta.relativePath;
+    // One delete fires Obsidian onDelete + chokidar `unlink`.
+    io.echo.mark(path, ECHO_COUNT_DELETE);
+    if (await io.vault.exists(path)) {
+      await io.vault.delete(path);
+    }
+    this.fileIndex.byPath.delete(path);
+    this.fileIndex.byId.delete(meta.fileId);
+    io.log.deleteFileMeta(this.binding.id, path);
+    this.forgetFoldState(meta.fileId);
+    await io.docs.release(this.binding.id, path);
   }
 
   private async applyServerRename(fileId: string, newPath: string): Promise<void> {
@@ -1656,8 +1852,20 @@ export class SyncEngine {
     // can come from `state.json` written by a build without the gate.
     if (!this.allowServerPath(oldPath, 'rename source', { requireBinding: false })) return;
 
-    if (await this.vault.exists(oldPath)) {
-      if (await this.vault.exists(newPath)) {
+    // Everything from here on is one local phase, the disk checks included.
+    // A rename cut anywhere in it leaves the old path on disk while the next
+    // engine's listing already shows the new one: that engine counts the
+    // rename as applied, writes the new path from the catch-up, and uploads
+    // the old one as a brand-new file — a duplicate for the whole team.
+    await this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
+  }
+
+  /** Apply a server rename to the disk and the index. Local phase only. */
+  private async moveLocalCopy(io: LocalIO, meta: IndexedMeta, newPath: string): Promise<void> {
+    const { fileId } = meta;
+    const oldPath = meta.relativePath;
+    if (await io.vault.exists(oldPath)) {
+      if (await io.vault.exists(newPath)) {
         // Destination already materialised locally — e.g. an initial-push
         // pass created it, or this rename was partially applied before.
         // `adapter.rename` throws "Destination file already exists" here,
@@ -1669,8 +1877,8 @@ export class SyncEngine {
         // the benign case and stays a delete; differing content parks the
         // local destination aside, the way `keep-both` does for binary
         // conflicts, so nothing disappears.
-        const sourceHash = await this.hashFile(oldPath);
-        const destHash = sourceHash === null ? null : await this.hashFile(newPath);
+        const sourceHash = await this.hashFile(io.vault, oldPath);
+        const destHash = sourceHash === null ? null : await this.hashFile(io.vault, newPath);
         if (sourceHash === null || destHash === null) {
           // Couldn't read one of them (locked file, antivirus, dropped network
           // drive). Guessing here either deletes a file we never read or parks
@@ -1682,10 +1890,10 @@ export class SyncEngine {
         // Echo budgets are claimed only once the disk is actually about to
         // change: every early return above would otherwise leave a live budget
         // behind that swallows a genuine external edit.
-        this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
-        this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
+        io.echo.mark(oldPath, ECHO_COUNT_RENAME);
+        io.echo.mark(newPath, ECHO_COUNT_RENAME);
         if (sourceHash === destHash) {
-          await this.vault.delete(oldPath);
+          await io.vault.delete(oldPath);
         } else {
           const aside = buildConflictPath(newPath, this.now());
           this.log.warn('server rename collided with a different local file', {
@@ -1698,22 +1906,22 @@ export class SyncEngine {
           // a second echo budget — `mark` adds to what is left. Without it the
           // leftover `unlink` reaches `handleLocalDelete` for a path that has
           // just become a live file: the 2026-08-06 incident.
-          this.recentlyApplied.mark(aside, ECHO_COUNT_RENAME);
-          this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
-          await this.vault.ensureParentFolder(aside);
-          await this.vault.rename(newPath, aside);
-          await this.vault.ensureParentFolder(newPath);
-          await this.vault.rename(oldPath, newPath);
+          io.echo.mark(aside, ECHO_COUNT_RENAME);
+          io.echo.mark(newPath, ECHO_COUNT_RENAME);
+          await io.vault.ensureParentFolder(aside);
+          await io.vault.rename(newPath, aside);
+          await io.vault.ensureParentFolder(newPath);
+          await io.vault.rename(oldPath, newPath);
         }
       } else {
-        this.recentlyApplied.mark(oldPath, ECHO_COUNT_RENAME);
-        this.recentlyApplied.mark(newPath, ECHO_COUNT_RENAME);
-        await this.vault.ensureParentFolder(newPath);
-        await this.vault.rename(oldPath, newPath);
+        io.echo.mark(oldPath, ECHO_COUNT_RENAME);
+        io.echo.mark(newPath, ECHO_COUNT_RENAME);
+        await io.vault.ensureParentFolder(newPath);
+        await io.vault.rename(oldPath, newPath);
       }
     }
 
-    this.operationLog.deleteFileMeta(this.binding.id, oldPath);
+    io.log.deleteFileMeta(this.binding.id, oldPath);
     this.fileIndex.byPath.delete(oldPath);
     if (!isInBinding(newPath, this.binding.localFolder)) {
       // The file left our folder. It stays on disk where the server says it
@@ -1722,13 +1930,13 @@ export class SyncEngine {
       // would make a later move back in look like an unknown file.
       this.fileIndex.byId.delete(fileId);
       this.outOfScope.set(fileId, { path: newPath, fileType: meta.fileType });
-      await this.docManager.release(this.binding.id, oldPath);
+      await io.docs.release(this.binding.id, oldPath);
       this.forgetFoldState(fileId);
       this.log.info('file moved out of the binding folder', { oldPath, newPath });
       return;
     }
     meta.relativePath = newPath;
-    this.operationLog.setFileMeta(meta);
+    io.log.setFileMeta(meta);
     this.fileIndex.byPath.set(newPath, meta);
   }
 
@@ -2160,6 +2368,44 @@ export class SyncEngine {
     }
   }
 
+  /**
+   * Replay one queued operation.
+   *
+   * A queued CREATE or binary UPDATE records that a file changed, not its
+   * bytes: the replay reads the disk again and sends what is there now. An
+   * entry the disk no longer bears out is dropped rather than sent — a CREATE
+   * or UPDATE whose file is gone, an UPDATE whose bytes still match the last
+   * sync, a DELETE handed over before its stale-delete check whose file is
+   * still there. `stop()` hands such entries over (see {@link hold}), and a
+   * missing file used to halt the drain on that entry for good.
+   *
+   * Some entries reach the server twice: the operation a drain had in flight
+   * when the engine stopped, and a change `stop()` handed over whose ack was
+   * still on the way. Sent again right away, that changes nothing on the
+   * server: a CREATE for a path it holds with the same hash is an idempotent
+   * replay (and the drain routes a path it already knows through modify), a
+   * DELETE of a tombstone and a RENAME to the file's current path are no-ops,
+   * a binary UPDATE rewrites the same bytes (and is skipped when the catch-up
+   * has already brought them down).
+   *
+   * Not so after a gap in which a teammate changed the same file: the server
+   * applies DELETE and RENAME by file id without comparing clocks. A resent
+   * DELETE removes a note the teammate re-created at that path in the meantime
+   * (a CREATE revives the tombstone under the same id), and a resent RENAME
+   * moves the file back from where the teammate had moved it since. A binary
+   * UPDATE is covered by the catch-up that runs first: it brings the newer
+   * version down (through the conflict modal), and the replay then finds the
+   * disk at the last sync and sends nothing — unless the user keeps their own
+   * copy.
+   *
+   * Resends used to be more frequent: the drain marked a pass sent only at
+   * its end, and an ack cut off by the disconnect never came, so a stop
+   * resent every operation of the pass. Now it is the one the drain had in
+   * flight, plus a live change whose ack was still on the way — without the
+   * hand-over, lost whenever the server had not got it. Refusing a stale resend takes a
+   * precondition the server checks: the expected source path, or the state
+   * the file was deleted in.
+   */
   private async replayPending(op: {
     opType: OperationType;
     filePath: string;
@@ -2188,7 +2434,7 @@ export class SyncEngine {
         path: op.filePath,
         newPath: op.newPath,
       });
-      await this.handleLocalDelete(op.filePath);
+      await this.handleLocalDelete(op.filePath, 'queue');
       this.throwIfStopped();
       return { ok: true };
     }
@@ -2208,7 +2454,7 @@ export class SyncEngine {
           // 56 junk copies in the 2026-06-12 incident). Route through the
           // modify path instead: Yjs diff for text, binary UPDATE otherwise.
           if (this.fileIndex.byPath.has(op.filePath)) {
-            await this.handleLocalModify(op.filePath);
+            await this.handleLocalModify(op.filePath, 'queue');
             this.throwIfStopped();
             return { ok: true };
           }
@@ -2262,10 +2508,21 @@ export class SyncEngine {
         case 'UPDATE': {
           const fileId = queuedFileId(op.payload);
           if (!fileId) return { ok: false, retryable: false, error: 'no_file_id' };
+          // Deleted (or renamed away) since: a later DELETE or RENAME in the
+          // queue carries that. Retrying a read that cannot succeed used to
+          // halt the drain on this entry for good, with every edit behind it.
+          if (!(await this.vault.exists(op.filePath))) {
+            return { ok: false, retryable: false, error: 'local_file_missing' };
+          }
           const data = await this.vault.readBinary(op.filePath);
           // Hash the bytes being sent, not the stale enqueue-time snapshot
           // — same reasoning as the CREATE case above.
           const contentHash = await sha256Hex(data);
+          // Still the bytes of the last sync — an edit undone, or a change
+          // `stop()` handed over before its handler got to compare hashes.
+          // Nothing to send; sending would overwrite a newer server version
+          // with the old one.
+          if (contentHash === this.fileIndex.byId.get(fileId)?.contentHash) return { ok: true };
           try {
             await this.uploadBlob(contentHash, data);
           } catch {
@@ -2293,6 +2550,14 @@ export class SyncEngine {
           return ackToOutcome(ack);
         }
         case 'DELETE': {
+          // Handed over by `stop()` before the stale-delete check had run
+          // (see `holdLocalDelete`): run it now. The event may have been a
+          // stray `unlink` of a file that is still there. Only for such an
+          // entry — the catch-up that has just run writes every text file
+          // the server still holds back to disk, an offline delete included.
+          if (op.payload[RECHECK_DELETE] === true && (await this.vault.exists(op.filePath))) {
+            return { ok: false, retryable: false, error: 'local_file_present' };
+          }
           let fileId = queuedFileId(op.payload);
           // A queued DELETE can carry an empty fileId (the path wasn't indexed
           // when it was enqueued). Resolve it from the now-refreshed index
@@ -2410,6 +2675,96 @@ export class SyncEngine {
    */
   private throwIfStopped(): void {
     this.lifetime.signal.throwIfAborted();
+  }
+
+  /**
+   * Take on a local change: until {@link settle} releases it, `stop()` hands
+   * it to the offline queue. A handler holds a change from the moment it
+   * accepts the event until the change is acknowledged, queued, or found to
+   * be a no-op — the stretch in which `stop()` would otherwise lose it: a
+   * transfer it cancels, an ack a disconnected socket never delivers, a disk
+   * read it lands on. `null` for a change replayed from the queue, which the
+   * queue holds already.
+   */
+  private hold(
+    from: 'watcher',
+    opType: OperationType,
+    filePath: string,
+    newPath: string | null,
+    payload: Record<string, unknown>,
+  ): HeldChange;
+  private hold(
+    from: LocalSource,
+    opType: OperationType,
+    filePath: string,
+    newPath: string | null,
+    payload: Record<string, unknown>,
+  ): HeldChange | null;
+  private hold(
+    from: LocalSource,
+    opType: OperationType,
+    filePath: string,
+    newPath: string | null,
+    payload: Record<string, unknown>,
+  ): HeldChange | null {
+    // Nothing new is taken on once stopped: `stop()` has already handed over
+    // what it holds.
+    this.throwIfStopped();
+    if (from === 'queue') return null;
+    const change: HeldChange = { opType, filePath, newPath, payload };
+    this.held.add(change);
+    return change;
+  }
+
+  private settle(change: HeldChange | null): void {
+    if (change) this.held.delete(change);
+  }
+
+  /**
+   * Queue every change still held, in the order they were taken on. Runs in
+   * `stop()` before the fence closes — the engine's last write, not a write
+   * after stop. The replay reads the disk again (see {@link replayPending}),
+   * so an entry handed over before its handler had read the file is still
+   * right, and one the disk has since overtaken is dropped there.
+   */
+  private handOverHeldChanges(): void {
+    for (const change of this.held) {
+      try {
+        this.operationLog.enqueueOperation(this.binding.id, {
+          ...change,
+          payload: { ...change.payload },
+        });
+      } catch (err) {
+        this.log.warn('could not queue a change held at stop', {
+          opType: change.opType,
+          path: change.filePath,
+          err,
+        });
+      }
+    }
+    this.held.clear();
+  }
+
+  /**
+   * Run a local phase to the end: the disk and bookkeeping steps of one
+   * change that must not be torn apart — a rename's disk moves and its file
+   * meta, a download's meta and its write. Checks for `stop()` once, before
+   * the first step, and hands the block the dependencies without the fence,
+   * so a `stop()` landing in between waits for it instead of cutting it.
+   *
+   * The block must stay local: no request, no emit, no modal, no
+   * `throwIfStopped`, no nested `commitLocal` — any of those would hold up
+   * `stop()` or tear the phase after all.
+   */
+  private async commitLocal<T>(block: (io: LocalIO) => Promise<T>): Promise<T> {
+    this.throwIfStopped();
+    const run = block(this.local);
+    this.localCommits.add(run);
+    try {
+      return await run;
+    } finally {
+      this.localCommits.delete(run);
+    }
   }
 
   /**

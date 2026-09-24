@@ -59,7 +59,8 @@ export interface FlushResult {
  * `signal` stops the drain for good — the engine passes its lifetime signal.
  * Once it aborts, no further operation is emitted, and an answer that arrives
  * afterwards is not recorded: that operation stays queued for the next drain,
- * which resends it (why the server takes that: `SyncEngine.stop`). The promise
+ * which resends it (what that does on the server: `SyncEngine.replayPending`
+ * — a no-op when sent again right away, not always after a gap). The promise
  * then rejects with the signal's reason.
  */
 export async function flushPendingQueue(
