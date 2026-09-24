@@ -160,7 +160,7 @@ describe('no storm of notices', () => {
     jest.runOnlyPendingTimers();
 
     expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain('notes under 30 names');
+    expect(notices[0]).toContain('(names: 30)');
     expect(notices[0]).toContain('"Q/What is 1?.md"');
     expect(notices[0]).toContain('sync.log');
     expect(logged).toHaveLength(30);
@@ -183,8 +183,8 @@ describe('no storm of notices', () => {
     // Twelve names over six seconds: the first notice is due five seconds
     // in, the rest once it has gone.
     expect(notices).toHaveLength(2);
-    expect(notices[0]).toContain('notes under 10 names');
-    expect(notices[1]).toContain('notes under 2 names');
+    expect(notices[0]).toContain('(names: 10)');
+    expect(notices[1]).toContain('(names: 2)');
     expect(shownAt.map((at) => at - start)).toEqual([5000, 20_000]);
   });
 
@@ -206,7 +206,7 @@ describe('no storm of notices', () => {
       expect((shownAt[i] ?? 0) - (shownAt[i - 1] ?? 0)).toBeGreaterThanOrEqual(15_000);
     }
     // Between them they count every name, and the log has each.
-    const counted = notices.map((n) => Number(/notes under (\d+) names/.exec(n)?.[1] ?? 1));
+    const counted = notices.map((n) => Number(/\(names: (\d+)\)/.exec(n)?.[1] ?? 1));
     expect(counted.reduce((a, b) => a + b, 0)).toBe(200);
     expect(logged).toHaveLength(200);
   });
@@ -344,7 +344,7 @@ describe('the warning that a rename is a delete for the team', () => {
     jest.runOnlyPendingTimers();
 
     expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain('notes under 2 names');
+    expect(notices[0]).toContain('(names: 2)');
     expect(notices[0]).toContain('"Plan|B.md"');
     expect(notices[0]).toContain('those renames look like deletes');
   });

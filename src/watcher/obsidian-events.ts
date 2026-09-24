@@ -218,10 +218,12 @@ export class ObsidianWatcher {
     const newIgnored = isAlwaysIgnored(file.path, this.configDir);
     // Renaming a note to `Why?.md` is the same delete for the team — the one
     // case of it the user doesn't mean, so it is reported. A rename that
-    // keeps the name at fault changes nothing for anyone: renaming the folder
-    // `FAQ` that holds `Question 1?.md` … `Question 40?.md` (Obsidian renames
-    // each note in it) or moving `Why?.md` to another folder isn't reported,
-    // while renaming `Why?.md` to `Why??.md` is — its author tried to fix it.
+    // keeps the name at fault within a binding changes nothing for anyone:
+    // renaming the folder `FAQ` that holds `Question 1?.md` …
+    // `Question 40?.md` (Obsidian renames each note in it) or moving
+    // `Why?.md` to another folder isn't reported, while renaming `Why?.md` to
+    // `Why??.md` is — its author tried to fix it — and so is moving it into
+    // another binding's folder, meant for that project's team.
     if (newIgnored) {
       const fromSynced = !oldIgnored && this.inEnabledBinding(oldPath);
       if (fromSynced || !this.keepsRefusedName(oldPath, file.path)) {
@@ -283,12 +285,17 @@ export class ObsidianWatcher {
   }
 
   /**
-   * True when a rename leaves a file in an enabled binding refused for the
-   * same name as before (`FAQ/Question 1?.md` → `FAQ 2026/Question 1?.md`,
-   * `U.S./a.md` → `U.S./b.md`).
+   * True when a rename leaves a file in the same enabled binding refused for
+   * the same name as before (`FAQ/Question 1?.md` → `FAQ 2026/Question 1?.md`,
+   * `U.S./a.md` → `U.S./b.md`). A move into another binding's folder is
+   * meant for another project, so it is reported: the note won't get there.
    */
   private keepsRefusedName(oldPath: string, newPath: string): boolean {
-    if (!this.inEnabledBinding(oldPath)) return false;
+    const sameBinding = this.getBindings().some(
+      (b) =>
+        b.enabled && isInBinding(oldPath, b.localFolder) && isInBinding(newPath, b.localFolder),
+    );
+    if (!sameBinding) return false;
     const before = windowsRefusal(oldPath, this.configDir);
     const after = windowsRefusal(newPath, this.configDir);
     return (

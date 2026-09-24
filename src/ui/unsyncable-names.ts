@@ -165,35 +165,52 @@ function remember(seen: Set<string>, key: string): boolean {
   return true;
 }
 
+/**
+ * Besides renaming, the notice tells how to deal with notes an older version
+ * synced under such a name: rename them in the web interface or through MCP,
+ * and once they are renamed there, carry over the edits made in the copy
+ * left under the old name and delete it. Whatever advises deleting also
+ * warns Windows users off deleting a name that ends in a dot or a space the
+ * usual way — Windows would delete the one without the dot or space.
+ */
 function noticeFor(batch: UnsyncableName[]): string {
   const renamed = batch.find((e) => e.renamedFrom !== undefined);
   const example = renamed ?? batch[0];
   if (example === undefined) return '';
   const names = new Set(batch.map((e) => e.name));
   const params = { name: example.name, problem: describeProblem(example.problem) };
+  const parts: string[] = [];
+  let advisesDelete = true;
   if (names.size > 1) {
-    return [
-      t('notice.unsyncableName.many', { ...params, count: names.size }),
-      ...(renamed !== undefined ? [t('notice.unsyncableName.many.renamed')] : []),
-      t('notice.unsyncableName.many.rename'),
-    ].join(' ');
-  }
-  const parts = [
-    t('notice.unsyncableName', params),
-    example.problem.kind === 'short-name'
-      ? t('notice.unsyncableName.alias')
-      : t('notice.unsyncableName.cannotKeep'),
-  ];
-  if (renamed === undefined) {
-    parts.push(t('notice.unsyncableName.rename'));
+    // Counted by the name at fault: `Why?.md` in two folders is one name.
+    const count = new Set(batch.map((e) => refusedSegment(e.name))).size;
+    parts.push(t('notice.unsyncableName.many', { ...params, count }));
+    if (example.problem.kind === 'short-name') parts.push(t('notice.unsyncableName.many.alias'));
+    parts.push(t('notice.unsyncableName.many.log'));
+    if (renamed !== undefined) parts.push(t('notice.unsyncableName.many.renamed'));
+    parts.push(t('notice.unsyncableName.many.rename'));
   } else {
-    parts.push(t('notice.unsyncableName.renamed'));
-    // A note renamed to `Why?.md` was synced under its old name, and renaming
-    // it again in Obsidian is right. A folder `U.S.` may also hold notes an
-    // older version synced: renamed in Obsidian, those would be uploaded a
-    // second time. (One name in the batch: a plain report of the same file
-    // can't come with it.)
-    if (example.name !== example.path) parts.push(t('notice.unsyncableName.renamed.older'));
+    parts.push(
+      t('notice.unsyncableName', params),
+      example.problem.kind === 'short-name'
+        ? t('notice.unsyncableName.alias')
+        : t('notice.unsyncableName.cannotKeep'),
+    );
+    if (renamed === undefined) {
+      parts.push(t('notice.unsyncableName.rename'));
+    } else {
+      parts.push(t('notice.unsyncableName.renamed'));
+      // A note renamed to `Why?.md` was synced under its old name, and
+      // renaming it again in Obsidian is right. A folder `U.S.` may also hold
+      // notes an older version synced: renamed in Obsidian, those would be
+      // uploaded a second time. (One name in the batch: a plain report of the
+      // same file can't come with it.)
+      advisesDelete = example.name !== example.path;
+      if (advisesDelete) parts.push(t('notice.unsyncableName.renamed.older'));
+    }
+  }
+  if (advisesDelete && batch.some((e) => e.problem.kind === 'trailing')) {
+    parts.push(t('notice.unsyncableName.trailingOnWindows'));
   }
   return parts.join(' ');
 }
