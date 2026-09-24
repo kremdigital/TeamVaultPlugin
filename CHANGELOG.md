@@ -35,18 +35,35 @@ uses [Semantic Versioning](https://semver.org/).
   system.** This extends the entry above about `:` and short names. A name
   that ends in a dot or a space (`Notes.`, `Notes `) is now refused, and so is
   a name with `*`, `?`, `<`, `>`, `"`, `|` or a control character (`Why?.md`).
-  Obsidian allows these on macOS and Linux, but a Windows teammate's disk
-  can't hold them: a `Why?.md` from a Mac stopped that teammate's sync, and
+  Obsidian allows these on macOS and Linux, but Windows can't keep them as
+  spelled: a `Why?.md` from a Mac stopped a Windows teammate's sync, and
   deleting a synced folder `Notes.` from Obsidian on Windows sent the folder
   `Notes` next to it to the Recycle Bin, a delete that went on to the whole
-  team. When you create, edit or rename such a note in Obsidian, a notice now
-  names it and says what is wrong with the name — once per name while the
-  plugin runs, even with notifications off — and `sync.log` gets a `warn`
-  line. Renaming a synced note to such a name works like deleting it for your
-  teammates. A note an older version already synced under such a name stays
+  team. When you create, edit or rename such a note in Obsidian, a notice
+  names it and says what is wrong with the name, even with notifications off,
+  and `sync.log` gets a `warn` line for it (unless Log level is Errors only).
+  A notice comes once per name while the plugin runs, wherever the name turns
+  up; names reported within a moment of each other (a link update across many
+  notes, a folder copied into the vault) share one notice, and while a notice
+  is up, the next one waits for it to go. Renaming the folder above such a
+  note, or moving the note within its binding, gives no notice. Renaming or
+  moving a synced note to such a name works like deleting it for your
+  teammates: a notice says so for each such note, and `sync.log` names the
+  note it was. A note an older version already synced under such a name stays
   on the server; to sync it again, rename it in the project's web interface
   or through MCP (renaming it in Obsidian uploads it as a new note and leaves
-  the old one on the server).
+  the old one on the server). Teammates on older versions then see it
+  renamed. Anyone on this version who already has a copy under the old name
+  keeps it, no longer synced: on a Mac or Linux for any such name, and on
+  Windows too for a name that ends in a dot or a space or a short name such
+  as `Draft~1.md`, which older versions wrote there as spelled. Copy any edits
+  made in that copy since the update over to the renamed note, then delete
+  the copy; the notice says so too. On Windows, don't delete a copy whose name
+  ends in a dot or a space in File Explorer, or in Obsidian while **Deleted
+  files** is set to **Move to system trash** (the default): Windows drops the
+  dot or space and deletes the synced file or folder named without it, for
+  the whole team. "What is never synced" in the README gives safe ways to
+  delete it.
 
 ### Fixed
 
@@ -89,9 +106,10 @@ uses [Semantic Versioning](https://semver.org/).
   them back in their place, and the cleanup of leftover local state is off
   while they are there. `sync.log` names each one by its position, id and the
   fields at fault, whatever the log level (Errors only included) — never the
-  entry itself, which may hold an API key. A notice that stays until dismissed says how many entries
-  were skipped and asks you to turn the plugin off (or quit Obsidian) before
-  fixing the file. While a binding is skipped, **Add binding** is disabled.
+  entry itself, which may hold an API key. A notice that stays until
+  dismissed says how many entries were skipped and asks you to turn the
+  plugin off (or quit Obsidian) before fixing the file. While a binding is
+  skipped, **Add binding** is disabled.
 - **Service files of the OS, editors and other sync tools no longer sync.**
   Since 0.3.4 a binding covers the whole vault, so `.DS_Store`,
   `desktop.ini`, `Thumbs.db`, Syncthing's `.stfolder` / `.stversions` and
@@ -114,13 +132,51 @@ uses [Semantic Versioning](https://semver.org/).
   doesn't report it again. With Log level at Errors only the line isn't
   written; once the level is raised, it shows at the next reconnect or after
   Pause sync and Resume sync.
-- **A file a teammate renamed or moved while your Obsidian was closed no
-  longer comes back under its old name.** Your copy stayed on disk under the
-  old name and the next start uploaded it as a new file, so every teammate got
-  a duplicate. It is now moved to the new name when sync starts, together with
-  any edits you made to it in the meantime — including names swapped between
-  two files, a new file created under the old name, and a rename that only
-  changes letter case on a Windows or Mac disk.
+- **A file a teammate renamed or moved while you were offline or Obsidian was
+  closed no longer comes back under its old name.** Your copy stayed on disk
+  under the old name, and the next start uploaded it as a new file, so every
+  teammate got a duplicate. It is now moved to the new name when sync starts.
+  This also covers names swapped between two files, a new file created under
+  the old name, and a rename that only changes letter case on a Windows or Mac
+  disk. A note keeps what you typed into it in the meantime, because its
+  offline editing history now moves to the new name with it.
+- **A teammate's rename that only changes a file's letter case no longer
+  deletes your copy on Windows and macOS.** Team Vault took `photo.png` for a
+  second file already there with the same content as `Photo.png`. It then
+  deleted the "duplicate", which was the only copy. On a Mac the same happened
+  with other spellings the disk treats as one name, such as `Straße` and
+  `STRASSE`.
+- **A new note no longer takes in the text of the note that had its name
+  before.** Team Vault keeps each note's offline editing history in Obsidian's
+  local storage, under the note's name. When a note was renamed, moved or
+  deleted, its history stayed under the old name. The next note created there
+  started from it, and Obsidian reuses "Untitled" for every new note. The old
+  note's text got mixed into the new one and went to the server for the whole
+  team. Each history now belongs to its note: it moves with the note and is
+  deleted with it. A leftover history from an earlier version is discarded
+  when another note takes the name.
+- **A note you deleted while offline stays deleted.** The delete went out when
+  you reconnected, but the sync that runs first had already written the note
+  back to disk. There it stayed, no longer synced. A new note you saved under
+  the same name meanwhile was taken for the deleted one. Its text went to the
+  server as the deleted note's, and the new note itself was never uploaded.
+  Now a note leaves Team Vault's records as soon as you delete it, and a new
+  note under its name is uploaded as a new note.
+- **A note you renamed while offline no longer comes back under its old
+  name.** The sync that ran before the rename was sent wrote the note back
+  under its old name, and that copy was then uploaded as a second note. A new
+  note saved under the old name meanwhile was taken for the renamed one. The
+  note is now recorded under its new name right away.
+- **A file a teammate deleted while you were offline no longer comes back, and
+  no longer stays behind on your disk.** A file renamed and then deleted came
+  back under its old name for the whole team: the next start uploaded your
+  copy as a new file. A file deleted without a rename stayed on your disk and
+  was no longer synced. Both are now removed when sync starts. You are asked
+  first only when your copy has changes the server may not have.
+- An attachment you edited and then renamed while offline now has its edit
+  uploaded. The queued edit looked for the file under its old name, found
+  nothing and was dropped, so the server kept the old version until the next
+  edit.
 - An attachment that was added and then renamed while you were offline is now
   saved under its current name. It used to be written under the name it was
   created with: the current name was missing (broken embeds) and the old name
