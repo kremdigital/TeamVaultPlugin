@@ -511,7 +511,7 @@ export default class ObsidianSyncPlugin extends Plugin {
     if (this.unloaded || !this.engineManager || !this.recentlyApplied) return;
 
     // A note named so that Windows can't keep it (`Why?.md`) is never synced;
-    // the user is told, once per name while the plugin runs.
+    // the user is told once per name, and once per synced note renamed to it.
     const unsyncableNames = new UnsyncableNameReporter({
       log: (message, context) => {
         if (!this.logger?.isEnabled('warn')) return false;

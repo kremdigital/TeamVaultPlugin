@@ -15,10 +15,20 @@ const MAX_REPORTED = 1000;
  */
 const QUIET_MS = 1000;
 
-/** …but no longer than this after the first of them. */
+/** …but no longer than this after the first of them… */
 const MAX_WAIT_MS = 5000;
 
-/** The `warn` line in `sync.log`, one per refused name and kind of report. */
+/**
+ * …and not while the previous one is still up: what comes in meanwhile
+ * waits for it to go and then shares the next one. A folder that another
+ * sync tool fills a note at a time gives a notice every 15 s, not every 5.
+ */
+const MIN_GAP_MS = NOTICE_TIMEOUT_MS;
+
+/**
+ * The `warn` line in `sync.log`: one per refused name, and one per synced
+ * note renamed to it (with `renamedFrom`).
+ */
 export const UNSYNCABLE_NAME_LOG = 'not synced: Windows cannot keep this name as spelled';
 
 export interface UnsyncableNameReporterOptions {
@@ -40,27 +50,40 @@ export interface UnsyncableNameReporterOptions {
  * deleted it for the whole team, and its author went on writing in a note
  * nobody else would ever see.
  *
- * Each name is told once while the plugin runs, by the name at fault (`U.S.`,
- * `Why?.md`), not by the file: renaming a folder to `U.S.` reports every note
- * in it, and one notice says it for all of them. The warning that a rename
- * looks like a delete to the team is kept apart — a name already told about
- * as merely unsynced still gets it once. Names reported together, such as a
- * link update touching thirty notes named `What is N?.md`, share one notice
- * that names one of them and sends the user to `sync.log` for the rest.
- * Always shown, like a conflict — the "Show sync notifications" setting is
- * about routine status, and this needs the user to act.
+ * A note created or edited under such a name is told once while the plugin
+ * runs, by the name at fault (`U.S.`, `Why?.md`), not by the file: every note
+ * in a folder `U.S.` shares one notice. A synced note renamed or moved to
+ * such a name is a delete for the team, so each one gets that warning — even
+ * when the name was told about before, and even the second note moved into
+ * the same folder `U.S.` — once per note and name. Names reported together,
+ * such as a link update touching thirty notes named `What is N?.md`, share
+ * one notice that names one of them and sends the user to `sync.log` for the
+ * rest; while a notice is up, the next one waits. Always shown, like a
+ * conflict — the "Show sync notifications" setting is about routine status,
+ * and this needs the user to act.
  */
 export class UnsyncableNameReporter {
   private readonly show: (message: string) => void;
   private readonly log:
     | ((message: string, context: Record<string, unknown>) => boolean | void)
     | undefined;
-  /** `kind\0name` (the refused path) written to `sync.log`. */
+  /** What was written to `sync.log`: see `reportKey`. */
   private readonly logged = new Set<string>();
-  /** `kind\0segment` (the refused name alone) put in a notice. */
+  /**
+   * What was put in a notice: `renamed` by `reportKey`, `plain` by the name
+   * at fault alone.
+   */
   private readonly told = new Set<string>();
+  /**
+   * Refused names (`WindowsRefusal.name`) a rename warning was given for.
+   * That warning says all a plain notice about the same name would: it
+   * carries the advice about notes an older version synced whenever the
+   * name may hold some (a folder).
+   */
+  private readonly warnedNames = new Set<string>();
   private pending: UnsyncableName[] = [];
   private batchStartedAt = 0;
+  private lastShownAt = Number.NEGATIVE_INFINITY;
   private timer: number | null = null;
   private disposed = false;
 
@@ -72,8 +95,8 @@ export class UnsyncableNameReporter {
   report(event: UnsyncableName): void {
     if (this.disposed) return;
     const renamed = event.renamedFrom !== undefined;
-    const logKey = `${kindOf(renamed)}\u0000${event.name}`;
-    if (!this.logged.has(logKey)) {
+    const key = reportKey(event);
+    if (!this.logged.has(key)) {
       const written = this.log?.(UNSYNCABLE_NAME_LOG, {
         path: event.path,
         name: event.name,
@@ -81,12 +104,15 @@ export class UnsyncableNameReporter {
         ...(event.problem.kind === 'character' ? { character: event.problem.character } : {}),
         ...(renamed ? { renamedFrom: event.renamedFrom } : {}),
       });
-      if (written !== false) remember(this.logged, logKey);
+      if (written !== false) remember(this.logged, key);
     }
-    // The rename warning says all the plain notice does, and more.
-    const segment = refusedSegment(event.name);
-    if (this.told.has(`renamed\u0000${segment}`)) return;
-    if (!remember(this.told, `${kindOf(renamed)}\u0000${segment}`)) return;
+    if (renamed) {
+      if (!remember(this.told, key)) return;
+      remember(this.warnedNames, event.name);
+    } else {
+      if (this.warnedNames.has(event.name)) return;
+      if (!remember(this.told, `plain\u0000${refusedSegment(event.name)}`)) return;
+    }
     this.enqueue(event);
   }
 
@@ -103,21 +129,32 @@ export class UnsyncableNameReporter {
     if (this.pending.length === 0) this.batchStartedAt = now;
     this.pending.push(event);
     if (this.timer !== null) window.clearTimeout(this.timer);
-    const wait = Math.min(QUIET_MS, this.batchStartedAt + MAX_WAIT_MS - now);
+    const due = Math.max(
+      Math.min(now + QUIET_MS, this.batchStartedAt + MAX_WAIT_MS),
+      this.lastShownAt + MIN_GAP_MS,
+    );
     // `window.*`, as the directory's guidelines ask (popout windows).
-    this.timer = window.setTimeout(() => this.flush(), Math.max(0, wait));
+    this.timer = window.setTimeout(() => this.flush(), Math.max(0, due - now));
   }
 
   private flush(): void {
     this.timer = null;
     const batch = this.pending;
     this.pending = [];
-    if (batch.length > 0) this.show(noticeFor(batch));
+    if (batch.length === 0) return;
+    this.lastShownAt = Date.now();
+    this.show(noticeFor(batch));
   }
 }
 
-function kindOf(renamed: boolean): 'renamed' | 'plain' {
-  return renamed ? 'renamed' : 'plain';
+/**
+ * A plain report by the refused name; a rename also by the synced note it
+ * took from the team, which is what its warning is about.
+ */
+function reportKey(event: UnsyncableName): string {
+  return event.renamedFrom !== undefined
+    ? `renamed\u0000${event.name}\u0000${event.renamedFrom}`
+    : `plain\u0000${event.name}`;
 }
 
 /** Adds `key` to `seen`; false when it was there already. */
@@ -132,24 +169,33 @@ function noticeFor(batch: UnsyncableName[]): string {
   const renamed = batch.find((e) => e.renamedFrom !== undefined);
   const example = renamed ?? batch[0];
   if (example === undefined) return '';
-  const segments = new Set(batch.map((e) => refusedSegment(e.name)));
+  const names = new Set(batch.map((e) => e.name));
   const params = { name: example.name, problem: describeProblem(example.problem) };
-  if (segments.size === 1) {
+  if (names.size > 1) {
     return [
-      t('notice.unsyncableName', params),
-      example.problem.kind === 'short-name'
-        ? t('notice.unsyncableName.alias')
-        : t('notice.unsyncableName.cannotKeep'),
-      renamed !== undefined
-        ? t('notice.unsyncableName.renamed')
-        : t('notice.unsyncableName.rename'),
+      t('notice.unsyncableName.many', { ...params, count: names.size }),
+      ...(renamed !== undefined ? [t('notice.unsyncableName.many.renamed')] : []),
+      t('notice.unsyncableName.many.rename'),
     ].join(' ');
   }
-  return [
-    t('notice.unsyncableName.many', { ...params, count: segments.size }),
-    ...(renamed !== undefined ? [t('notice.unsyncableName.many.renamed')] : []),
-    t('notice.unsyncableName.many.rename'),
-  ].join(' ');
+  const parts = [
+    t('notice.unsyncableName', params),
+    example.problem.kind === 'short-name'
+      ? t('notice.unsyncableName.alias')
+      : t('notice.unsyncableName.cannotKeep'),
+  ];
+  if (renamed === undefined) {
+    parts.push(t('notice.unsyncableName.rename'));
+  } else {
+    parts.push(t('notice.unsyncableName.renamed'));
+    // A note renamed to `Why?.md` was synced under its old name, and renaming
+    // it again in Obsidian is right. A folder `U.S.` may also hold notes an
+    // older version synced: renamed in Obsidian, those would be uploaded a
+    // second time. (One name in the batch: a plain report of the same file
+    // can't come with it.)
+    if (example.name !== example.path) parts.push(t('notice.unsyncableName.renamed.older'));
+  }
+  return parts.join(' ');
 }
 
 function describeProblem(problem: WindowsNameProblem): string {

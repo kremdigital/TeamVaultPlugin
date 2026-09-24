@@ -26,6 +26,19 @@ import type { VaultBinding } from '@/settings/settings';
  *   - a name shaped like a Windows short name (`Notes~2.md`) was said to be
  *     one Windows can't keep, while Windows keeps it: the danger is that it
  *     can open another file by its 8.3 alias.
+ *
+ * And the first fix for them went too far:
+ *
+ *   - told once per name at fault, the warning that a rename is a delete
+ *     came for the first synced note renamed `Why?.md` and not for the next
+ *     one, in another folder, or for the next note moved into `U.S.`;
+ *   - the rename warning about a folder `U.S.` didn't say that notes an
+ *     older version synced in it must be renamed in the web interface or
+ *     through MCP, and it silenced the plain notice that did;
+ *   - a folder another sync tool filled a note at a time still gave a notice
+ *     every five seconds;
+ *   - `sync.log` lost the line about a note renamed into a folder `U.S.`
+ *     once a note created there had been logged.
  */
 
 class FakeVault {
@@ -56,6 +69,8 @@ interface Bench {
   vault: FakeVault;
   events: VaultEvent[];
   notices: string[];
+  /** When each notice came up (`Date.now()`, faked). */
+  shownAt: number[];
   logged: Array<Record<string, unknown>>;
   reporter: UnsyncableNameReporter;
 }
@@ -65,9 +80,13 @@ function bench(bindings: VaultBinding[] = [BINDING]): Bench {
   const vault = new FakeVault();
   const events: VaultEvent[] = [];
   const notices: string[] = [];
+  const shownAt: number[] = [];
   const logged: Array<Record<string, unknown>> = [];
   const reporter = new UnsyncableNameReporter({
-    show: (message) => notices.push(message),
+    show: (message) => {
+      notices.push(message);
+      shownAt.push(Date.now());
+    },
     log: (message, context) => void logged.push({ message, ...context }),
   });
   const watcher = new ObsidianWatcher({
@@ -83,7 +102,7 @@ function bench(bindings: VaultBinding[] = [BINDING]): Bench {
   });
   watcher.onEvent((e) => events.push(e));
   watcher.start(vault as unknown as WatchableVault);
-  return { vault, events, notices, logged, reporter };
+  return { vault, events, notices, shownAt, logged, reporter };
 }
 
 beforeEach(() => {
@@ -152,7 +171,8 @@ describe('no storm of notices', () => {
   });
 
   it('groups what arrives in a burst, but shows a long one in parts', () => {
-    const { vault, notices } = bench();
+    const { vault, notices, shownAt } = bench();
+    const start = Date.now();
 
     for (let i = 1; i <= 12; i++) {
       vault.fire('create', { path: `In/Idea ${i}?.md` });
@@ -160,10 +180,35 @@ describe('no storm of notices', () => {
     }
     jest.runOnlyPendingTimers();
 
-    // Twelve names over six seconds: the first notice is due five seconds in.
+    // Twelve names over six seconds: the first notice is due five seconds
+    // in, the rest once it has gone.
     expect(notices).toHaveLength(2);
     expect(notices[0]).toContain('notes under 10 names');
     expect(notices[1]).toContain('notes under 2 names');
+    expect(shownAt.map((at) => at - start)).toEqual([5000, 20_000]);
+  });
+
+  it('keeps a slow stream to one notice at a time', () => {
+    const { vault, notices, shownAt, logged } = bench();
+    const start = Date.now();
+
+    // Another sync tool fills a folder after start-up, a note every 300 ms.
+    for (let i = 1; i <= 200; i++) {
+      vault.fire('create', { path: `FAQ/Question ${i}?.md` });
+      jest.advanceTimersByTime(300);
+    }
+    jest.runOnlyPendingTimers();
+
+    expect(notices.length).toBeLessThanOrEqual(5);
+    // The first comes soon, each next one only once the one before has gone.
+    expect((shownAt[0] ?? Number.POSITIVE_INFINITY) - start).toBeLessThanOrEqual(5000);
+    for (let i = 1; i < shownAt.length; i++) {
+      expect((shownAt[i] ?? 0) - (shownAt[i - 1] ?? 0)).toBeGreaterThanOrEqual(15_000);
+    }
+    // Between them they count every name, and the log has each.
+    const counted = notices.map((n) => Number(/notes under (\d+) names/.exec(n)?.[1] ?? 1));
+    expect(counted.reduce((a, b) => a + b, 0)).toBe(200);
+    expect(logged).toHaveLength(200);
   });
 
   it('tells a name once, whatever folder it turns up in', () => {
@@ -194,7 +239,7 @@ describe('no storm of notices', () => {
 
 describe('the warning that a rename is a delete for the team', () => {
   it('comes even after the name was told about as unsynced', () => {
-    const { vault, events, notices } = bench();
+    const { vault, events, notices, logged } = bench();
 
     vault.fire('create', { path: 'U.S./New.md' });
     jest.runOnlyPendingTimers();
@@ -211,6 +256,60 @@ describe('the warning that a rename is a delete for the team', () => {
     expect(notices[0]).not.toContain('looks like a delete');
     expect(notices[1]).toContain('"U.S."');
     expect(notices[1]).toContain('the rename looks like a delete');
+    // And `sync.log` tells which synced note went.
+    expect(logged).toContainEqual(
+      expect.objectContaining({ path: 'U.S./Trip plan.md', renamedFrom: 'Trip plan.md' }),
+    );
+  });
+
+  it('comes for each synced note given such a name, in whatever folder', () => {
+    const { vault, events, notices, logged } = bench();
+    const renames: Array<[string, string]> = [
+      ['Why?.md', 'Trip.md'],
+      ['Work/Why?.md', 'Work/Plan.md'],
+      ['U.S./Budget.md', 'Budget.md'],
+      ['Archive/U.S./Goals.md', 'Goals.md'],
+      // A second note dragged into the same folder later on.
+      ['U.S./Ideas.md', 'Ideas.md'],
+    ];
+
+    for (const [to, from] of renames) {
+      vault.fire('rename', { path: to }, from);
+      jest.runOnlyPendingTimers();
+    }
+
+    const deleted = renames.map(([, from]) => from);
+    expect(events.filter((e) => e.type === 'delete').map((e) => e.path)).toEqual(deleted);
+    expect(notices).toHaveLength(renames.length);
+    for (const notice of notices) expect(notice).toContain('the rename looks like a delete');
+    expect(logged.map((e) => e['renamedFrom'])).toEqual(deleted);
+  });
+
+  it('is one notice for a synced folder given such a name, with a log line per note', () => {
+    const { vault, notices, logged } = bench();
+
+    vault.fire('rename', { path: 'Trip?', kind: 'folder' }, 'Trip');
+    for (let i = 1; i <= 3; i++) vault.fire('rename', { path: `Trip?/n${i}.md` }, `Trip/n${i}.md`);
+    jest.runOnlyPendingTimers();
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('"Trip?"');
+    expect(notices[0]).toContain('the rename looks like a delete');
+    expect(logged.map((e) => e['renamedFrom'])).toEqual(['Trip/n1.md', 'Trip/n2.md', 'Trip/n3.md']);
+  });
+
+  it('is not repeated for a note renamed back and then to that name again', () => {
+    const { vault, events, notices } = bench();
+
+    vault.fire('rename', { path: 'Why?.md' }, 'Trip.md');
+    jest.runOnlyPendingTimers();
+    vault.fire('rename', { path: 'Trip.md' }, 'Why?.md');
+    jest.runOnlyPendingTimers();
+    vault.fire('rename', { path: 'Why?.md' }, 'Trip.md');
+    jest.runOnlyPendingTimers();
+
+    expect(events.map((e) => e.type)).toEqual(['delete', 'create', 'delete']);
+    expect(notices).toHaveLength(1);
   });
 
   it('makes a later plain notice about the same name unnecessary', () => {
@@ -278,6 +377,58 @@ describe('what the notice advises', () => {
     expect(ru).toContain('Переименуйте, чтобы синхронизировать с командой');
     expect(ru).toContain('Если заметку уже синхронизировала старая версия Team Vault');
     expect(ru).toContain('в веб-интерфейсе проекта или через MCP');
+  });
+
+  it.each([
+    ['en', "the project's web interface or through MCP", 'the rename looks like a delete'],
+    ['ru', 'в веб-интерфейсе проекта или через MCP', 'переименование выглядит как удаление'],
+  ] as const)(
+    'says so in the warning about a note moved into such a folder (%s)',
+    (language, webOrMcp, looksLikeDelete) => {
+      setLanguage(language);
+      const { vault, notices } = bench();
+
+      // The folder was synced by 0.3.7, `Старое.md` in it is on the server.
+      vault.fire('rename', { path: 'Итоги 2024 г./План.md' }, 'План.md');
+      jest.runOnlyPendingTimers();
+      vault.fire('modify', { path: 'Итоги 2024 г./Старое.md' });
+      jest.runOnlyPendingTimers();
+
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain(looksLikeDelete);
+      expect(notices[0]).toContain(webOrMcp);
+    },
+  );
+
+  it('says so when an edit comes with a rename warning about the same name', () => {
+    const { vault, notices } = bench();
+
+    vault.fire('modify', { path: 'U.S./Old.md' });
+    vault.fire('rename', { path: 'U.S./Trip.md' }, 'Trip.md');
+    jest.runOnlyPendingTimers();
+
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain('the rename looks like a delete');
+    expect(notices[0]).toContain("the project's web interface or through MCP");
+  });
+
+  it('leaves it out for a note renamed to such a name itself, but not for others so named', () => {
+    const { vault, notices } = bench();
+
+    // This version synced it as `Plan.md`: renaming it again here is right.
+    vault.fire('rename', { path: 'Why?.md' }, 'Plan.md');
+    jest.runOnlyPendingTimers();
+    vault.fire('modify', { path: 'Why?.md' });
+    jest.runOnlyPendingTimers();
+    // A note elsewhere under that name may be one an older version synced.
+    vault.fire('modify', { path: 'Old/Why?.md' });
+    jest.runOnlyPendingTimers();
+
+    expect(notices).toHaveLength(2);
+    expect(notices[0]).toContain('the rename looks like a delete');
+    expect(notices[0]).not.toContain('web interface');
+    expect(notices[1]).toContain('"Old/Why?.md"');
+    expect(notices[1]).toContain("the project's web interface or through MCP");
   });
 
   it('does so for several names too', () => {

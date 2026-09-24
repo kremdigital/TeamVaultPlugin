@@ -241,7 +241,7 @@ describe('UnsyncableNameReporter', () => {
     });
   });
 
-  it('tells it once per name while the plugin runs', () => {
+  it('tells a name once while the plugin runs, and a rename once per synced note', () => {
     const show = jest.fn();
     const log = jest.fn();
     const reporter = new UnsyncableNameReporter({ show, log });
@@ -255,14 +255,17 @@ describe('UnsyncableNameReporter', () => {
       inFolder('a.md'),
       inFolder('b.md'),
       renamed,
+      // Renamed back and to the bad name again: the user knows by now.
+      renamed,
+      // Another synced note given that name: another delete for the team.
       { ...renamed, renamedFrom: 'Other.md' },
     ]) {
       reporter.report(event);
       jest.runOnlyPendingTimers();
     }
 
-    expect(show).toHaveBeenCalledTimes(2);
-    expect(log).toHaveBeenCalledTimes(2);
+    expect(show).toHaveBeenCalledTimes(3);
+    expect(log).toHaveBeenCalledTimes(3);
   });
 
   it.each([
