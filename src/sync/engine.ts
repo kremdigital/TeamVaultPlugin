@@ -1806,7 +1806,8 @@ export class SyncEngine {
       this.log.debug('refused a path supplied by the server', details);
       return rejection;
     }
-    if (!this.log.isEnabled('warn')) return false;
+    // Refused either way; recorded only once the warn line is really written.
+    if (!this.log.isEnabled('warn')) return rejection;
     // Paths come from the server: cap the memory they can take.
     if (this.reportedRefusals.size >= MAX_REPORTED_REFUSALS) this.reportedRefusals.clear();
     this.reportedRefusals.add(key);
