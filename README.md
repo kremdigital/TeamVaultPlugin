@@ -187,7 +187,8 @@ with a long s.
     Windows `desktop.ini::$DATA` is `desktop.ini` itself);
   - names shaped like a Windows short name: up to 8 characters ending in `~`
     and digits, optionally with an extension of up to 3 (`PROJEC~1`,
-    `Draft~1.md`);
+    `Draft~1.md`). Windows can store such a name, but it may also be the
+    short name of another file or folder, which it then opens instead;
   - names ending in a dot or a space (a folder `Notes.` or `Notes `):
     Windows drops the dot or space, so deleting such a folder there could
     delete the folder `Notes` next to it instead;
@@ -200,15 +201,26 @@ with a long s.
   even between two Macs — so that no teammate uploads a name another
   teammate's disk can't hold. Unlike the rest of this list, such a name is
   often a note you meant to share, so when you create, edit or rename one in
-  Obsidian, a notice names it and what is wrong with it (once per name while
-  the plugin runs, and in `sync.log` at `warn`). Renaming a synced note to
-  such a name works like deleting it for your teammates.
+  Obsidian, a notice names it and what is wrong with it, and `sync.log` gets
+  a `warn` line for it (unless **Log level** is **Errors only**). A notice
+  comes once per name while the plugin runs, wherever the name turns up;
+  names reported within a moment of each other (a link update across many
+  notes, a folder copied into the vault) share one notice, and `sync.log`
+  lists each of them. A rename that keeps the name at fault — renaming the
+  folder above such a note, or moving the note — isn't reported, since
+  nothing changes for your teammates. Renaming a synced note to such a name
+  works like deleting it for your teammates; the notice says so, even if
+  that name was reported before.
 
   Rename the note to sync it. A note an older version already synced under
   such a name is still on the server: rename it in the project's web
-  interface (or have an MCP agent do it), and it is renamed for everyone,
-  history included — then delete your local copy under the old name, which no
-  longer syncs. Renamed in Obsidian, it is uploaded as a new note, and the
+  interface (or have an MCP agent do it), and teammates get it under the new
+  name, history included. Teammates on an older version see it renamed. With
+  this version, a copy under the old name that is already on a teammate's
+  disk (a Mac or Linux one) stays there next to the renamed note and no
+  longer syncs, so everyone who has one — you included — deletes it, after
+  copying over any edits made in it since the update, which never reached
+  the server. Renamed in Obsidian, the note is uploaded as a new one, and the
   old one stays on the server, where teammates on older versions still see
   it, until someone deletes it there.
 
@@ -275,14 +287,16 @@ Look for `[error]` lines. Common causes:
 - The binding is switched off (toggle in **Team Vault → Vaults**).
 - The file's name is on the built-in ignore list — see
   [What is never synced](#what-is-never-synced). Local files like that are
-  skipped without a log line, except a name Windows can't keep, which gets
-  a notice and a `not synced: Windows cannot keep this name` line; one the
-  server still holds is logged as
+  skipped without a log line, except a name Windows can't keep: when you
+  create, edit or rename such a note, it gets a notice and a `warn` line
+  `not synced: Windows cannot keep this name as spelled`. One the server
+  still holds is logged as
   `refused a path supplied by the server` with `"reason":"ignored"` (or
   `"invalid"` for a name Windows can't keep as spelled) — at `warn`
   once per path while the plugin runs, and at `debug` after that. With
-  **Log level** at **Errors only** that line isn't written; raise the level,
-  then run **Pause sync** and **Resume sync** to see it.
+  **Log level** at **Errors only** neither `warn` line is written; raise the
+  level, then edit the note (for a path from the server, run **Pause sync**
+  and **Resume sync**) to see it.
 - A binding made by an older version points to a subfolder that no longer
   exists — remove it and bind the vault again. Note that the new binding
   covers the whole vault, so every note in it goes to the project.
