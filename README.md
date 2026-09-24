@@ -280,7 +280,9 @@ Look for `[error]` lines. Common causes:
   server still holds is logged as
   `refused a path supplied by the server` with `"reason":"ignored"` (or
   `"invalid"` for a name Windows can't keep as spelled) — at `warn`
-  once per path while the plugin runs, and at `debug` after that.
+  once per path while the plugin runs, and at `debug` after that. With
+  **Log level** at **Errors only** that line isn't written; raise the level,
+  then run **Pause sync** and **Resume sync** to see it.
 - A binding made by an older version points to a subfolder that no longer
   exists — remove it and bind the vault again. Note that the new binding
   covers the whole vault, so every note in it goes to the project.

@@ -82,6 +82,18 @@ describe('Logger — child', () => {
     expect(sink.entries.map((e) => e.message)).toEqual(['p', 'c', 'g', 'w']);
     expect(child.getLevel()).toBe('warn');
   });
+
+  it('answers isEnabled with the level the family shares now', () => {
+    const parent = new Logger('error', new RecordingSink(), {}, { now: fixedNow });
+    const child = parent.child({ component: 'engine' });
+    expect(child.isEnabled('error')).toBe(true);
+    expect(child.isEnabled('warn')).toBe(false);
+    parent.setLevel('warn');
+    expect(child.isEnabled('warn')).toBe(true);
+    expect(child.isEnabled('info')).toBe(false);
+    parent.setLevel('debug');
+    expect(child.isEnabled('debug')).toBe(true);
+  });
 });
 
 describe('formatLogEntry', () => {

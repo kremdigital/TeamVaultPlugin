@@ -94,6 +94,15 @@ export class Logger {
   }
 
   /**
+   * Whether an entry at `level` gets to the sink now. For a caller that
+   * remembers what it has logged: an entry the level filter dropped was never
+   * written, and must not count as reported.
+   */
+  isEnabled(level: LogLevel): boolean {
+    return LEVEL_ORDER[level] <= LEVEL_ORDER[this.levelBox.current];
+  }
+
+  /**
    * Build a logger that adds extra context to every entry. Cheap — the
    * sink and the level are shared, only the local context object is copied.
    */
@@ -122,7 +131,7 @@ export class Logger {
   }
 
   private emit(level: LogLevel, message: string, args: unknown[]): void {
-    if (LEVEL_ORDER[level] > LEVEL_ORDER[this.levelBox.current]) return;
+    if (!this.isEnabled(level)) return;
     const entry: LogEntry = {
       level,
       timestamp: this.now().toISOString(),

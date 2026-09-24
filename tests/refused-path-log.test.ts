@@ -11,7 +11,7 @@ import {
 } from '@/client/socket';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
-import { Logger, type LogEntry } from '@/utils/logger';
+import { Logger, type LogEntry, type LogLevel } from '@/utils/logger';
 
 /**
  * A path from the server the plugin refuses is logged at `warn` once while
@@ -163,14 +163,18 @@ async function flushAsync(times = 20): Promise<void> {
   }
 }
 
-function harness(bindings: VaultBinding[]): {
+function harness(
+  bindings: VaultBinding[],
+  level: LogLevel = 'debug',
+): {
   manager: EngineManager;
+  logger: Logger;
   entries: LogEntry[];
   /** Answer the joins of the engines that connected since, and let them settle. */
   join: () => Promise<number>;
 } {
   const entries: LogEntry[] = [];
-  const logger = new Logger('debug', {
+  const logger = new Logger(level, {
     write: (e) => {
       entries.push(e);
     },
@@ -199,7 +203,7 @@ function harness(bindings: VaultBinding[]): {
     await flushAsync();
     return sockets.length;
   };
-  return { manager, entries, join };
+  return { manager, logger, entries, join };
 }
 
 /** The refusals logged at `level`, as `bindingId path`. */
@@ -267,6 +271,64 @@ describe('a refused server path in sync.log', () => {
       ['b1', 'b2'].flatMap((b) => SERVICE_FILES.map((p) => `${b} ${p}`)).sort(),
     );
     expect(refused(entries, 'debug')).toHaveLength(2 * SERVICE_FILES.length);
+    await manager.stop();
+  });
+});
+
+describe('a refused server path with Log level set to Errors only', () => {
+  // At Errors only the `warn` line is dropped. The path used to be remembered
+  // as reported all the same, and the memory now outlives the engine: after
+  // the user raised the level (it applies at once, no reload) neither a
+  // resume nor switching the binding off and on showed the refusal again —
+  // only Debug or a plugin reload did.
+  it('is reported at warn after the level goes up and sync is resumed', async () => {
+    const { manager, logger, entries, join } = harness([makeBinding('b1', 'p1')], 'error');
+    await manager.start();
+    expect(await join()).toBe(1);
+    expect(manager.getAggregateStatus().state).toBe('connected');
+    expect(entries.filter((e) => e.message === 'refused a path supplied by the server')).toEqual(
+      [],
+    );
+
+    logger.setLevel('warn');
+    await manager.pause();
+    await manager.resume();
+    expect(await join()).toBe(1);
+    expect(refused(entries, 'warn')).toEqual(SERVICE_FILES.map((p) => `b1 ${p}`).sort());
+
+    // Reported now: the next engine logs the same paths at debug only.
+    logger.setLevel('debug');
+    await manager.pause();
+    await manager.resume();
+    expect(await join()).toBe(1);
+    expect(refused(entries, 'warn')).toHaveLength(SERVICE_FILES.length);
+    expect(refused(entries, 'debug')).toEqual(SERVICE_FILES.map((p) => `b1 ${p}`).sort());
+    await manager.stop();
+  });
+
+  it('is reported at warn at the first reconnect after the level goes up', async () => {
+    const { manager, logger, entries, join } = harness([makeBinding('b1', 'p1')], 'error');
+    await manager.start();
+    const [socket] = FakeSocket.fresh;
+    expect(await join()).toBe(1);
+    const engine = manager.getEngine('b1');
+
+    const reconnect = async (): Promise<void> => {
+      socket?.disconnect();
+      socket?.connect();
+      await flushAsync(5);
+      socket?.ackOk({ operations: [], yjsDocs: [] });
+      await flushAsync();
+    };
+    logger.setLevel('info');
+    await reconnect();
+    // The same engine, reading the file index again.
+    expect(manager.getEngine('b1')).toBe(engine);
+    expect(manager.getAggregateStatus().state).toBe('connected');
+    expect(refused(entries, 'warn')).toEqual(SERVICE_FILES.map((p) => `b1 ${p}`).sort());
+
+    await reconnect();
+    expect(refused(entries, 'warn')).toHaveLength(SERVICE_FILES.length);
     await manager.stop();
   });
 });

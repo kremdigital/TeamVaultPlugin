@@ -1773,6 +1773,13 @@ export class SyncEngine {
    * reading. The set of reported paths outlives the engine (see
    * `SyncEngineDeps.reportedRefusals`): pausing and resuming sync runs a new
    * engine, which must not report them all again.
+   *
+   * A path counts as reported only once its `warn` line is written. With Log
+   * level set to Errors only that line is dropped, and a path remembered all
+   * the same never showed at `warn`: the set outlives the engine, so neither a
+   * resume nor switching the binding off and on brought it back. Left out of
+   * the set, it is logged at the first reconnect or resume after the level
+   * goes up.
    */
   private allowServerPath(
     path: string,
@@ -1799,6 +1806,7 @@ export class SyncEngine {
       this.log.debug('refused a path supplied by the server', details);
       return rejection;
     }
+    if (!this.log.isEnabled('warn')) return false;
     // Paths come from the server: cap the memory they can take.
     if (this.reportedRefusals.size >= MAX_REPORTED_REFUSALS) this.reportedRefusals.clear();
     this.reportedRefusals.add(key);
