@@ -208,26 +208,44 @@ with a long s.
   notes, a folder copied into the vault) share one notice, and `sync.log`
   lists each of them. While a notice is up, the next one waits for it to go.
   A rename that keeps the name at fault — renaming the folder above such a
-  note, or moving the note — isn't reported, since nothing changes for your
-  teammates. Renaming or moving a synced note to such a name works like
-  deleting it for your teammates: a notice says so for each such note, even
-  if the name was reported before, and `sync.log` names the note it was.
+  note, or moving the note within its binding — isn't reported, since
+  nothing changes for your teammates; moving it into the folder of another
+  binding (one an older version made) is. Renaming or moving a synced note to
+  such a name works like deleting it for your teammates: a notice says so for
+  each such note, even if the name was reported before, and `sync.log` names
+  the note it was.
 
   Rename the note to sync it. A note an older version already synced under
   such a name is still on the server: rename it in the project's web
   interface (or have an MCP agent do it), and teammates get it under the new
-  name, history included. Teammates on an older version see it renamed.
-  Anyone with this version who already has a copy under the old name keeps
-  it next to the renamed note, no longer synced. For a name Windows can't
-  store (with `:`, `*`, `?`, `<`, `>`, `"`, `|` or a control character, or
-  ending in a dot or a space) that is anyone on a Mac or Linux; for a short
-  name such as `Draft~1.md`, anyone at all, Windows included. Everyone who
-  has such a copy — you included — deletes it, after copying over any edits
-  made in it since the update, which never reached the server. Renamed in
-  Obsidian, the note is uploaded as a new one, and the old one stays on the
-  server, where teammates on older versions still see it, until someone
-  deletes it there. The same goes for a folder with such a name: rename it,
-  or the notes in it, in the web interface or through MCP.
+  name, history included. Renamed in Obsidian, the note is uploaded as a new
+  one, and the old one stays on the server, where teammates on older
+  versions still see it, until someone deletes it there. The same goes for a
+  folder with such a name: rename it, or the notes in it, in the web
+  interface or through MCP.
+
+  After such a rename in the web interface, teammates on an older version
+  see the note renamed. Anyone with this version who already has a copy
+  under the old name keeps it next to the renamed note, no longer synced.
+  For a name with `:`, `*`, `?`, `<`, `>`, `"`, `|` or a control character,
+  that is anyone on a Mac or Linux: Windows can't store such a name. For a
+  name ending in a dot or a space, or a short name such as `Draft~1.md`, it
+  is anyone at all, Windows included: an older version wrote such names
+  there as spelled. Everyone who has such a copy — you included — deletes
+  it, after copying over any edits made in it since the update, which never
+  reached the server. The notice about such a copy says so too.
+
+  On Windows, take care deleting a copy whose name ends in a dot or a space.
+  File Explorer, a plain `rd` or `del`, and Obsidian with **Deleted files**
+  (**Settings → Files and links**) at **Move to system trash**, the default,
+  all drop the dot or space and delete the file or folder named without it:
+  the synced folder `Notes` instead of the copy `Notes.`, and the plugin then
+  deletes `Notes` for the whole team. Set **Deleted files** to **Move to
+  Obsidian trash** or **Permanently delete** before deleting such a copy in
+  Obsidian, or delete it from a command prompt by its full path with the
+  `\\?\` prefix, which keeps the name as spelled:
+  `rd /s "\\?\C:\Vault\Notes."` for a folder, `del "\\?\C:\Vault\Plan.md."`
+  for a file.
 
 The list is built in and the same on every device, so there is no setting
 for it. Such files that an older version already uploaded stay on the
