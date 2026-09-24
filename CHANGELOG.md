@@ -6,6 +6,78 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Security
+
+- **Server paths that Windows resolves to a different file are refused.**
+  The path gate compared names as spelled, so on Windows a path in NTFS
+  stream syntax (`name::$DATA`, `folder::$INDEX_ALLOCATION`) or an 8.3 short
+  name (`NAME~1`) could reach a file or folder the gate refuses by its real
+  name — the config folder or `.git`. Any name with a `:` in it (Obsidian
+  doesn't allow one either) and any name shaped like a Windows short name —
+  up to 8 characters ending in `~` and digits, with an optional extension of
+  up to 3 — is now never synced, in either direction and on every system.
+
+### Fixed
+
+- **Disabling, reloading or pausing the plugin now stops the sync work
+  already under way.** The same goes for switching a binding off. Before, a
+  connect-time catch-up, an offline-queue drain, a file download or upload,
+  or a note being fetched from the server kept running afterwards: a server
+  answer that arrived later still wrote vault files, rewrote the local sync
+  state and triggered further requests. Now large file transfers in progress
+  are cancelled, and an edit whose upload or acknowledgement was cut short is
+  queued and sent when sync resumes. A server rename, delete or file download
+  that had already started on disk is finished first, so no stray copy is
+  left behind to be uploaded as a new file. Queued offline edits the server
+  has already acknowledged are no longer sent twice; at most the one in
+  flight at the moment of stopping goes out again.
+- A queued offline edit to an attachment that no longer exists at its path
+  no longer halts the whole offline queue. A queued attachment edit whose
+  bytes match the last synced version is no longer re-uploaded.
+- **A save that lands while Team Vault is writing a teammate's edit into the
+  same note is no longer overwritten.** The note is re-read right before the
+  write and the save is merged in. A note deleted at that moment is no longer
+  written back.
+- A teammate's edit is no longer deleted when you save a note while that edit
+  is being written to disk and the note has no merge base yet (for example,
+  right after upgrading from 0.3.1 or earlier, or after Obsidian's local
+  storage was cleared). It also reaches the disk now when git or an external
+  editor briefly replaces the note at that moment; before, disk and server
+  stayed out of step until the next change.
+- **A binding the plugin can't read in `data.json` no longer loses its unsent
+  changes.** Sometimes `data.json` is valid JSON but can't be fully used,
+  usually after a hand edit: a binding lacks a field it needs (`id`,
+  `serverId`, `projectId`), a server lacks its `id`, `url` or `apiKey`, or
+  `bindings`/`servers` isn't a list. The plugin used to drop such an entry
+  silently; the start-up cleanup then deleted that binding's offline queue and
+  offline documents as orphaned, and the next settings save erased the entry
+  from `data.json`. Now such entries are skipped but kept: every save writes
+  them back in their place, and the cleanup of leftover local state is off
+  while they are there. `sync.log` gets a warning naming each one by its
+  position, id and the fields at fault — never the entry itself, which may
+  hold an API key. A notice that stays until dismissed says how many entries
+  were skipped and asks you to turn the plugin off (or quit Obsidian) before
+  fixing the file. While a binding is skipped, **Add binding** is disabled.
+- **Service files of the OS, editors and other sync tools no longer sync.**
+  Since 0.3.4 a binding covers the whole vault, so `.DS_Store`,
+  `desktop.ini`, `Thumbs.db`, Syncthing's `.stfolder` / `.stversions` and
+  similar files went to the project and on to every teammate's disk. The
+  built-in ignore list now covers macOS (`.DS_Store`, `._*`, `Icon\r`, iCloud
+  placeholders, `.AppleDouble`, the volume folders), Windows (`desktop.ini`,
+  `Thumbs.db`, `$RECYCLE.BIN`, `System Volume Information`), Linux
+  (`.directory`, `.Trash-<uid>`), the lock and swap files of Office,
+  LibreOffice, Vim and Emacs, and the service files of Syncthing, Resilio
+  Sync, Dropbox, Google Drive and Nextcloud / ownCloud. They are neither
+  uploaded nor written to disk, and a copy the server still holds can't
+  overwrite or delete the local file. The full list is in the README, under
+  "What is never synced".
+- A folder named like a temporary file (`drafts~`, `old.tmp`) is now skipped
+  with everything in it. Before, the filesystem watcher skipped the folder
+  while the Obsidian watcher and the first upload synced the notes inside.
+- A path from the server that the plugin refuses is logged at `warn` once
+  while the plugin runs and at `debug` after that, instead of on every
+  reconnect.
+
 ## [0.3.7] — 2026-09-23
 
 ### Fixed
