@@ -81,7 +81,7 @@ export class Menu {
 export class PluginSettingTab {
   app: unknown;
   plugin: unknown;
-  containerEl: HTMLElement = {} as HTMLElement;
+  containerEl: HTMLElement = fakeEl();
   constructor(app: unknown, plugin: unknown) {
     this.app = app;
     this.plugin = plugin;
@@ -90,12 +90,13 @@ export class PluginSettingTab {
   hide(): void {}
 }
 
-/** An element that swallows the few DOM helpers modals call. */
+/** An element that swallows the few DOM helpers modals and the settings tab call. */
 function fakeEl(): HTMLElement {
   const el = {
     empty: () => undefined,
     setText: () => undefined,
     createEl: () => fakeEl(),
+    createDiv: () => fakeEl(),
   };
   return el as unknown as HTMLElement;
 }
@@ -131,12 +132,20 @@ export class ButtonComponent {
   readonly focusSpy = jest.fn();
   buttonEl = { focus: this.focusSpy } as unknown as HTMLButtonElement;
   text = '';
+  disabled = false;
   private clickHandler: (() => unknown) | null = null;
   setButtonText(text: string): this {
     this.text = text;
     return this;
   }
   setWarning(): this {
+    return this;
+  }
+  setCta(): this {
+    return this;
+  }
+  setDisabled(disabled: boolean): this {
+    this.disabled = disabled;
     return this;
   }
   onClick(handler: () => unknown): this {
@@ -149,14 +158,65 @@ export class ButtonComponent {
   }
 }
 
+/** A dropdown, text field or toggle: takes the calls, keeps nothing. */
+class InputComponent {
+  addOption(_value: string, _display: string): this {
+    return this;
+  }
+  setValue(_value: unknown): this {
+    return this;
+  }
+  setPlaceholder(_placeholder: string): this {
+    return this;
+  }
+  setDisabled(_disabled: boolean): this {
+    return this;
+  }
+  onChange(_handler: (value: never) => unknown): this {
+    return this;
+  }
+}
+
 export class Setting {
   /** Every button any `Setting` made, in order, for tests to click. */
   static buttons: ButtonComponent[] = [];
-  constructor(_containerEl: unknown) {}
+  /** Every `Setting` made, in order, for tests to look at. */
+  static all: Setting[] = [];
+  name = '';
+  desc = '';
+  /** This setting's own buttons, in order. */
+  readonly settingButtons: ButtonComponent[] = [];
+  constructor(_containerEl: unknown) {
+    Setting.all.push(this);
+  }
+  setName(name: string): this {
+    this.name = name;
+    return this;
+  }
+  setDesc(desc: string): this {
+    this.desc = desc;
+    return this;
+  }
+  setHeading(): this {
+    return this;
+  }
   addButton(build: (button: ButtonComponent) => unknown): this {
     const button = new ButtonComponent();
     Setting.buttons.push(button);
+    this.settingButtons.push(button);
     build(button);
+    return this;
+  }
+  addDropdown(build: (dropdown: InputComponent) => unknown): this {
+    build(new InputComponent());
+    return this;
+  }
+  addText(build: (text: InputComponent) => unknown): this {
+    build(new InputComponent());
+    return this;
+  }
+  addToggle(build: (toggle: InputComponent) => unknown): this {
+    build(new InputComponent());
     return this;
   }
 }

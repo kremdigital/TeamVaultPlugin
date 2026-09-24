@@ -3,7 +3,7 @@ import { t } from '@/i18n';
 import { ApiClient, ApiError, type ApiProject } from '@/client/api';
 import { uuid } from '@/utils/id';
 import type { ServerConfig, VaultBinding } from '../settings';
-import { canAddBinding, VAULT_ROOT } from '../folder-utils';
+import { VAULT_ROOT, type BindingAddBlock } from '../folder-utils';
 
 /**
  * Modal for binding the vault to a server-side project.
@@ -27,7 +27,8 @@ export class AddBindingModal extends Modal {
   constructor(
     app: App,
     private readonly servers: ServerConfig[],
-    private readonly existingBindings: VaultBinding[],
+    /** What keeps a binding from being added now (see `bindingAddBlock`). */
+    private readonly addBlock: () => BindingAddBlock | null,
     private readonly onAdd: (binding: VaultBinding) => Promise<void> | void,
   ) {
     super(app);
@@ -101,10 +102,17 @@ export class AddBindingModal extends Modal {
           .onClick(async () => {
             if (!this.serverId) return new Notice(t('modal.addBinding.errors.serverRequired'));
             if (!this.projectId) return new Notice(t('modal.addBinding.errors.projectRequired'));
-            // The settings tab disables "Add" once a binding exists; this is
-            // the backstop for a modal opened before that.
-            if (!canAddBinding(this.existingBindings)) {
-              return new Notice(t('modal.addBinding.errors.alreadyBound'));
+            // The settings tab disables "Add" while something blocks it; this
+            // is the backstop for a modal opened before that.
+            const block = this.addBlock();
+            if (block) {
+              return new Notice(
+                t(
+                  block === 'bound'
+                    ? 'modal.addBinding.errors.alreadyBound'
+                    : 'modal.addBinding.errors.unreadableBinding',
+                ),
+              );
             }
             const project = this.projects.find((p) => p.id === this.projectId);
             const binding: VaultBinding = {

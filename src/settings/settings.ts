@@ -275,8 +275,12 @@ function withSkipped(list: readonly unknown[], skipped: SkippedList | null): unk
   if (skipped.kind === 'not-a-list') {
     // As the file had it while there is nothing to add to it. Once there is,
     // a list — with the value as its last entry, where the next load skips
-    // it again. A `null` holds nothing to keep, and as an entry it would only
-    // be reported on every start.
+    // it again, or reads it, if it is a whole entry that lost its brackets.
+    // A `null` holds nothing to keep, and as an entry it would only be
+    // reported on every start. Only a server list gets this far — a server
+    // read back does no harm. No binding can be added while the binding list
+    // is skipped (`bindingAddBlock`): one read back would be a second binding
+    // on the vault.
     if (list.length === 0) return skipped.raw;
     return skipped.raw === null ? list : [...list, skipped.raw];
   }

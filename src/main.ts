@@ -9,6 +9,7 @@ import {
   type SkippedSettings,
 } from '@/settings/settings';
 import { readSettingsFile, type SettingsFileRead } from '@/settings/settings-file';
+import { bindingAddBlock, type BindingAddBlock } from '@/settings/folder-utils';
 import { getLanguage, setLanguage, t } from '@/i18n';
 import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
 import { SyncSettingsTab } from '@/settings/tab';
@@ -278,6 +279,15 @@ export default class ObsidianSyncPlugin extends Plugin {
     // Sticky, like the other settings-file notices: a skipped binding does
     // not sync, and nothing else in the UI says so.
     new Notice(t('notice.settingsSkipped', { path, what: parts.join(', ') }), 0);
+  }
+
+  /**
+   * What keeps the settings tab from adding a binding, if anything: one the
+   * vault has, or one `data.json` has that the plugin could not read
+   * (`skippedSettings`) — see `bindingAddBlock`.
+   */
+  bindingAddBlock(): BindingAddBlock | null {
+    return bindingAddBlock(this.settings.bindings, this.skippedSettings?.bindings ?? null);
   }
 
   async saveSettings(): Promise<void> {

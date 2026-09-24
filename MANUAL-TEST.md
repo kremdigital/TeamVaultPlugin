@@ -305,7 +305,10 @@ down` (он допустим, только если выгрузка занял�
 6. Открыть вальт: появляется неисчезающее уведомление «Team Vault: часть
    файла настроек плагина (…/data.json) не удалось прочитать — привязок:
    1…» (English: "Team Vault: part of the plugin settings file … could not
-   be read — bindings: 1…"). Привязки во вкладке настроек нет. В `sync.log` —
+   be read — bindings: 1…"). Уведомление просит сначала выключить плагин
+   или закрыть Obsidian и только потом править файл. Привязки во вкладке
+   настроек нет, кнопка «Привязать хранилище» неактивна, под ней пояснение:
+   плагин не смог прочитать часть списка привязок. В `sync.log` —
    строка `[warn]` с текстом `settings entries unreadable` и
    `orphaned-state sweep skipped`, в ней `"invalid":["projectId"]`; строк
    `swept orphaned` нет. `data.json` и `state.json` не изменились ни на

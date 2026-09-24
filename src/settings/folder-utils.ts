@@ -1,4 +1,4 @@
-import type { VaultBinding } from './settings';
+import type { SkippedList, VaultBinding } from './settings';
 
 /**
  * Normalize a vault-relative folder path to a canonical form used by the
@@ -50,4 +50,25 @@ export const VAULT_ROOT = '/';
  */
 export function canAddBinding(bindings: VaultBinding[]): boolean {
   return !isFolderInUse(bindings, VAULT_ROOT);
+}
+
+/**
+ * Why a new binding can't be added now:
+ *   - `bound` — the vault has a binding already (see {@link canAddBinding});
+ *   - `unreadable` — `data.json` holds bindings the plugin could not read
+ *     (`skippedBindings`, from `parseSettings`). One of them may be this
+ *     vault's own binding. A save keeps it in the file, so a new binding next
+ *     to it would become a second one covering the vault — both syncing every
+ *     file — as soon as the user fixes the old one.
+ */
+export type BindingAddBlock = 'bound' | 'unreadable';
+
+/** What keeps a new binding from being added; `null` when nothing does. */
+export function bindingAddBlock(
+  bindings: VaultBinding[],
+  skippedBindings: SkippedList | null,
+): BindingAddBlock | null {
+  if (!canAddBinding(bindings)) return 'bound';
+  if (skippedBindings) return 'unreadable';
+  return null;
 }

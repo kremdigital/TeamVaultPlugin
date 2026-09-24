@@ -12,7 +12,7 @@ import { AddServerModal } from './modals/server-modal';
 import { AddBindingModal } from './modals/binding-modal';
 import { LogViewerModal } from '@/ui/modals/log-viewer-modal';
 import { confirmAction } from '@/ui/modals/confirm-modal';
-import { canAddBinding, normalizeFolderPath } from './folder-utils';
+import { normalizeFolderPath } from './folder-utils';
 
 /**
  * Top-level settings UI. Three sections, in order:
@@ -136,19 +136,24 @@ export class SyncSettingsTab extends PluginSettingTab {
     }
 
     // A binding covers the whole vault, so it overlaps any other: one per vault.
-    const alreadyBound = !canAddBinding(this.plugin.settings.bindings);
+    // That counts a binding data.json has but the plugin could not read.
+    const block = this.plugin.bindingAddBlock();
     const addSetting = new Setting(parent);
-    if (alreadyBound) addSetting.setDesc(t('settings.bindings.onlyOne'));
+    if (block) {
+      addSetting.setDesc(
+        t(block === 'bound' ? 'settings.bindings.onlyOne' : 'settings.bindings.unreadable'),
+      );
+    }
     addSetting.addButton((btn) =>
       btn
         .setButtonText(t('settings.bindings.add'))
         .setCta()
-        .setDisabled(this.plugin.settings.servers.length === 0 || alreadyBound)
+        .setDisabled(this.plugin.settings.servers.length === 0 || block !== null)
         .onClick(() => {
           new AddBindingModal(
             this.app,
             this.plugin.settings.servers,
-            this.plugin.settings.bindings,
+            () => this.plugin.bindingAddBlock(),
             async (binding) => {
               this.plugin.settings.bindings.push(binding);
               await this.plugin.saveSettings();

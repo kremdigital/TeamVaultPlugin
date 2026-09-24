@@ -1,7 +1,9 @@
 import type { App, PluginManifest } from 'obsidian';
-import { Notice } from './__mocks__/obsidian';
+import { type ButtonComponent, Notice, Setting } from './__mocks__/obsidian';
 import TeamVaultPlugin from '@/main';
 import { handOffTeardown } from '@/integration/plugin-teardown';
+import { SyncSettingsTab } from '@/settings/tab';
+import { t } from '@/i18n';
 
 /**
  * `main.ts` itself, for the one thing only it decides: what `onload` still
@@ -467,6 +469,9 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     expect(Notice.shown[0]?.timeout).toBe(0);
     expect(Notice.shown[0]?.message).toContain(`${dir}/data.json`);
     expect(Notice.shown[0]?.message).toContain('bindings: 1');
+    // A running plugin saves its settings over a hand edit of data.json: the
+    // notice says to turn it off before fixing the file, not after.
+    expect(Notice.shown[0]?.message).toContain('first turn the plugin off');
   });
 
   it('keeps such an entry in data.json when it saves, in its place', async () => {
@@ -550,5 +555,62 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     expect(state).not.toContain('binding-gone');
     expect(app.files.get(`${dir}/sync.log`)).toContain('swept orphaned binding state');
     expect(Notice.shown).toEqual([]);
+  });
+
+  /** The settings tab's "Add binding" setting and button, as the tab renders them. */
+  function addBindingSetting(
+    app: App,
+    plugin: TeamVaultPlugin,
+  ): { setting: Setting; button: ButtonComponent } {
+    Setting.all = [];
+    new SyncSettingsTab(app, plugin).display();
+    for (const setting of Setting.all) {
+      const button = setting.settingButtons.find((b) => b.text === t('settings.bindings.add'));
+      if (button) return { setting, button };
+    }
+    throw new Error('the settings tab has no "Add binding" button');
+  }
+
+  // Were a binding added next to one the plugin could not read, the save would
+  // keep both, and fixing the old one would leave two bindings on the vault
+  // root — both syncing every file.
+  it.each([
+    ['a binding in it has no project id', [{ ...withoutProject('binding-1'), localFolder: '/' }]],
+    ['its binding list is not a list', { ...binding('binding-1'), localFolder: '/' }],
+  ])('will not add a binding while %s', async (_case, bindings) => {
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings,
+      clientId: 'client-1',
+    });
+
+    const { app, plugin } = await loadThroughSweeps({ [`${dir}/data.json`]: data }, dir, id);
+
+    expect(plugin.settings.bindings).toEqual([]);
+    expect(plugin.bindingAddBlock()).toBe('unreadable');
+    const { setting, button } = addBindingSetting(app, plugin);
+    expect(button.disabled).toBe(true);
+    expect(setting.desc).toBe(t('settings.bindings.unreadable'));
+  });
+
+  it('lets a binding be added once the file is read in full and has none', async () => {
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [],
+      clientId: 'client-1',
+    });
+
+    const { app, plugin } = await loadThroughSweeps({ [`${dir}/data.json`]: data }, dir, id);
+
+    expect(plugin.bindingAddBlock()).toBeNull();
+    const { setting, button } = addBindingSetting(app, plugin);
+    expect(button.disabled).toBe(false);
+    expect(setting.desc).toBe('');
   });
 });
