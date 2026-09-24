@@ -3121,6 +3121,130 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     await h.engine.stop();
   });
 
+  it('a save landing under the snapshot of a note without a fold marker keeps the remote edit', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    // No fold marker: a log from before 0.3.2, a cleared IndexedDB, a fresh
+    // state.json. A teammate's edit made while this device was offline comes
+    // with the catch-up, and the user's save lands right after the snapshot
+    // writing that edit out has read the note. Folded without a base, the save
+    // wins outright: the teammate's line is deleted from the doc, the disk and
+    // the server.
+    const serverDoc = await syncedNote(h, 'v1\n');
+    serverDoc.getText('content').insert(0, 'remote line\n');
+    let markerAtRead: string | null | undefined = null;
+    let saved: Promise<void> | undefined;
+    const read = h.vault.readText.bind(h.vault);
+    h.vault.readText = async (path) => {
+      const seen = await read(path);
+      // The first read with the edit already in the doc is the snapshot's.
+      if (
+        path === PATH &&
+        h.doc.has('b1', PATH) &&
+        h.doc.getText('b1', PATH).startsWith('remote line')
+      ) {
+        h.vault.readText = read;
+        markerAtRead = h.log.getFileMeta('b1', PATH)?.foldedHash;
+        putDisk(h, 'v1\nlocal line\n');
+        saved = h.engine.handleVaultEvent({
+          type: 'modify',
+          bindingId: 'b1',
+          path: PATH,
+          source: 'obsidian',
+        });
+      }
+      return seen;
+    };
+    const connected = nextConnected(h);
+    await h.engine.start();
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+    });
+    await connected;
+    // The save's event waits for the snapshot on the path lock.
+    await saved;
+    await drainToServer(h, serverDoc);
+
+    expect(markerAtRead).toBeUndefined();
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a note replaced while its snapshot is in flight gets the remote edit written out', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await foldedAt(h, 'v1\n');
+
+    // Git or an editor replaces the note (unlink + create) with the user's
+    // save while the snapshot of a teammate's edit is in flight: the snapshot
+    // reads the note, finds it gone right before the write and leaves the path
+    // to the watcher. The save is folded in when its events arrive; the merged
+    // text must still reach the disk, or disk and doc silently disagree until
+    // the next remote edit or reconnect.
+    const exists = h.vault.exists.bind(h.vault);
+    let events: Promise<void> | undefined;
+    changeAfterReads(h, 1, () => {
+      h.vault.files.delete(PATH);
+      h.vault.exists = async (path) => {
+        const there = await exists(path);
+        if (path === PATH && !there) {
+          // The snapshot has seen the note gone; it is back a moment later.
+          h.vault.exists = exists;
+          putDisk(h, 'v1\nlocal line\n');
+          events = (async () => {
+            await h.engine.handleVaultEvent({
+              type: 'delete',
+              bindingId: 'b1',
+              path: PATH,
+              source: 'obsidian',
+            });
+            await h.engine.handleVaultEvent({
+              type: 'modify',
+              bindingId: 'b1',
+              path: PATH,
+              source: 'obsidian',
+            });
+          })();
+        }
+        return there;
+      };
+    });
+    const written = nextWrite(h);
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(await written).toBe(expected);
+    expect(events).toBeDefined();
+    await events;
+    await drainToServer(h, serverDoc);
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
   it('a note that keeps changing under its snapshot is written once it settles, with every save in it', async () => {
     const Y = await import('yjs');
     const h = buildHarness({ snapshotMs: 0 });

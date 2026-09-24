@@ -1115,6 +1115,14 @@ export class SyncEngine {
         }
         const content = await this.vault.readText(path);
         await this.foldDiskEditsIntoDoc(path, content);
+        // The doc may hold remote edits the disk doesn't have yet. Their own
+        // snapshot usually writes them out, but not when it found the note
+        // gone right before its write (an unlink + create by git or an editor)
+        // and left the path to the watcher — this event. Without a snapshot
+        // here, disk and doc would disagree until the next remote edit.
+        if (this.docManager.getText(this.binding.id, path) !== content) {
+          this.scheduleSnapshotToDisk(path);
+        }
       });
       return;
     }
@@ -2319,7 +2327,13 @@ export class SyncEngine {
         this.scheduleSnapshotToDisk(path);
         return;
       }
-      // A save: fold it three-way like any other, then check again.
+      // A save. Its base is the text this snapshot was about to write over:
+      // the fold above took it into the doc, which is why the write could
+      // replace it. For a note without a fold marker yet (a log from before
+      // 0.3.2, a cleared IndexedDB) that fold left no base behind, and the save
+      // would be folded without one — disk wins, deleting the doc's unwritten
+      // remote edits everywhere. Record it, then fold the save three-way.
+      if (meta && diskText !== null) await this.markFolded(meta, diskText);
       diskText = current;
     }
     // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
