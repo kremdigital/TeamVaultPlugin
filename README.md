@@ -154,23 +154,38 @@ name in it matches, in any letter case:
   you set in Obsidian), Obsidian's `.trash`, `.git`, and the server's own
   `.versions` / `.staging`.
 - **Temporary files** — names ending in `.tmp` or `~`, and the leftovers of
-  Obsidian's interrupted saves (`<name>.tmp.<pid>.<hex>`).
+  Obsidian's interrupted saves (`<name>.tmp.<pid>.<hex>`). A folder with
+  such a name is skipped with everything in it.
+- **Editors** — the owner files Word, Excel and PowerPoint keep next to an
+  open document (`~$<name>`), LibreOffice's lock files (`.~lock.<name>#`),
+  Vim's swap files (`.<name>.swp`) and Emacs' lock files (`.#<name>`).
 - **macOS** — `.DS_Store`, AppleDouble files (`._<name>`), the folder icon
   file `Icon\r` (its name ends in a carriage return), iCloud placeholders
-  (`.<name>.icloud`), and what macOS keeps at the root of a volume:
-  `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems`,
-  `.DocumentRevisions-V100`.
+  (`.<name>.icloud`), netatalk's `.AppleDouble` folders, and what macOS keeps
+  at the root of a volume: `.Spotlight-V100`, `.fseventsd`, `.Trashes`,
+  `.TemporaryItems`, `.DocumentRevisions-V100`.
 - **Windows** — `desktop.ini`, `Thumbs.db`, `$RECYCLE.BIN`,
   `System Volume Information`.
 - **Linux** — `.directory` (Dolphin) and `.Trash-<uid>` folders.
 - **Other sync tools** — Syncthing's `.stfolder`, `.stversions` and
   `.stignore`; Resilio Sync's `.sync` folder and unfinished `*.!sync`
-  downloads; Dropbox's `.dropbox` and `.dropbox.cache`; Google Drive's
-  `.tmp.drivedownload` and `.tmp.driveupload`.
+  downloads; Dropbox's `.dropbox`, `.dropbox.attr` and `.dropbox.cache`;
+  Google Drive's `.tmp.drivedownload` and `.tmp.driveupload`; the Nextcloud
+  and ownCloud client's journal (`.sync_<hex>.db` with its `-wal` / `-shm`
+  files) and `.owncloudsync.log`.
+- **Names Windows opens as a different file** — any name with a `:` in it
+  (Obsidian doesn't allow one either; on Windows `desktop.ini::$DATA` is
+  `desktop.ini` itself), and names shaped like a Windows short name: up to
+  8 characters ending in `~` and digits, optionally with an extension of up
+  to 3 (`PROJEC~1`, `Draft~1.md`). On Windows such a name may open a
+  different file or folder than the one it spells, so none of them is
+  synced, on any system.
 
 The list is built in and the same on every device, so there is no setting
 for it. Such files that an older version already uploaded stay on the
-server; the plugin leaves them alone.
+server; the plugin leaves them alone. Renaming a note to a name on the list
+works like moving it to the trash: teammates see it deleted, and your copy
+stays on your disk only.
 
 ## Commands
 
@@ -229,7 +244,9 @@ Look for `[error]` lines. Common causes:
 - The file's name is on the built-in ignore list — see
   [What is never synced](#what-is-never-synced). Local files like that are
   skipped without a log line; one the server still holds is logged as
-  `refused a path supplied by the server` with `"reason":"ignored"`.
+  `refused a path supplied by the server` with `"reason":"ignored"` (or
+  `"invalid"` for a name Windows would open as another file) — at `warn`
+  once per path while the plugin runs, and at `debug` after that.
 - A binding made by an older version points to a subfolder that no longer
   exists — remove it and bind the vault again. Note that the new binding
   covers the whole vault, so every note in it goes to the project.
@@ -237,9 +254,9 @@ Look for `[error]` lines. Common causes:
 **External agent edits don't propagate** — the FS watcher uses chokidar
 on the vault root and respects the same ignore list: the config folder,
 `.trash`, `.git`, the server's own `.versions` / `.staging`, temporary files,
-and the service files of the OS and other sync tools (`.DS_Store`,
-`desktop.ini`, `Thumbs.db`, `.stfolder`, … — the full list is in
-[What is never synced](#what-is-never-synced)). For a binding made to a
+editors' lock and swap files, and the service files of the OS and other sync
+tools (`.DS_Store`, `desktop.ini`, `Thumbs.db`, `.stfolder`, … — the full list
+is in [What is never synced](#what-is-never-synced)). For a binding made to a
 subfolder by an older version, files outside that folder are correctly
 ignored.
 
@@ -286,6 +303,11 @@ edits in `…conflict-<ts>.<ext>`.
   editor of the Team Vault server.
 - Desktop only: the filesystem watcher and the log both use Node APIs that
   Obsidian mobile doesn't expose.
+- Don't keep a bound vault in iCloud Drive with **Optimize Mac Storage** on
+  macOS 13 or earlier. To free space, macOS swaps a note for a
+  `.<name>.icloud` placeholder. Team Vault reads that as the note being
+  deleted and deletes it for the whole team. Move the vault out of iCloud
+  Drive or turn the optimization off.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.

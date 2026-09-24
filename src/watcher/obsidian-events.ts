@@ -13,7 +13,8 @@ import type { RecentlyApplied } from './recently-applied';
  *   - Drop what the shared ignore list refuses (`isAlwaysIgnored` in
  *     `path-utils`, the same list chokidar and the engine use). Obsidian
  *     never indexes a dotted path, so here that is mostly service files
- *     without a dot, such as `desktop.ini` and `Thumbs.db`.
+ *     without a dot, such as `desktop.ini`, `Thumbs.db` and Office's
+ *     `~$<name>` owner files, and folders named like temporary files.
  *   - Debounce `modify` per (binding, path) — Obsidian fires several
  *     events per save (`metadata`, `links`, etc) and the engine doesn't
  *     need every microtick.

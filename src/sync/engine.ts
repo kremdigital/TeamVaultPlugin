@@ -53,6 +53,9 @@ const NOOP_LOG_SINK: LogSink = {
 };
 const SILENT_LOGGER = new Logger('error', NOOP_LOG_SINK);
 
+/** How many refused server paths an engine remembers as already reported. */
+const MAX_REPORTED_REFUSALS = 1000;
+
 /**
  * Per-binding sync engine — the central orchestrator.
  *
@@ -171,6 +174,9 @@ export class SyncEngine {
    * folder would arrive as a rename for a file we know nothing about.
    */
   private outOfScope = new Map<string, { path: string; fileType: FileType }>();
+
+  /** Server paths already refused at `warn` — see `allowServerPath`. */
+  private readonly reportedRefusals = new Set<string>();
 
   /** Local vector clock for the binding — bumped before each outgoing op. */
   private vectorClock: VectorClock;
@@ -1122,6 +1128,12 @@ export class SyncEngine {
    * Refusal is never fatal: it logs and returns `false`, because the caller
    * chain of `handleServerFileEvent` turns a throw into engine status
    * `error`.
+   *
+   * A path is logged at `warn` the first time this engine refuses it and at
+   * `debug` after that. The file index is re-read on every reconnect, and the
+   * `.DS_Store` files an older version uploaded — one per folder a Mac user
+   * opened in Finder — otherwise filled `sync.log` with the same lines on each
+   * one, crowding out the entries worth reading.
    */
   private allowServerPath(
     path: string,
@@ -1133,12 +1145,16 @@ export class SyncEngine {
       configDir: this.configDir,
     });
     if (rejection === null) return true;
-    this.log.warn('refused a path supplied by the server', {
-      context,
-      path,
-      reason: rejection,
-      configDir: this.configDir,
-    });
+    const details = { context, path, reason: rejection, configDir: this.configDir };
+    const key = `${rejection}\u0000${path}`;
+    if (this.reportedRefusals.has(key)) {
+      this.log.debug('refused a path supplied by the server', details);
+      return false;
+    }
+    // Paths come from the server: cap the memory they can take.
+    if (this.reportedRefusals.size >= MAX_REPORTED_REFUSALS) this.reportedRefusals.clear();
+    this.reportedRefusals.add(key);
+    this.log.warn('refused a path supplied by the server', details);
     return false;
   }
 

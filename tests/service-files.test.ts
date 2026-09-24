@@ -13,6 +13,7 @@ import { FsWatcher, type FsWatcherFactory } from '@/watcher/fs-watcher';
 import { ObsidianWatcher, type VaultEvent, type WatchableVault } from '@/watcher/obsidian-events';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
+import { Logger, type LogEntry } from '@/utils/logger';
 
 /**
  * Служебные файлы ОС и других синхронизаторов. С 0.3.4 привязка всегда
@@ -203,7 +204,7 @@ interface Harness {
   ra: RecentlyApplied;
 }
 
-function buildHarness(): Harness {
+function buildHarness(opts: { logger?: Logger } = {}): Harness {
   const vault = new MemoryVault();
   const log = new OperationLog();
   const ra = new RecentlyApplied();
@@ -231,6 +232,7 @@ function buildHarness(): Harness {
     recentlyApplied: ra,
     apiClient: api,
     socketClient: new SocketClient({ server, clientId: 'device-1', factory: socketFactory }),
+    ...(opts.logger ? { logger: opts.logger } : {}),
   });
   return {
     engine,
@@ -543,6 +545,208 @@ describe('служебные файлы — движок', () => {
 
     expect(await h.vault.readText('desktop.ini')).toBe('[.ShellClassInfo]');
     expect(h.apiCalls.filter((c) => c.url.endsWith('/files/f3'))).toHaveLength(0);
+    await h.engine.stop();
+  });
+});
+
+// -- Имена-двойники Windows, суффиксы на папках, редакторы, шум в логе ----------
+
+function captureLogger(): { logger: Logger; entries: LogEntry[] } {
+  const entries: LogEntry[] = [];
+  const logger = new Logger('debug', {
+    write: (e) => {
+      entries.push(e);
+    },
+  });
+  return { logger, entries };
+}
+
+/** Записи об отказе в пути от сервера, по уровню. */
+function refusals(entries: LogEntry[], level: LogEntry['level']): LogEntry[] {
+  return entries.filter(
+    (e) => e.level === level && e.message === 'refused a path supplied by the server',
+  );
+}
+
+describe('имена, которые Windows открывает как другой файл', () => {
+  // На NTFS `.obsidian::$INDEX_ALLOCATION` — это сама папка конфигурации, а
+  // `OBSIDI~1` — её короткое имя. Гейт сравнивал сегменты целиком и пропускал
+  // оба пути: движок индексировал файл, а запись снимка документа читала
+  // настоящий `data.json` с API-ключом и отправляла его в проект.
+  it.each([
+    '.obsidian::$INDEX_ALLOCATION/plugins/team-vault/data.json',
+    'OBSIDI~1/plugins/team-vault/data.json',
+  ])('живой file:created с %j не индексируется и не трогает data.json', async (path) => {
+    const { logger, entries } = captureLogger();
+    const h = buildHarness({ logger });
+    h.vault.files.set('.obsidian/plugins/team-vault/data.json', bytes('{"apiKey":"osk_secret"}'));
+    h.apiResponses.set('GET /api/projects/p1/files/f9', response({ arrayBuffer: bytes('evil') }));
+    await startJoined(h);
+    const seen: EngineStatus[] = [];
+    h.engine.onStatus((s) => seen.push(s));
+    const emitsBefore = h.socket().emits.length;
+
+    h.socket().fire('file:created', {
+      result: { outcome: { fileId: 'f9', path } },
+      log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+    });
+    await flushAsync(20);
+
+    expect(h.engine.getFileIdForPath(path)).toBeNull();
+    expect(h.apiCalls.filter((c) => c.url.endsWith('/files/f9'))).toHaveLength(0);
+    expect(h.socket().emits.slice(emitsBefore)).toHaveLength(0);
+    expect(await h.vault.exists(path)).toBe(false);
+    expect(await h.vault.readText('.obsidian/plugins/team-vault/data.json')).toBe(
+      '{"apiKey":"osk_secret"}',
+    );
+    expect(seen).not.toContain('error');
+    expect(refusals(entries, 'warn')[0]?.args[0]).toMatchObject({
+      context: 'create',
+      path,
+      reason: 'invalid',
+    });
+    await h.engine.stop();
+  });
+
+  it('из листинга не индексируются desktop.ini::$DATA и GIT~1/hooks/…', async () => {
+    const h = buildHarness();
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'idea.md' },
+        { id: 'f2', path: 'notes/desktop.ini::$DATA', fileType: 'BINARY' },
+        { id: 'f3', path: 'GIT~1/hooks/post-checkout', fileType: 'BINARY' },
+      ]),
+    );
+    h.vault.files.set('idea.md', bytes('ok'));
+    h.vault.files.set('notes/desktop.ini', bytes('[.ShellClassInfo]'));
+
+    await startJoined(h);
+    h.socket().fire('file:updated-binary', { fileId: 'f2' });
+    h.socket().fire('file:updated-binary', { fileId: 'f3' });
+    await flushAsync(20);
+
+    expect(h.engine.getFileIdForPath('idea.md')).toBe('f1');
+    expect(h.engine.getFileIdForPath('notes/desktop.ini::$DATA')).toBeNull();
+    expect(h.engine.getFileIdForPath('GIT~1/hooks/post-checkout')).toBeNull();
+    expect(h.apiCalls.filter((c) => /\/files\/f[23]$/.test(c.url))).toHaveLength(0);
+    expect(await h.vault.readText('notes/desktop.ini')).toBe('[.ShellClassInfo]');
+    expect(await h.vault.exists('GIT~1/hooks/post-checkout')).toBe(false);
+    await h.engine.stop();
+  });
+});
+
+describe('служебные файлы — суффиксы на папках и файлы редакторов', () => {
+  afterEach(() => {
+    FakeChokidar.last = null;
+  });
+
+  it('вотчер Obsidian согласен с chokidar: заметки в папке drafts~ не синхронизируются', () => {
+    // chokidar не заходит в папку `drafts~` (предикат `ignored` видит суффикс
+    // у папки), а вотчер Obsidian видел заметки внутри как обычные.
+    const fsWatcher = new FsWatcher({
+      vaultBasePath: '/vault',
+      bindings: () => [binding],
+      recentlyApplied: new RecentlyApplied(),
+      factory: chokidarFactory,
+    });
+    fsWatcher.start();
+    expect(FakeChokidar.last?.options.ignored?.('/vault/drafts~')).toBe(true);
+
+    const vault = new FakeObsidianVault();
+    const events: VaultEvent[] = [];
+    const watcher = new ObsidianWatcher({
+      bindings: () => [binding],
+      recentlyApplied: new RecentlyApplied(),
+      setTimeout: () => undefined,
+      clearTimeout: () => undefined,
+    });
+    watcher.onEvent((e) => events.push(e));
+    watcher.start(vault as unknown as WatchableVault);
+
+    for (const path of ['drafts~/idea.md', 'old.tmp/idea.md', 'attachments/~$report.docx']) {
+      vault.fire('create', { path, kind: 'file' });
+      vault.fire('delete', { path, kind: 'file' });
+    }
+    vault.fire('create', { path: 'idea.md', kind: 'file' });
+
+    expect(events).toEqual([
+      { type: 'create', bindingId: 'b1', path: 'idea.md', source: 'obsidian' },
+    ]);
+    watcher.stop();
+    void fsWatcher.stop();
+  });
+
+  it('начальная выгрузка пропускает файлы редакторов и заметки в папке drafts~', async () => {
+    const h = buildHarness();
+    // Как и выше: служебные — первыми, иначе цикл встал бы на ack первого файла.
+    h.vault.files.set('attachments/~$report.docx', bytes('owner'));
+    h.vault.files.set('attachments/.~lock.plan.odt#', bytes('lock'));
+    h.vault.files.set('notes/.idea.md.swp', bytes('swap'));
+    h.vault.files.set('drafts~/idea.md', bytes('draft'));
+    h.vault.files.set('.sync_4a5b6c7d8e9f.db-wal', bytes('wal'));
+    h.vault.files.set('OBSIDI~1/app.json', bytes('{}'));
+    h.vault.files.set('idea.md', bytes('ok'));
+
+    await startJoined(h);
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'idea.md' } });
+    await flushAsync(20);
+
+    expect(h.socket().createdPaths()).toEqual(['idea.md']);
+    await h.engine.stop();
+  });
+});
+
+describe('отказ в пути от сервера в логе', () => {
+  it('пишется в warn один раз за работу движка, при реконнектах — в debug', async () => {
+    // `.DS_Store`, выгруженные 0.3.4–0.3.7, лежат на сервере в каждой папке, а
+    // листинг перечитывается при каждом подключении.
+    const { logger, entries } = captureLogger();
+    const h = buildHarness({ logger });
+    h.apiResponses.set(
+      'GET /api/projects/p1/files',
+      listing([
+        { id: 'f1', path: 'idea.md' },
+        { id: 'f2', path: '.DS_Store', fileType: 'BINARY' },
+        { id: 'f3', path: 'notes/.DS_Store', fileType: 'BINARY' },
+      ]),
+    );
+    h.vault.files.set('idea.md', bytes('ok'));
+    await startJoined(h);
+
+    for (let i = 0; i < 2; i++) {
+      h.socket().disconnect();
+      h.socket().connect();
+      await flushAsync(5);
+      h.socket().ackOk({ operations: [], yjsDocs: [] });
+      await flushAsync(20);
+    }
+
+    const warned = refusals(entries, 'warn').map((e) => (e.args[0] as { path: string }).path);
+    expect(warned.sort()).toEqual(['.DS_Store', 'notes/.DS_Store']);
+    expect(refusals(entries, 'debug')).toHaveLength(4);
+    expect(h.engine.getFileIdForPath('.DS_Store')).toBeNull();
+    await h.engine.stop();
+  });
+
+  it('другой путь или другая причина снова пишется в warn', async () => {
+    const { logger, entries } = captureLogger();
+    const h = buildHarness({ logger });
+    await startJoined(h);
+
+    for (const path of ['.DS_Store', '.DS_Store', 'OBSIDI~1/app.json', '.DS_Store']) {
+      h.socket().fire('file:created', {
+        result: { outcome: { fileId: 'f9', path } },
+        log: { id: 'l1', vectorClock: { srv: 1 }, createdAt: '2026-01-01' },
+      });
+      await flushAsync(5);
+    }
+
+    expect(refusals(entries, 'warn').map((e) => e.args[0])).toEqual([
+      expect.objectContaining({ path: '.DS_Store', reason: 'ignored' }),
+      expect.objectContaining({ path: 'OBSIDI~1/app.json', reason: 'invalid' }),
+    ]);
+    expect(refusals(entries, 'debug')).toHaveLength(2);
     await h.engine.stop();
   });
 });

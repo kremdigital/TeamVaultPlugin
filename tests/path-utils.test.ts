@@ -219,6 +219,22 @@ describe('service files of the OS and other sync tools', () => {
     // Google Drive
     '.tmp.drivedownload/12345',
     '.tmp.driveupload/67890',
+    // Office, LibreOffice, Vim, Emacs
+    'attachments/~$report.docx',
+    '~$budget.xlsx',
+    '.~lock.report.docx#',
+    'attachments/.~lock.plan.odt#',
+    'notes/.idea.md.swp',
+    'notes/.idea.md.swo',
+    'notes/.#idea.md',
+    // netatalk, Dropbox, Nextcloud / ownCloud
+    'notes/.AppleDouble/idea.md',
+    '.dropbox.attr',
+    '.sync_4a5b6c7d8e9f.db',
+    '.sync_4a5b6c7d8e9f.db-wal',
+    '.sync_4a5b6c7d8e9f.db-shm',
+    '._sync_4a5b6c7d8e9f.db',
+    '.owncloudsync.log',
   ])('ignores %j', (path) => {
     expect(isAlwaysIgnored(path)).toBe(true);
     expect(checkVaultPath(path, { bindingFolder: '/' })).toBe('ignored');
@@ -251,6 +267,13 @@ describe('service files of the OS and other sync tools', () => {
     expect(isAlwaysIgnored('notes/.Trash-old/x.md')).toBe(false);
     expect(isAlwaysIgnored('notes/sync.md')).toBe(false);
     expect(checkVaultPath('notes/sync.md', { bindingFolder: '/' })).toBeNull();
+    expect(isAlwaysIgnored('notes/~report.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/$report.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/lock.report.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/idea.swp')).toBe(false);
+    expect(isAlwaysIgnored('notes/#idea.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/sync_4a5b.db')).toBe(false);
+    expect(isAlwaysIgnored('AppleDouble/idea.md')).toBe(false);
   });
 
   it('filters them out of chokidar at the vault root and below', () => {
@@ -266,6 +289,99 @@ describe('service files of the OS and other sync tools', () => {
       isIgnoredAbsolutePath('/home/u/.stversions/vault/idea.md', '/home/u/.stversions/vault'),
     ).toBe(false);
     expect(isIgnoredAbsolutePath('D:/.sync/vault/idea.md', 'D:/.sync/vault')).toBe(false);
+  });
+});
+
+/**
+ * Suffixes used to be checked at the end of the whole path only, while
+ * chokidar asks about each folder before walking into it: a folder named
+ * `drafts~` was skipped by chokidar, yet the Obsidian watcher, the initial
+ * upload and the server gate synced the notes inside it.
+ */
+describe('temporary-name suffixes on folders', () => {
+  it.each(['drafts~/idea.md', 'old.tmp/idea.md', 'dl.!sync/idea.md', 'a.tmp.1.ff/idea.md'])(
+    'ignores the notes inside %j, as chokidar ignores the folder',
+    (path) => {
+      const folder = path.slice(0, path.indexOf('/'));
+      expect(isIgnoredAbsolutePath(`/vault/${folder}`, '/vault')).toBe(true);
+      expect(isAlwaysIgnored(path)).toBe(true);
+      expect(checkVaultPath(path, { bindingFolder: '/' })).toBe('ignored');
+    },
+  );
+
+  it('keeps folders that merely contain the suffix', () => {
+    expect(isAlwaysIgnored('tmp-drafts/idea.md')).toBe(false);
+    expect(isAlwaysIgnored('data.tmp.notes/idea.md')).toBe(false);
+    expect(isAlwaysIgnored('a~b/idea.md')).toBe(false);
+  });
+});
+
+/**
+ * On Windows a server path could reach what the gate refuses under another
+ * name: NTFS stream syntax (`desktop.ini::$DATA` is `desktop.ini`,
+ * `.obsidian::$INDEX_ALLOCATION` is the config folder) and 8.3 short names
+ * (`OBSIDI~1` is `.obsidian` on a volume that generates them). Both open the
+ * real file through Node's `fs` — checked on NTFS — so the config folder's
+ * `data.json`, with the API key, could be read into a note and sent to the
+ * project, and a `.git` hook written.
+ */
+describe('names Windows resolves to a different file', () => {
+  it.each([
+    'notes/desktop.ini::$DATA',
+    '.DS_Store::$DATA',
+    '.stfolder::$INDEX_ALLOCATION/marker',
+    '.obsidian::$INDEX_ALLOCATION/plugins/team-vault/data.json',
+    '.obsidian:$I30:$INDEX_ALLOCATION/plugins/team-vault/data.json',
+    '.git::$INDEX_ALLOCATION/hooks/post-checkout',
+    'notes/idea.md:hidden',
+    'OBSIDI~1/plugins/team-vault/data.json',
+    'obsidi~1/plugins/team-vault/data.json',
+    'OB1A2B~1/plugins/team-vault/data.json',
+    'GIT~1/hooks/post-checkout',
+    'notes/DS_STO~1',
+    'DROPBO~1.CAC/2026-09-22/idea.md',
+    'STFOL~12/marker',
+  ])('refuses %j in both directions', (path) => {
+    expect(checkVaultPath(path, { bindingFolder: '/' })).toBe('invalid');
+    expect(checkVaultPath(path)).toBe('invalid');
+    expect(isAlwaysIgnored(path)).toBe(true);
+    expect(isIgnoredAbsolutePath(`D:\\vault\\${path.replace(/\//g, '\\')}`, 'D:\\vault')).toBe(
+      true,
+    );
+  });
+
+  it('refuses a short name of a custom config folder', () => {
+    expect(
+      checkVaultPath('CONFIG~1/plugins/team-vault/data.json', {
+        bindingFolder: '/',
+        configDir: '.config-obs',
+      }),
+    ).toBe('invalid');
+    expect(
+      checkVaultPath('.config-obs::$INDEX_ALLOCATION/plugins/team-vault/data.json', {
+        bindingFolder: '/',
+        configDir: '.config-obs',
+      }),
+    ).toBe('invalid');
+  });
+
+  it('keeps names that cannot be a short name', () => {
+    // More than 8 characters before the extension, or more than 3 after it,
+    // or a space — NTFS never generates such a short name.
+    expect(checkVaultPath('notes/Chapter~1.md', { bindingFolder: '/' })).toBeNull();
+    expect(checkVaultPath('notes/IMG~1.jpeg', { bindingFolder: '/' })).toBeNull();
+    expect(checkVaultPath('notes/My note~1.md', { bindingFolder: '/' })).toBeNull();
+    expect(checkVaultPath('notes/idea~v2.md', { bindingFolder: '/' })).toBeNull();
+    expect(checkVaultPath('notes/a~b.md', { bindingFolder: '/' })).toBeNull();
+    expect(checkVaultPath('Проекты/идея.md', { bindingFolder: '/' })).toBeNull();
+    expect(isAlwaysIgnored('notes/Chapter~1.md')).toBe(false);
+  });
+
+  it('keeps the reasons that come first', () => {
+    // A drive letter is still "absolute", a `..` still "traversal".
+    expect(checkVaultPath('C:/Windows/system.ini', { bindingFolder: '/' })).toBe('absolute');
+    expect(checkVaultPath('a:b.md', { bindingFolder: '/' })).toBe('absolute');
+    expect(checkVaultPath('notes/../GIT~1/config', { bindingFolder: '/' })).toBe('traversal');
   });
 });
 

@@ -63,10 +63,11 @@ export const DEFAULT_CONFIG_DIR = '.obsidian';
  * compared case-insensitively — a `.git` or a `desktop.ini` in a subfolder is
  * still a repository and still Explorer's file.
  *
- * This list (with the patterns below) is the ONE source of truth for both
- * directions: `isAlwaysIgnored` backs the chokidar `ignored` predicate, both
- * watchers, the engine's outgoing gate and offline-queue replay, and
- * `checkVaultPath` — the gate for every path the server sends.
+ * This list (with the patterns, suffixes and Windows aliases below) is the ONE
+ * source of truth for both directions: `isAlwaysIgnored` backs the chokidar
+ * `ignored` predicate, both watchers, the engine's outgoing gate and
+ * offline-queue replay, and `checkVaultPath` — the gate for every path the
+ * server sends.
  *
  * Team Vault's and Obsidian's own:
  *   - `.obsidian` — a config folder. Kept even when `configDir` differs: in
@@ -96,6 +97,8 @@ export const DEFAULT_CONFIG_DIR = '.obsidian';
  *     Finder: synced, they would come back to the team as new notes.
  *   - `Icon\r` — a folder's custom icon on macOS (the name really ends in a
  *     carriage return).
+ *   - `.AppleDouble` — the resource-fork folder netatalk (an AFP server on
+ *     Linux or a NAS) puts in every folder a Mac opens over the share.
  *   - `desktop.ini` — Explorer's per-folder settings; `Thumbs.db` — its
  *     thumbnail cache (Windows).
  *   - `$RECYCLE.BIN`, `System Volume Information` — the Recycle Bin and the
@@ -105,9 +108,12 @@ export const DEFAULT_CONFIG_DIR = '.obsidian';
  *     file versions and its per-device ignore file. Its temporary files
  *     (`.syncthing.*.tmp`, `~syncthing~*.tmp`) fall under the `.tmp` suffix.
  *   - `.sync` — Resilio Sync's folder settings and archive.
- *   - `.dropbox`, `.dropbox.cache` — Dropbox's folder marker and cache.
+ *   - `.dropbox`, `.dropbox.attr`, `.dropbox.cache` — Dropbox's folder
+ *     marker, attributes and cache.
  *   - `.tmp.drivedownload`, `.tmp.driveupload` — Google Drive's transfer
  *     folders.
+ *   - `.owncloudsync.log` — the Nextcloud / ownCloud client's log at the root
+ *     of its sync folder; its journal database is matched by a pattern below.
  */
 export const ALWAYS_IGNORED_SEGMENTS = [
   '.obsidian',
@@ -123,6 +129,7 @@ export const ALWAYS_IGNORED_SEGMENTS = [
   '.TemporaryItems',
   '.DocumentRevisions-V100',
   'Icon\r',
+  '.AppleDouble',
   // Windows
   'desktop.ini',
   'Thumbs.db',
@@ -138,10 +145,13 @@ export const ALWAYS_IGNORED_SEGMENTS = [
   '.sync',
   // Dropbox
   '.dropbox',
+  '.dropbox.attr',
   '.dropbox.cache',
   // Google Drive
   '.tmp.drivedownload',
   '.tmp.driveupload',
+  // Nextcloud / ownCloud
+  '.owncloudsync.log',
 ] as const;
 
 /**
@@ -150,11 +160,34 @@ export const ALWAYS_IGNORED_SEGMENTS = [
  *   - `._<name>` — AppleDouble: macOS stores a file's extended attributes
  *     next to it this way on FAT, exFAT and network shares.
  *   - `.<name>.icloud` — iCloud Drive's placeholder for a file evicted from
- *     the disk ("Optimize Mac Storage"), a stub instead of the content.
+ *     the disk ("Optimize Mac Storage"), a stub instead of the content. This
+ *     only keeps the stub off the server: the eviction itself still looks
+ *     like the note being deleted (README, Limitations).
  *   - `.Trash-<uid>` — the Linux desktop trash on a removable volume; like
  *     `.Trashes`, it holds deleted files.
+ *   - `~$<name>` — the owner file Word, Excel and PowerPoint keep next to an
+ *     open document (`~$report.docx`). It has no dot in front, so both
+ *     watchers see it; synced, it went to the team on open and was deleted
+ *     from their disks on close.
+ *   - `.~lock.<name>#` — LibreOffice's lock file for an open document.
+ *   - `.sync_<hex>.db` with its `-wal` / `-shm` / `-journal` companions — the
+ *     Nextcloud / ownCloud client's journal at the root of its sync folder.
+ *     It changes on every sync run and would be re-uploaded each time. (The
+ *     older `._sync_<hex>.db` falls under AppleDouble's `._`.)
+ *   - `.<name>.swp` … `.<name>.swa` — Vim's swap files; `.#<name>` — Emacs'
+ *     lock files. Editing a note from a terminal (see the README on external
+ *     edits) leaves them next to it for as long as the editor is open.
  */
-const ALWAYS_IGNORED_SEGMENT_PATTERNS = [/^\._/, /^\..+\.icloud$/, /^\.trash-\d+$/] as const;
+const ALWAYS_IGNORED_SEGMENT_PATTERNS = [
+  /^\._/,
+  /^\..+\.icloud$/,
+  /^\.trash-\d+$/,
+  /^~\$/,
+  /^\.~lock\..*#$/,
+  /^\.sync_[0-9a-f]+\.db(?:-wal|-shm|-journal)?$/,
+  /^\..+\.sw[a-p]$/,
+  /^\.#/,
+] as const;
 
 /**
  * Case- and unicode-folded form used for every comparison here. macOS hands
@@ -179,6 +212,10 @@ const IGNORED_SEGMENT_SET: ReadonlySet<string> = new Set(ALWAYS_IGNORED_SEGMENTS
 /**
  * `.tmp` and `~` — editors' temporary and backup copies (Syncthing's
  * temporary files too). `.!sync` — a file Resilio Sync is still downloading.
+ * Tested against every segment like the names above: chokidar asks about a
+ * folder before it walks into it, so a folder named `drafts~` was skipped by
+ * chokidar while the Obsidian watcher and the server gate, which only looked
+ * at the end of the whole path, synced the notes inside it.
  */
 const ALWAYS_IGNORED_SUFFIX = ['.tmp', '~', '.!sync'] as const;
 
@@ -190,6 +227,48 @@ const ALWAYS_IGNORED_SUFFIX = ['.tmp', '~', '.!sync'] as const;
  * initial-push pass treated the artifact as a real note and uploaded it.
  */
 const ATOMIC_TMP_PATTERN = /\.tmp\.(\d+)\.[0-9a-f]+$/i;
+
+/**
+ * An 8.3 short name: up to 8 characters with `~<digits>` at the end, then
+ * optionally a dot and up to 3 more (`OBSIDI~1`, `DROPBO~1.CAC`, the hashed
+ * `OB1A2B~1`). Group 1 is the part before the extension.
+ */
+const SHORT_NAME_PATTERN = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
+
+/**
+ * True for a name that Windows opens as a DIFFERENT file or folder than the
+ * one it spells — so no rule above, which compares names, can vouch for it:
+ *
+ *   - Any `:`. On NTFS `name:stream` addresses a stream of `name`, and
+ *     `desktop.ini::$DATA` IS `desktop.ini`, `.obsidian::$INDEX_ALLOCATION`
+ *     IS the config folder. Node's `fs` and Obsidian's adapter pass the name
+ *     through as is. Obsidian itself forbids `:` in file names on every
+ *     platform.
+ *   - An 8.3 short name. NTFS gives long names a short alias (on the system
+ *     volume by default), and `OBSIDI~1/plugins/team-vault/data.json` opens
+ *     the plugin's settings, API key included; `GIT~1/hooks/…` writes a git
+ *     hook. Which alias a folder got depends on the disk, so every name of
+ *     that shape is refused. A real note named like one (`Draft~1.md`) is not
+ *     synced either — the price of not guessing.
+ *
+ * Trailing dots and spaces (`.obsidian.`) are not on the list: Windows drops
+ * them only on the Win32 path, and Node opens files through `\\?\`, which
+ * keeps the name literal.
+ */
+function isWindowsAlias(segment: string): boolean {
+  if (segment.includes(':')) return true;
+  const shortName = SHORT_NAME_PATTERN.exec(segment);
+  return shortName !== null && (shortName[1] ?? '').length <= 8;
+}
+
+/** One folded segment against every per-name rule of the ignore list. */
+function isIgnoredSegment(segment: string): boolean {
+  if (IGNORED_SEGMENT_SET.has(segment)) return true;
+  if (ALWAYS_IGNORED_SEGMENT_PATTERNS.some((re) => re.test(segment))) return true;
+  if (ALWAYS_IGNORED_SUFFIX.some((suffix) => segment.endsWith(suffix))) return true;
+  if (ATOMIC_TMP_PATTERN.test(segment)) return true;
+  return isWindowsAlias(segment);
+}
 
 /**
  * True if the file should be filtered out entirely, regardless of binding.
@@ -206,16 +285,9 @@ export function isAlwaysIgnored(vaultPath: string, configDir?: string): boolean 
   // downloaded vault's `Архив/.obsidian-work/` as ordinary notes.
   const cfg = configPrefix(configDir);
   if (cfg !== '' && (path === cfg || path.startsWith(`${cfg}/`))) return true;
-  // These names are refused anywhere in the tree: a `.git` or a `.trash` in a
-  // subfolder is still a repository and still a trash can.
-  for (const segment of path.split('/')) {
-    if (IGNORED_SEGMENT_SET.has(segment)) return true;
-    if (ALWAYS_IGNORED_SEGMENT_PATTERNS.some((re) => re.test(segment))) return true;
-  }
-  for (const suffix of ALWAYS_IGNORED_SUFFIX) {
-    if (path.endsWith(suffix)) return true;
-  }
-  return ATOMIC_TMP_PATTERN.test(path);
+  // Everything else is refused anywhere in the tree: a `.git` or a `.trash`
+  // in a subfolder is still a repository and still a trash can.
+  return path.split('/').some(isIgnoredSegment);
 }
 
 /**
@@ -240,7 +312,13 @@ export function isIgnoredAbsolutePath(
 }
 
 /** Why a path was refused. `null` from `checkVaultPath` means "allowed". */
-export type PathRejection = 'empty' | 'absolute' | 'traversal' | 'ignored' | 'outside-binding';
+export type PathRejection =
+  | 'empty'
+  | 'absolute'
+  | 'traversal'
+  | 'invalid'
+  | 'ignored'
+  | 'outside-binding';
 
 /**
  * The single gate for paths that arrive from outside — above all the ones the
@@ -266,6 +344,10 @@ export function checkVaultPath(
   // empty segment (`a//b`) is not a path Obsidian ever produces.
   const segments = path.split('/');
   if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'traversal';
+  // `.obsidian::$INDEX_ALLOCATION/…`, `OBSIDI~1/…` — on Windows these open a
+  // folder whose name the checks below would never see. `isAlwaysIgnored`
+  // refuses them too; this only gives the log its own reason.
+  if (segments.some((s) => isWindowsAlias(fold(s)))) return 'invalid';
   if (isAlwaysIgnored(path, opts.configDir)) return 'ignored';
   if (opts.bindingFolder !== undefined && !isInBinding(path, opts.bindingFolder)) {
     return 'outside-binding';
