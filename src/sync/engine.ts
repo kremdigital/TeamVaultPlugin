@@ -2121,13 +2121,18 @@ export class SyncEngine {
    * awaits: meanwhile the file may have been deleted (writing its meta back
    * would resurrect a ghost entry in the log) or the index rebuilt on
    * reconnect (the object in hand is no longer the one folds will read).
+   * `log` is the unfenced one inside a {@link commitLocal} block.
    */
-  private setFoldedHash(meta: IndexedMeta, hash: string): void {
+  private setFoldedHash(
+    meta: IndexedMeta,
+    hash: string,
+    log: OperationLog = this.operationLog,
+  ): void {
     const live = this.fileIndex.byId.get(meta.fileId);
     if (live !== meta) meta.foldedHash = hash;
     if (!live || live.foldedHash === hash) return;
     live.foldedHash = hash;
-    this.operationLog.setFileMeta(live);
+    log.setFileMeta(live);
   }
 
   /**
@@ -2307,7 +2312,7 @@ export class SyncEngine {
       // edits arriving in the same window (the silent-rollback incident).
       if (diskText !== null && diskText === text) {
         if (meta) {
-          this.recordSnapshotMeta(meta, text, hash);
+          this.recordSnapshotMeta(this.operationLog, meta, text, hash);
           await this.markFolded(meta, text, hash);
         }
         return;
@@ -2322,9 +2327,10 @@ export class SyncEngine {
       if (current === null) return;
       if (attempt >= SNAPSHOT_FOLD_ATTEMPTS) {
         // Still changing. The doc keeps the remote edits in the meantime, and
-        // a later snapshot folds whatever the disk settles on.
-        this.log.info('disk keeps changing under the snapshot, retrying later', path);
+        // a later snapshot folds whatever the disk settles on. Scheduled
+        // first: a stopped engine refuses there, before promising a retry.
         this.scheduleSnapshotToDisk(path);
+        this.log.info('disk keeps changing under the snapshot, retrying later', path);
         return;
       }
       // A save. Its base is the text this snapshot was about to write over:
@@ -2336,40 +2342,68 @@ export class SyncEngine {
       if (meta && diskText !== null) await this.markFolded(meta, diskText);
       diskText = current;
     }
-    // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
-    // watcher echo of this write must find the file already recorded.
-    if (meta) this.recordSnapshotMeta(meta, text, hash);
-    // See `applyServerUpdateBinary` — a single overwrite can fan out into
-    // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
-    // `unlink` + `add` (atomic-rename split). Budget for the worst case so
-    // a stray `unlink` doesn't trigger handleLocalDelete and a stray `add`
-    // doesn't then find an empty fileIndex and emit a phantom file:create.
-    // The createText branch only sees create-style echoes (Obsidian
-    // onCreate + chokidar `add`), so the smaller CREATE budget is exact.
-    if (diskText !== null) {
-      this.recentlyApplied.mark(path, ECHO_COUNT_WRITE);
-      await this.vault.writeText(path, text);
-    } else {
-      await this.vault.ensureParentFolder(path);
-      this.recentlyApplied.mark(path, ECHO_COUNT_CREATE);
-      await this.vault.createText(path, text);
-    }
-    // Only after the write succeeded: disk and doc now agree on `text`. A base
-    // recorded before a failed write would make the next fold read the old
-    // disk as local deletions of everything this snapshot was bringing in.
-    if (meta) await this.markFolded(meta, text, meta.contentHash);
+    // One local phase from the file meta to the fold marker. A `stop()` landing
+    // on the write used to let the file be written while the marker, refused
+    // by the fence, kept naming the old disk — next to a `contentHash` of the
+    // new text. The next engine then folded that disk against a base it does
+    // not descend from: a remote edit that reached the doc during the write
+    // was deleted everywhere, or doubled. `stop()` waits for the phase now.
+    const written = text;
+    const overwrite = diskText !== null;
+    await this.commitLocal(async (io) => {
+      // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
+      // watcher echo of this write must find the file already recorded.
+      if (meta) this.recordSnapshotMeta(io.log, meta, written, hash);
+      // See `applyServerUpdateBinary` — a single overwrite can fan out into
+      // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
+      // `unlink` + `add` (atomic-rename split). Budget for the worst case so
+      // a stray `unlink` doesn't trigger handleLocalDelete and a stray `add`
+      // doesn't then find an empty fileIndex and emit a phantom file:create.
+      // The createText branch only sees create-style echoes (Obsidian
+      // onCreate + chokidar `add`), so the smaller CREATE budget is exact.
+      if (overwrite) {
+        io.echo.mark(path, ECHO_COUNT_WRITE);
+        await io.vault.writeText(path, written);
+      } else {
+        await io.vault.ensureParentFolder(path);
+        io.echo.mark(path, ECHO_COUNT_CREATE);
+        await io.vault.createText(path, written);
+      }
+      // Only after the write succeeded: disk and doc now agree on `text`. A
+      // base recorded before a failed write would make the next fold read the
+      // old disk as local deletions of everything this snapshot was bringing in.
+      if (meta) {
+        this.foldBases.set(meta.fileId, { text: written, hash });
+        this.setFoldedHash(meta, hash, io.log);
+      }
+    });
   }
 
   /** The note's text on disk, `null` when there is no file. */
   private async readDiskText(path: string): Promise<string | null> {
-    return (await this.vault.exists(path)) ? await this.vault.readText(path) : null;
+    if (!(await this.vault.exists(path))) return null;
+    try {
+      return await this.vault.readText(path);
+    } catch (err) {
+      // Deleted between the two calls — a snapshot must treat that like a
+      // note that was never there, not fail (and with it the whole catch-up).
+      // Any other read error still surfaces.
+      this.throwIfStopped();
+      if (!(await this.vault.exists(path))) return null;
+      throw err;
+    }
   }
 
   /** Record `text` (hashed to `hash`) as the file's synced content. */
-  private recordSnapshotMeta(meta: IndexedMeta, text: string, hash: string): void {
+  private recordSnapshotMeta(
+    log: OperationLog,
+    meta: IndexedMeta,
+    text: string,
+    hash: string,
+  ): void {
     meta.contentHash = hash;
     meta.size = new TextEncoder().encode(text).byteLength;
-    this.operationLog.setFileMeta(meta);
+    log.setFileMeta(meta);
   }
 
   // -- Pending queue --------------------------------------------------------
@@ -2801,9 +2835,10 @@ export class SyncEngine {
   /**
    * Run a local phase to the end: the disk and bookkeeping steps of one
    * change that must not be torn apart — a rename's disk moves and its file
-   * meta, a download's meta and its write. Checks for `stop()` once, before
-   * the first step, and hands the block the dependencies without the fence,
-   * so a `stop()` landing in between waits for it instead of cutting it.
+   * meta, a download's meta and its write, a note snapshot's meta, write and
+   * fold marker. Checks for `stop()` once, before the first step, and hands
+   * the block the dependencies without the fence, so a `stop()` landing in
+   * between waits for it instead of cutting it.
    *
    * The block must stay local: no request, no emit, no modal, no
    * `throwIfStopped`, no nested `commitLocal` — any of those would hold up
