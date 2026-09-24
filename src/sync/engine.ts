@@ -1,5 +1,6 @@
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import { ApiClient, ApiError } from '@/client/api';
+import type { ApiFile } from '@/client/types';
 import {
   SocketClient,
   type FileEvent as SocketFileEvent,
@@ -42,6 +43,7 @@ import {
   checkVaultPath,
   isAlwaysIgnored,
   isInBinding,
+  type PathRejection,
 } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
@@ -172,6 +174,14 @@ interface FileMetaIndex {
   byId: Map<string, IndexedMeta>;
 }
 
+/** A rename missed while the engine was away — see `renamedWhileAway`. */
+interface RenamedWhileAway {
+  /** The file as this device last synced it, at the old path. */
+  meta: IndexedMeta;
+  /** Where the server has it now. */
+  to: string;
+}
+
 /**
  * How many watcher echoes a single system-applied disk operation can
  * trigger — both Obsidian's `vault.on(...)` and chokidar fire for the
@@ -252,12 +262,21 @@ export class SyncEngine {
    * `fileIndex` (so catch-up never hydrates hundreds of foreign docs and
    * `state.json` stays about our folder) and never reach the disk — but the
    * engine still has to recognise them, otherwise a file moved back INTO the
-   * folder would arrive as a rename for a file we know nothing about.
+   * folder would arrive as a rename for a file we know nothing about. Files
+   * at a path this client never writes (see `allowServerPath`) are kept here
+   * for the same reason.
    */
   private outOfScope = new Map<string, { path: string; fileType: FileType }>();
 
   /** Server paths already refused at `warn` — see `allowServerPath`. */
   private readonly reportedRefusals = new Set<string>();
+
+  /**
+   * Files renamed on the server to a name this client never writes while the
+   * user is asked what to do with the local copy (see `dropLocalCopy`): id →
+   * where the server has the file now.
+   */
+  private readonly movedAway = new Map<string, string>();
 
   /** Local vector clock for the binding — bumped before each outgoing op. */
   private vectorClock: VectorClock;
@@ -558,8 +577,9 @@ export class SyncEngine {
       }
 
       // Apply server-side operations the client missed.
+      const superseded = supersededRenames(result.operations);
       for (const op of result.operations) {
-        await this.applyServerOperation(op);
+        await this.applyServerOperation(op, superseded);
         this.throwIfStopped();
       }
 
@@ -873,9 +893,18 @@ export class SyncEngine {
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
     this.outOfScope.clear();
+    const away = this.renamedWhileAway(files);
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
     for (const f of files) {
+      const moved = away.get(f.id);
+      if (moved) {
+        // Indexed where our copy still is, as this device last synced it; the
+        // rename is applied below, once the index is complete.
+        byPath.set(moved.meta.relativePath, moved.meta);
+        byId.set(f.id, moved.meta);
+        continue;
+      }
       // Throw-away artifacts that an older client uploaded (e.g. Obsidian's
       // `*.tmp.<pid>.<hex>` atomic-write leftovers) must stay invisible —
       // indexing them would let server events materialise them on disk. The
@@ -884,6 +913,9 @@ export class SyncEngine {
         // Drop the stale mirror as well: a path we now refuse was written to
         // `state.json` by an older build and would otherwise linger there.
         this.operationLog.deleteFileMeta(this.binding.id, f.path);
+        // Known by id all the same, like a file outside the binding: renamed
+        // to a name we sync later, it arrives as a file we can adopt.
+        this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         continue;
       }
       if (!isInBinding(f.path, this.binding.localFolder)) {
@@ -921,6 +953,79 @@ export class SyncEngine {
       this.operationLog.setFileMeta(meta);
     }
     this.fileIndex = { byPath, byId };
+    await this.applyRenamesWhileAway(away);
+  }
+
+  /**
+   * Files the listing shows at another path than the one this device last
+   * synced them at: a teammate renamed or moved them while this engine was
+   * not connected. Keyed by file id; `meta` is the file as `state.json` has
+   * it, at the old path, and `to` is where the server has it now.
+   *
+   * Nothing else would catch them. The catch-up skips their RENAME as already
+   * applied (the index built from the listing has the new path), the old path
+   * stays on disk outside the index, and `initialPush` uploads it as a
+   * brand-new file — a duplicate under the old name for the whole team.
+   */
+  private renamedWhileAway(files: readonly ApiFile[]): Map<string, RenamedWhileAway> {
+    const lastSynced = new Map<string, FileMeta>();
+    for (const meta of this.operationLog.listFileMeta(this.binding.id)) {
+      if (meta.serverFileId !== '' && !lastSynced.has(meta.serverFileId)) {
+        lastSynced.set(meta.serverFileId, meta);
+      }
+    }
+    const moves = new Map<string, RenamedWhileAway>();
+    for (const f of files) {
+      const last = lastSynced.get(f.id);
+      if (!last || last.relativePath === f.path) continue;
+      // Recorded at the new path as well: that copy is the current one.
+      if (this.operationLog.getFileMeta(this.binding.id, f.path)?.serverFileId === f.id) continue;
+      // Only from a path this binding syncs. The meta comes from `state.json`,
+      // which a build without the gate may have written.
+      const from = checkVaultPath(last.relativePath, {
+        bindingFolder: this.binding.localFolder,
+        configDir: this.configDir,
+      });
+      if (from !== null) continue;
+      moves.set(f.id, { meta: { ...last, fileId: f.id, fileType: f.fileType }, to: f.path });
+    }
+    // The old path must be free: a file the listing still shows there — one
+    // created in its place, or renamed there — keeps it, and ours is left to
+    // the catch-up as before. A move dropped that way leaves its file at the
+    // listed path, which can be the old path of another move: repeat.
+    for (;;) {
+      const staying = new Set(files.filter((f) => !moves.has(f.id)).map((f) => f.path));
+      const blocked = [...moves.keys()].filter((id) => {
+        const move = moves.get(id);
+        return move !== undefined && staying.has(move.meta.relativePath);
+      });
+      if (blocked.length === 0) return moves;
+      for (const id of blocked) moves.delete(id);
+    }
+  }
+
+  /**
+   * Apply renames missed while away the way a live rename is applied (see
+   * {@link applyServerRename}): the disk move with its collision checks, a
+   * move out of the binding, a rename to a name this client never writes.
+   */
+  private async applyRenamesWhileAway(moves: Map<string, RenamedWhileAway>): Promise<void> {
+    const pending = [...moves].map(([fileId, move]) => ({
+      fileId,
+      from: move.meta.relativePath,
+      to: move.to,
+    }));
+    while (pending.length > 0) {
+      // Vacate a path before another file moves into it. A cycle (two names
+      // swapped) goes in listing order; the collision check keeps both files.
+      const sources = new Set(pending.map((move) => move.from));
+      const free = pending.findIndex((move) => !sources.has(move.to));
+      const [next] = pending.splice(Math.max(free, 0), 1);
+      if (!next) return;
+      this.log.info('file renamed while this device was away', { from: next.from, to: next.to });
+      await this.applyServerRename(next.fileId, next.to);
+      this.throwIfStopped();
+    }
   }
 
   // -- Local → Server -------------------------------------------------------
@@ -1427,22 +1532,31 @@ export class SyncEngine {
     context: string,
     opts: { requireBinding?: boolean } = {},
   ): boolean {
+    return this.refuseServerPath(path, context, opts) === null;
+  }
+
+  /** {@link allowServerPath} that says why: `null` when the path may be used. */
+  private refuseServerPath(
+    path: string,
+    context: string,
+    opts: { requireBinding?: boolean } = {},
+  ): PathRejection | null {
     const rejection = checkVaultPath(path, {
       ...(opts.requireBinding === false ? {} : { bindingFolder: this.binding.localFolder }),
       configDir: this.configDir,
     });
-    if (rejection === null) return true;
+    if (rejection === null) return null;
     const details = { context, path, reason: rejection, configDir: this.configDir };
     const key = `${rejection}\u0000${path}`;
     if (this.reportedRefusals.has(key)) {
       this.log.debug('refused a path supplied by the server', details);
-      return false;
+      return rejection;
     }
     // Paths come from the server: cap the memory they can take.
     if (this.reportedRefusals.size >= MAX_REPORTED_REFUSALS) this.reportedRefusals.clear();
     this.reportedRefusals.add(key);
     this.log.warn('refused a path supplied by the server', details);
-    return false;
+    return rejection;
   }
 
   /** Local counterpart: throw-away artifacts and never-synced folders. */
@@ -1531,7 +1645,10 @@ export class SyncEngine {
    * Live real-time events still flow through `handleServerFileEvent` and
    * bypass these guards entirely — concurrent ops always apply.
    */
-  private async applyServerOperation(op: ServerOperation): Promise<void> {
+  private async applyServerOperation(
+    op: ServerOperation,
+    superseded: ReadonlySet<ServerOperation>,
+  ): Promise<void> {
     switch (op.opType) {
       case 'CREATE': {
         if (!isInBinding(op.filePath, this.binding.localFolder)) return;
@@ -1580,6 +1697,10 @@ export class SyncEngine {
         const meta = this.fileIndex.byId.get(fileId);
         if (!meta) break;
         if (meta.relativePath === op.newPath) break;
+        // A later rename in this catch-up moves the file on, so this name is
+        // history: applied, it would move the local copy there and back — or,
+        // for a name this client never writes, delete it and fetch it again.
+        if (superseded.has(op)) break;
         await this.applyServerRename(fileId, op.newPath);
         break;
       }
@@ -1594,17 +1715,25 @@ export class SyncEngine {
     path: string;
     fileType: FileType;
   }): Promise<void> {
-    // Mirror of the refreshFileIndex filter for live events: never
-    // materialise a throw-away artifact another client uploaded.
-    if (!this.allowServerPath(payload.path, 'create')) return;
     // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
     // (the stale-CREATE guard requires it). Reuse that entry — resetting
     // its contentHash/size to zero would break every downstream three-way
     // compare (`detectBinaryConflict`, `foldDiskEditsIntoDoc`, the
     // unhydrated-doc guard in `handleLocalModify`).
-    const meta: FileMeta & { fileId: string } = this.fileIndex.byId.get(payload.id) ?? {
+    const known = this.fileIndex.byId.get(payload.id);
+    // The path the file lives at NOW. A catch-up CREATE carries the path the
+    // file was created at, and a later rename in the same catch-up is skipped
+    // as already applied — the listing has the new name. Writing a binary at
+    // the old one left the new name missing and the old one for `initialPush`
+    // to upload as a second file (or, with the old name taken by another file
+    // since, put these bytes under that file's name).
+    const path = known?.relativePath ?? payload.path;
+    // Mirror of the refreshFileIndex filter for live events: never
+    // materialise a throw-away artifact another client uploaded.
+    if (!this.allowServerPath(path, 'create')) return;
+    const meta: IndexedMeta = known ?? {
       bindingId: this.binding.id,
-      relativePath: payload.path,
+      relativePath: path,
       serverFileId: payload.id,
       fileId: payload.id,
       contentHash: '',
@@ -1612,20 +1741,19 @@ export class SyncEngine {
       fileType: payload.fileType,
       lastSyncedAt: Date.now(),
     };
-    this.fileIndex.byPath.set(meta.relativePath, meta);
+    this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(payload.id, meta);
 
     // Pull initial bytes — Yjs takes over for text after the first
-    // snapshot, but the file on disk needs to exist. `meta.relativePath`
-    // (not `payload.path`) so a reused index entry keeps its current name.
+    // snapshot, but the file on disk needs to exist.
     if (payload.fileType === 'TEXT') {
-      this.wireYjsForTextFile(payload.id, meta.relativePath);
+      this.wireYjsForTextFile(payload.id, path);
     } else {
       // Catch-up replays can fire applyServerCreate for a binary file the
       // client already has on disk (synced earlier). `createBinary` throws
       // on existing paths, so just bail — meta is already up-to-date from
       // refreshFileIndex.
-      if (await this.vault.exists(payload.path)) return;
+      if (await this.vault.exists(path)) return;
       const buf = await this.downloadFile(payload.id);
       this.throwIfStopped();
       const hash = await sha256Hex(buf);
@@ -1639,9 +1767,9 @@ export class SyncEngine {
         io.log.setFileMeta(meta);
         // One createBinary fires Obsidian onCreate + chokidar 'add' — two
         // echoes that both need consuming.
-        io.echo.mark(payload.path, ECHO_COUNT_CREATE);
-        await io.vault.ensureParentFolder(payload.path);
-        await io.vault.createBinary(payload.path, buf);
+        io.echo.mark(path, ECHO_COUNT_CREATE);
+        await io.vault.ensureParentFolder(path);
+        await io.vault.createBinary(path, buf);
       });
     }
   }
@@ -1777,7 +1905,15 @@ export class SyncEngine {
     // Deleting is a write too: a stale index entry naming the config folder
     // must not let the server erase files there.
     if (!this.allowServerPath(meta.relativePath, 'delete')) return;
+    await this.dropLocalCopy(meta, null);
+  }
 
+  /**
+   * The local copy of a file that has left what this client syncs: deleted on
+   * the server (`movedTo` null), or renamed there to `movedTo`, a name this
+   * client never writes (see {@link retireMovedAway}).
+   */
+  private async dropLocalCopy(meta: IndexedMeta, movedTo: string | null): Promise<void> {
     // One local phase, from the check to the delete. A delete stopped before
     // it reaches the disk is not replayed: the next catch-up no longer finds
     // the file in the listing and has nothing to apply it to, so the local
@@ -1793,17 +1929,33 @@ export class SyncEngine {
           return { localBuf, localHash };
         }
       }
-      await this.removeLocalCopy(io, meta);
+      await this.removeLocalCopy(io, meta, movedTo);
       return null;
     });
     if (!conflict) return;
 
     const { localBuf, localHash } = conflict;
+    if (movedTo !== null) this.movedAway.set(meta.fileId, movedTo);
     const resolution = await this.conflictResolver.resolveDeleteConflict({
       filePath: meta.relativePath,
       localSize: localBuf.byteLength,
     });
     this.throwIfStopped();
+    if (movedTo !== null) {
+      // Where the server has the file now: a later rename to another name we
+      // never write moves it on, one to a name we sync ends the question.
+      const away = this.movedAway.get(meta.fileId);
+      this.movedAway.delete(meta.fileId);
+      // Renamed to a name we sync while the user was deciding: that rename
+      // took the local copy along, and nothing is left to decide.
+      if (away === undefined) return;
+      if (resolution === 'restore-server') {
+        await this.restoreMovedAway(meta, away);
+        return;
+      }
+      await this.commitLocal((io) => this.removeLocalCopy(io, meta, away));
+      return;
+    }
     if (resolution === 'restore-server') {
       // Push the local content as a fresh CREATE so the server
       // un-deletes it. The recipient broadcast will reset our state.
@@ -1833,8 +1985,16 @@ export class SyncEngine {
     await this.commitLocal((io) => this.removeLocalCopy(io, meta));
   }
 
-  /** Delete the local copy of a file the server deleted, bookkeeping included. */
-  private async removeLocalCopy(io: LocalIO, meta: IndexedMeta): Promise<void> {
+  /**
+   * Delete the local copy of a file the server deleted, bookkeeping included.
+   * `movedTo`: the file was renamed to a name this client never writes; it is
+   * remembered by id there, so a rename back is recognised.
+   */
+  private async removeLocalCopy(
+    io: LocalIO,
+    meta: IndexedMeta,
+    movedTo: string | null = null,
+  ): Promise<void> {
     const path = meta.relativePath;
     // One delete fires Obsidian onDelete + chokidar `unlink`.
     io.echo.mark(path, ECHO_COUNT_DELETE);
@@ -1845,6 +2005,9 @@ export class SyncEngine {
     this.fileIndex.byId.delete(meta.fileId);
     io.log.deleteFileMeta(this.binding.id, path);
     this.forgetFoldState(meta.fileId);
+    if (movedTo !== null) {
+      this.outOfScope.set(meta.fileId, { path: movedTo, fileType: meta.fileType });
+    }
     await io.docs.release(this.binding.id, path);
   }
 
@@ -1854,7 +2017,19 @@ export class SyncEngine {
     // sync has moved, and refusing it would leave our copy behind for
     // `initialPush` to upload again as a brand-new file (a duplicate for the
     // whole team).
-    if (!this.allowServerPath(newPath, 'rename', { requireBinding: false })) return;
+    const refused = this.refuseServerPath(newPath, 'rename', { requireBinding: false });
+    if (refused !== null) {
+      // A name on the ignore list, or one Windows opens as another file: the
+      // file has left what this client syncs. A path that is garbage instead
+      // (`../x`, `/etc/x`) changes nothing here.
+      if (refused === 'ignored' || refused === 'invalid') {
+        await this.retireMovedAway(fileId, newPath);
+      }
+      return;
+    }
+    // Back to a name we sync while the user is still asked about the local
+    // copy (see `dropLocalCopy`): the move below takes that copy along.
+    this.movedAway.delete(fileId);
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) {
       await this.adoptRenamedFile(fileId, newPath);
@@ -1872,6 +2047,77 @@ export class SyncEngine {
     // rename as applied, writes the new path from the catch-up, and uploads
     // the old one as a brand-new file — a duplicate for the whole team.
     await this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
+  }
+
+  /**
+   * The server renamed a file we sync to `newPath`, a name this client never
+   * writes: on the ignore list, or one Windows opens as another file. The
+   * server refuses few of those names on input, and a 0.3.7 client, the MCP
+   * server or the REST API sends such renames.
+   *
+   * Handled like the local counterpart README describes — renaming a note to
+   * a name on the list works like moving it to the trash: here the file is
+   * treated as deleted on the server. Left in place, the copy under the old
+   * name dropped out of the index on the next connect and `initialPush`
+   * uploaded it as a new file, bringing the old name back for everyone. It is
+   * never moved to `newPath` either: that could be the config folder.
+   */
+  private async retireMovedAway(fileId: string, newPath: string): Promise<void> {
+    const meta = this.fileIndex.byId.get(fileId);
+    if (!meta) {
+      // Not a file we sync; keep its shadow entry current (see `outOfScope`).
+      const shadow = this.outOfScope.get(fileId);
+      if (shadow) this.outOfScope.set(fileId, { ...shadow, path: newPath });
+      return;
+    }
+    // The user is already being asked about this copy: only the name moves on.
+    if (this.movedAway.has(fileId)) {
+      this.movedAway.set(fileId, newPath);
+      return;
+    }
+    if (!this.allowServerPath(meta.relativePath, 'rename source', { requireBinding: false })) {
+      return;
+    }
+    this.log.info('file renamed to a name that is never synced; removing the local copy', {
+      path: meta.relativePath,
+      newPath,
+    });
+    await this.dropLocalCopy(meta, newPath);
+  }
+
+  /**
+   * "Restore on server" for a file renamed to a name this client never writes
+   * (see {@link retireMovedAway}): the local copy has edits, so move the file
+   * back to the name it has here, then send them. Creating it anew instead
+   * would start a second history next to the one the local doc carries — the
+   * doubled-text incidents. Offline, or refused by the server, nothing
+   * changes: the copy stays indexed under the old name, so it is not uploaded
+   * as a new file, and the next connect asks again.
+   */
+  private async restoreMovedAway(meta: IndexedMeta, movedTo: string): Promise<void> {
+    const path = meta.relativePath;
+    if (!this.socket.isConnected()) return;
+    try {
+      const ack = await this.socket.emitFileRename({
+        projectId: this.binding.projectId,
+        clientId: this.clientId,
+        vectorClock: this.bumpClock(),
+        fileId: meta.fileId,
+        filePath: movedTo,
+        newPath: path,
+      });
+      this.throwIfStopped();
+      if (!ack.ok) {
+        this.log.warn('could not move a renamed file back', { path, movedTo, error: ack.error });
+        return;
+      }
+    } catch {
+      this.throwIfStopped();
+      this.log.debug('moving a renamed file back failed; asking again on reconnect', path);
+      return;
+    }
+    this.persistVectorClock();
+    await this.handleLocalModify(path);
   }
 
   /** Apply a server rename to the disk and the index. Local phase only. */
@@ -2925,6 +3171,29 @@ function describeError(err: unknown, fallback: string): string {
   if (err instanceof ApiError) return `${err.kind} (HTTP ${err.status})`;
   if (err instanceof Error) return err.message;
   return fallback;
+}
+
+/**
+ * The renames and moves of a catch-up that a later one of the same file
+ * supersedes. The operations come in the order the server applied them.
+ */
+function supersededRenames(ops: readonly ServerOperation[]): Set<ServerOperation> {
+  const fileIdOf = (op: ServerOperation): string | null => {
+    if (op.opType !== 'RENAME' && op.opType !== 'MOVE') return null;
+    const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
+    return typeof fileId === 'string' && fileId !== '' ? fileId : null;
+  };
+  const last = new Map<string, ServerOperation>();
+  for (const op of ops) {
+    const fileId = fileIdOf(op);
+    if (fileId !== null) last.set(fileId, op);
+  }
+  const superseded = new Set<ServerOperation>();
+  for (const op of ops) {
+    const fileId = fileIdOf(op);
+    if (fileId !== null && last.get(fileId) !== op) superseded.add(op);
+  }
+  return superseded;
 }
 
 function mergeClocks(a: VectorClock, b: VectorClock): VectorClock {

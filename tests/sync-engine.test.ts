@@ -3715,7 +3715,7 @@ describe('SyncEngine — гейт путей от сервера', () => {
     await h.engine.stop();
   });
 
-  it('переименование в папку конфигурации не трогает файл и не перенацеливает метаданные', async () => {
+  it('переименование в папку конфигурации не трогает её файлы и не перенацеливает метаданные', async () => {
     // Полный сценарий утечки: сервер переименовывает известный нам файл в
     // data.json. До фикса meta.relativePath уезжал на этот путь, и дальше
     // любая выгрузка отправляла на сервер содержимое настроек.
@@ -3741,9 +3741,13 @@ describe('SyncEngine — гейт путей от сервера', () => {
     await flushAsync(20);
 
     expect(seen).not.toContain('error');
-    expect(await h.vault.readText('note.md')).toBe('моя заметка');
-    expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
+    // Имя, которое клиент никогда не пишет: заметка ушла из синхронизации, как
+    // при удалении (см. «Renaming a note to a name on the list» в README), —
+    // но метаданные не перенацелены на файл настроек.
+    expect(await h.vault.exists('note.md')).toBe(false);
+    expect(h.engine.getFileIdForPath('note.md')).toBeNull();
     expect(h.engine.getFileIdForPath('.obsidian/plugins/team-vault/data.json')).toBeNull();
+    expect(h.log.getFileMeta('b1', '.obsidian/plugins/team-vault/data.json')).toBeNull();
     // Чужой файл не тронут и не «отставлен в сторону».
     expect(await h.vault.readText('.obsidian/plugins/team-vault/data.json')).toBe(
       '{"apiKey":"osync_secret"}',
