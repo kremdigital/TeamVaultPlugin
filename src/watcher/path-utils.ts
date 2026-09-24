@@ -190,24 +190,96 @@ const ALWAYS_IGNORED_SEGMENT_PATTERNS = [
 ] as const;
 
 /**
- * Case- and unicode-folded form used for every comparison here. macOS hands
- * out NFD for non-ASCII names while the server may store NFC; on APFS both
- * open the same folder, so comparing raw strings would let a config folder
- * named `.конфиг` through in one of the two forms.
+ * Code points HFS+ (the Mac file system before APFS, still found on drives
+ * formatted "Mac OS Extended") skips when it compares names, so there
+ * `.obs<U+200C>idian` IS `.obsidian`. The list is git's (`is_hfs_dotgit`,
+ * CVE-2014-9390).
+ */
+const HFS_IGNORABLE = /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g;
+
+/**
+ * Case- and unicode-folded form used for every name comparison here. It has to
+ * merge every two spellings that some file system opens as the same folder:
+ * otherwise the server can spell the config folder, `.git` or `.trash` so that
+ * the gate reads another name while the disk opens the real one.
+ *
+ *   - APFS, case-insensitive as macOS formats it by default, compares names by
+ *     full Unicode case folding after canonical decomposition: `ſ` (long s) is
+ *     `s`, `ß` and `ẞ` are `ss`, the ligature `ﬁ` is `fi`, and NFD is NFC. With
+ *     `toLowerCase` alone `.obſidian/plugins/team-vault/data.json` passed the
+ *     gate and opened the plugin's own settings, API key included, on a Mac.
+ *   - HFS+ also skips the code points above.
+ *   - NTFS upper-cases each character by the volume's table.
+ *
+ * Lower, then upper, then lower again gets full case folding out of the
+ * built-in string functions: the upper step turns `ſ` into `S` and expands
+ * `ß` and the ligatures, and the first lower step turns `ẞ` into `ß` for
+ * it. Checked for every code point against Python's `str.casefold`, APFS's
+ * folding table and NTFS on Windows 11. A few pairs no file system merges are
+ * merged too (`ı` with `i`): one refusal too many is safe, one too few is
+ * not. Only the comparison changes — a path is written to disk as the server
+ * spelled it.
  */
 function fold(value: string): string {
-  return normalizeSeparators(value).normalize('NFC').toLowerCase();
+  return normalizeSeparators(value)
+    .normalize('NFD')
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .replace(HFS_IGNORABLE, '')
+    .normalize('NFC');
 }
 
-/** The config folder, folded, with surrounding slashes trimmed. `''` if unset. */
-function configPrefix(configDir?: string): string {
-  return fold(configDir ?? '')
-    .replace(/^\/+/, '')
-    .replace(/\/+$/, '');
+/**
+ * Stricter key for comparing a whole name with a listed one — the config
+ * folder, `.git`, `desktop.ini`, …: compatibility forms are merged as well, so
+ * `．obsidian` (a fullwidth dot) and `.ＧＩＴ` count too. Only a volume that
+ * normalizes names that way opens them as the real folder (ZFS with
+ * `normalization=formKC`, a NAS option), and no note is named like that by
+ * chance. The patterns and suffixes below stay on `fold`: there NFKC would
+ * turn a Japanese folder `日記～` (fullwidth tilde) into `日記~` and skip it
+ * as a backup copy.
+ *
+ * `folded` is `fold(value)` when the caller already has it: most names have
+ * no compatibility form, and then the key is that fold.
+ */
+function nameKey(value: string, folded?: string): string {
+  const compatible = value.normalize('NFKC');
+  if (compatible === value && folded !== undefined) return folded;
+  return fold(compatible);
 }
 
-/** `ALWAYS_IGNORED_SEGMENTS`, folded once — `isAlwaysIgnored` runs per chokidar path. */
-const IGNORED_SEGMENT_SET: ReadonlySet<string> = new Set(ALWAYS_IGNORED_SEGMENTS.map(fold));
+/**
+ * A path's segments as spelled: separators unified, NFC, case kept. Each rule
+ * folds a segment on its own, the way it needs to.
+ */
+function spelledSegments(vaultPath: string): string[] {
+  return normalizeSeparators(vaultPath).normalize('NFC').split('/');
+}
+
+/** `configSegments` for the last folder asked about — every call passes the same one. */
+let lastConfigDir = '';
+let lastConfigSegments: readonly string[] = [];
+
+/**
+ * The config folder as leading-segment keys, `[]` if unset. Obsidian keeps it
+ * at the vault root (`Vault.configDir` is one name, see `isListedPath`).
+ */
+function configSegments(configDir?: string): readonly string[] {
+  const dir = configDir ?? '';
+  if (dir !== lastConfigDir) {
+    lastConfigDir = dir;
+    lastConfigSegments = spelledSegments(dir)
+      .map((segment) => nameKey(segment))
+      .filter((key) => key !== '');
+  }
+  return lastConfigSegments;
+}
+
+/** `ALWAYS_IGNORED_SEGMENTS`, keyed once — `isAlwaysIgnored` runs per chokidar path. */
+const IGNORED_SEGMENT_KEYS: ReadonlySet<string> = new Set(
+  ALWAYS_IGNORED_SEGMENTS.map((name) => nameKey(name)),
+);
 
 /**
  * `.tmp` and `~` — editors' temporary and backup copies (Syncthing's
@@ -235,9 +307,24 @@ const ATOMIC_TMP_PATTERN = /\.tmp\.(\d+)\.[0-9a-f]+$/i;
  */
 const SHORT_NAME_PATTERN = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
 
+/** Characters Windows can't have in a name (besides `/`, `\` and `:`). */
+const WINDOWS_FORBIDDEN_CHARS = /[*?<>"|]/;
+
+/** A control character (U+0000–U+001F) — Windows can't have one in a name either. */
+function hasControlCharacter(segment: string): boolean {
+  for (let i = 0; i < segment.length; i++) {
+    if (segment.charCodeAt(i) < 0x20) return true;
+  }
+  return false;
+}
+
 /**
  * True for a name that Windows opens as a DIFFERENT file or folder than the
- * one it spells — so no rule above, which compares names, can vouch for it:
+ * one it spells, or can't give a file at all — so no rule above, which
+ * compares names, can vouch for it. Tested on the segment as spelled (NFC,
+ * any case), since that is what NTFS compares: none of these rules has a
+ * letter in it, and folding `STRAßE~1` into `strasse~1` would make it too
+ * long for a short name.
  *
  *   - Any `:`. On NTFS `name:stream` addresses a stream of `name`, and
  *     `desktop.ini::$DATA` IS `desktop.ini`, `.obsidian::$INDEX_ALLOCATION`
@@ -250,44 +337,66 @@ const SHORT_NAME_PATTERN = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
  *     hook. Which alias a folder got depends on the disk, so every name of
  *     that shape is refused. A real note named like one (`Draft~1.md`) is not
  *     synced either — the price of not guessing.
+ *   - A trailing dot or space (`Notes.`, `.obsidian `). Node writes the name
+ *     literally (it opens files through `\\?\`), but Explorer and the shell
+ *     drop the dot or space: deleting a synced `Notes.` from Obsidian (it goes
+ *     to the system trash through the shell) trashed the real `Notes` next to
+ *     it, and the delete went on to the whole team. Obsidian on Windows
+ *     refuses such names itself.
+ *   - `* ? < > " |` and control characters. Windows can't store them, while
+ *     Obsidian on macOS and Linux allows all but `:`. A Mac user's `Why?.md`
+ *     reached a Windows teammate whose disk refused to write it, and the
+ *     failed write stalled that teammate's sync.
  *
- * Trailing dots and spaces (`.obsidian.`) are not on the list: Windows drops
- * them only on the Win32 path, and Node opens files through `\\?\`, which
- * keeps the name literal.
+ * Every device refuses these names in both directions, as with the list
+ * above: a name one teammate's disk can't hold is not uploaded by another.
  */
 function isWindowsAlias(segment: string): boolean {
-  if (segment.includes(':')) return true;
+  if (segment.includes(':') || WINDOWS_FORBIDDEN_CHARS.test(segment)) return true;
+  if (hasControlCharacter(segment)) return true;
+  if (segment.endsWith('.') || segment.endsWith(' ')) return true;
   const shortName = SHORT_NAME_PATTERN.exec(segment);
   return shortName !== null && (shortName[1] ?? '').length <= 8;
 }
 
-/** One folded segment against every per-name rule of the ignore list. */
-function isIgnoredSegment(segment: string): boolean {
-  if (IGNORED_SEGMENT_SET.has(segment)) return true;
-  if (ALWAYS_IGNORED_SEGMENT_PATTERNS.some((re) => re.test(segment))) return true;
-  if (ALWAYS_IGNORED_SUFFIX.some((suffix) => segment.endsWith(suffix))) return true;
-  if (ATOMIC_TMP_PATTERN.test(segment)) return true;
-  return isWindowsAlias(segment);
+/** One segment against the named list (by `nameKey`), its patterns and suffixes (by `fold`). */
+function isListedSegment(segment: string): boolean {
+  const folded = fold(segment);
+  if (IGNORED_SEGMENT_KEYS.has(nameKey(segment, folded))) return true;
+  if (ALWAYS_IGNORED_SEGMENT_PATTERNS.some((re) => re.test(folded))) return true;
+  if (ALWAYS_IGNORED_SUFFIX.some((suffix) => folded.endsWith(suffix))) return true;
+  return ATOMIC_TMP_PATTERN.test(folded);
+}
+
+/** The config folder and the named list — everything but the Windows rules. */
+function isListedPath(segments: readonly string[], configDir?: string): boolean {
+  // The config folder is matched at the vault root only. Obsidian reads its
+  // settings from `<vault>/<configDir>` and nowhere else (`Vault.configDir`
+  // is a single name), so a folder of that name deeper down is inert content:
+  // a user whose folder is `.obsidian-work` may well keep a downloaded
+  // vault's `Архив/.obsidian-work/` as ordinary notes. `.obsidian`, the name
+  // every other vault's config folder has, is on the list and refused
+  // anywhere.
+  const cfg = configSegments(configDir);
+  if (cfg.length > 0 && cfg.every((name, i) => nameKey(segments[i] ?? '') === name)) return true;
+  // Everything else is refused anywhere in the tree: a `.git` or a `.trash`
+  // in a subfolder is still a repository and still a trash can.
+  return segments.some(isListedSegment);
 }
 
 /**
  * True if the file should be filtered out entirely, regardless of binding.
  *
- * Matching is case-insensitive: `.OBSIDIAN/plugins/team-vault/data.json` is
- * the same folder as `.obsidian/...` on Windows and macOS, and comparing
- * case-sensitively let a server-supplied path walk straight past the filter.
+ * Matching ignores letter case and Unicode spelling (see `fold`):
+ * `.OBSIDIAN/plugins/team-vault/data.json` is the same folder as
+ * `.obsidian/...` on Windows and macOS, and comparing case-sensitively let a
+ * server-supplied path walk straight past the filter.
  */
 export function isAlwaysIgnored(vaultPath: string, configDir?: string): boolean {
-  const path = fold(vaultPath);
-  if (path === '') return true;
-  // The config folder lives at the vault root, so it is matched as a prefix —
-  // not as a segment. A user whose folder is `.obsidian-work` may well keep a
-  // downloaded vault's `Архив/.obsidian-work/` as ordinary notes.
-  const cfg = configPrefix(configDir);
-  if (cfg !== '' && (path === cfg || path.startsWith(`${cfg}/`))) return true;
-  // Everything else is refused anywhere in the tree: a `.git` or a `.trash`
-  // in a subfolder is still a repository and still a trash can.
-  return path.split('/').some(isIgnoredSegment);
+  // Empty — or nothing but code points HFS+ skips, which `fold` drops.
+  if (normalizeSeparators(vaultPath).replace(HFS_IGNORABLE, '') === '') return true;
+  const segments = spelledSegments(vaultPath);
+  return isListedPath(segments, configDir) || segments.some(isWindowsAlias);
 }
 
 /**
@@ -344,11 +453,15 @@ export function checkVaultPath(
   // empty segment (`a//b`) is not a path Obsidian ever produces.
   const segments = path.split('/');
   if (segments.some((s) => s === '' || s === '.' || s === '..')) return 'traversal';
-  // `.obsidian::$INDEX_ALLOCATION/…`, `OBSIDI~1/…` — on Windows these open a
-  // folder whose name the checks below would never see. `isAlwaysIgnored`
-  // refuses them too; this only gives the log its own reason.
-  if (segments.some((s) => isWindowsAlias(fold(s)))) return 'invalid';
-  if (isAlwaysIgnored(path, opts.configDir)) return 'ignored';
+  // The same predicate as for local paths, so both directions refuse alike.
+  // The reason for the log is 'ignored' when the name is on the list (`Icon\r`
+  // is, though its carriage return breaks a Windows rule too) and 'invalid'
+  // when only a Windows rule refuses it: `.obsidian::$INDEX_ALLOCATION/…` and
+  // `OBSIDI~1/…` open a folder whose name the list never sees, `Why?.md`
+  // can't be written on Windows.
+  if (isAlwaysIgnored(path, opts.configDir)) {
+    return isListedPath(segments, opts.configDir) ? 'ignored' : 'invalid';
+  }
   if (opts.bindingFolder !== undefined && !isInBinding(path, opts.bindingFolder)) {
     return 'outside-binding';
   }

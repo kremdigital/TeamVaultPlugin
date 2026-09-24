@@ -148,11 +148,16 @@ server whenever it connects, including at startup.
 Some paths are skipped in both directions: they are never uploaded, and a
 copy that arrives from the server is neither written to disk nor allowed to
 delete or overwrite the local file. A path is skipped when any folder or file
-name in it matches, in any letter case:
+name in it matches — except your vault's config folder, which is matched at
+the vault root only, the one place Obsidian reads it from. Names are compared
+the way a disk that ignores letter case compares them: `.OBSIDIAN` matches,
+and so does a spelling macOS opens as the same folder, such as `.obſidian`
+with a long s.
 
-- **Obsidian and Team Vault** — the config folder (`.obsidian`, or the one
-  you set in Obsidian), Obsidian's `.trash`, `.git`, and the server's own
-  `.versions` / `.staging`.
+- **Obsidian and Team Vault** — your vault's config folder at the vault root
+  (`.obsidian`, or the one you set in Obsidian), a folder named `.obsidian`
+  anywhere (another vault's settings), Obsidian's `.trash`, `.git`, and the
+  server's own `.versions` / `.staging`.
 - **Temporary files** — names ending in `.tmp` or `~`, and the leftovers of
   Obsidian's interrupted saves (`<name>.tmp.<pid>.<hex>`). A folder with
   such a name is skipped with everything in it.
@@ -173,19 +178,32 @@ name in it matches, in any letter case:
   Google Drive's `.tmp.drivedownload` and `.tmp.driveupload`; the Nextcloud
   and ownCloud client's journal (`.sync_<hex>.db` with its `-wal` / `-shm`
   files) and `.owncloudsync.log`.
-- **Names Windows opens as a different file** — any name with a `:` in it
-  (Obsidian doesn't allow one either; on Windows `desktop.ini::$DATA` is
-  `desktop.ini` itself), and names shaped like a Windows short name: up to
-  8 characters ending in `~` and digits, optionally with an extension of up
-  to 3 (`PROJEC~1`, `Draft~1.md`). On Windows such a name may open a
-  different file or folder than the one it spells, so none of them is
-  synced, on any system.
+- **Names Windows can't keep as spelled** — on Windows such a name opens a
+  different file or folder than the one it spells, or can't be written at
+  all:
+  - any name with a `:` in it (Obsidian doesn't allow one either; on
+    Windows `desktop.ini::$DATA` is `desktop.ini` itself);
+  - names shaped like a Windows short name: up to 8 characters ending in `~`
+    and digits, optionally with an extension of up to 3 (`PROJEC~1`,
+    `Draft~1.md`);
+  - names ending in a dot or a space (a folder `Notes.` or `Notes `):
+    Windows drops the dot or space, so deleting such a folder there could
+    delete the folder `Notes` next to it instead;
+  - names with `*`, `?`, `<`, `>`, `"`, `|` or a control character (a note
+    `Why?.md`): Windows can't store them.
+
+  Obsidian on Windows refuses all of these but short names; on macOS and
+  Linux it lets you create most of them. None of them is synced on any
+  system — not even between two Macs — so that no teammate uploads a name
+  another teammate's disk can't hold. Rename such a note (`Why.md`) to sync
+  it.
 
 The list is built in and the same on every device, so there is no setting
 for it. Such files that an older version already uploaded stay on the
-server; the plugin leaves them alone. Renaming a note to a name on the list
-works like moving it to the trash: teammates see it deleted, and your copy
-stays on your disk only.
+server; the plugin leaves them alone, and your own copy stays on your disk
+without syncing any more. Renaming a note to a name on the list works like
+moving it to the trash: teammates see it deleted, and your copy stays on
+your disk only.
 
 ## Commands
 
@@ -245,7 +263,7 @@ Look for `[error]` lines. Common causes:
   [What is never synced](#what-is-never-synced). Local files like that are
   skipped without a log line; one the server still holds is logged as
   `refused a path supplied by the server` with `"reason":"ignored"` (or
-  `"invalid"` for a name Windows would open as another file) — at `warn`
+  `"invalid"` for a name Windows can't keep as spelled) — at `warn`
   once per path while the plugin runs, and at `debug` after that.
 - A binding made by an older version points to a subfolder that no longer
   exists — remove it and bind the vault again. Note that the new binding

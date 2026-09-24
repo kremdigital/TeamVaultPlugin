@@ -14,7 +14,9 @@ import type { RecentlyApplied } from './recently-applied';
  *     `path-utils`, the same list chokidar and the engine use). Obsidian
  *     never indexes a dotted path, so here that is mostly service files
  *     without a dot, such as `desktop.ini`, `Thumbs.db` and Office's
- *     `~$<name>` owner files, and folders named like temporary files.
+ *     `~$<name>` owner files, folders named like temporary files, and
+ *     names Windows can't keep as spelled (`Why?.md`, a folder `Notes.`),
+ *     which Obsidian allows on macOS and Linux.
  *   - Debounce `modify` per (binding, path) — Obsidian fires several
  *     events per save (`metadata`, `links`, etc) and the engine doesn't
  *     need every microtick.
