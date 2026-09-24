@@ -56,8 +56,9 @@ server — here is exactly what that means:
   itself, whatever the server asks for.
 - **Synced content is the content of the bound vault** — note text, binary
   attachments, paths, and their edit history — sent to your server so other
-  devices and teammates can receive it. The config folder, `.trash` and
-  `.git` are never synced.
+  devices and teammates can receive it. The config folder, `.trash`, `.git`
+  and the service files of the OS and other sync tools are never synced (see
+  [What is never synced](#what-is-never-synced)).
 - **No telemetry, no analytics, no crash reporting.** The plugin sends
   nothing anywhere else, and collects nothing about you.
 - **Logs stay local**, in `.obsidian/plugins/team-vault/sync.log`.
@@ -142,6 +143,35 @@ synchronizing. The status bar shows the aggregate state.
 There is no "sync on startup" switch: every binding catches up with the
 server whenever it connects, including at startup.
 
+### What is never synced
+
+Some paths are skipped in both directions: they are never uploaded, and a
+copy that arrives from the server is neither written to disk nor allowed to
+delete or overwrite the local file. A path is skipped when any folder or file
+name in it matches, in any letter case:
+
+- **Obsidian and Team Vault** — the config folder (`.obsidian`, or the one
+  you set in Obsidian), Obsidian's `.trash`, `.git`, and the server's own
+  `.versions` / `.staging`.
+- **Temporary files** — names ending in `.tmp` or `~`, and the leftovers of
+  Obsidian's interrupted saves (`<name>.tmp.<pid>.<hex>`).
+- **macOS** — `.DS_Store`, AppleDouble files (`._<name>`), the folder icon
+  file `Icon\r` (its name ends in a carriage return), iCloud placeholders
+  (`.<name>.icloud`), and what macOS keeps at the root of a volume:
+  `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems`,
+  `.DocumentRevisions-V100`.
+- **Windows** — `desktop.ini`, `Thumbs.db`, `$RECYCLE.BIN`,
+  `System Volume Information`.
+- **Linux** — `.directory` (Dolphin) and `.Trash-<uid>` folders.
+- **Other sync tools** — Syncthing's `.stfolder`, `.stversions` and
+  `.stignore`; Resilio Sync's `.sync` folder and unfinished `*.!sync`
+  downloads; Dropbox's `.dropbox` and `.dropbox.cache`; Google Drive's
+  `.tmp.drivedownload` and `.tmp.driveupload`.
+
+The list is built in and the same on every device, so there is no setting
+for it. Such files that an older version already uploaded stay on the
+server; the plugin leaves them alone.
+
 ## Commands
 
 Available from the command palette (`Ctrl/Cmd-P`), where Obsidian lists
@@ -196,15 +226,22 @@ headers cleanly, the socket can't establish. Check Caddy / nginx logs.
 Look for `[error]` lines. Common causes:
 
 - The binding is switched off (toggle in **Team Vault → Vaults**).
+- The file's name is on the built-in ignore list — see
+  [What is never synced](#what-is-never-synced). Local files like that are
+  skipped without a log line; one the server still holds is logged as
+  `refused a path supplied by the server` with `"reason":"ignored"`.
 - A binding made by an older version points to a subfolder that no longer
   exists — remove it and bind the vault again. Note that the new binding
   covers the whole vault, so every note in it goes to the project.
 
 **External agent edits don't propagate** — the FS watcher uses chokidar
 on the vault root and respects the same ignore list: the config folder,
-`.trash`, `.git`, and the server's own `.versions` / `.staging`. For a
-binding made to a subfolder by an older version, files outside that folder
-are correctly ignored.
+`.trash`, `.git`, the server's own `.versions` / `.staging`, temporary files,
+and the service files of the OS and other sync tools (`.DS_Store`,
+`desktop.ini`, `Thumbs.db`, `.stfolder`, … — the full list is in
+[What is never synced](#what-is-never-synced)). For a binding made to a
+subfolder by an older version, files outside that folder are correctly
+ignored.
 
 **"The plugin settings file is damaged" notice** — the plugin's `data.json`
 (in `.obsidian/plugins/team-vault/`) isn't valid JSON any more, usually

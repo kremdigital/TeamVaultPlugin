@@ -21,8 +21,10 @@ import type { VaultEvent, VaultEventHandler } from './obsidian-events';
  *     Obsidian (CLI scripts, AI agents writing directly to disk, …) get
  *     observed. Obsidian's `vault.on(...)` only fires for app-mediated
  *     edits.
- *   - Ignore noise: `.obsidian`, `.git`, `.versions`, temp files,
- *     anything outside an enabled binding's `localFolder`.
+ *   - Ignore noise: `.obsidian`, `.git`, `.versions`, temp files, service
+ *     files of the OS and of other sync tools (`.DS_Store`, `desktop.ini`,
+ *     `.stfolder`, … — the list lives in `path-utils`), anything outside an
+ *     enabled binding's `localFolder`.
  *   - Debounce writes — external agents commonly rewrite a file in
  *     several syscalls; we want one event after the dust settles.
  *   - Suppress events triggered by our own `vault.modify(...)` calls

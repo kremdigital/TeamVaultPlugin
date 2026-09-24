@@ -58,8 +58,17 @@ export function normalizeSeparators(p: string): string {
 export const DEFAULT_CONFIG_DIR = '.obsidian';
 
 /**
- * Paths the watchers and the sync engine never touch, whatever the binding
- * covers:
+ * Names the watchers and the sync engine never touch, whatever the binding
+ * covers. A path is ignored when ANY of its segments equals one of them,
+ * compared case-insensitively — a `.git` or a `desktop.ini` in a subfolder is
+ * still a repository and still Explorer's file.
+ *
+ * This list (with the patterns below) is the ONE source of truth for both
+ * directions: `isAlwaysIgnored` backs the chokidar `ignored` predicate, both
+ * watchers, the engine's outgoing gate and offline-queue replay, and
+ * `checkVaultPath` — the gate for every path the server sends.
+ *
+ * Team Vault's and Obsidian's own:
  *   - `.obsidian` — a config folder. Kept even when `configDir` differs: in
  *     that vault it belongs to *another* Obsidian setup, not to this one.
  *     The directory's linter flags the literal (hardcoded-config-path); here
@@ -69,6 +78,36 @@ export const DEFAULT_CONFIG_DIR = '.obsidian';
  *     them outright, so uploading one would retry for ever.
  *   - `.trash` — Obsidian's vault trash. Without it a note deleted into the
  *     trash reappears as a create, and the delete travels back to the server.
+ *
+ * Service files of the OS and of other sync tools. Since 0.3.4 a binding
+ * always covers the whole vault, so whatever these tools leave in the vault
+ * root went to the project and on to every teammate's disk. Each name is one
+ * that nobody keeps as content: most start with a dot, and Obsidian never
+ * indexes a path with a dotted segment (nor lets you name a file that way), so
+ * none of them can be a note; the rest (`Icon\r`, `desktop.ini`, `Thumbs.db`,
+ * `$RECYCLE.BIN`, `System Volume Information`) are names the OS keeps for
+ * itself. There is no user-editable list on purpose: one fixed list is the
+ * same on every device of the team, so no client uploads what another one
+ * refuses to write.
+ *   - `.DS_Store` — Finder's per-folder view settings (macOS).
+ *   - `.Spotlight-V100`, `.fseventsd`, `.Trashes`, `.TemporaryItems`,
+ *     `.DocumentRevisions-V100` — what macOS keeps at the root of a volume,
+ *     i.e. of a vault kept on a USB stick. `.Trashes` holds files deleted in
+ *     Finder: synced, they would come back to the team as new notes.
+ *   - `Icon\r` — a folder's custom icon on macOS (the name really ends in a
+ *     carriage return).
+ *   - `desktop.ini` — Explorer's per-folder settings; `Thumbs.db` — its
+ *     thumbnail cache (Windows).
+ *   - `$RECYCLE.BIN`, `System Volume Information` — the Recycle Bin and the
+ *     restore-point store at the root of a Windows volume.
+ *   - `.directory` — Dolphin's per-folder settings (KDE, Linux).
+ *   - `.stfolder`, `.stversions`, `.stignore` — Syncthing's folder marker, its
+ *     file versions and its per-device ignore file. Its temporary files
+ *     (`.syncthing.*.tmp`, `~syncthing~*.tmp`) fall under the `.tmp` suffix.
+ *   - `.sync` — Resilio Sync's folder settings and archive.
+ *   - `.dropbox`, `.dropbox.cache` — Dropbox's folder marker and cache.
+ *   - `.tmp.drivedownload`, `.tmp.driveupload` — Google Drive's transfer
+ *     folders.
  */
 export const ALWAYS_IGNORED_SEGMENTS = [
   '.obsidian',
@@ -76,7 +115,46 @@ export const ALWAYS_IGNORED_SEGMENTS = [
   '.versions',
   '.staging',
   '.trash',
+  // macOS
+  '.DS_Store',
+  '.Spotlight-V100',
+  '.fseventsd',
+  '.Trashes',
+  '.TemporaryItems',
+  '.DocumentRevisions-V100',
+  'Icon\r',
+  // Windows
+  'desktop.ini',
+  'Thumbs.db',
+  '$RECYCLE.BIN',
+  'System Volume Information',
+  // Linux (KDE)
+  '.directory',
+  // Syncthing
+  '.stfolder',
+  '.stversions',
+  '.stignore',
+  // Resilio Sync
+  '.sync',
+  // Dropbox
+  '.dropbox',
+  '.dropbox.cache',
+  // Google Drive
+  '.tmp.drivedownload',
+  '.tmp.driveupload',
 ] as const;
+
+/**
+ * Service names that come in families rather than one fixed spelling. Tested
+ * against every segment, after folding (so written in lower case):
+ *   - `._<name>` — AppleDouble: macOS stores a file's extended attributes
+ *     next to it this way on FAT, exFAT and network shares.
+ *   - `.<name>.icloud` — iCloud Drive's placeholder for a file evicted from
+ *     the disk ("Optimize Mac Storage"), a stub instead of the content.
+ *   - `.Trash-<uid>` — the Linux desktop trash on a removable volume; like
+ *     `.Trashes`, it holds deleted files.
+ */
+const ALWAYS_IGNORED_SEGMENT_PATTERNS = [/^\._/, /^\..+\.icloud$/, /^\.trash-\d+$/] as const;
 
 /**
  * Case- and unicode-folded form used for every comparison here. macOS hands
@@ -95,7 +173,14 @@ function configPrefix(configDir?: string): string {
     .replace(/\/+$/, '');
 }
 
-const ALWAYS_IGNORED_SUFFIX = ['.tmp', '~'] as const;
+/** `ALWAYS_IGNORED_SEGMENTS`, folded once — `isAlwaysIgnored` runs per chokidar path. */
+const IGNORED_SEGMENT_SET: ReadonlySet<string> = new Set(ALWAYS_IGNORED_SEGMENTS.map(fold));
+
+/**
+ * `.tmp` and `~` — editors' temporary and backup copies (Syncthing's
+ * temporary files too). `.!sync` — a file Resilio Sync is still downloading.
+ */
+const ALWAYS_IGNORED_SUFFIX = ['.tmp', '~', '.!sync'] as const;
 
 /**
  * Obsidian's desktop adapter writes files atomically: content goes to
@@ -123,9 +208,9 @@ export function isAlwaysIgnored(vaultPath: string, configDir?: string): boolean 
   if (cfg !== '' && (path === cfg || path.startsWith(`${cfg}/`))) return true;
   // These names are refused anywhere in the tree: a `.git` or a `.trash` in a
   // subfolder is still a repository and still a trash can.
-  const segments = path.split('/');
-  for (const name of ALWAYS_IGNORED_SEGMENTS) {
-    if (segments.includes(name)) return true;
+  for (const segment of path.split('/')) {
+    if (IGNORED_SEGMENT_SET.has(segment)) return true;
+    if (ALWAYS_IGNORED_SEGMENT_PATTERNS.some((re) => re.test(segment))) return true;
   }
   for (const suffix of ALWAYS_IGNORED_SUFFIX) {
     if (path.endsWith(suffix)) return true;

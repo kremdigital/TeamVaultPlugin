@@ -172,6 +172,103 @@ describe('ignored folders — config dir, trash, case, unicode', () => {
   });
 });
 
+/**
+ * Since 0.3.4 a binding always covers the whole vault, so the service files
+ * other tools leave in the vault root (and in every folder) went to the
+ * project: the filter only knew the config folder, `.git`, `.trash`, the
+ * server's folders and temporary files.
+ */
+describe('service files of the OS and other sync tools', () => {
+  it.each([
+    // macOS
+    '.DS_Store',
+    'notes/.DS_Store',
+    '.Spotlight-V100/Store-V2/index',
+    '.fseventsd/fseventsd-uuid',
+    '.Trashes/501/deleted.md',
+    '.TemporaryItems/folders.501/x',
+    '.DocumentRevisions-V100/db-V1/db.sqlite',
+    'notes/Icon\r',
+    'notes/._idea.md',
+    '._.DS_Store',
+    'notes/.idea.md.icloud',
+    // Windows
+    'desktop.ini',
+    'Проекты/desktop.ini',
+    'Thumbs.db',
+    'images/Thumbs.db',
+    '$RECYCLE.BIN/S-1-5-21/$R1.md',
+    'System Volume Information/tracking.log',
+    // Linux
+    'notes/.directory',
+    '.Trash-1000/files/deleted.md',
+    // Syncthing
+    '.stfolder',
+    '.stfolder/syncthing-folder-0a1b2c.txt',
+    '.stversions/notes/idea~20260922-101500.md',
+    '.stignore',
+    'notes/.syncthing.idea.md.tmp',
+    'notes/~syncthing~idea.md.tmp',
+    // Resilio Sync
+    '.sync/ID',
+    '.sync/Archive/idea.md',
+    'notes/idea.md.!sync',
+    // Dropbox
+    '.dropbox',
+    '.dropbox.cache/2026-09-22/idea.md',
+    // Google Drive
+    '.tmp.drivedownload/12345',
+    '.tmp.driveupload/67890',
+  ])('ignores %j', (path) => {
+    expect(isAlwaysIgnored(path)).toBe(true);
+    expect(checkVaultPath(path, { bindingFolder: '/' })).toBe('ignored');
+  });
+
+  it('matches regardless of case', () => {
+    // Windows and macOS file systems don't care — and neither may the gate:
+    // a server-supplied `DESKTOP.INI` would still overwrite Explorer's file.
+    expect(isAlwaysIgnored('.ds_store')).toBe(true);
+    expect(isAlwaysIgnored('notes/DESKTOP.INI')).toBe(true);
+    expect(isAlwaysIgnored('thumbs.db')).toBe(true);
+    expect(isAlwaysIgnored('.STFOLDER/marker')).toBe(true);
+    expect(isAlwaysIgnored('$Recycle.Bin/x.md')).toBe(true);
+    expect(isAlwaysIgnored('notes/IDEA.MD.!SYNC')).toBe(true);
+    expect(isAlwaysIgnored('notes/.Idea.md.iCloud')).toBe(true);
+  });
+
+  it('keeps notes whose names merely resemble a service file', () => {
+    expect(isAlwaysIgnored('notes/DS_Store.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/desktop.ini.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/my-desktop.ini')).toBe(false);
+    expect(isAlwaysIgnored('Thumbs.db.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/Icon.png')).toBe(false);
+    expect(isAlwaysIgnored('Icon/readme.md')).toBe(false);
+    expect(isAlwaysIgnored('sync/log.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/stfolder.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/idea.icloud')).toBe(false);
+    expect(isAlwaysIgnored('notes/a_b.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/Trash-1000.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/.Trash-old/x.md')).toBe(false);
+    expect(isAlwaysIgnored('notes/sync.md')).toBe(false);
+    expect(checkVaultPath('notes/sync.md', { bindingFolder: '/' })).toBeNull();
+  });
+
+  it('filters them out of chokidar at the vault root and below', () => {
+    expect(isIgnoredAbsolutePath('D:\\vault\\desktop.ini', 'D:\\vault')).toBe(true);
+    expect(isIgnoredAbsolutePath('/Users/u/vault/notes/.DS_Store', '/Users/u/vault')).toBe(true);
+    expect(isIgnoredAbsolutePath('/home/u/vault/.stversions', '/home/u/vault')).toBe(true);
+  });
+
+  it('does not look at folders above the vault root', () => {
+    // A vault kept inside a Syncthing folder's versions, or in a Dropbox cache
+    // being restored from: the folder names above the root are not ours to judge.
+    expect(
+      isIgnoredAbsolutePath('/home/u/.stversions/vault/idea.md', '/home/u/.stversions/vault'),
+    ).toBe(false);
+    expect(isIgnoredAbsolutePath('D:/.sync/vault/idea.md', 'D:/.sync/vault')).toBe(false);
+  });
+});
+
 describe('checkVaultPath', () => {
   it('allows a normal note inside the binding', () => {
     expect(checkVaultPath('notes/idea.md', { bindingFolder: 'notes' })).toBeNull();

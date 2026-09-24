@@ -10,6 +10,10 @@ import type { RecentlyApplied } from './recently-applied';
  *
  *   - Map each Obsidian event to a typed `VaultEvent` enriched with the
  *     binding it belongs to (or drop it if it doesn't fall inside any).
+ *   - Drop what the shared ignore list refuses (`isAlwaysIgnored` in
+ *     `path-utils`, the same list chokidar and the engine use). Obsidian
+ *     never indexes a dotted path, so here that is mostly service files
+ *     without a dot, such as `desktop.ini` and `Thumbs.db`.
  *   - Debounce `modify` per (binding, path) — Obsidian fires several
  *     events per save (`metadata`, `links`, etc) and the engine doesn't
  *     need every microtick.
