@@ -50,22 +50,38 @@ export interface FlushResult {
  * failures (the op no longer makes sense — file deleted on the server,
  * for example) are removed from the queue and reported as `dropped` so
  * the caller can log them.
+ *
+ * Each outcome is recorded as soon as it arrives, not once at the end of the
+ * pass: a drain cut short (by `signal`, or by the plugin going away) must not
+ * leave everything the server already accepted in the queue, to be sent a
+ * second time by the next drain.
+ *
+ * `signal` stops the drain for good — the engine passes its lifetime signal.
+ * Once it aborts, no further operation is emitted, and an answer that arrives
+ * afterwards is not recorded: that operation stays queued for the next drain,
+ * which resends it (why the server takes that: `SyncEngine.stop`). The promise
+ * then rejects with the signal's reason.
  */
 export async function flushPendingQueue(
   bindingId: string,
   log: OperationLog,
   emit: PendingEmitter,
+  options: { signal?: AbortSignal } = {},
 ): Promise<FlushResult> {
+  const { signal } = options;
   const pending = log.dequeueOperations(bindingId);
-  const sentIds: number[] = [];
+  let sent = 0;
   let dropped: PendingOperation | null = null;
   let droppedCount = 0;
   let haltedOn: PendingOperation | null = null;
 
   for (const op of pending) {
+    signal?.throwIfAborted();
     const outcome = await safeEmit(op, emit);
+    signal?.throwIfAborted();
     if (outcome.ok) {
-      sentIds.push(op.id);
+      log.markSent([op.id]);
+      sent += 1;
       continue;
     }
     if (outcome.retryable) {
@@ -73,14 +89,13 @@ export async function flushPendingQueue(
       break;
     }
     // Non-retryable: drop it and keep going.
-    sentIds.push(op.id);
+    log.markSent([op.id]);
     droppedCount += 1;
     if (!dropped) dropped = op;
   }
 
-  if (sentIds.length > 0) log.markSent(sentIds);
   return {
-    sent: sentIds.length - droppedCount,
+    sent,
     dropped,
     droppedCount,
     haltedOn,

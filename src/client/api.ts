@@ -100,6 +100,18 @@ export interface BinaryRequestParam {
   method: string;
   headers: Record<string, string>;
   body?: ArrayBuffer;
+  /** Cancels the transfer — handed to `fetch` as is. */
+  signal?: AbortSignal;
+}
+
+/**
+ * Per-call options for the binary transfers. Only these can be cancelled:
+ * they run over `fetch`, which takes an `AbortSignal`. `requestUrl` (every
+ * JSON call) has no way to stop a request once sent, so a caller that stops
+ * caring has to ignore the late answer itself.
+ */
+export interface TransferOptions {
+  signal?: AbortSignal;
 }
 
 /**
@@ -120,6 +132,7 @@ const defaultBinaryRequest: BinaryRequestFn = async (params) => {
     method: params.method,
     headers: params.headers,
     ...(params.body !== undefined ? { body: params.body } : {}),
+    ...(params.signal !== undefined ? { signal: params.signal } : {}),
   };
   // The directory's linter asks for `requestUrl` here (no-restricted-globals,
   // a warning its config won't let us disable). Kept on purpose — see above:
@@ -205,10 +218,15 @@ export class ApiClient {
   }
 
   /** Download raw file bytes. Empty file is `ArrayBuffer` of length 0. */
-  async downloadFile(projectId: string, fileId: string): Promise<ArrayBuffer> {
+  async downloadFile(
+    projectId: string,
+    fileId: string,
+    options: TransferOptions = {},
+  ): Promise<ArrayBuffer> {
     return this.binary(
       'GET',
       `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}`,
+      options,
     );
   }
 
@@ -239,11 +257,20 @@ export class ApiClient {
    * references it by hash in a metadata-only `file:create` /
    * `file:update-binary` socket op, keeping large payloads off the socket.
    */
-  async uploadBlob(projectId: string, contentHash: string, content: ArrayBuffer): Promise<void> {
+  async uploadBlob(
+    projectId: string,
+    contentHash: string,
+    content: ArrayBuffer,
+    options: TransferOptions = {},
+  ): Promise<void> {
     await this.sendBinary(
       'PUT',
       `/api/projects/${encodeURIComponent(projectId)}/blobs/${encodeURIComponent(contentHash)}`,
-      { body: content, contentType: 'application/octet-stream' },
+      {
+        body: content,
+        contentType: 'application/octet-stream',
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
+      },
     );
   }
 
@@ -299,10 +326,12 @@ export class ApiClient {
     projectId: string,
     fileId: string,
     versionId: string,
+    options: TransferOptions = {},
   ): Promise<ArrayBuffer> {
     return this.binary(
       'GET',
       `/api/projects/${encodeURIComponent(projectId)}/files/${encodeURIComponent(fileId)}/versions/${encodeURIComponent(versionId)}`,
+      options,
     );
   }
 
@@ -321,8 +350,16 @@ export class ApiClient {
     return parsed as T;
   }
 
-  private async binary(method: string, path: string): Promise<ArrayBuffer> {
-    const res = await this.sendBinary(method, path, {});
+  private async binary(
+    method: string,
+    path: string,
+    options: TransferOptions,
+  ): Promise<ArrayBuffer> {
+    const res = await this.sendBinary(
+      method,
+      path,
+      options.signal !== undefined ? { signal: options.signal } : {},
+    );
     return res.arrayBuffer;
   }
 
@@ -360,7 +397,7 @@ export class ApiClient {
   private async sendBinary(
     method: string,
     path: string,
-    options: { body?: ArrayBuffer; contentType?: string },
+    options: { body?: ArrayBuffer; contentType?: string; signal?: AbortSignal },
   ): Promise<RequestUrlResponse> {
     const headers: Record<string, string> = {
       'X-API-Key': this.apiKey,
@@ -375,8 +412,12 @@ export class ApiClient {
         method,
         headers,
         ...(options.body !== undefined ? { body: options.body } : {}),
+        ...(options.signal !== undefined ? { signal: options.signal } : {}),
       });
     } catch (err) {
+      // Cancelled by the caller: hand back its reason, not a network failure —
+      // the caller must not queue a retry for a transfer it called off.
+      options.signal?.throwIfAborted();
       throw new ApiError(err instanceof Error ? err.message : 'network error', 'network', 0, true);
     }
     if (res.status >= 200 && res.status < 300) return res;

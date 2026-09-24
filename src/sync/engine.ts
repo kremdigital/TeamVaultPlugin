@@ -40,6 +40,7 @@ import {
 } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
+import { EngineStoppedError, fence } from './stop-fence';
 
 /**
  * Silent fallback so the engine always has a logger to call, even when one
@@ -74,6 +75,13 @@ const MAX_REPORTED_REFUSALS = 1000;
  *
  * Construction is deeply DI-friendly so unit tests can drive every flow
  * without a real server, real Yjs persistence, or a real Obsidian vault.
+ *
+ * An engine is single-use: once {@link SyncEngine.stop} has run, nothing it
+ * had started may touch the vault, the operation log, a Y.Doc or the network
+ * again, and it never starts again — the `EngineManager` spawns a fresh one.
+ * Every dependency is held through a stop fence (see `stop-fence.ts`), so the
+ * check after each `await` is built in: a flow that wakes up after `stop()`
+ * refuses on its next call and unwinds.
  */
 
 export interface SyncEngineDeps {
@@ -158,6 +166,17 @@ export class SyncEngine {
   private readonly recentlyApplied: RecentlyApplied;
   private readonly api: ApiClient;
   private readonly socket: SocketClient;
+  /**
+   * The same client as {@link socket}, unfenced — only `stop()` uses it, to
+   * disconnect after the fence has closed.
+   */
+  private readonly socketLink: SocketClient;
+  /**
+   * Aborted by `stop()`, with an {@link EngineStoppedError} as the reason.
+   * Closes the fence around every dependency and cancels binary transfers
+   * still in flight.
+   */
+  private readonly lifetime = new AbortController();
   private readonly diskSnapshotDebounceMs: number;
   private readonly conflictResolver: ConflictResolver;
   private readonly now: () => number;
@@ -248,15 +267,20 @@ export class SyncEngine {
     this.binding = deps.binding;
     this.server = deps.server;
     this.clientId = deps.clientId;
-    this.vault = deps.vault;
-    this.operationLog = deps.operationLog;
-    this.docManager = deps.docManager;
-    this.recentlyApplied = deps.recentlyApplied;
-    this.api = deps.apiClient ?? new ApiClient(deps.server);
-    this.socket =
+    // Everything the engine can act on goes through the fence: the shared
+    // vault, log, docs and echo set (a paused engine's successor uses the same
+    // ones), the network, and the conflict modal.
+    const { signal } = this.lifetime;
+    this.vault = fence(deps.vault, signal);
+    this.operationLog = fence(deps.operationLog, signal);
+    this.docManager = fence(deps.docManager, signal);
+    this.recentlyApplied = fence(deps.recentlyApplied, signal);
+    this.api = fence(deps.apiClient ?? new ApiClient(deps.server), signal);
+    this.socketLink =
       deps.socketClient ?? new SocketClient({ server: deps.server, clientId: deps.clientId });
+    this.socket = fence(this.socketLink, signal);
     this.diskSnapshotDebounceMs = deps.diskSnapshotDebounceMs ?? 500;
-    this.conflictResolver = deps.conflictResolver ?? defaultConflictResolver;
+    this.conflictResolver = fence(deps.conflictResolver ?? defaultConflictResolver, signal);
     this.now = deps.now ?? Date.now;
     this.configDir = deps.configDir ?? DEFAULT_CONFIG_DIR;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
@@ -276,6 +300,9 @@ export class SyncEngine {
    * no-op.
    */
   async start(): Promise<void> {
+    // Single use — see the class comment. A restart would hand the new socket
+    // to flows of the previous run.
+    if (this.hasStopped) return;
     if (this.status !== 'stopped' && this.status !== 'error') return;
     this.setStatus('connecting');
 
@@ -292,12 +319,33 @@ export class SyncEngine {
     );
     this.cleanups.push(this.socket.onFileEvent((event) => void this.handleServerFileEvent(event)));
     this.cleanups.push(this.socket.onYjsUpdate((msg) => this.handleServerYjsUpdate(msg)));
-    this.cleanups.push(this.socket.onYjsCatchup((batch) => void this.handleYjsCatchup(batch)));
+    this.cleanups.push(
+      this.socket.onYjsCatchup((batch) => this.detach(this.handleYjsCatchup(batch))),
+    );
 
     this.socket.connect();
   }
 
+  /**
+   * Stop for good (plugin disabled or reloaded, sync paused, binding switched
+   * off or removed).
+   *
+   * Work already under way cannot be interrupted: it sits on socket acks,
+   * `requestUrl` calls and disk reads. Aborting the lifetime signal makes sure
+   * none of it has any further effect. Binary transfers in flight are
+   * cancelled; everything else refuses at the fence the moment a flow wakes
+   * up, so a late answer is dropped without writing the vault, the operation
+   * log or a Y.Doc and without another request.
+   *
+   * The one operation the drain had in flight stays queued, and the next
+   * engine sends it again. The server absorbs that: a CREATE for a path it
+   * holds with the same hash is a replay (no conflict copy) — and the drain
+   * routes a path it already knows through modify anyway — a DELETE of a
+   * tombstone and a RENAME to the current path are no-ops, a binary UPDATE
+   * rewrites the same bytes.
+   */
   async stop(): Promise<void> {
+    this.lifetime.abort(new EngineStoppedError());
     for (const cb of this.cleanups) cb();
     this.cleanups = [];
     for (const d of this.snapshotDebouncers.values()) d.cancel();
@@ -306,7 +354,7 @@ export class SyncEngine {
     this.foldBases.clear();
     this.skippedDocs.clear();
     this.hydrations.clear();
-    this.socket.disconnect();
+    this.socketLink.disconnect();
     this.setStatus('stopped');
   }
 
@@ -345,6 +393,20 @@ export class SyncEngine {
   async handleVaultEvent(event: VaultEvent): Promise<void> {
     if (event.bindingId !== this.binding.id) return;
     if (!this.binding.enabled) return;
+    // An event that was already on its way when the engine stopped. Queueing
+    // it would be a write from a plugin that is off, so it counts as an edit
+    // made while the plugin was off.
+    if (this.hasStopped) return;
+    try {
+      await this.dispatchVaultEvent(event);
+    } catch (err) {
+      // `stop()` landed while the event was being handled — nothing to report.
+      if (this.hasStopped) return;
+      throw err;
+    }
+  }
+
+  private async dispatchVaultEvent(event: VaultEvent): Promise<void> {
     // Outgoing side of the same gate. The watchers filter too, but events also
     // arrive from the offline queue and from re-queued NACKs, and a build that
     // predates the gate could have recorded a path we must never upload — the
@@ -398,6 +460,7 @@ export class SyncEngine {
       const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
+      this.throwIfStopped();
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -406,6 +469,7 @@ export class SyncEngine {
       this.pendingCatchup = [];
       for (const batch of buffered) {
         await this.processCatchupBatch(batch);
+        this.throwIfStopped();
       }
 
       if (!result.ok) {
@@ -417,6 +481,7 @@ export class SyncEngine {
       // Apply server-side operations the client missed.
       for (const op of result.operations) {
         await this.applyServerOperation(op);
+        this.throwIfStopped();
       }
 
       // Hydrate Yjs docs. New servers STREAM them via `yjs:catchup` (handled by
@@ -428,8 +493,10 @@ export class SyncEngine {
         this.catchupResolve = null;
         for (const snap of result.yjsDocs ?? []) {
           await this.applyCatchupDoc(snap);
+          this.throwIfStopped();
         }
       }
+      this.throwIfStopped();
 
       // Подписка на отправку локальных правок — ЛЕНИВО.
       //
@@ -461,9 +528,11 @@ export class SyncEngine {
       // Reconnect catch-up tail, kicked off in the background so the
       // `connected` status doesn't wait on every queued upload. Ordering
       // inside is load-bearing — see `drainThenInitialPush`.
-      void this.drainThenInitialPush();
+      this.detach(this.drainThenInitialPush());
     } catch (err) {
       this.catchupResolve = null;
+      // Cut short by `stop()` — not a sync failure.
+      if (this.hasStopped) return;
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
   }
@@ -487,6 +556,7 @@ export class SyncEngine {
   private async processCatchupBatch(batch: YjsCatchupBatch): Promise<void> {
     for (const snap of batch.docs) {
       await this.applyCatchupDoc(snap);
+      this.throwIfStopped();
     }
     if (batch.done) {
       this.catchupResolve?.();
@@ -546,6 +616,7 @@ export class SyncEngine {
       }
       return same;
     } catch {
+      this.throwIfStopped();
       return false;
     }
   }
@@ -603,16 +674,22 @@ export class SyncEngine {
    * to `connected` regardless (the initial-push drain reconciles the rest).
    */
   private waitForCatchup(done: Promise<void>): Promise<void> {
+    const { signal } = this.lifetime;
     return new Promise<void>((resolve) => {
       let settled = false;
       const finish = (): void => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timer);
+        signal.removeEventListener('abort', finish);
         this.catchupResolve = null;
         resolve();
       };
       const timer = window.setTimeout(finish, CATCHUP_TIMEOUT_MS);
+      // `stop()` ends the wait at once: the connect flow unwinds instead of
+      // holding the engine in memory until the guard fires.
+      if (signal.aborted) finish();
+      else signal.addEventListener('abort', finish, { once: true });
       void done.then(finish);
     });
   }
@@ -634,6 +711,8 @@ export class SyncEngine {
     try {
       await this.flushPendingOperations();
     } catch {
+      // A drain stopped with the engine ends the tail here.
+      this.throwIfStopped();
       // A failed drain must not block the initial-push pass — pre-existing
       // files still need their first upload, and whatever stayed queued is
       // retried on the next reconnect. `initialPush` itself skips paths
@@ -659,6 +738,7 @@ export class SyncEngine {
     // and a file the server deleted but that is still on disk would come back
     // as a fresh CREATE. Honour the server's tombstones instead.
     const tombstoned = await this.fetchServerTombstones();
+    this.throwIfStopped();
     if (tombstoned === null) {
       // Couldn't confirm the server's tombstones. Don't risk re-uploading a
       // deleted-but-still-on-disk file — after catch-up merges the delete
@@ -669,6 +749,7 @@ export class SyncEngine {
       return;
     }
     for (const path of paths) {
+      this.throwIfStopped();
       // Watcher events are filtered upstream, but this pass walks the raw
       // vault listing — without the same filter it uploads throw-away
       // artifacts (e.g. Obsidian's orphaned `*.tmp.<pid>.<hex>` files).
@@ -682,6 +763,7 @@ export class SyncEngine {
       try {
         await this.handleLocalCreate(path);
       } catch {
+        this.throwIfStopped();
         // Per-file failures are swallowed — the watcher / next reconnect
         // will surface them again.
       }
@@ -702,12 +784,15 @@ export class SyncEngine {
       });
       return new Set(files.filter((f) => f.deletedAt !== null).map((f) => f.path));
     } catch {
+      this.throwIfStopped();
       return null;
     }
   }
 
   private async refreshFileIndex(): Promise<void> {
     const files = await this.api.getProjectFiles(this.binding.projectId);
+    // A listing that lands after `stop()` must not rewrite the log's file meta.
+    this.throwIfStopped();
     this.outOfScope.clear();
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
@@ -789,6 +874,7 @@ export class SyncEngine {
       try {
         // Binary bytes are staged over REST; text rides inline (small).
         const data = await this.stageBinaryBlob(fileType, hash, buffer);
+        this.throwIfStopped();
         const ack = await this.socket.emitFileCreate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
@@ -799,6 +885,7 @@ export class SyncEngine {
           size: buffer.byteLength,
           ...(data !== undefined ? { data } : {}),
         });
+        this.throwIfStopped();
         if (ack.ok) {
           // Server ack carries `outcome.{fileId, path}` — record the file in
           // the local index immediately. Without this the broadcast event
@@ -813,6 +900,7 @@ export class SyncEngine {
           return;
         }
       } catch {
+        this.throwIfStopped();
         // Staging upload or emit failed (offline / server error) — fall through
         // to the offline queue, which replays on the next reconnect.
         this.log.debug('create staging/emit failed; queueing', path);
@@ -879,8 +967,22 @@ export class SyncEngine {
     buffer: ArrayBuffer,
   ): Promise<ArrayBuffer | undefined> {
     if (fileType !== 'BINARY') return buffer;
-    await this.api.uploadBlob(this.binding.projectId, contentHash, buffer);
+    await this.uploadBlob(contentHash, buffer);
     return undefined;
+  }
+
+  /** `PUT /blobs/:hash`, cancelled by `stop()` — see {@link lifetime}. */
+  private uploadBlob(contentHash: string, buffer: ArrayBuffer): Promise<void> {
+    return this.api.uploadBlob(this.binding.projectId, contentHash, buffer, {
+      signal: this.lifetime.signal,
+    });
+  }
+
+  /** Download a file's current bytes, cancelled by `stop()`. */
+  private downloadFile(fileId: string): Promise<ArrayBuffer> {
+    return this.api.downloadFile(this.binding.projectId, fileId, {
+      signal: this.lifetime.signal,
+    });
   }
 
   private async handleLocalModify(path: string): Promise<void> {
@@ -933,7 +1035,8 @@ export class SyncEngine {
     if (this.socket.isConnected()) {
       try {
         // Binary bytes go to the REST staging area; the socket op is metadata-only.
-        await this.api.uploadBlob(this.binding.projectId, hash, buffer);
+        await this.uploadBlob(hash, buffer);
+        this.throwIfStopped();
         const ack = await this.socket.emitFileUpdateBinary({
           projectId: this.binding.projectId,
           clientId: this.clientId,
@@ -942,6 +1045,7 @@ export class SyncEngine {
           contentHash: hash,
           size: buffer.byteLength,
         });
+        this.throwIfStopped();
         if (ack.ok) {
           meta.contentHash = hash;
           meta.size = buffer.byteLength;
@@ -950,6 +1054,7 @@ export class SyncEngine {
           return;
         }
       } catch {
+        this.throwIfStopped();
         this.log.debug('binary update staging/emit failed; queueing', path);
       }
     }
@@ -996,6 +1101,7 @@ export class SyncEngine {
       const files = await this.api.getProjectFiles(this.binding.projectId);
       return files.find((f) => f.path === path)?.id ?? '';
     } catch {
+      this.throwIfStopped();
       return '';
     }
   }
@@ -1018,6 +1124,7 @@ export class SyncEngine {
     // later dropped as `no_file_id`, so the deletion never propagates.
     if (!fileId && this.socket.isConnected()) {
       fileId = await this.resolveServerFileId(path);
+      this.throwIfStopped();
     }
     if (this.socket.isConnected() && fileId) {
       const ack = await this.socket.emitFileDelete({
@@ -1027,6 +1134,7 @@ export class SyncEngine {
         fileId,
         filePath: path,
       });
+      this.throwIfStopped();
       if (ack.ok) {
         this.fileIndex.byPath.delete(path);
         this.fileIndex.byId.delete(fileId);
@@ -1083,6 +1191,7 @@ export class SyncEngine {
         filePath: oldPath,
         newPath,
       });
+      this.throwIfStopped();
       if (ack.ok) {
         if (meta) {
           this.operationLog.deleteFileMeta(this.binding.id, oldPath);
@@ -1169,6 +1278,7 @@ export class SyncEngine {
       if (!(await this.vault.exists(path))) return null;
       return await sha256Hex(await this.vault.readBinary(path));
     } catch {
+      this.throwIfStopped();
       return null;
     }
   }
@@ -1211,11 +1321,14 @@ export class SyncEngine {
           break;
       }
     } catch (err) {
+      // Cut short by `stop()` — not a failure to apply.
+      if (this.hasStopped) return;
       this.setStatus('error', describeError(err, 'apply_failed'));
     }
   }
 
   private handleServerYjsUpdate(msg: YjsUpdateMessage): void {
+    if (this.hasStopped) return;
     const meta = this.fileIndex.byId.get(msg.fileId);
     if (!meta) return;
     this.rememberBaseBeforeRemote(meta);
@@ -1333,7 +1446,8 @@ export class SyncEngine {
       // on existing paths, so just bail — meta is already up-to-date from
       // refreshFileIndex.
       if (await this.vault.exists(payload.path)) return;
-      const buf = await this.api.downloadFile(this.binding.projectId, payload.id);
+      const buf = await this.downloadFile(payload.id);
+      this.throwIfStopped();
       // Same ordering as `applyServerUpdateBinary` — meta first, then the
       // disk write, so the watcher echo's hash compare short-circuits.
       meta.size = buf.byteLength;
@@ -1354,7 +1468,8 @@ export class SyncEngine {
     // transfer. An entry can predate the gate — it comes back from
     // `state.json` written by an older build.
     if (!this.allowServerPath(meta.relativePath, 'update')) return;
-    const newBuf = await this.api.downloadFile(this.binding.projectId, fileId);
+    const newBuf = await this.downloadFile(fileId);
+    this.throwIfStopped();
     const newHash = await sha256Hex(newBuf);
 
     // Conflict detection — only triggers when the user has uncommitted edits.
@@ -1372,6 +1487,8 @@ export class SyncEngine {
           localSize: localBuf.byteLength,
           serverSize: newBuf.byteLength,
         });
+        // The modal can be answered long after the plugin went away.
+        this.throwIfStopped();
         if (resolution === 'keep-local') {
           // Push our local content as the new server version. Bump clock,
           // emit; if offline, queue. The server will then broadcast it
@@ -1379,7 +1496,8 @@ export class SyncEngine {
           // matches the local hash, so the second pass is a no-op.
           if (this.socket.isConnected()) {
             try {
-              await this.api.uploadBlob(this.binding.projectId, localHash, localBuf);
+              await this.uploadBlob(localHash, localBuf);
+              this.throwIfStopped();
               await this.socket.emitFileUpdateBinary({
                 projectId: this.binding.projectId,
                 clientId: this.clientId,
@@ -1388,7 +1506,9 @@ export class SyncEngine {
                 contentHash: localHash,
                 size: localBuf.byteLength,
               });
+              this.throwIfStopped();
             } catch {
+              this.throwIfStopped();
               this.log.debug(
                 'keep-local binary push failed; reconcile on reconnect',
                 meta.relativePath,
@@ -1473,12 +1593,14 @@ export class SyncEngine {
           filePath: meta.relativePath,
           localSize: localBuf.byteLength,
         });
+        this.throwIfStopped();
         if (resolution === 'restore-server') {
           // Push the local content as a fresh CREATE so the server
           // un-deletes it. The recipient broadcast will reset our state.
           if (this.socket.isConnected()) {
             try {
               const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
+              this.throwIfStopped();
               await this.socket.emitFileCreate({
                 projectId: this.binding.projectId,
                 clientId: this.clientId,
@@ -1490,6 +1612,7 @@ export class SyncEngine {
                 ...(data !== undefined ? { data } : {}),
               });
             } catch {
+              this.throwIfStopped();
               this.log.debug(
                 'restore-server push failed; reconcile on reconnect',
                 meta.relativePath,
@@ -1630,11 +1753,13 @@ export class SyncEngine {
   // -- Yjs disk snapshotting ------------------------------------------------
 
   private scheduleSnapshotToDisk(path: string): void {
+    // No new timers after `stop()` — it has already cancelled the existing ones.
+    this.throwIfStopped();
     let d = this.snapshotDebouncers.get(path);
     if (!d) {
       d = debounce<[]>(() => {
         this.snapshotDebouncers.delete(path);
-        void this.snapshotDocToDisk(path);
+        this.detach(this.snapshotDocToDisk(path));
       }, this.diskSnapshotDebounceMs);
       this.snapshotDebouncers.set(path, d);
     }
@@ -1691,6 +1816,7 @@ export class SyncEngine {
       return;
     }
     const base = marker === undefined ? null : await this.resolveFoldBase(meta, marker);
+    this.throwIfStopped();
     // Remote updates keep landing while the awaits above yield, so the doc is
     // read only now, and everything from here to `setText` is synchronous — a
     // merge computed against an older doc text would delete what arrived since.
@@ -1732,17 +1858,20 @@ export class SyncEngine {
   private async loadBaseFromHistory(meta: IndexedMeta, marker: string): Promise<string | null> {
     try {
       const versions = await this.api.getFileVersions(this.binding.projectId, meta.fileId);
+      this.throwIfStopped();
       const match = versions.find((v) => v.contentHash === marker);
       if (!match) return null;
       const bytes = await this.api.downloadFileVersion(
         this.binding.projectId,
         meta.fileId,
         match.id,
+        { signal: this.lifetime.signal },
       );
       // Keep a BOM as a character so the re-encoded bytes (and hash) match.
       const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
       return (await sha256Hex(text)) === marker ? text : null;
     } catch {
+      this.throwIfStopped();
       return null;
     }
   }
@@ -1812,6 +1941,7 @@ export class SyncEngine {
         await this.markFolded(meta, disk);
       }
     } catch {
+      this.throwIfStopped();
       // Unreadable disk — no agreement to record; the fold copes without.
     }
   }
@@ -1836,7 +1966,11 @@ export class SyncEngine {
     const running = this.hydrations.get(meta.fileId);
     if (running) return running;
     const run = this.hydrate(meta)
-      .catch((err) => this.log.debug('hydration failed', meta.relativePath, err))
+      .catch((err: unknown) => {
+        // A hydration cut short by `stop()` failed nothing; whoever waits on
+        // it refuses at its own next step.
+        if (!this.hasStopped) this.log.debug('hydration failed', meta.relativePath, err);
+      })
       .finally(() => {
         if (this.hydrations.get(meta.fileId) === run) this.hydrations.delete(meta.fileId);
       });
@@ -1855,6 +1989,7 @@ export class SyncEngine {
   private async hydrate(meta: IndexedMeta): Promise<void> {
     if (!this.socket.isConnected() || this.yjsFetchUnavailable) return;
     const result = await this.socket.fetchYjsDoc(this.binding.projectId, meta.fileId);
+    this.throwIfStopped();
     if (!result.ok) {
       // A server that predates `yjs:fetch` never answers; don't make every
       // later save wait out the timeout again before the next connect.
@@ -1984,6 +2119,9 @@ export class SyncEngine {
     newPath: string | null,
     payload: Record<string, unknown>,
   ): void {
+    // The fence refuses this too; spelled out because the queue is what the
+    // next engine replays without asking.
+    this.throwIfStopped();
     this.operationLog.enqueueOperation(this.binding.id, {
       opType,
       filePath,
@@ -2000,7 +2138,9 @@ export class SyncEngine {
    */
   private async flushPendingOperations(): Promise<void> {
     const emit: PendingEmitter = (op) => this.replayPending(op);
-    const result = await flushPendingQueue(this.binding.id, this.operationLog, emit);
+    const result = await flushPendingQueue(this.binding.id, this.operationLog, emit, {
+      signal: this.lifetime.signal,
+    });
     // A halted drain used to be invisible: the queue simply stopped moving and
     // nothing said so. Surface it — one stuck operation holds back every edit
     // queued behind it.
@@ -2049,6 +2189,7 @@ export class SyncEngine {
         newPath: op.newPath,
       });
       await this.handleLocalDelete(op.filePath);
+      this.throwIfStopped();
       return { ok: true };
     }
     try {
@@ -2068,6 +2209,7 @@ export class SyncEngine {
           // modify path instead: Yjs diff for text, binary UPDATE otherwise.
           if (this.fileIndex.byPath.has(op.filePath)) {
             await this.handleLocalModify(op.filePath);
+            this.throwIfStopped();
             return { ok: true };
           }
           const data = await this.vault.readBinary(op.filePath);
@@ -2085,8 +2227,10 @@ export class SyncEngine {
             // Binary bytes go to the REST staging area; text rides inline.
             inlineData = await this.stageBinaryBlob(fileType, contentHash, data);
           } catch {
+            this.throwIfStopped();
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
+          this.throwIfStopped();
           const ack = await this.socket.emitFileCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -2097,6 +2241,7 @@ export class SyncEngine {
             size: data.byteLength,
             ...(inlineData !== undefined ? { data: inlineData } : {}),
           });
+          this.throwIfStopped();
           if (ack.ok) {
             // Keep `fileIndex` authoritative so the initial-push pass that
             // runs right after the drain skips this file instead of
@@ -2122,10 +2267,12 @@ export class SyncEngine {
           // — same reasoning as the CREATE case above.
           const contentHash = await sha256Hex(data);
           try {
-            await this.api.uploadBlob(this.binding.projectId, contentHash, data);
+            await this.uploadBlob(contentHash, data);
           } catch {
+            this.throwIfStopped();
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
+          this.throwIfStopped();
           const ack = await this.socket.emitFileUpdateBinary({
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -2134,6 +2281,7 @@ export class SyncEngine {
             contentHash,
             size: data.byteLength,
           });
+          this.throwIfStopped();
           if (ack.ok) {
             const meta = this.fileIndex.byId.get(fileId);
             if (meta) {
@@ -2164,6 +2312,7 @@ export class SyncEngine {
             fileId,
             filePath: op.filePath,
           });
+          this.throwIfStopped();
           if (ack.ok) {
             const meta = this.fileIndex.byId.get(fileId);
             if (meta) this.fileIndex.byPath.delete(meta.relativePath);
@@ -2197,6 +2346,7 @@ export class SyncEngine {
             op.opType === 'RENAME'
               ? await this.socket.emitFileRename(payload)
               : await this.socket.emitFileMove(payload);
+          this.throwIfStopped();
           if (ack.ok) {
             // Move the index entry so the post-drain initial-push pass
             // recognises the file at its new path instead of re-uploading
@@ -2217,6 +2367,8 @@ export class SyncEngine {
         }
       }
     } catch (err) {
+      // Stopped mid-replay: the drain ends here and the op stays queued.
+      this.throwIfStopped();
       return {
         ok: false,
         retryable: true,
@@ -2241,6 +2393,35 @@ export class SyncEngine {
 
   // -- Misc internals -------------------------------------------------------
 
+  /**
+   * True once `stop()` has run. Not the same as status `stopped`, which is
+   * also where a never-started engine sits (and queues offline edits).
+   */
+  private get hasStopped(): boolean {
+    return this.lifetime.signal.aborted;
+  }
+
+  /**
+   * End the calling flow if `stop()` ran while it was waiting. Used right
+   * after an answer arrives (an ack, a listing, a download, the conflict
+   * modal) and first thing in `catch` blocks that would otherwise fall back
+   * to something else: queueing, a retry, a fold without a base. The fence
+   * refuses those anyway; this makes the flow leave where it resumed.
+   */
+  private throwIfStopped(): void {
+    this.lifetime.signal.throwIfAborted();
+  }
+
+  /**
+   * Run a flow nobody awaits. Being cut short by `stop()` is not a failure
+   * and ends it silently; any other rejection surfaces as it did before.
+   */
+  private detach(flow: Promise<void>): void {
+    void flow.catch((err: unknown) => {
+      if (!this.hasStopped) throw err;
+    });
+  }
+
   private bumpClock(): VectorClock {
     this.vectorClock = increment(this.vectorClock, this.clientId);
     return this.vectorClock;
@@ -2251,6 +2432,9 @@ export class SyncEngine {
   }
 
   private setStatus(status: EngineStatus, detail?: string): void {
+    // A flow that wakes up after `stop()` has nothing left to report: the
+    // engine stays `stopped`.
+    if (this.hasStopped && status !== 'stopped') return;
     this.status = status;
     // Observability: surface every transition through the logger so a sync
     // failure is diagnosable from sync.log / DevTools, not just the status
