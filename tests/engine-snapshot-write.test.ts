@@ -153,6 +153,45 @@ describe('SyncEngine — the re-read right before a snapshot’s write', () => {
     await next.engine.stop();
   });
 
+  it('does not write back a note deleted between the first exists() and its read', async () => {
+    const h = buildHarness();
+    const serverDoc = await connectWithNote(h, 'v1\n');
+    // The user deletes the note right after the snapshot's first exists().
+    const exists = h.vault.exists.bind(h.vault);
+    let armed = true;
+    h.vault.exists = async (path: string): Promise<boolean> => {
+      const there = await exists(path);
+      if (armed && path === 'note.md' && h.doc.getText('b1', 'note.md').startsWith('r1')) {
+        armed = false;
+        h.vault.files.delete('note.md');
+      }
+      return there;
+    };
+    remoteEdit(h, serverDoc, 'f1', 'r1\n');
+    await flushAsync(20);
+    expect(armed).toBe(false);
+
+    // It used to be taken for a note not written yet and created again; the
+    // delete event below then found it on disk and sent nothing.
+    expect(h.vault.files.has('note.md')).toBe(false);
+    expect(h.statuses).not.toContain('error');
+    void h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'delete',
+      path: 'note.md',
+      source: 'obsidian',
+    });
+    await flushAsync();
+    expect(h.socket().pending('file:delete').payload).toMatchObject({
+      fileId: 'f1',
+      filePath: 'note.md',
+    });
+    h.socket().pending('file:delete').ack({ ok: true });
+    await flushAsync();
+    expect(h.vault.files.has('note.md')).toBe(false);
+    await h.engine.stop();
+  });
+
   it('logs no retry once stopped while the disk kept changing under the snapshot', async () => {
     const entries: LogEntry[] = [];
     const logger = new Logger('debug', {
