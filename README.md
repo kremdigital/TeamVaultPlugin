@@ -314,12 +314,12 @@ is valid JSON, but a server or a binding in it lacks a field the plugin needs
 starts with the rest. The skipped entries don't sync, but they stay in the
 file as they are, and their unsent offline changes are kept: the start-up
 cleanup of leftover local state is off until they are fixed. `sync.log` names
-each one — its position in the list, its id and the fields at fault. While a
-binding is skipped, **Add binding** stays disabled: the skipped one may be this
-vault's binding, and a vault holds only one. To fix or remove the entries,
-first turn the plugin off in Settings → Community plugins (or quit Obsidian) —
-a running plugin saves its settings over your edit — then edit `data.json` and
-turn the plugin back on.
+each one, whatever the log level — its position in the list, its id and the
+fields at fault. While a binding is skipped, **Add binding** stays disabled:
+the skipped one may be this vault's binding, and a vault holds only one. To
+fix or remove the entries, first turn the plugin off in Settings → Community
+plugins (or quit Obsidian) — a running plugin saves its settings over your
+edit — then edit `data.json` and turn the plugin back on.
 
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the

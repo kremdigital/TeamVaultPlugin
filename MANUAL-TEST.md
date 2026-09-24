@@ -309,8 +309,9 @@ down` (он допустим, только если выгрузка занял�
    или закрыть Obsidian и только потом править файл. Привязки во вкладке
    настроек нет, кнопка «Привязать хранилище» неактивна, под ней пояснение:
    плагин не смог прочитать часть списка привязок. В `sync.log` —
-   строка `[warn]` с текстом `settings entries unreadable` и
-   `orphaned-state sweep skipped`, в ней `"invalid":["projectId"]`; строк
+   строка `[error]` с текстом `settings entries unreadable` и
+   `orphaned-state sweep skipped`, в ней `"invalid":["projectId"]` (строка
+   пишется при любом уровне журнала, в том числе «Только ошибки»); строк
    `swept orphaned` нет. `data.json` и `state.json` не изменились ни на
    байт.
 7. Закрыть Obsidian, вернуть `projectId`, включить сеть и открыть вальт:

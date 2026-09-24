@@ -250,11 +250,17 @@ export default class ObsidianSyncPlugin extends Plugin {
   /**
    * Say which servers and bindings of `data.json` are skipped, and that the
    * orphan sweep is off until they are fixed. The log gets positions, ids and
-   * the fields at fault; the notice, how many.
+   * the fields at fault — never an entry itself, which may hold an API key;
+   * the notice, how many.
+   *
+   * At `error`, like the other settings-file reports: the notice and the
+   * settings tab send the user to `sync.log` for the details, and at `warn`
+   * the line never got there with Log level set to Errors only. Nor did
+   * switching the level bring it back — it is written once, at start.
    */
   private reportSkippedSettings(skipped: SkippedSettings): void {
     const path = this.settingsFilePath();
-    this.logger?.warn(
+    this.logger?.error(
       'settings entries unreadable; kept in the file, orphaned-state sweep skipped',
       {
         path,

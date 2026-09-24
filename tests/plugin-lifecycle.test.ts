@@ -460,7 +460,7 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     expect(app.files.get(`${dir}/state.json`)).toBe(state);
     expect(app.files.get(`${dir}/data.json`)).toBe(data);
     const log = app.files.get(`${dir}/sync.log`) ?? '';
-    expect(log).toContain('[warn]');
+    expect(log).toContain('[error]');
     expect(log).toContain('orphaned-state sweep skipped');
     expect(log).toContain('"bindings":[{"index":0,"id":"binding-1","invalid":["projectId"]}]');
     expect(log).not.toContain('swept orphaned');
@@ -472,6 +472,30 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     // A running plugin saves its settings over a hand edit of data.json: the
     // notice says to turn it off before fixing the file, not after.
     expect(Notice.shown[0]?.message).toContain('first turn the plugin off');
+  });
+
+  it('names the skipped entries in sync.log with Log level set to Errors only', async () => {
+    // The notice and the settings tab send the user to sync.log for which
+    // entry and why. Logged at `warn`, the line never got there at this level.
+    const id = `team-vault-skipped-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [withoutProject('binding-1')],
+      clientId: 'client-1',
+      logLevel: 'error',
+    });
+
+    const { app, plugin } = await loadThroughSweeps({ [`${dir}/data.json`]: data }, dir, id);
+
+    expect(plugin.settings.logLevel).toBe('error');
+    expect(Notice.shown[0]?.message).toContain('sync.log');
+    const log = app.files.get(`${dir}/sync.log`) ?? '';
+    expect(log).toContain('settings entries unreadable');
+    expect(log).toContain('"bindings":[{"index":0,"id":"binding-1","invalid":["projectId"]}]');
+    // Still positions, ids and fields only: no server entry, no key.
+    expect(log).not.toContain('osk_1');
   });
 
   it('keeps such an entry in data.json when it saves, in its place', async () => {
