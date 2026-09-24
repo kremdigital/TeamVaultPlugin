@@ -173,6 +173,9 @@ export class MemoryVault implements VaultAdapter {
   }
 }
 
+/** A database of Obsidian's own, listed next to the plugin's (see {@link FakeIndexedDb}). */
+export const FOREIGN_DB = 'obsidian-vault-cache';
+
 /**
  * y-indexeddb stand-in: one database per name, kept across releases and
  * restarts (a new `DocManager` on the same instance). Like the real one, a
@@ -180,9 +183,16 @@ export class MemoryVault implements VaultAdapter {
  * origin, keeps a small key/value area, and `clearData` deletes the database.
  * The registry lists and deletes databases by name, as the renderer's
  * `indexedDB` does for every vault on the machine.
+ *
+ * It starts with one database that is not the plugin's ({@link FOREIGN_DB}),
+ * as Obsidian's origin always has: an empty listing is what a runtime that
+ * cannot list databases returns, and `DocManager` then opens a store under
+ * every name it checks — a path Obsidian never takes.
  */
 export class FakeIndexedDb {
-  readonly dbs = new Map<string, { updates: Uint8Array[]; custom: Map<string, unknown> }>();
+  readonly dbs = new Map<string, { updates: Uint8Array[]; custom: Map<string, unknown> }>([
+    [FOREIGN_DB, { updates: [], custom: new Map() }],
+  ]);
   /** Every database deleted, in order. */
   readonly deleted: string[] = [];
   readonly registry: IdbRegistry = {
@@ -390,6 +400,8 @@ export interface HarnessOptions {
    * predecessor's): `FakeIndexedDb.manager()` for docs that persist.
    */
   docs?: DocManager;
+  /** Debounce of the disk snapshot after a remote edit; 0 (the next tick) by default. */
+  diskSnapshotDebounceMs?: number;
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -489,7 +501,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     apiClient: track(api, 'api', calls),
     socketClient: track(socket, 'socket', calls),
     conflictResolver: track(resolver, 'modal', calls),
-    diskSnapshotDebounceMs: 0,
+    diskSnapshotDebounceMs: opts.diskSnapshotDebounceMs ?? 0,
     ...(opts.logger ? { logger: opts.logger } : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));

@@ -150,11 +150,17 @@ const KEPT: OpenResult = { discarded: false, owner: null };
 
 /** What {@link DocManager.move} found and did. */
 export interface MoveResult {
+  /**
+   * The old name held a history — or a store that did not load in time, which
+   * may hold one. `false` when there was nothing to carry: no doc and no store
+   * under the name, or an empty one.
+   */
+  found: boolean;
   /** The history under the old name was carried to the new one. */
   carried: boolean;
   /**
-   * The old name had a store that did not load in time: whatever it held
-   * stayed behind.
+   * The old name had a store that did not load in time: whatever it held was
+   * not carried, and is deleted with the old name.
    */
   lost: boolean;
   /**
@@ -428,6 +434,19 @@ export class DocManager {
    * same synchronous step: the caller moves its own records there, so a
    * remote update arriving meanwhile finds the file under one name or the
    * other, and never lands on a doc about to be deleted.
+   *
+   * A doc opened only for the move — the note had none open under either
+   * name — is closed again once its history is stored under `to`: a folder
+   * of notes renamed would otherwise keep a doc and a database connection per
+   * note in memory, and the catch-up, which skips a note whose disk matches
+   * the server only while its doc is not loaded, would take the full path for
+   * every one of them. The next use opens it from the store. Not when
+   * `keepOpen` says the caller still needs it (a snapshot pending for the
+   * file), nor while it holds remote updates it could not integrate yet: the
+   * store has only what the doc integrated.
+   *
+   * Deleting a store is best effort: a database IndexedDB refuses to delete
+   * does not stop the move, nor the rename it is part of.
    */
   move(
     bindingId: string,
@@ -435,16 +454,25 @@ export class DocManager {
     to: string,
     owner: string,
     switchOver: () => void,
+    opts: { keepOpen?: () => boolean } = {},
   ): Promise<MoveResult> {
     const fromKey = this.cacheKey(bindingId, from);
     const toKey = this.cacheKey(bindingId, to);
     return this.serially([fromKey, toKey], async () => {
-      const result: MoveResult = { carried: false, lost: false, foreign: null, displaced: null };
+      const result: MoveResult = {
+        found: false,
+        carried: false,
+        lost: false,
+        foreign: null,
+        displaced: null,
+      };
       if (from === to) {
         switchOver();
         result.carried = true;
         return result;
       }
+      // Neither name has a doc open: whatever this move opens, it closes.
+      const transient = !this.cache.has(fromKey) && !this.cache.has(toKey);
       let source = this.cache.get(fromKey) ?? null;
       if (source === null && (await this.mayHaveStore(bindingId, from))) {
         source = this.acquire(bindingId, from, false);
@@ -452,6 +480,7 @@ export class DocManager {
       if (source !== null) {
         if (!(await this.settle(source))) result.lost = true;
         else if (source.owner !== null && source.owner !== owner) result.foreign = source.owner;
+        result.found = result.lost || hasHistory(source.doc);
       }
       let target = this.cache.get(toKey) ?? null;
       if (target === null && (await this.mayHaveStore(bindingId, to))) {
@@ -488,8 +517,22 @@ export class DocManager {
       this.localSubs.delete(fromKey);
       if (subs) this.localSubs.set(toKey, subs);
       else if (!kept) this.localSubs.delete(toKey);
+      // Closed before `switchOver`, so the caller finds no doc open under the
+      // new name and leaves it to be wired when it is next opened. The history
+      // and the stamp were handed to the store above, before the connection
+      // closes.
+      const closing =
+        transient &&
+        !subs &&
+        target !== null &&
+        this.cache.get(toKey) === target &&
+        !hasPending(target.doc) &&
+        opts.keepOpen?.() !== true
+          ? this.release(bindingId, to).catch(() => undefined)
+          : null;
       switchOver();
       if (source !== null || this.cache.has(fromKey)) await this.clear(bindingId, from);
+      await closing;
       return result;
     });
   }
@@ -729,12 +772,20 @@ export class DocManager {
    */
   private claim(entry: ManagedEntry, fileId: string): void {
     entry.owner = fileId;
-    void (async (): Promise<void> => {
-      await entry.ready;
+    const write = (): void => {
       const persistence = entry.persistence;
       if (entry.dead || !persistence?.set) return;
-      await persistence.set(OWNER_KEY, fileId);
-    })().catch(() => undefined);
+      try {
+        void Promise.resolve(persistence.set(OWNER_KEY, fileId)).catch(() => undefined);
+      } catch {
+        // Unwritable: the store stays unstamped.
+      }
+    };
+    // Handed to the store right away when it is open: a doc closed right after
+    // (see `move`) still gets its stamp — y-indexeddb queues the write ahead of
+    // the close.
+    if (entry.waiting && entry.ready) void entry.ready.then(write, () => undefined);
+    else write();
   }
 
   /** Run `task` after every earlier {@link open} / {@link move} on any of `keys`. */
@@ -864,8 +915,10 @@ export class DocManager {
   /**
    * Evict a cached entry and erase its persisted data via `clearData`. Returns
    * whether the data was actually deleted — `false` when the backend only
-   * supports `destroy` (close), so {@link purgeBinding} knows it must still
-   * delete the database by name.
+   * supports `destroy` (close), or refused the delete, so the caller knows it
+   * must still delete the database by name. Never throws: y-indexeddb rejects
+   * both calls when its database never opened, and a rename or a delete must
+   * not fail on the store it leaves behind.
    */
   private async clearCached(bindingId: string, filePath: string): Promise<boolean> {
     const key = this.cacheKey(bindingId, filePath);
@@ -882,13 +935,24 @@ export class DocManager {
       return false;
     }
     let cleared = false;
-    if (entry.persistence?.clearData) {
-      await entry.persistence.clearData();
-      cleared = true;
-    } else if (entry.persistence) {
-      await entry.persistence.destroy();
-    } else {
+    const persistence = entry.persistence;
+    if (persistence === null) {
       cleared = true; // in-memory only — nothing on disk to delete.
+    } else {
+      try {
+        if (persistence.clearData) {
+          await persistence.clearData();
+          cleared = true;
+        } else {
+          await persistence.destroy();
+        }
+      } catch {
+        try {
+          await persistence.destroy();
+        } catch {
+          // Closed or not, the database is deleted by name next.
+        }
+      }
     }
     entry.doc.destroy();
     return cleared;
@@ -917,4 +981,9 @@ export class DocManager {
 /** Whether a doc holds any integrated operation. */
 function hasHistory(doc: Y.Doc): boolean {
   return doc.store.clients.size > 0;
+}
+
+/** Whether a doc holds remote updates it could not integrate yet. */
+function hasPending(doc: Y.Doc): boolean {
+  return doc.store.pendingStructs !== null || doc.store.pendingDs !== null;
 }

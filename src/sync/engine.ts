@@ -370,6 +370,15 @@ export class SyncEngine {
    */
   private newDocs: IndexedMeta[] = [];
 
+  /**
+   * Paths vacated by deletes made on this device and sent by this connect's
+   * queue drain. The server holds a tombstone there now, and `initialPush`
+   * skips a tombstoned path as a deleted file still on disk. Not these: the
+   * delete was checked against the disk, so a file there now is a new one —
+   * a note saved under the name while the plugin was off — and is uploaded.
+   */
+  private freedHere = new Set<string>();
+
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
 
@@ -589,6 +598,7 @@ export class SyncEngine {
       this.indexReady = false;
       this.pendingCatchup = [];
       this.yjsFetchUnavailable = false;
+      this.freedHere.clear();
       // Arm the streamed-catch-up completion signal before the join so a fast
       // server stream can't resolve before we're waiting on it.
       const catchupDone = new Promise<void>((resolve) => {
@@ -819,10 +829,8 @@ export class SyncEngine {
    * note's (see `DocManager.open`). Every flow that folds into, writes out or
    * pushes back a doc comes through here first.
    *
-   * A history found to be another file's is started anew. What it held is
-   * still on disk, and the fold markers of both files are set back to their
-   * last synced content (see {@link forgetFoldedEdits}), so their next fold
-   * merges the disk three-way instead of taking it as folded already.
+   * A history found to be another file's is started anew (see
+   * {@link afterDocOpen}).
    */
   private async openDoc(meta: IndexedMeta): Promise<void> {
     // A rename may move the file while its doc loads: open it where it is now.
@@ -835,10 +843,12 @@ export class SyncEngine {
 
   /**
    * A note's doc was found holding a history that is not the note's, and
-   * started anew (see `DocManager.open`). What it held is still on disk, and
-   * the fold markers of both files are set back to their last synced content
-   * (see {@link forgetFoldedEdits}), so their next fold merges the disk
-   * three-way instead of taking it as folded already.
+   * started anew (see `DocManager.open`). The note's fold marker is set back
+   * to its last synced content (see {@link forgetFoldedEdits}): what it named
+   * as folded may have gone with that doc, and the next fold merges the disk
+   * three-way instead of taking it as folded already. The other file's marker
+   * stays: that history is a leftover, and the file's live doc is under its
+   * own name (see {@link afterDocMove}).
    */
   private afterDocOpen(meta: IndexedMeta, path: string, opened: OpenResult): void {
     if (!opened.discarded) return;
@@ -847,7 +857,6 @@ export class SyncEngine {
       fileId: meta.fileId,
       owner: opened.owner,
     });
-    if (opened.owner !== null) this.forgetFoldedEdits(this.operationLog, opened.owner);
     this.forgetFoldedEdits(this.operationLog, meta.fileId);
   }
 
@@ -963,7 +972,7 @@ export class SyncEngine {
       // Deleted on the server while this device was away: removed below, not
       // uploaded again.
       if (deletedAway.has(path)) continue;
-      if (tombstoned.has(path)) {
+      if (tombstoned.has(path) && !this.freedHere.has(path)) {
         this.log.debug('initialPush: skipping server-tombstoned path', path);
         continue;
       }
@@ -975,10 +984,10 @@ export class SyncEngine {
         // will surface them again.
       }
     }
-    for (const record of deletedAway.values()) {
+    for (const away of deletedAway.values()) {
       this.throwIfStopped();
       try {
-        await this.dropDeletedWhileAway(record);
+        await this.dropDeletedWhileAway(away.record, away.serverHash);
       } catch {
         this.throwIfStopped();
         // Left as it is: the next connect finds the record again.
@@ -998,18 +1007,19 @@ export class SyncEngine {
    * renamed, it stayed on disk, never synced again.
    */
   private deletedWhileAway(
-    deletedIds: ReadonlySet<string>,
+    deleted: ReadonlyMap<string, string>,
     pending: ReadonlySet<string>,
-  ): Map<string, FileMeta> {
-    const out = new Map<string, FileMeta>();
+  ): Map<string, { record: FileMeta; serverHash: string }> {
+    const out = new Map<string, { record: FileMeta; serverHash: string }>();
     for (const record of this.operationLog.listFileMeta(this.binding.id)) {
       const id = record.serverFileId;
-      if (id === '' || !deletedIds.has(id) || this.fileIndex.byId.has(id)) continue;
+      const serverHash = id === '' ? undefined : deleted.get(id);
+      if (serverHash === undefined || this.fileIndex.byId.has(id)) continue;
       const path = record.relativePath;
       if (this.fileIndex.byPath.has(path) || pending.has(path) || !this.isLocalName(path)) {
         continue;
       }
-      out.set(path, record);
+      out.set(path, { record, serverHash });
     }
     return out;
   }
@@ -1019,13 +1029,29 @@ export class SyncEngine {
    * when the server had it, asked about first when it may hold edits the
    * server never got — any change since the last sync, a fold into the doc
    * included: the catch-up pushed nothing back for a file it did not know.
+   *
+   * The server had it when the copy is its last content (`serverHash`, from
+   * the tombstone) or, for a note, one in its version history. A note's
+   * `contentHash` moves only when a snapshot writes the file, so a note once
+   * edited on this device differs from it for good, and every such note a
+   * teammate deleted meanwhile used to ask, one dialog after another, about
+   * edits the server had long had.
    */
-  private async dropDeletedWhileAway(record: FileMeta): Promise<void> {
+  private async dropDeletedWhileAway(record: FileMeta, serverHash: string): Promise<void> {
+    const path = record.relativePath;
     this.log.info('removing the local copy of a file deleted while this device was away', {
-      path: record.relativePath,
+      path,
     });
+    const localHash = await this.hashFile(this.vault, path);
+    const serverHad =
+      localHash !== null &&
+      localHash !== record.contentHash &&
+      (localHash === serverHash ||
+        (record.fileType === 'TEXT' &&
+          (await this.serverHadVersion(record.serverFileId, localHash))));
     await this.dropLocalCopy({ ...record, fileId: record.serverFileId }, null, {
       pushedBack: false,
+      ...(serverHad ? { serverHad: localHash } : {}),
     });
   }
 
@@ -1038,14 +1064,18 @@ export class SyncEngine {
    */
   private async fetchServerTombstones(): Promise<{
     paths: Set<string>;
-    ids: Set<string>;
+    /** Id → the content the server last had. */
+    ids: Map<string, string>;
   } | null> {
     try {
       const files = await this.api.getProjectFiles(this.binding.projectId, {
         includeDeleted: true,
       });
       const deleted = files.filter((f) => f.deletedAt !== null);
-      return { paths: new Set(deleted.map((f) => f.path)), ids: new Set(deleted.map((f) => f.id)) };
+      return {
+        paths: new Set(deleted.map((f) => f.path)),
+        ids: new Map(deleted.map((f) => [f.id, f.contentHash])),
+      };
     } catch {
       this.throwIfStopped();
       return null;
@@ -1053,11 +1083,15 @@ export class SyncEngine {
   }
 
   private async refreshFileIndex(): Promise<void> {
-    const files = await this.api.getProjectFiles(this.binding.projectId);
+    const listed = await this.api.getProjectFiles(this.binding.projectId);
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
+    // Deleted here while offline: gone, as far as this device is concerned.
+    const deletedHere = this.queuedDeletes();
+    await this.forgetQueuedDeletes(deletedHere);
+    const files = listed.filter((f) => !deletedHere.has(f.id));
     // Renamed here while offline: the queue is what says where these are.
-    const here = this.queuedRenames();
+    const here = this.queuedRenames(deletedHere);
     this.renamedHere = here;
     const away = this.renamedWhileAway(files, here);
     this.renamesLeft.clear();
@@ -1364,7 +1398,7 @@ export class SyncEngine {
    * A rename into a name this client never writes is left out: the replay
    * sends it as the delete it stands for.
    */
-  private queuedRenames(): Map<string, string> {
+  private queuedRenames(deleted: ReadonlySet<string>): Map<string, string> {
     const here = new Map<string, string>();
     for (const op of this.operationLog.dequeueOperations(this.binding.id)) {
       if (op.opType !== 'RENAME' && op.opType !== 'MOVE') continue;
@@ -1373,7 +1407,48 @@ export class SyncEngine {
       if (this.isLocalName(op.newPath)) here.set(fileId, op.newPath);
       else here.delete(fileId);
     }
+    // Deleted after the rename: nowhere here.
+    for (const fileId of deleted) here.delete(fileId);
     return here;
+  }
+
+  /**
+   * Files deleted on this device whose DELETE still waits in the offline
+   * queue, by id (see {@link forgetDeletedHere}). The listing still has them:
+   * indexed, the catch-up wrote the deleted note back to disk and a new note
+   * under its name was taken for it. So the index refresh leaves them out, as
+   * if the server had them deleted already, which the drain makes so next.
+   *
+   * Not a delete `stop()` handed over before its stale-delete check (see
+   * {@link holdLocalDelete}): it may be a stray `unlink` of a file still there,
+   * and the replay decides that.
+   */
+  private queuedDeletes(): Set<string> {
+    const deleted = new Set<string>();
+    for (const op of this.operationLog.dequeueOperations(this.binding.id)) {
+      if (op.opType !== 'DELETE' || op.payload[RECHECK_DELETE] === true) continue;
+      const fileId = queuedFileId(op.payload);
+      if (fileId !== '') deleted.add(fileId);
+    }
+    return deleted;
+  }
+
+  /**
+   * Drop what this device still records of the files in `deleted` (see
+   * {@link queuedDeletes}): a DELETE `stop()` handed over while its ack was on
+   * the way left the file in `state.json`, and its doc in the store. Only the
+   * databases of those files' own names, by name.
+   */
+  private async forgetQueuedDeletes(deleted: ReadonlySet<string>): Promise<void> {
+    if (deleted.size === 0) return;
+    for (const record of this.operationLog.listFileMeta(this.binding.id)) {
+      if (!deleted.has(record.serverFileId)) continue;
+      const path = record.relativePath;
+      this.operationLog.deleteFileMeta(this.binding.id, path);
+      if (record.fileType !== 'TEXT') continue;
+      await this.dropDoc(this.docManager, record.serverFileId, path);
+      this.throwIfStopped();
+    }
   }
 
   /** Whether this binding syncs `path` as a name of its own. */
@@ -1943,6 +2018,30 @@ export class SyncEngine {
       return;
     }
     this.queue('DELETE', path, null, { fileId });
+    await this.forgetDeletedHere(fileId, path);
+  }
+
+  /**
+   * A file deleted here whose DELETE waits in the offline queue: it leaves the
+   * index, `state.json` and its doc at once, as an offline rename moves them
+   * (see {@link handleLocalRename}); the next connect leaves it out of the
+   * listing until the queue has sent the delete (see {@link queuedDeletes}).
+   *
+   * Left in place until the ack, the file was still this device's under its
+   * name: the catch-up wrote the deleted note back to disk, where it stayed
+   * after the delete went out, never synced again, and a new note saved under
+   * the name meanwhile (Obsidian reuses "Untitled") was folded into the
+   * deleted one's doc — its text went to the server as the deleted note's,
+   * and the new note itself was never uploaded.
+   */
+  private async forgetDeletedHere(fileId: string, path: string): Promise<void> {
+    await this.commitLocal(async (io) => {
+      if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
+        this.fileIndex.byId.delete(fileId);
+      }
+      this.forgetPath(io.log, fileId, path);
+      await this.dropDoc(io.docs, fileId, path);
+    });
   }
 
   private async handleLocalRename(oldPath: string, newPath: string): Promise<void> {
@@ -1979,10 +2078,23 @@ export class SyncEngine {
       // offline, the old name was written back by the catch-up and uploaded
       // as a second file, and a new note saved under it was folded into this
       // one.
+      //
+      // The rename goes out, or into the queue, whatever became of that: the
+      // file is under the new name on disk. Held back by a failure here, it
+      // was lost, and the next connect moved the file back to the old name.
       if (meta) {
-        await this.withPathLock(oldPath, () =>
-          this.commitLocal((io) => this.relocate(io, meta, newPath)),
-        );
+        try {
+          await this.withPathLock(oldPath, () =>
+            this.commitLocal((io) => this.relocate(io, meta, newPath)),
+          );
+        } catch (err) {
+          this.throwIfStopped();
+          this.log.warn('could not move a renamed file’s records to its new name', {
+            oldPath,
+            newPath,
+            error: describeError(err, 'relocate_failed'),
+          });
+        }
       }
       if (this.socket.isConnected() && fileId) {
         const ack = await this.socket.emitFileRename({
@@ -2087,7 +2199,11 @@ export class SyncEngine {
       switchOver();
       return;
     }
-    const moved = await io.docs.move(this.binding.id, oldPath, newPath, meta.fileId, switchOver);
+    // A snapshot pending for the file is written under the new name, from the
+    // doc: kept open for it (see `DocManager.move`).
+    const moved = await io.docs.move(this.binding.id, oldPath, newPath, meta.fileId, switchOver, {
+      keepOpen: () => this.snapshotDebouncers.has(oldPath),
+    });
     this.afterDocMove(io.log, meta, moved);
   }
 
@@ -2126,16 +2242,27 @@ export class SyncEngine {
   }
 
   /**
-   * After a note's doc was moved (see `DocManager.move`): a history that did
-   * not come along leaves the fold marker naming disk content that was only
-   * in it. Set back to the last synced content, the next fold merges the
-   * disk three-way against a verified base instead of taking it as folded —
-   * a catch-up would otherwise overwrite an edit folded while offline.
+   * After a note's doc was moved (see `DocManager.move`): a history that was
+   * under the old name and did not come along — a store that did not load in
+   * time, or one stamped for another file — leaves the fold marker naming
+   * disk content that may have been only in it. Set back to the last synced
+   * content, the next fold merges the disk three-way against a verified base
+   * instead of taking it as folded: a catch-up would otherwise overwrite an
+   * edit folded while offline.
+   *
+   * Only then. With nothing under the old name — a note whose disk matched
+   * the server, so the catch-up never opened its doc; a store lost to a
+   * cleared IndexedDB; one a build before 0.3.8 left under an earlier name —
+   * the marker is right as it is, and set back it made the next fold merge a
+   * disk that already matched the server against an older base: a teammate's
+   * edit arriving next was deleted for everyone, or the note's own last edit
+   * doubled.
+   *
+   * Nor the marker of any other file: a history of another file found under
+   * either name is a leftover, and that file's live doc is under its own name.
    */
   private afterDocMove(log: OperationLog, meta: IndexedMeta, moved: MoveResult): void {
-    if (moved.foreign !== null) this.forgetFoldedEdits(log, moved.foreign);
-    if (moved.displaced !== null) this.forgetFoldedEdits(log, moved.displaced);
-    if (!moved.carried) this.forgetFoldedEdits(log, meta.fileId);
+    if (moved.found && !moved.carried) this.forgetFoldedEdits(log, meta.fileId);
   }
 
   /**
@@ -2603,7 +2730,7 @@ export class SyncEngine {
   private async dropLocalCopy(
     meta: IndexedMeta,
     movedTo: string | null,
-    opts: { pushedBack: boolean } = { pushedBack: true },
+    opts: { pushedBack: boolean; serverHad?: string } = { pushedBack: true },
   ): Promise<void> {
     // One local phase, from the check to the delete. A delete stopped before
     // it reaches the disk is not replayed: the next catch-up no longer finds
@@ -2616,7 +2743,12 @@ export class SyncEngine {
       if (await io.vault.exists(meta.relativePath)) {
         const localBuf = await io.vault.readBinary(meta.relativePath);
         const localHash = await sha256Hex(localBuf);
-        if (this.mayHoldUnsentEdits(meta, localHash, opts.pushedBack)) {
+        // The server had this very content: nothing to lose. Changed since
+        // that was looked up, the copy is asked about.
+        if (
+          localHash !== opts.serverHad &&
+          this.mayHoldUnsentEdits(meta, localHash, opts.pushedBack)
+        ) {
           return { localBuf, localHash };
         }
       }
@@ -3781,6 +3913,9 @@ export class SyncEngine {
           });
           this.throwIfStopped();
           if (ack.ok) {
+            // Checked against the disk, when it was queued or just above: a
+            // file there now is a new one.
+            this.freedHere.add(op.filePath);
             const at = this.currentPathOf(fileId, op.filePath);
             if (this.fileIndex.byId.get(fileId)?.relativePath === at) {
               this.fileIndex.byId.delete(fileId);

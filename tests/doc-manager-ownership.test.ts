@@ -189,7 +189,13 @@ describe('DocManager — move', () => {
     });
     await flushAsync();
 
-    expect(moved).toEqual({ carried: true, lost: false, foreign: null, displaced: null });
+    expect(moved).toEqual({
+      found: true,
+      carried: true,
+      lost: false,
+      foreign: null,
+      displaced: null,
+    });
     expect(order).toEqual(['switch:A\nmine\n']);
     expect(dm.has('b1', 'a.md')).toBe(false);
     expect(idb.dbs.has(dbNameOf('a.md'))).toBe(false);
