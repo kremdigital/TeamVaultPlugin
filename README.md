@@ -206,7 +206,9 @@ with a long s.
   comes once per name while the plugin runs, wherever the name turns up;
   names reported within a moment of each other (a link update across many
   notes, a folder copied into the vault) share one notice, and `sync.log`
-  lists each of them. While a notice is up, the next one waits for it to go.
+  lists each of them. A notice comes no sooner than 15 seconds after the one
+  before, about when that one goes by itself, and takes in what was reported
+  meanwhile.
   A rename that keeps the name at fault — renaming the folder above such a
   note, or moving the note within its binding — isn't reported, since
   nothing changes for your teammates; moving it into the folder of another

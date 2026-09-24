@@ -8,6 +8,7 @@ import {
 } from '@/watcher/obsidian-events';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import type { VaultBinding } from '@/settings/settings';
+import { manualStep, readme } from './docs-text';
 
 /**
  * A third review of the notices about names Windows can't keep as spelled
@@ -273,5 +274,63 @@ describe.each([
     expect(notices[0]).toContain(text.note);
     expect(notices[0]).toContain(text.noteOlder);
     expect(notices[0]).not.toContain(text.folder);
+  });
+});
+
+describe('what the docs say about these notices', () => {
+  it('README: every rename of a synced note to such a name gets a notice and a log line', () => {
+    expect(readme()).toContain(
+      'a notice says so for every such rename, even if the name was reported before or the same note was renamed so earlier',
+    );
+    expect(readme()).toContain('`sync.log` gets a line for each, naming the note it was');
+  });
+
+  it('README and MANUAL-TEST S16 step 2: the gap between notices is fixed', () => {
+    const { vault, notices, shownAt } = bench();
+
+    vault.fire('create', { path: 'Why?.md' });
+    jest.advanceTimersByTime(1000);
+    expect(notices).toHaveLength(1);
+    // Whether the first is still up or was clicked away, the next one
+    // waits out the gap from when the first came up.
+    vault.fire('create', { path: 'Who?.md' });
+    jest.runOnlyPendingTimers();
+    expect(notices).toHaveLength(2);
+    const gap = (shownAt[1] ?? 0) - (shownAt[0] ?? 0);
+    expect(gap).toBe(15_000);
+
+    expect(readme()).not.toContain('waits for it to go');
+    expect(readme()).toContain(
+      `A notice comes no sooner than ${gap / 1000} seconds after the one before`,
+    );
+    const step2 = manualStep('S16', 2);
+    expect(step2).not.toContain('на экране их не больше одного');
+    expect(step2).toContain(`не чаще раза в ${gap / 1000} секунд`);
+    expect(step2).toContain('Пауза не зависит от того, видно ли предыдущее');
+  });
+
+  it('MANUAL-TEST S16 step 4: the notice about a new note in `U.S.` is described as it is', () => {
+    setLanguage('ru');
+    const { vault, notices } = bench();
+    vault.fire('create', { path: 'U.S./Без названия.md' });
+    jest.runOnlyPendingTimers();
+
+    expect(notices).toHaveLength(1);
+    const notice = notices[0] ?? '';
+    // It does speak of deleting: a leftover copy, and how not to on Windows.
+    expect(notice).toContain('удалите копию');
+    expect(notice).toContain('На Windows не удаляйте файл или папку');
+    expect(notice).not.toContain('выглядит как удаление');
+
+    const step4 = manualStep('S16', 4);
+    expect(step4).not.toContain('без слов об удалении');
+    // The step quotes the notice.
+    const quoted = 'Переименуйте папку, чтобы синхронизировать её заметки с командой';
+    expect(notice).toContain(quoted);
+    expect(step4).toContain(quoted);
+    expect(step4).toContain(
+      'Фразы «для коллег это переименование выглядит как удаление» в нём нет',
+    );
+    expect(step4).toContain('предупреждение, что на Windows такое имя нельзя удалять');
   });
 });
