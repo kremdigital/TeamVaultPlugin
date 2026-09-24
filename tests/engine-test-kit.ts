@@ -10,7 +10,12 @@
 import * as Y from 'yjs';
 import { SyncEngine, type EngineStatus } from '@/sync/engine';
 import { OperationLog } from '@/sync/operation-log';
-import { DocManager } from '@/crdt/doc-manager';
+import {
+  DocManager,
+  type DocPersistence,
+  type IdbRegistry,
+  type PersistenceFactory,
+} from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import { ApiClient, type RequestUrlResponse } from '@/client/api';
 import type { ApiFile } from '@/client/types';
@@ -168,6 +173,94 @@ export class MemoryVault implements VaultAdapter {
   }
 }
 
+/**
+ * y-indexeddb stand-in: one database per name, kept across releases and
+ * restarts (a new `DocManager` on the same instance). Like the real one, a
+ * store loads asynchronously and applies what it holds with itself as the
+ * origin, keeps a small key/value area, and `clearData` deletes the database.
+ * The registry lists and deletes databases by name, as the renderer's
+ * `indexedDB` does for every vault on the machine.
+ */
+export class FakeIndexedDb {
+  readonly dbs = new Map<string, { updates: Uint8Array[]; custom: Map<string, unknown> }>();
+  /** Every database deleted, in order. */
+  readonly deleted: string[] = [];
+  readonly registry: IdbRegistry = {
+    list: () => Promise.resolve([...this.dbs.keys()]),
+    delete: (name) => {
+      if (this.dbs.delete(name)) this.deleted.push(name);
+      return Promise.resolve();
+    },
+  };
+  readonly factory: PersistenceFactory = (name, doc) => this.open(name, doc);
+
+  /** A fresh `DocManager` on these databases — what a restart of Obsidian builds. */
+  manager(): DocManager {
+    return new DocManager({ persistenceFactory: this.factory, idb: this.registry });
+  }
+
+  /** The text a database holds, as a doc loaded from it would show it. */
+  textOf(name: string): string | null {
+    const db = this.dbs.get(name);
+    if (!db) return null;
+    const doc = new Y.Doc();
+    for (const u of db.updates) Y.applyUpdate(doc, u);
+    const text = doc.getText('content').toJSON();
+    doc.destroy();
+    return text;
+  }
+
+  private open(name: string, doc: Y.Doc): DocPersistence {
+    let db = this.dbs.get(name);
+    if (!db) {
+      db = { updates: [], custom: new Map() };
+      this.dbs.set(name, db);
+    }
+    const store = db;
+    let destroyed = false;
+    const onUpdate = (update: Uint8Array, origin: unknown): void => {
+      if (!destroyed && origin !== persistence) store.updates.push(update);
+    };
+    const persistence: DocPersistence = {
+      whenSynced: Promise.resolve().then(() => {
+        if (destroyed) return;
+        Y.transact(
+          doc,
+          () => {
+            for (const u of store.updates) Y.applyUpdate(doc, u);
+          },
+          persistence,
+          false,
+        );
+      }),
+      destroy: () => {
+        destroyed = true;
+        doc.off('update', onUpdate);
+      },
+      clearData: () => {
+        destroyed = true;
+        doc.off('update', onUpdate);
+        if (this.dbs.get(name) === store) {
+          this.dbs.delete(name);
+          this.deleted.push(name);
+        }
+      },
+      get: (key) => Promise.resolve(store.custom.get(key)),
+      set: (key, value) => {
+        store.custom.set(key, value);
+        return Promise.resolve();
+      },
+    };
+    doc.on('update', onUpdate);
+    return persistence;
+  }
+}
+
+/** The database name `DocManager` gives the doc of `path` in binding `b1`. */
+export function dbNameOf(path: string): string {
+  return `team-vault-b1-${encodeURIComponent(path)}`;
+}
+
 export interface Emit {
   event: string;
   payload: unknown;
@@ -292,6 +385,11 @@ export interface HarnessOptions {
   /** Bind to a subfolder instead of the vault root. */
   localFolder?: string;
   logger?: Logger;
+  /**
+   * The docs the engine uses, instead of an in-memory `DocManager` (or the
+   * predecessor's): `FakeIndexedDb.manager()` for docs that persist.
+   */
+  docs?: DocManager;
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -334,7 +432,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   const routes = new Map<string, Responder>();
   const vault = predecessor?.vault ?? new MemoryVault();
   const log = predecessor?.log ?? new OperationLog();
-  const doc = predecessor?.doc ?? new DocManager();
+  const doc = opts.docs ?? predecessor?.doc ?? new DocManager();
   const ra = predecessor?.echo ?? new RecentlyApplied();
 
   // Filled in below; the routes and the modal read it when they are called.

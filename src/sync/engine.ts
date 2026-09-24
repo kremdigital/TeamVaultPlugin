@@ -10,7 +10,7 @@ import {
   type YjsCatchupBatch,
 } from '@/client/socket';
 import * as Y from 'yjs';
-import { DocManager } from '@/crdt/doc-manager';
+import { DocManager, type MoveResult, type OpenResult } from '@/crdt/doc-manager';
 import { mergeText3 } from '@/crdt/text-merge';
 import {
   OperationLog,
@@ -43,6 +43,7 @@ import {
   checkVaultPath,
   isAlwaysIgnored,
   isInBinding,
+  pathKey,
   type PathRejection,
 } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
@@ -350,6 +351,25 @@ export class SyncEngine {
   /** Set when a `yjs:fetch` timed out; cleared on the next connect. */
   private yjsFetchUnavailable = false;
 
+  /**
+   * The local-update subscription on each doc, by doc path — see
+   * {@link wire}. One per path: wiring a path again replaces it.
+   */
+  private wired = new Map<string, () => void>();
+
+  /**
+   * Files renamed on this device whose RENAME still waits in the offline
+   * queue: id → the name the file has here. Until the server has the rename,
+   * the queue is what says where they are — see {@link queuedRenames}.
+   */
+  private renamedHere = new Map<string, string>();
+
+  /**
+   * Notes the index refresh put under a name this device has no record of
+   * them at — see {@link claimNewDocs}. Filled by `indexListedFile`.
+   */
+  private newDocs: IndexedMeta[] = [];
+
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
 
@@ -464,6 +484,8 @@ export class SyncEngine {
     }
     for (const cb of this.cleanups) cb();
     this.cleanups = [];
+    for (const off of this.wired.values()) off();
+    this.wired.clear();
     for (const d of this.snapshotDebouncers.values()) d.cancel();
     this.snapshotDebouncers.clear();
     this.pathLocks.clear();
@@ -622,7 +644,7 @@ export class SyncEngine {
       // Подписка на отправку локальных правок — ЛЕНИВО.
       //
       // Раньше здесь был проход по всем текстовым файлам проекта с вызовом
-      // `wireYjsForTextFile`, а тот через `onLocalUpdate` создаёт документ:
+      // `wire`, а тот через `onLocalUpdate` создаёт документ:
       // `Y.Doc` плюс отдельная база `y-indexeddb` на КАЖДЫЙ файл. На вальте в
       // 1062 файла это занимало поток интерфейса на десятки секунд, из-за чего
       // пропускался heartbeat, соединение рвалось и catch-up начинался заново —
@@ -633,13 +655,13 @@ export class SyncEngine {
       // применение серверного апдейта).
       for (const meta of this.fileIndex.byPath.values()) {
         if (meta.fileType === 'TEXT' && this.docManager.has(this.binding.id, meta.relativePath)) {
-          this.wireYjsForTextFile(meta.fileId, meta.relativePath);
+          this.wire(meta.fileId, meta.relativePath);
         }
       }
       this.cleanups.push(
         this.docManager.onDocAcquired(this.binding.id, (filePath) => {
           const meta = this.fileIndex.byPath.get(filePath);
-          if (meta?.fileType === 'TEXT') this.wireYjsForTextFile(meta.fileId, filePath);
+          if (meta?.fileType === 'TEXT') this.wire(meta.fileId, filePath);
         }),
       );
 
@@ -758,7 +780,10 @@ export class SyncEngine {
     // server's state to a doc that hasn't finished loading computes a bogus
     // push-back diff and snapshots a local-history-less merge over the file
     // on disk — a silent rollback.
-    await this.docManager.whenSynced(this.binding.id, meta.relativePath);
+    await this.openDoc(meta);
+    // Deleted while the store loaded. (Renamed, it took the doc along, and
+    // `meta` names the new path.)
+    if (this.fileIndex.byId.get(snap.fileId) !== meta) return;
     await this.withPathLock(meta.relativePath, () => this.noteDiskAgreement(meta));
     this.rememberBaseBeforeRemote(meta);
     const update = Uint8Array.from(snap.sync1);
@@ -786,6 +811,62 @@ export class SyncEngine {
         fileId: meta.fileId,
         update: missing,
       });
+    }
+  }
+
+  /**
+   * Wait for a note's doc to load, and make sure the history in it is this
+   * note's (see `DocManager.open`). Every flow that folds into, writes out or
+   * pushes back a doc comes through here first.
+   *
+   * A history found to be another file's is started anew. What it held is
+   * still on disk, and the fold markers of both files are set back to their
+   * last synced content (see {@link forgetFoldedEdits}), so their next fold
+   * merges the disk three-way instead of taking it as folded already.
+   */
+  private async openDoc(meta: IndexedMeta): Promise<void> {
+    // A rename may move the file while its doc loads: open it where it is now.
+    for (let tries = 0; tries < 3; tries++) {
+      const path = meta.relativePath;
+      this.afterDocOpen(meta, path, await this.docManager.open(this.binding.id, path, meta.fileId));
+      if (meta.relativePath === path) return;
+    }
+  }
+
+  /**
+   * A note's doc was found holding a history that is not the note's, and
+   * started anew (see `DocManager.open`). What it held is still on disk, and
+   * the fold markers of both files are set back to their last synced content
+   * (see {@link forgetFoldedEdits}), so their next fold merges the disk
+   * three-way instead of taking it as folded already.
+   */
+  private afterDocOpen(meta: IndexedMeta, path: string, opened: OpenResult): void {
+    if (!opened.discarded) return;
+    this.log.warn('a note’s offline history belonged to another file; starting it anew', {
+      path,
+      fileId: meta.fileId,
+      owner: opened.owner,
+    });
+    if (opened.owner !== null) this.forgetFoldedEdits(this.operationLog, opened.owner);
+    this.forgetFoldedEdits(this.operationLog, meta.fileId);
+  }
+
+  /**
+   * Notes indexed under a name this device has no record of them at (see
+   * `indexListedFile`): whatever history is stored under that name is not
+   * theirs — unless stamped for them. A build before 0.3.8 left the history
+   * of a note renamed or deleted away under its old name, without a stamp,
+   * and the next note there took it for its own. Checked once per connect,
+   * before anything folds into, writes out or pushes back these docs; only
+   * names with a store are opened (see `DocManager.claimStored`).
+   */
+  private async claimNewDocs(metas: readonly IndexedMeta[]): Promise<void> {
+    for (const meta of metas) {
+      const path = meta.relativePath;
+      if (this.fileIndex.byPath.get(path) !== meta) continue;
+      const opened = await this.docManager.claimStored(this.binding.id, path, meta.fileId);
+      this.throwIfStopped();
+      if (opened !== null) this.afterDocOpen(meta, path, opened);
     }
   }
 
@@ -858,9 +939,9 @@ export class SyncEngine {
     // resurrect an intentionally-deleted file: initialPush walks the raw disk,
     // and a file the server deleted but that is still on disk would come back
     // as a fresh CREATE. Honour the server's tombstones instead.
-    const tombstoned = await this.fetchServerTombstones();
+    const tombstones = await this.fetchServerTombstones();
     this.throwIfStopped();
-    if (tombstoned === null) {
+    if (tombstones === null) {
       // Couldn't confirm the server's tombstones. Don't risk re-uploading a
       // deleted-but-still-on-disk file — after catch-up merges the delete
       // clock, the server's causal guard can't stop the resurrection. Defer
@@ -869,6 +950,8 @@ export class SyncEngine {
       this.log.debug('initialPush: tombstone lookup failed; deferring upload pass');
       return;
     }
+    const tombstoned = tombstones.paths;
+    const deletedAway = this.deletedWhileAway(tombstones.ids, pending);
     for (const path of paths) {
       this.throwIfStopped();
       // Watcher events are filtered upstream, but this pass walks the raw
@@ -877,6 +960,9 @@ export class SyncEngine {
       if (this.isIgnoredLocalPath(path)) continue;
       if (this.fileIndex.byPath.has(path)) continue;
       if (pending.has(path)) continue;
+      // Deleted on the server while this device was away: removed below, not
+      // uploaded again.
+      if (deletedAway.has(path)) continue;
       if (tombstoned.has(path)) {
         this.log.debug('initialPush: skipping server-tombstoned path', path);
         continue;
@@ -889,21 +975,77 @@ export class SyncEngine {
         // will surface them again.
       }
     }
+    for (const record of deletedAway.values()) {
+      this.throwIfStopped();
+      try {
+        await this.dropDeletedWhileAway(record);
+      } catch {
+        this.throwIfStopped();
+        // Left as it is: the next connect finds the record again.
+      }
+    }
   }
 
   /**
-   * Vault paths the server currently holds as tombstones (soft-deleted). Used
-   * by `initialPush` to avoid resurrecting an intentionally-deleted file that
-   * is still on disk. Returns `null` on error (distinct from an empty set) so
-   * the caller can fail CLOSED — a failed lookup must not silently re-upload
-   * deleted files.
+   * Local copies of files the server deleted while this device was away, by
+   * path: `state.json` has them under an id the server holds as a tombstone,
+   * and nothing has them in the index.
+   *
+   * The catch-up misses such a file: it is not in the listing, so its DELETE
+   * finds nothing to apply to. Renamed before it was deleted, its tombstone
+   * is under the new name, and `initialPush` uploaded the copy under the old
+   * one as a new file — the deleted note came back for the whole team. Not
+   * renamed, it stayed on disk, never synced again.
    */
-  private async fetchServerTombstones(): Promise<Set<string> | null> {
+  private deletedWhileAway(
+    deletedIds: ReadonlySet<string>,
+    pending: ReadonlySet<string>,
+  ): Map<string, FileMeta> {
+    const out = new Map<string, FileMeta>();
+    for (const record of this.operationLog.listFileMeta(this.binding.id)) {
+      const id = record.serverFileId;
+      if (id === '' || !deletedIds.has(id) || this.fileIndex.byId.has(id)) continue;
+      const path = record.relativePath;
+      if (this.fileIndex.byPath.has(path) || pending.has(path) || !this.isLocalName(path)) {
+        continue;
+      }
+      out.set(path, record);
+    }
+    return out;
+  }
+
+  /**
+   * Apply the delete of {@link deletedWhileAway} to the local copy: removed
+   * when the server had it, asked about first when it may hold edits the
+   * server never got — any change since the last sync, a fold into the doc
+   * included: the catch-up pushed nothing back for a file it did not know.
+   */
+  private async dropDeletedWhileAway(record: FileMeta): Promise<void> {
+    this.log.info('removing the local copy of a file deleted while this device was away', {
+      path: record.relativePath,
+    });
+    await this.dropLocalCopy({ ...record, fileId: record.serverFileId }, null, {
+      pushedBack: false,
+    });
+  }
+
+  /**
+   * Vault paths and ids the server currently holds as tombstones
+   * (soft-deleted). Used by `initialPush` to avoid resurrecting an
+   * intentionally-deleted file that is still on disk. Returns `null` on error
+   * (distinct from an empty set) so the caller can fail CLOSED — a failed
+   * lookup must not silently re-upload deleted files.
+   */
+  private async fetchServerTombstones(): Promise<{
+    paths: Set<string>;
+    ids: Set<string>;
+  } | null> {
     try {
       const files = await this.api.getProjectFiles(this.binding.projectId, {
         includeDeleted: true,
       });
-      return new Set(files.filter((f) => f.deletedAt !== null).map((f) => f.path));
+      const deleted = files.filter((f) => f.deletedAt !== null);
+      return { paths: new Set(deleted.map((f) => f.path)), ids: new Set(deleted.map((f) => f.id)) };
     } catch {
       this.throwIfStopped();
       return null;
@@ -914,10 +1056,18 @@ export class SyncEngine {
     const files = await this.api.getProjectFiles(this.binding.projectId);
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
-    const away = this.renamedWhileAway(files);
+    // Renamed here while offline: the queue is what says where these are.
+    const here = this.queuedRenames();
+    this.renamedHere = here;
+    const away = this.renamedWhileAway(files, here);
     this.renamesLeft.clear();
-    const occupied = await this.clearStaleCopies(files, away);
+    const occupied = await this.clearStaleCopies(files, away, here);
     this.outOfScope.clear();
+    this.newDocs = [];
+    // Names our files took here: a file the listing has there is not indexed
+    // over ours (see `queuedRenames`).
+    const takenHere = new Set(here.values());
+    const renamed: ApiFile[] = [];
     // Old paths of the files renamed while away: whatever the listing shows
     // there now is indexed once our copy has moved out (see `deferred`).
     const vacating = new Set([...away.values()].map((move) => move.meta.relativePath));
@@ -925,6 +1075,12 @@ export class SyncEngine {
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
     for (const f of files) {
+      const local = here.get(f.id);
+      if (local !== undefined && local !== f.path && this.isLocalName(local)) {
+        // Indexed under the name it has here, below.
+        renamed.push(f);
+        continue;
+      }
       const moved = away.get(f.id);
       if (moved) {
         // Indexed where our copy still is, as this device last synced it; the
@@ -960,15 +1116,17 @@ export class SyncEngine {
         deferred.push(f);
         continue;
       }
-      if (occupied.has(f.path)) {
-        // Another file's copy we could not read is still there. Left for the
-        // next connect, known by id meanwhile.
+      if (occupied.has(f.path) || (takenHere.has(f.path) && local !== f.path)) {
+        // Another file's copy we could not read is still there, or our own
+        // file took the name here and has not told the server yet. Left for
+        // the next connect, known by id meanwhile.
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         continue;
       }
       this.indexListedFile(f, byPath, byId);
     }
     this.fileIndex = { byPath, byId };
+    for (const f of renamed) await this.indexRenamedHere(f, here.get(f.id) ?? f.path);
     await this.applyRenamesWhileAway(away);
     for (const f of deferred) {
       // A rename that could not be applied keeps its old path — and with it
@@ -979,13 +1137,21 @@ export class SyncEngine {
       }
       this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId);
     }
+    const fresh = this.newDocs;
+    this.newDocs = [];
+    await this.claimNewDocs(fresh);
   }
 
-  /** Index one file of the listing at its listed path, and mirror it to `state.json`. */
+  /**
+   * Index one file of the listing at its listed path, and mirror it to
+   * `state.json`. `recorded`: this device's record of the file, when it is
+   * not the one at `f.path`.
+   */
   private indexListedFile(
     f: ApiFile,
     byPath: Map<string, IndexedMeta>,
     byId: Map<string, IndexedMeta>,
+    recorded: FileMeta | null = this.operationLog.getFileMeta(this.binding.id, f.path),
   ): void {
     // Preserve the client's last-known `contentHash` (the "common
     // ancestor" from the engine's perspective) for files we've synced
@@ -1001,7 +1167,6 @@ export class SyncEngine {
     // while the disk holds the other file's bytes, and a note would fold the
     // other file's text into this one (see `clearStaleCopies`). A record with
     // no id comes from an old log and keeps the benefit of the doubt.
-    const recorded = this.operationLog.getFileMeta(this.binding.id, f.path);
     const existing =
       recorded !== null && (recorded.serverFileId === f.id || recorded.serverFileId === '')
         ? recorded
@@ -1023,6 +1188,9 @@ export class SyncEngine {
     byId.set(f.id, meta);
     // Mirror into SQLite so the next reconnect has it.
     this.operationLog.setFileMeta(meta);
+    // New to this device under this name: a history stored there is not this
+    // note's (see `claimNewDocs`).
+    if (existing === null && f.fileType === 'TEXT') this.newDocs.push(meta);
   }
 
   /**
@@ -1039,7 +1207,10 @@ export class SyncEngine {
    * A file the listing shows at the old path now does not stop the move: the
    * copy there is ours, as `state.json` says, and moves out first.
    */
-  private renamedWhileAway(files: readonly ApiFile[]): Map<string, RenamedWhileAway> {
+  private renamedWhileAway(
+    files: readonly ApiFile[],
+    here: ReadonlyMap<string, string>,
+  ): Map<string, RenamedWhileAway> {
     const lastSynced = new Map<string, FileMeta>();
     for (const meta of this.operationLog.listFileMeta(this.binding.id)) {
       if (meta.serverFileId !== '' && !lastSynced.has(meta.serverFileId)) {
@@ -1048,6 +1219,9 @@ export class SyncEngine {
     }
     const moves = new Map<string, RenamedWhileAway>();
     for (const f of files) {
+      // Renamed on this device as well: the queued rename wins, as it does on
+      // the server when it gets there.
+      if (here.has(f.id)) continue;
       const last = lastSynced.get(f.id);
       if (!last || last.relativePath === f.path) continue;
       // Recorded at the new path as well: that copy is the current one.
@@ -1086,6 +1260,7 @@ export class SyncEngine {
   private async clearStaleCopies(
     files: readonly ApiFile[],
     away: ReadonlyMap<string, RenamedWhileAway>,
+    here: ReadonlyMap<string, string>,
   ): Promise<Set<string>> {
     const occupied = new Set<string>();
     for (const f of files) {
@@ -1102,6 +1277,8 @@ export class SyncEngine {
       if (stale === null || stale.serverFileId === '' || stale.serverFileId === f.id) continue;
       // Moved away itself: it vacates the path before anything moves in.
       if (away.has(stale.serverFileId)) continue;
+      // Our own file under the name it was given here: its rename is queued.
+      if (here.has(stale.serverFileId)) continue;
       if (!(await this.clearStaleCopy(stale, f, away.has(f.id)))) occupied.add(f.path);
       this.throwIfStopped();
     }
@@ -1138,6 +1315,7 @@ export class SyncEngine {
     return this.commitLocal(async (io) => {
       if (!(await io.vault.exists(path))) {
         io.log.deleteFileMeta(this.binding.id, path);
+        await this.dropDoc(io.docs, stale.serverFileId, path);
         return true;
       }
       const now = await this.hashFile(io.vault, path);
@@ -1168,10 +1346,68 @@ export class SyncEngine {
         await io.vault.rename(path, aside);
       }
       io.log.deleteFileMeta(this.binding.id, path);
-      this.forgetFoldState(stale.serverFileId);
-      await io.docs.release(this.binding.id, path);
+      await this.dropDoc(io.docs, stale.serverFileId, path);
       return true;
     });
+  }
+
+  /**
+   * Files renamed on this device whose RENAME is still in the offline queue:
+   * id → the name the file has here, after the last such rename.
+   *
+   * The listing still has these under their old names. Taken for renames made
+   * on the server, they were moved back on disk; indexed where the listing
+   * has them, the catch-up wrote the old name back and `initialPush` uploaded
+   * it as a second file once the queue had sent the rename. A new note saved
+   * under the old name meanwhile was folded into the renamed one. The queue
+   * sends the rename next, and until then it is what says where the file is.
+   * A rename into a name this client never writes is left out: the replay
+   * sends it as the delete it stands for.
+   */
+  private queuedRenames(): Map<string, string> {
+    const here = new Map<string, string>();
+    for (const op of this.operationLog.dequeueOperations(this.binding.id)) {
+      if (op.opType !== 'RENAME' && op.opType !== 'MOVE') continue;
+      const fileId = queuedFileId(op.payload);
+      if (fileId === '' || op.newPath === null) continue;
+      if (this.isLocalName(op.newPath)) here.set(fileId, op.newPath);
+      else here.delete(fileId);
+    }
+    return here;
+  }
+
+  /** Whether this binding syncs `path` as a name of its own. */
+  private isLocalName(path: string): boolean {
+    return (
+      checkVaultPath(path, {
+        bindingFolder: this.binding.localFolder,
+        configDir: this.configDir,
+      }) === null
+    );
+  }
+
+  /**
+   * Index a listed file under `local`, the name it was given on this device
+   * (see {@link queuedRenames}), with this device's record of it — at `local`,
+   * or where a build before 0.3.8 left it until the ack, at the listed name.
+   * Its doc comes along if it is not there yet.
+   */
+  private async indexRenamedHere(f: ApiFile, local: string): Promise<void> {
+    const atLocal = this.operationLog.getFileMeta(this.binding.id, local);
+    const atListed = this.operationLog.getFileMeta(this.binding.id, f.path);
+    const recorded =
+      atLocal?.serverFileId === f.id ? atLocal : atListed?.serverFileId === f.id ? atListed : null;
+    // Where the file was recorded: its doc is there.
+    const from = recorded?.relativePath ?? local;
+    this.indexListedFile(
+      { ...f, path: from },
+      this.fileIndex.byPath,
+      this.fileIndex.byId,
+      recorded,
+    );
+    const meta = this.fileIndex.byId.get(f.id);
+    if (!meta || from === local) return;
+    await this.withPathLock(from, () => this.commitLocal((io) => this.relocate(io, meta, local)));
   }
 
   /** Whether the server's version history of a file holds content hashing to `hash`. */
@@ -1202,8 +1438,12 @@ export class SyncEngine {
       fileId,
       from: move.meta.relativePath,
       to: move.to,
+      /** Stepped aside once already (see below). */
+      aside: false,
     }));
-    const key = (path: string): string => path.toLowerCase();
+    // Names compare the way the path gate does — a Mac opens `Λογος` and
+    // `ΛΟΓΟΣ`, or `Straße` and `STRASSE`, as one file; `toLowerCase` does not.
+    const key = pathKey;
     /** Old paths that stay taken: their move failed or waits on one that did. */
     const stuck = new Set<string>();
     const leave = (move: { fileId: string; from: string }): void => {
@@ -1220,10 +1460,21 @@ export class SyncEngine {
       const free = pending.findIndex(
         (move) => !pending.some((other) => other !== move && key(other.from) === key(move.to)),
       );
-      const move = pending[Math.max(free, 0)];
-      if (!move) return;
       if (free < 0) {
-        // A cycle: step one file aside, and the move into its name is free.
+        // Every move waits on another: step one file of a cycle aside, and
+        // the move into its name is free. A move waiting on a cycle without
+        // being on it — two new names the disk takes for one, which the server
+        // allows — is not: stepped aside, it would still wait, and step aside
+        // again under a name longer each time. Each move steps aside once;
+        // one that would have to again is left for the next connect.
+        const move = cycleMove(pending, key);
+        if (!move) return;
+        if (move.aside) {
+          pending.splice(pending.indexOf(move), 1);
+          leave(move);
+          continue;
+        }
+        move.aside = true;
         const spare = await this.spareMovePath(this.vault, move.from);
         this.throwIfStopped();
         if (await this.tryMoveWhileAway(move.fileId, move.from, spare, { aside: true })) {
@@ -1234,6 +1485,8 @@ export class SyncEngine {
         }
         continue;
       }
+      const move = pending[free];
+      if (!move) return;
       pending.splice(free, 1);
       this.log.info('file renamed while this device was away', { from: move.from, to: move.to });
       if (!(await this.tryMoveWhileAway(move.fileId, move.from, move.to, { aside: false }))) {
@@ -1257,8 +1510,13 @@ export class SyncEngine {
     const meta = this.fileIndex.byId.get(fileId);
     if (meta?.relativePath === from) {
       try {
-        if (opts.aside) await this.commitLocal((io) => this.moveLocalCopy(io, meta, to));
-        else await this.applyServerRename(fileId, to);
+        if (opts.aside) {
+          await this.withPathLock(from, () =>
+            this.commitLocal((io) => this.moveLocalCopy(io, meta, to)),
+          );
+        } else {
+          await this.applyServerRename(fileId, to);
+        }
       } catch (err) {
         this.throwIfStopped();
         this.log.warn('could not apply a rename made while away; retrying on the next connect', {
@@ -1337,7 +1595,13 @@ export class SyncEngine {
           // re-upload (creating server-side conflict-renamed copies).
           const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
           if (outcome?.fileId && outcome?.path) {
-            this.recordCreatedFile(outcome.fileId, outcome.path, fileType, hash, buffer.byteLength);
+            await this.recordCreatedFile(
+              outcome.fileId,
+              outcome.path,
+              fileType,
+              hash,
+              buffer.byteLength,
+            );
           }
           this.persistVectorClock();
           return;
@@ -1361,13 +1625,13 @@ export class SyncEngine {
    * authoritative — the initial-push pass relies on that to avoid
    * re-uploading files the server already has.
    */
-  private recordCreatedFile(
+  private async recordCreatedFile(
     fileId: string,
     path: string,
     fileType: FileType,
     contentHash: string,
     size: number,
-  ): void {
+  ): Promise<void> {
     // The path comes back from the server's ack and may differ from the one
     // we sent (conflict rename). From here it flows into `fileIndex` and
     // `state.json`, which every later disk write reads — so it passes the
@@ -1389,7 +1653,7 @@ export class SyncEngine {
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(fileId, meta);
     this.operationLog.setFileMeta(meta);
-    if (fileType === 'TEXT') this.wireYjsForTextFile(fileId, path);
+    if (fileType === 'TEXT') await this.startDoc(fileId, path);
   }
 
   /**
@@ -1456,7 +1720,10 @@ export class SyncEngine {
       // The fold itself is three-way — see `foldDiskEditsIntoDoc` for the
       // reverted-edit bug a plain doc↔disk diff caused.
       await this.withPathLock(path, async () => {
-        await this.docManager.whenSynced(this.binding.id, path);
+        await this.openDoc(meta);
+        // Moved or deleted while the doc loaded: this event is about a name
+        // the note no longer has.
+        if (this.fileIndex.byPath.get(path) !== meta) return;
         await this.ensureHydrated(meta);
         if (!this.docManager.hasState(this.binding.id, path) && meta.size > 0) {
           this.log.debug('defer text modify until doc hydrates', path);
@@ -1659,14 +1926,11 @@ export class SyncEngine {
         this.fileIndex.byId.delete(fileId);
         this.operationLog.deleteFileMeta(this.binding.id, path);
         // A concurrent remote yjs:update may have scheduled a debounced disk
-        // snapshot for this path. With meta gone but the doc still live,
-        // writeDocSnapshot's `docManager.has` guard stays true and (no `!meta`
-        // guard) it would recreate the just-deleted file. Cancel the pending
-        // snapshot and release the doc — the same teardown applyServerDelete does.
-        this.snapshotDebouncers.get(path)?.cancel();
-        this.snapshotDebouncers.delete(path);
-        this.forgetFoldState(fileId);
-        await this.docManager.release(this.binding.id, path);
+        // snapshot for this path: cancelled, or it would recreate the
+        // just-deleted file. The doc and its store go too: left in place, they
+        // were the history of the next note created under this name — the
+        // same teardown applyServerDelete does.
+        await this.dropDoc(this.docManager, fileId, path);
         this.persistVectorClock();
         return;
       }
@@ -1706,6 +1970,20 @@ export class SyncEngine {
     // would upload the new path as a second file.
     const change = this.hold('watcher', 'RENAME', oldPath, newPath, { fileId });
     try {
+      // The note is under its new name on disk already, so it is recorded
+      // there at once, its doc with it — whether the server hears of the
+      // rename now or from the offline queue. Left under the old name until
+      // the ack, the doc stayed there after it as well: the next note created
+      // under that name (Obsidian reuses "Untitled") took this one's history,
+      // and its edits went out under this note's id. Left there while
+      // offline, the old name was written back by the catch-up and uploaded
+      // as a second file, and a new note saved under it was folded into this
+      // one.
+      if (meta) {
+        await this.withPathLock(oldPath, () =>
+          this.commitLocal((io) => this.relocate(io, meta, newPath)),
+        );
+      }
       if (this.socket.isConnected() && fileId) {
         const ack = await this.socket.emitFileRename({
           projectId: this.binding.projectId,
@@ -1717,13 +1995,6 @@ export class SyncEngine {
         });
         this.throwIfStopped();
         if (ack.ok) {
-          if (meta) {
-            this.operationLog.deleteFileMeta(this.binding.id, oldPath);
-            meta.relativePath = newPath;
-            this.operationLog.setFileMeta(meta);
-            this.fileIndex.byPath.delete(oldPath);
-            this.fileIndex.byPath.set(newPath, meta);
-          }
           this.persistVectorClock();
           return;
         }
@@ -1734,8 +2005,15 @@ export class SyncEngine {
     }
   }
 
-  /** Wire a text file's Yjs doc to the socket so future edits stream upstream. */
-  private wireYjsForTextFile(fileId: string, path: string): void {
+  /**
+   * Wire a text file's Yjs doc to the socket so future edits stream upstream.
+   * Replaces whatever the path was wired to: the subscription carries the
+   * file id, and each wiring used to add one more that lived until the engine
+   * stopped — so once a name changed hands, the new note's edits went out
+   * under the id of the one renamed away as well.
+   */
+  private wire(fileId: string, path: string): void {
+    this.unwire(path);
     const off = this.docManager.onLocalUpdate(this.binding.id, path, (update) => {
       if (!this.socket.isConnected()) return; // y-indexeddb keeps it; reconnect resends.
       void this.socket.emitYjsUpdate({
@@ -1744,7 +2022,142 @@ export class SyncEngine {
         update,
       });
     });
-    this.cleanups.push(off);
+    // Subscribing creates a doc not cached yet, and `onDocAcquired` wires it
+    // right there, inside the call: that nested wiring goes, or every edit of
+    // the note went out twice.
+    this.unwire(path);
+    this.wired.set(path, off);
+  }
+
+  private unwire(path: string): void {
+    const off = this.wired.get(path);
+    if (off === undefined) return;
+    this.wired.delete(path);
+    off();
+  }
+
+  /**
+   * A note new under `path` — created here or by a teammate: whatever doc and
+   * store another note left under that name is deleted (only that database,
+   * by name), then the new note is wired.
+   */
+  private async startDoc(fileId: string, path: string): Promise<void> {
+    this.unwire(path);
+    await this.docManager.clear(this.binding.id, path);
+    // Deleted or moved on meanwhile.
+    if (this.fileIndex.byPath.get(path)?.fileId !== fileId) return;
+    this.wire(fileId, path);
+  }
+
+  /**
+   * `path` no longer belongs to file `fileId` (deleted, or gone out of what
+   * this binding syncs): its pending snapshot, fold state, subscription, doc
+   * and store go. A pending snapshot would write the file back; a doc left in
+   * place was the history of the next note created under this name. Not when
+   * another file is indexed there since — the doc is that one's. `docs` is
+   * the unfenced manager inside a {@link commitLocal} block.
+   */
+  private async dropDoc(docs: DocManager, fileId: string, path: string): Promise<void> {
+    this.forgetFoldState(fileId);
+    const holder = this.fileIndex.byPath.get(path);
+    if (holder !== undefined && holder.fileId !== fileId) return;
+    this.snapshotDebouncers.get(path)?.cancel();
+    this.snapshotDebouncers.delete(path);
+    this.unwire(path);
+    await docs.clear(this.binding.id, path);
+  }
+
+  /**
+   * Record a file under `newPath` — the index, `state.json`, and its doc,
+   * carried there with its pending snapshot and its subscription. The disk
+   * is the caller's. Local phase only; see `DocManager.move` for how the
+   * doc goes and why the records move in the same step.
+   */
+  private async relocate(io: LocalIO, meta: IndexedMeta, newPath: string): Promise<void> {
+    const oldPath = meta.relativePath;
+    const switchOver = (): void => {
+      this.forgetPath(io.log, meta.fileId, oldPath);
+      meta.relativePath = newPath;
+      io.log.setFileMeta(meta);
+      this.fileIndex.byPath.set(newPath, meta);
+      this.fileIndex.byId.set(meta.fileId, meta);
+      this.carryPathState(io.docs, meta, oldPath, newPath);
+    };
+    if (meta.fileType !== 'TEXT' || oldPath === newPath) {
+      switchOver();
+      return;
+    }
+    const moved = await io.docs.move(this.binding.id, oldPath, newPath, meta.fileId, switchOver);
+    this.afterDocMove(io.log, meta, moved);
+  }
+
+  /**
+   * Move what the engine keeps by path for a file: a pending snapshot is
+   * rescheduled under the new name (the remote edit it was for is in the
+   * doc carried there), the subscription is known under the new name.
+   *
+   * A doc the move brought to the new name without a subscription — the note
+   * had none open under the old one — is wired here: `DocManager.move` opens
+   * it for itself, so `onDocAcquired` never fires for it, and the note's
+   * edits stayed on this device until the next reconnect. A subscription
+   * another file left under the new name is dropped.
+   */
+  private carryPathState(
+    docs: DocManager,
+    meta: IndexedMeta,
+    oldPath: string,
+    newPath: string,
+  ): void {
+    const pending = this.snapshotDebouncers.get(oldPath);
+    this.snapshotDebouncers.delete(oldPath);
+    const wired = this.wired.get(oldPath);
+    this.wired.delete(oldPath);
+    if (this.wired.get(newPath) !== wired) this.unwire(newPath);
+    if (wired !== undefined) this.wired.set(newPath, wired);
+    // Not after `stop()`: it has dropped every subscription and cancelled
+    // every snapshot already.
+    if (this.hasStopped) return;
+    if (wired === undefined && meta.fileType === 'TEXT' && docs.has(this.binding.id, newPath)) {
+      this.wire(meta.fileId, newPath);
+    }
+    if (pending === undefined) return;
+    pending.cancel();
+    this.scheduleSnapshotToDisk(newPath);
+  }
+
+  /**
+   * After a note's doc was moved (see `DocManager.move`): a history that did
+   * not come along leaves the fold marker naming disk content that was only
+   * in it. Set back to the last synced content, the next fold merges the
+   * disk three-way against a verified base instead of taking it as folded —
+   * a catch-up would otherwise overwrite an edit folded while offline.
+   */
+  private afterDocMove(log: OperationLog, meta: IndexedMeta, moved: MoveResult): void {
+    if (moved.foreign !== null) this.forgetFoldedEdits(log, moved.foreign);
+    if (moved.displaced !== null) this.forgetFoldedEdits(log, moved.displaced);
+    if (!moved.carried) this.forgetFoldedEdits(log, meta.fileId);
+  }
+
+  /**
+   * Stop trusting what file `fileId` had folded into its doc: its fold marker
+   * goes back to the last synced content, in the index and in `state.json`.
+   * `log` is the unfenced one inside a {@link commitLocal} block.
+   */
+  private forgetFoldedEdits(log: OperationLog, fileId: string): void {
+    this.foldBases.delete(fileId);
+    const reset = (meta: FileMeta): boolean => {
+      if (meta.fileType !== 'TEXT' || meta.foldedHash === undefined) return false;
+      if (meta.foldedHash === meta.contentHash) return false;
+      meta.foldedHash = meta.contentHash;
+      return true;
+    };
+    const live = this.fileIndex.byId.get(fileId);
+    if (live && reset(live)) log.setFileMeta(live);
+    for (const recorded of log.listFileMeta(this.binding.id)) {
+      if (recorded.serverFileId !== fileId) continue;
+      if (live && recorded.relativePath === live.relativePath) continue;
+      if (reset(recorded)) log.setFileMeta(recorded);
+    }
   }
 
   // -- Path gate ------------------------------------------------------------
@@ -1968,6 +2381,10 @@ export class SyncEngine {
         // whose new name that file still holds. Tried again here, it failed
         // the whole connect, or took over the name of the file in its way.
         if (this.renamesLeft.has(fileId)) break;
+        // Renamed on this device as well, and the queue sends that rename
+        // next (see `queuedRenames`): applied, this one moved the file there
+        // and the replay moved it back.
+        if (this.renamedHere.has(fileId)) break;
         await this.applyServerRename(fileId, op.newPath);
         break;
       }
@@ -2014,7 +2431,10 @@ export class SyncEngine {
     // Pull initial bytes — Yjs takes over for text after the first
     // snapshot, but the file on disk needs to exist.
     if (payload.fileType === 'TEXT') {
-      this.wireYjsForTextFile(payload.id, path);
+      // New here: a doc under this name is another note's history. A catch-up
+      // CREATE of a file the listing gave us keeps the doc it has.
+      if (known) this.wire(payload.id, path);
+      else await this.startDoc(payload.id, path);
     } else {
       // Catch-up replays can fire applyServerCreate for a binary file the
       // client already has on disk (synced earlier). `createBinary` throws
@@ -2180,7 +2600,11 @@ export class SyncEngine {
    * the server (`movedTo` null), or renamed there to `movedTo`, a name this
    * client never writes (see {@link retireMovedAway}).
    */
-  private async dropLocalCopy(meta: IndexedMeta, movedTo: string | null): Promise<void> {
+  private async dropLocalCopy(
+    meta: IndexedMeta,
+    movedTo: string | null,
+    opts: { pushedBack: boolean } = { pushedBack: true },
+  ): Promise<void> {
     // One local phase, from the check to the delete. A delete stopped before
     // it reaches the disk is not replayed: the next catch-up no longer finds
     // the file in the listing and has nothing to apply it to, so the local
@@ -2192,7 +2616,9 @@ export class SyncEngine {
       if (await io.vault.exists(meta.relativePath)) {
         const localBuf = await io.vault.readBinary(meta.relativePath);
         const localHash = await sha256Hex(localBuf);
-        if (this.mayHoldUnsentEdits(meta, localHash)) return { localBuf, localHash };
+        if (this.mayHoldUnsentEdits(meta, localHash, opts.pushedBack)) {
+          return { localBuf, localHash };
+        }
       }
       await this.removeLocalCopy(io, meta, movedTo);
       return null;
@@ -2262,11 +2688,12 @@ export class SyncEngine {
    * either, and asking about it offered to undo a teammate's delete or
    * rename over edits the server already had. Only once connected, though:
    * until the catch-up has pushed the doc back, a save folded while offline
-   * has not reached the server.
+   * has not reached the server. `pushedBack: false` for a note the catch-up
+   * did not push back at all — one deleted on the server while away.
    */
-  private mayHoldUnsentEdits(meta: IndexedMeta, localHash: string): boolean {
+  private mayHoldUnsentEdits(meta: IndexedMeta, localHash: string, pushedBack = true): boolean {
     if (!detectDeleteConflict({ storedHash: meta.contentHash, localHash })) return false;
-    if (meta.fileType !== 'TEXT' || this.status !== 'connected') return true;
+    if (meta.fileType !== 'TEXT' || this.status !== 'connected' || !pushedBack) return true;
     return localHash !== meta.foldedHash;
   }
 
@@ -2286,13 +2713,16 @@ export class SyncEngine {
     if (await io.vault.exists(path)) {
       await io.vault.delete(path);
     }
-    this.forgetPath(io, meta.fileId, path);
-    this.fileIndex.byId.delete(meta.fileId);
-    this.forgetFoldState(meta.fileId);
+    this.forgetPath(io.log, meta.fileId, path);
+    // Only its own entry: a record left by a file deleted while away is not
+    // what the index has under this id.
+    if (this.fileIndex.byId.get(meta.fileId)?.relativePath === path) {
+      this.fileIndex.byId.delete(meta.fileId);
+    }
     if (movedTo !== null) {
       this.outOfScope.set(meta.fileId, { path: movedTo, fileType: meta.fileType });
     }
-    await io.docs.release(this.binding.id, path);
+    await this.dropDoc(io.docs, meta.fileId, path);
   }
 
   private async applyServerRename(fileId: string, newPath: string): Promise<void> {
@@ -2330,7 +2760,13 @@ export class SyncEngine {
     // engine's listing already shows the new one: that engine counts the
     // rename as applied, writes the new path from the catch-up, and uploads
     // the old one as a brand-new file — a duplicate for the whole team.
-    await this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
+    //
+    // After a save being folded into the note under its old name, too: the
+    // doc moves with the file, and a fold finishing on the old name after the
+    // move would land in a doc nobody reads again.
+    await this.withPathLock(oldPath, () =>
+      this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath)),
+    );
   }
 
   /**
@@ -2404,101 +2840,176 @@ export class SyncEngine {
     await this.handleLocalModify(path);
   }
 
-  /** Apply a server rename to the disk and the index. Local phase only. */
+  /**
+   * Apply a server rename to the disk, the index and the note's doc. Local
+   * phase only.
+   */
   private async moveLocalCopy(io: LocalIO, meta: IndexedMeta, newPath: string): Promise<void> {
     const { fileId } = meta;
     const oldPath = meta.relativePath;
+    /** Where the file stepped aside to, if it did. */
+    let spare: string | null = null;
     if (await io.vault.exists(oldPath)) {
       /** Where the file is on disk until the rename proper. */
       let source = oldPath;
-      if (oldPath !== newPath && oldPath.toLowerCase() === newPath.toLowerCase()) {
-        // Only the case changes (`Photo.png` → `photo.png`). On a disk that
-        // ignores case (Windows, macOS) the new name "exists" — it is this
-        // very file — and the collision check below compared the file with
-        // itself, found them equal and deleted the only copy. Step it aside
-        // first: afterwards the new name exists only if it is another file.
-        source = await this.spareMovePath(io.vault, oldPath);
+      if (oldPath !== newPath && pathKey(oldPath) === pathKey(newPath)) {
+        // Only the case or the spelling changes (`Photo.png` → `photo.png`,
+        // `Λογος` → `ΛΟΓΟΣ`, NFD → NFC). On a disk that takes both for one name
+        // (Windows, macOS) the new name "exists" — it is this very file — and
+        // the collision check below compared the file with itself, found them
+        // equal and deleted the only copy. Step it aside first: afterwards the
+        // new name exists only if it is another file. Names compare the way
+        // the path gate compares them: `toLowerCase` kept the final sigma,
+        // `ß`/`SS` and NFD/NFC apart, and a Mac disk merges each pair.
+        spare = await this.spareMovePath(io.vault, oldPath);
         io.echo.mark(oldPath, ECHO_COUNT_RENAME);
-        io.echo.mark(source, ECHO_COUNT_RENAME);
-        await io.vault.rename(oldPath, source);
+        io.echo.mark(spare, ECHO_COUNT_RENAME);
+        await io.vault.rename(oldPath, spare);
+        // Recorded there at once. The rename proper failing (a file locked by
+        // another program) or the app killed before it used to leave the file
+        // under the spare name with no record of it, for the next connect to
+        // upload as a new file. Now that connect moves it on from there.
+        this.recordStepAside(io.log, meta, oldPath, spare);
+        source = spare;
       }
-      if (await io.vault.exists(newPath)) {
-        // Destination already materialised locally — e.g. an initial-push
-        // pass created it, or this rename was partially applied before.
-        // `adapter.rename` throws "Destination file already exists" here,
-        // which would otherwise crash the engine to `error` status.
-        //
-        // Dropping the source used to be the answer, but that is a silent
-        // local data loss driven by a remote event: whoever controls the
-        // server picks the file to destroy (fixed in 0.3.3). Identical content is
-        // the benign case and stays a delete; differing content parks the
-        // local destination aside, the way `keep-both` does for binary
-        // conflicts, so nothing disappears.
-        const sourceHash = await this.hashFile(io.vault, source);
-        const destHash = sourceHash === null ? null : await this.hashFile(io.vault, newPath);
-        if (sourceHash === null || destHash === null) {
-          // Couldn't read one of them (locked file, antivirus, dropped network
-          // drive). Guessing here either deletes a file we never read or parks
-          // a file that is in fact identical — leave both alone, and leave the
-          // index untouched so the next reconnect retries from the listing.
-          this.log.warn('server rename: could not compare the local files', { oldPath, newPath });
-          if (source !== oldPath) {
-            io.echo.mark(source, ECHO_COUNT_RENAME);
-            io.echo.mark(oldPath, ECHO_COUNT_RENAME);
-            await io.vault.rename(source, oldPath);
-          }
-          return;
-        }
-        // Echo budgets are claimed only once the disk is actually about to
-        // change: every early return above would otherwise leave a live budget
-        // behind that swallows a genuine external edit.
-        io.echo.mark(source, ECHO_COUNT_RENAME);
-        io.echo.mark(newPath, ECHO_COUNT_RENAME);
-        if (sourceHash === destHash) {
-          await io.vault.delete(source);
-        } else {
-          const aside = buildConflictPath(newPath, this.now());
-          this.log.warn('server rename collided with a different local file', {
-            oldPath,
-            newPath,
-            aside,
-          });
-          // `newPath` takes part in TWO renames here (as the source of the
-          // park-aside and as the destination of the real rename), so it needs
-          // a second echo budget — `mark` adds to what is left. Without it the
-          // leftover `unlink` reaches `handleLocalDelete` for a path that has
-          // just become a live file: the 2026-08-06 incident.
-          io.echo.mark(aside, ECHO_COUNT_RENAME);
-          io.echo.mark(newPath, ECHO_COUNT_RENAME);
-          await io.vault.ensureParentFolder(aside);
-          await io.vault.rename(newPath, aside);
-          await io.vault.ensureParentFolder(newPath);
-          await io.vault.rename(source, newPath);
-        }
-      } else {
-        io.echo.mark(source, ECHO_COUNT_RENAME);
-        io.echo.mark(newPath, ECHO_COUNT_RENAME);
-        await io.vault.ensureParentFolder(newPath);
-        await io.vault.rename(source, newPath);
+      let moved: boolean;
+      try {
+        moved = await this.moveOnDisk(io, source, oldPath, newPath);
+      } catch (err) {
+        if (spare !== null) await this.stepBack(io, meta, spare, oldPath);
+        throw err;
+      }
+      if (!moved) {
+        if (spare !== null) await this.stepBack(io, meta, spare, oldPath);
+        return;
       }
     }
+    if (spare !== null) this.forgetRecord(io.log, fileId, spare);
 
-    this.forgetPath(io, fileId, oldPath);
     if (!isInBinding(newPath, this.binding.localFolder)) {
       // The file left our folder. It stays on disk where the server says it
       // is, but it is no longer ours to track: keeping it in `fileIndex` would
       // mirror a foreign path into `state.json`, and forgetting it entirely
-      // would make a later move back in look like an unknown file.
-      this.fileIndex.byId.delete(fileId);
+      // would make a later move back in look like an unknown file. Its doc
+      // goes: moved back in, it is fetched again.
+      this.forgetPath(io.log, fileId, oldPath);
+      if (this.fileIndex.byId.get(fileId) === meta) this.fileIndex.byId.delete(fileId);
       this.outOfScope.set(fileId, { path: newPath, fileType: meta.fileType });
-      await io.docs.release(this.binding.id, oldPath);
-      this.forgetFoldState(fileId);
+      await this.dropDoc(io.docs, fileId, oldPath);
       this.log.info('file moved out of the binding folder', { oldPath, newPath });
       return;
     }
-    meta.relativePath = newPath;
-    io.log.setFileMeta(meta);
-    this.fileIndex.byPath.set(newPath, meta);
+    await this.relocate(io, meta, newPath);
+  }
+
+  /**
+   * Record in `state.json` that a file stepped aside to `spare` (see
+   * {@link moveLocalCopy}). The index keeps the old name, and the doc stays
+   * there: both move once, to the new name, when the rename proper is done.
+   */
+  private recordStepAside(
+    log: OperationLog,
+    meta: IndexedMeta,
+    oldPath: string,
+    spare: string,
+  ): void {
+    this.forgetRecord(log, meta.fileId, oldPath);
+    log.setFileMeta({ ...meta, relativePath: spare });
+  }
+
+  /** Undo {@link recordStepAside} when the rename proper did not happen: best effort. */
+  private async stepBack(
+    io: LocalIO,
+    meta: IndexedMeta,
+    spare: string,
+    oldPath: string,
+  ): Promise<void> {
+    try {
+      if (await io.vault.exists(spare)) {
+        io.echo.mark(spare, ECHO_COUNT_RENAME);
+        io.echo.mark(oldPath, ECHO_COUNT_RENAME);
+        await io.vault.rename(spare, oldPath);
+      }
+    } catch (err) {
+      // Left under the spare name, recorded there: the next connect moves it on.
+      this.log.warn('could not move a file back from a spare name', {
+        path: spare,
+        oldPath,
+        error: describeError(err, 'rename_failed'),
+      });
+      return;
+    }
+    this.forgetRecord(io.log, meta.fileId, spare);
+    io.log.setFileMeta({ ...meta, relativePath: oldPath });
+  }
+
+  /**
+   * The disk part of {@link moveLocalCopy}: move the file from `source` to
+   * `newPath`. `false` when it could not compare the two local files and
+   * left both alone — the index is then left as it is too, and the next
+   * reconnect retries from the listing.
+   */
+  private async moveOnDisk(
+    io: LocalIO,
+    source: string,
+    oldPath: string,
+    newPath: string,
+  ): Promise<boolean> {
+    if (await io.vault.exists(newPath)) {
+      // Destination already materialised locally — e.g. an initial-push
+      // pass created it, or this rename was partially applied before.
+      // `adapter.rename` throws "Destination file already exists" here,
+      // which would otherwise crash the engine to `error` status.
+      //
+      // Dropping the source used to be the answer, but that is a silent
+      // local data loss driven by a remote event: whoever controls the
+      // server picks the file to destroy (fixed in 0.3.3). Identical content is
+      // the benign case and stays a delete; differing content parks the
+      // local destination aside, the way `keep-both` does for binary
+      // conflicts, so nothing disappears.
+      const sourceHash = await this.hashFile(io.vault, source);
+      const destHash = sourceHash === null ? null : await this.hashFile(io.vault, newPath);
+      if (sourceHash === null || destHash === null) {
+        // Couldn't read one of them (locked file, antivirus, dropped network
+        // drive). Guessing here either deletes a file we never read or parks
+        // a file that is in fact identical — leave both alone, and leave the
+        // index untouched so the next reconnect retries from the listing.
+        this.log.warn('server rename: could not compare the local files', { oldPath, newPath });
+        return false;
+      }
+      // Echo budgets are claimed only once the disk is actually about to
+      // change: every early return above would otherwise leave a live budget
+      // behind that swallows a genuine external edit.
+      io.echo.mark(source, ECHO_COUNT_RENAME);
+      io.echo.mark(newPath, ECHO_COUNT_RENAME);
+      if (sourceHash === destHash) {
+        await io.vault.delete(source);
+      } else {
+        const aside = buildConflictPath(newPath, this.now());
+        this.log.warn('server rename collided with a different local file', {
+          oldPath,
+          newPath,
+          aside,
+        });
+        // `newPath` takes part in TWO renames here (as the source of the
+        // park-aside and as the destination of the real rename), so it needs
+        // a second echo budget — `mark` adds to what is left. Without it the
+        // leftover `unlink` reaches `handleLocalDelete` for a path that has
+        // just become a live file: the 2026-08-06 incident.
+        io.echo.mark(aside, ECHO_COUNT_RENAME);
+        io.echo.mark(newPath, ECHO_COUNT_RENAME);
+        await io.vault.ensureParentFolder(aside);
+        await io.vault.rename(newPath, aside);
+        await io.vault.ensureParentFolder(newPath);
+        await io.vault.rename(source, newPath);
+      }
+    } else {
+      io.echo.mark(source, ECHO_COUNT_RENAME);
+      io.echo.mark(newPath, ECHO_COUNT_RENAME);
+      await io.vault.ensureParentFolder(newPath);
+      await io.vault.rename(source, newPath);
+    }
+    return true;
   }
 
   /**
@@ -2507,12 +3018,17 @@ export class SyncEngine {
    * listed at the old name of one renamed while away (see
    * {@link refreshFileIndex}) must not lose its entry to that move.
    */
-  private forgetPath(io: LocalIO, fileId: string, path: string): void {
+  private forgetPath(log: OperationLog, fileId: string, path: string): void {
     const indexed = this.fileIndex.byPath.get(path);
     if (indexed === undefined || indexed.fileId === fileId) this.fileIndex.byPath.delete(path);
-    const recorded = io.log.getFileMeta(this.binding.id, path);
+    this.forgetRecord(log, fileId, path);
+  }
+
+  /** {@link forgetPath} for `state.json` only. */
+  private forgetRecord(log: OperationLog, fileId: string, path: string): void {
+    const recorded = log.getFileMeta(this.binding.id, path);
     if (recorded !== null && (recorded.serverFileId === fileId || recorded.serverFileId === '')) {
-      io.log.deleteFileMeta(this.binding.id, path);
+      log.deleteFileMeta(this.binding.id, path);
     }
   }
 
@@ -2856,8 +3372,14 @@ export class SyncEngine {
     if (!this.allowServerPath(path, 'snapshot')) return;
     // Never snapshot a doc whose offline store is still loading — its text
     // is a partial view and the write would destroy the full copy on disk.
-    await this.docManager.whenSynced(this.binding.id, path);
     const meta = this.fileIndex.byPath.get(path);
+    if (meta) {
+      await this.openDoc(meta);
+      // Moved or deleted meanwhile: the snapshot under the new name is its own.
+      if (this.fileIndex.byPath.get(path) !== meta) return;
+    } else {
+      await this.docManager.whenSynced(this.binding.id, path);
+    }
     // A doc with a history gap, or one the catch-up skipped, is pulled from
     // the server first — a live delta for such a note otherwise has nothing
     // to attach to and never reaches the disk.
@@ -3164,7 +3686,7 @@ export class SyncEngine {
             // re-uploading it.
             const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
             if (outcome?.fileId && outcome?.path) {
-              this.recordCreatedFile(
+              await this.recordCreatedFile(
                 outcome.fileId,
                 outcome.path,
                 fileType,
@@ -3178,13 +3700,17 @@ export class SyncEngine {
         case 'UPDATE': {
           const fileId = queuedFileId(op.payload);
           if (!fileId) return { ok: false, retryable: false, error: 'no_file_id' };
-          // Deleted (or renamed away) since: a later DELETE or RENAME in the
-          // queue carries that. Retrying a read that cannot succeed used to
-          // halt the drain on this entry for good, with every edit behind it.
-          if (!(await this.vault.exists(op.filePath))) {
+          // Where the file is now: renamed since — by a teammate while away,
+          // or here — it is not at the queued path any more, and the edit was
+          // dropped as "missing".
+          const path = this.currentPathOf(fileId, op.filePath);
+          // Deleted since: a later DELETE in the queue carries that. Retrying a
+          // read that cannot succeed used to halt the drain on this entry for
+          // good, with every edit behind it.
+          if (!(await this.vault.exists(path))) {
             return { ok: false, retryable: false, error: 'local_file_missing' };
           }
-          const data = await this.vault.readBinary(op.filePath);
+          const data = await this.vault.readBinary(path);
           // Hash the bytes being sent, not the stale enqueue-time snapshot
           // — same reasoning as the CREATE case above.
           const contentHash = await sha256Hex(data);
@@ -3225,10 +3751,16 @@ export class SyncEngine {
           // stray `unlink` of a file that is still there. Only for such an
           // entry — the catch-up that has just run writes every text file
           // the server still holds back to disk, an offline delete included.
-          if (op.payload[RECHECK_DELETE] === true && (await this.vault.exists(op.filePath))) {
+          let fileId = queuedFileId(op.payload);
+          // Checked where the file is now: moved by a rename made while away,
+          // it is not at the queued path, and the stray `unlink` went out as a
+          // delete of a live file.
+          if (
+            op.payload[RECHECK_DELETE] === true &&
+            (await this.vault.exists(this.currentPathOf(fileId, op.filePath)))
+          ) {
             return { ok: false, retryable: false, error: 'local_file_present' };
           }
-          let fileId = queuedFileId(op.payload);
           // A queued DELETE can carry an empty fileId (the path wasn't indexed
           // when it was enqueued). Resolve it from the now-refreshed index
           // before giving up, and log the drop rather than losing it silently.
@@ -3249,16 +3781,15 @@ export class SyncEngine {
           });
           this.throwIfStopped();
           if (ack.ok) {
-            const meta = this.fileIndex.byId.get(fileId);
-            if (meta) this.fileIndex.byPath.delete(meta.relativePath);
-            this.fileIndex.byId.delete(fileId);
-            this.operationLog.deleteFileMeta(this.binding.id, op.filePath);
-            // Release the doc + drop any pending snapshot so a debounced write
-            // can't recreate the deleted file (see handleLocalDelete).
-            this.snapshotDebouncers.get(op.filePath)?.cancel();
-            this.snapshotDebouncers.delete(op.filePath);
-            this.forgetFoldState(fileId);
-            await this.docManager.release(this.binding.id, op.filePath);
+            const at = this.currentPathOf(fileId, op.filePath);
+            if (this.fileIndex.byId.get(fileId)?.relativePath === at) {
+              this.fileIndex.byId.delete(fileId);
+            }
+            this.forgetPath(this.operationLog, fileId, at);
+            if (at !== op.filePath) this.forgetPath(this.operationLog, fileId, op.filePath);
+            // Drop the doc + any pending snapshot so a debounced write can't
+            // recreate the deleted file (see handleLocalDelete).
+            await this.dropDoc(this.docManager, fileId, at);
           }
           return ackToOutcome(ack);
         }
@@ -3283,19 +3814,19 @@ export class SyncEngine {
               : await this.socket.emitFileMove(payload);
           this.throwIfStopped();
           if (ack.ok) {
-            // Move the index entry so the post-drain initial-push pass
-            // recognises the file at its new path instead of re-uploading
-            // it. If the server actually conflict-renamed (a genuine
-            // concurrent rename onto the same target), the broadcast
-            // `renamed` event reconciles `fileIndex` to the real path
-            // afterwards.
+            // The index has the file under the name it has here already (see
+            // `queuedRenames`). One still under the queued source — a queue
+            // entry the index refresh did not take up — moves now, so the
+            // post-drain initial-push pass recognises the file at its new path
+            // instead of re-uploading it. If the server actually
+            // conflict-renamed (a genuine concurrent rename onto the same
+            // target), the broadcast `renamed` event reconciles `fileIndex`
+            // to the real path afterwards.
             const meta = this.fileIndex.byId.get(fileId);
-            if (meta) {
-              this.operationLog.deleteFileMeta(this.binding.id, meta.relativePath);
-              this.fileIndex.byPath.delete(meta.relativePath);
-              meta.relativePath = newPath;
-              this.fileIndex.byPath.set(newPath, meta);
-              this.operationLog.setFileMeta(meta);
+            if (meta && meta.relativePath === op.filePath) {
+              await this.withPathLock(op.filePath, () =>
+                this.commitLocal((io) => this.relocate(io, meta, newPath)),
+              );
             }
           }
           return ackToOutcome(ack);
@@ -3310,6 +3841,11 @@ export class SyncEngine {
         error: err instanceof Error ? err.message : 'unknown',
       };
     }
+  }
+
+  /** Where file `fileId` is now, by the index; `queued` when it is not indexed. */
+  private currentPathOf(fileId: string, queued: string): string {
+    return (fileId !== '' ? this.fileIndex.byId.get(fileId)?.relativePath : undefined) ?? queued;
   }
 
   /**
@@ -3542,10 +4078,31 @@ function supersededRenames(ops: readonly ServerOperation[]): Set<ServerOperation
 function buildMovePath(filePath: string, n: number): string {
   const slash = filePath.lastIndexOf('/');
   const dir = filePath.slice(0, slash + 1);
-  const basename = filePath.slice(slash + 1);
+  // A file stepped aside before keeps one suffix, not one more each time.
+  const basename = filePath.slice(slash + 1).replace(/\.moving-\d+(?=\.[^.]*$|$)/, '');
   const dot = basename.lastIndexOf('.');
   if (dot <= 0) return `${dir}${basename}.moving-${n}`;
   return `${dir}${basename.slice(0, dot)}.moving-${n}${basename.slice(dot)}`;
+}
+
+/**
+ * A move of `applyRenamesWhileAway` that stands on a cycle, when every move
+ * waits on another: following each move to the one whose old name its new
+ * name takes, the first move met twice. `null` when there is none.
+ */
+function cycleMove<T extends { from: string; to: string }>(
+  pending: readonly T[],
+  key: (path: string) => string,
+): T | null {
+  const next = (move: T): T | undefined =>
+    pending.find((other) => other !== move && key(other.from) === key(move.to));
+  const seen = new Set<T>();
+  let move = pending[0];
+  while (move !== undefined && !seen.has(move)) {
+    seen.add(move);
+    move = next(move);
+  }
+  return move ?? null;
 }
 
 function mergeClocks(a: VectorClock, b: VectorClock): VectorClock {

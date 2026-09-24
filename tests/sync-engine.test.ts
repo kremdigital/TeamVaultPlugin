@@ -987,6 +987,19 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     expect(h.doc.getText('b1', 'draft.md')).toBe('v2 edited');
   });
 
+  /** `state.json` has `note.md` (f1) from an earlier sync. */
+  function syncedBefore(h: ReturnType<typeof buildHarness>): void {
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: 'note.md',
+      serverFileId: 'f1',
+      contentHash: 'h',
+      size: 0,
+      fileType: 'TEXT',
+      lastSyncedAt: 1,
+    });
+  }
+
   it('pushes local-only Yjs ops back to the server on reconnect', async () => {
     const Y = await import('yjs');
     const h = buildHarness();
@@ -1014,7 +1027,10 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     }));
 
     // Simulate offline edits sitting in y-indexeddb: the docManager has
-    // local content the server has never seen.
+    // local content the server has never seen — for a note this device has
+    // synced before (a history under a name the device has no record of the
+    // note at is another note's, and is discarded).
+    syncedBefore(h);
     h.doc.setText('b1', 'note.md', 'offline-only edits');
 
     await h.engine.start();
@@ -1075,6 +1091,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
       text: '',
     }));
     // Offline edits the server has never seen — must be pushed back on catch-up.
+    syncedBefore(h);
     h.doc.setText('b1', 'note.md', 'offline-only edits');
 
     await h.engine.start();

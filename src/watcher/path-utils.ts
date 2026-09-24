@@ -231,6 +231,17 @@ function fold(value: string): string {
 }
 
 /**
+ * The key two spellings of a vault path share when some disk opens them as
+ * the same file — {@link fold}, the comparison the gate itself makes. The
+ * engine compares names with it wherever a disk that ignores case matters:
+ * `toLowerCase` alone keeps `Λογος`/`ΛΟΓΟΣ` (final sigma), `Straße`/`STRASSE`
+ * and NFD/NFC spellings apart, and a Mac opens each pair as one file.
+ */
+export function pathKey(vaultPath: string): string {
+  return fold(vaultPath);
+}
+
+/**
  * Stricter key for comparing a whole name with a listed one — the config
  * folder, `.git`, `desktop.ini`, …: compatibility forms are merged as well, so
  * `．obsidian` (a fullwidth dot) and `.ＧＩＴ` count too. Only a volume that
