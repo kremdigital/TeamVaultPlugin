@@ -86,6 +86,14 @@ export class EngineManager {
   private readonly subs = new Map<string, () => void>();
   /** Last status known per engine — feeds the aggregate. */
   private readonly statuses = new Map<string, EngineStatus>();
+  /**
+   * Per binding, the server paths its engines have already refused at `warn`
+   * (`SyncEngineDeps.reportedRefusals`). Here and not in the engine: pause,
+   * resume and switching a binding off and on replace the engine, and each
+   * new one logged the same `.DS_Store` refusals at `warn` again. Kept until
+   * the plugin unloads, or until the binding is removed.
+   */
+  private readonly reportedRefusals = new Map<string, Set<string>>();
   private listeners = new Set<AggregateListener>();
   private paused = false;
   /**
@@ -143,6 +151,9 @@ export class EngineManager {
     // distinguishes "removed" (purge local state) from "merely disabled"
     // (keep its queue for when it's switched back on).
     const known = new Set(bindings.map((b) => b.id));
+    for (const id of [...this.reportedRefusals.keys()]) {
+      if (!known.has(id)) this.reportedRefusals.delete(id);
+    }
 
     for (const binding of bindings) {
       if (!binding.enabled) continue;
@@ -239,6 +250,11 @@ export class EngineManager {
     const socketClient = this.deps.socketClient
       ? this.deps.socketClient(server, this.deps.clientId)
       : undefined;
+    let reportedRefusals = this.reportedRefusals.get(binding.id);
+    if (!reportedRefusals) {
+      reportedRefusals = new Set();
+      this.reportedRefusals.set(binding.id, reportedRefusals);
+    }
     const engineDeps: SyncEngineDeps = {
       binding,
       server,
@@ -247,6 +263,7 @@ export class EngineManager {
       operationLog: this.deps.operationLog,
       docManager: this.deps.docManager,
       recentlyApplied: this.deps.recentlyApplied,
+      reportedRefusals,
       ...(apiClient ? { apiClient } : {}),
       ...(socketClient ? { socketClient } : {}),
       ...(this.deps.conflictResolver ? { conflictResolver: this.deps.conflictResolver } : {}),

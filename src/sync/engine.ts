@@ -61,7 +61,7 @@ const NOOP_LOG_SINK: LogSink = {
 };
 const SILENT_LOGGER = new Logger('error', NOOP_LOG_SINK);
 
-/** How many refused server paths an engine remembers as already reported. */
+/** How many refused server paths a binding remembers as already reported. */
 const MAX_REPORTED_REFUSALS = 1000;
 
 /**
@@ -134,6 +134,14 @@ export interface SyncEngineDeps {
    * only flipping the status bar.
    */
   logger?: Logger;
+  /**
+   * Server paths this binding's engines have already refused at `warn` — see
+   * `allowServerPath`. The `EngineManager` hands every engine of a binding the
+   * same set, kept while the plugin runs: pausing sync or switching the
+   * binding off and on spawns a new engine, and with a set of its own that
+   * engine reported every such path at `warn` again. Default: a new set.
+   */
+  reportedRefusals?: Set<string>;
 }
 
 export type EngineStatus = 'stopped' | 'connecting' | 'syncing' | 'connected' | 'error' | 'offline';
@@ -271,8 +279,11 @@ export class SyncEngine {
    */
   private outOfScope = new Map<string, { path: string; fileType: FileType }>();
 
-  /** Server paths already refused at `warn` — see `allowServerPath`. */
-  private readonly reportedRefusals = new Set<string>();
+  /**
+   * Server paths already refused at `warn` — see `allowServerPath`. Shared
+   * with the binding's earlier and later engines (`SyncEngineDeps`).
+   */
+  private readonly reportedRefusals: Set<string>;
 
   /**
    * Files renamed on the server to a name this client never writes while the
@@ -380,6 +391,7 @@ export class SyncEngine {
     this.conflictResolver = fence(deps.conflictResolver ?? defaultConflictResolver, signal);
     this.now = deps.now ?? Date.now;
     this.configDir = deps.configDir ?? DEFAULT_CONFIG_DIR;
+    this.reportedRefusals = deps.reportedRefusals ?? new Set();
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -1753,11 +1765,14 @@ export class SyncEngine {
    * chain of `handleServerFileEvent` turns a throw into engine status
    * `error`.
    *
-   * A path is logged at `warn` the first time this engine refuses it and at
-   * `debug` after that. The file index is re-read on every reconnect, and the
-   * `.DS_Store` files an older version uploaded — one per folder a Mac user
-   * opened in Finder — otherwise filled `sync.log` with the same lines on each
-   * one, crowding out the entries worth reading.
+   * A path is logged at `warn` the first time the binding's engines refuse it
+   * while the plugin runs, and at `debug` after that. The file index is
+   * re-read on every reconnect, and the `.DS_Store` files an older version
+   * uploaded — one per folder a Mac user opened in Finder — otherwise filled
+   * `sync.log` with the same lines on each one, crowding out the entries worth
+   * reading. The set of reported paths outlives the engine (see
+   * `SyncEngineDeps.reportedRefusals`): pausing and resuming sync runs a new
+   * engine, which must not report them all again.
    */
   private allowServerPath(
     path: string,
