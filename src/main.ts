@@ -77,6 +77,7 @@ export default class ObsidianSyncPlugin extends Plugin {
   private fsWatcher: FsWatcher | null = null;
   private statusBar: StatusBar | null = null;
   private notices: NoticeService | null = null;
+  private unsyncableNames: UnsyncableNameReporter | null = null;
   private unsubscribeAggregate: (() => void) | null = null;
   /**
    * Set by `onunload`. A request an engine had in flight can settle after
@@ -177,6 +178,9 @@ export default class ObsidianSyncPlugin extends Plugin {
   override onunload(): void {
     this.logger?.info('plugin unloading');
     this.unloaded = true;
+    // A notice about a name Windows can't keep that still waits for the
+    // names reported with it is dropped; its `sync.log` line is written.
+    this.unsyncableNames?.dispose();
     // Synchronous on purpose: Obsidian does not await onunload. Listeners,
     // watchers, the status bar and the sockets are gone when this returns;
     // the rest — the engines settling, the operation log flushing its
@@ -509,8 +513,13 @@ export default class ObsidianSyncPlugin extends Plugin {
     // A note named so that Windows can't keep it (`Why?.md`) is never synced;
     // the user is told, once per name while the plugin runs.
     const unsyncableNames = new UnsyncableNameReporter({
-      log: (message, context) => this.logger?.warn(message, context),
+      log: (message, context) => {
+        if (!this.logger?.isEnabled('warn')) return false;
+        this.logger.warn(message, context);
+        return true;
+      },
     });
+    this.unsyncableNames = unsyncableNames;
     this.obsidianWatcher = new ObsidianWatcher({
       bindings: () => this.settings.bindings,
       recentlyApplied: this.recentlyApplied,

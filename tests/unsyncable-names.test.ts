@@ -1,6 +1,6 @@
 import { Notice } from './__mocks__/obsidian';
 import { setLanguage } from '@/i18n';
-import { UnsyncableNameReporter } from '@/ui/unsyncable-names';
+import { UNSYNCABLE_NAME_LOG, UnsyncableNameReporter } from '@/ui/unsyncable-names';
 import {
   ObsidianWatcher,
   type UnsyncableName,
@@ -211,15 +211,19 @@ describe('UnsyncableNameReporter', () => {
     renamedFrom: 'Idea.md',
   };
 
+  // Names reported together share one notice, shown after a short pause.
   beforeEach(() => {
+    jest.useFakeTimers();
     setLanguage('en');
     Notice.shown = [];
   });
+  afterEach(() => jest.useRealTimers());
   afterAll(() => setLanguage('en'));
 
   it('shows a notice that names the note and the character, and logs it', () => {
     const log = jest.fn();
     new UnsyncableNameReporter({ log }).report(renamed);
+    jest.runOnlyPendingTimers();
 
     expect(Notice.shown).toHaveLength(1);
     const { message, timeout } = Notice.shown[0] ?? { message: '', timeout: 0 };
@@ -228,7 +232,7 @@ describe('UnsyncableNameReporter', () => {
     expect(message).toContain('the rename looks like a delete');
     expect(message).toContain('Rename it again');
     expect(timeout).toBe(15_000);
-    expect(log).toHaveBeenCalledWith('not synced: Windows cannot keep this name', {
+    expect(log).toHaveBeenCalledWith(UNSYNCABLE_NAME_LOG, {
       path: 'Why does it fail?.md',
       name: 'Why does it fail?.md',
       problem: 'character',
@@ -247,10 +251,15 @@ describe('UnsyncableNameReporter', () => {
       problem: { kind: 'trailing' },
     });
 
-    reporter.report(inFolder('a.md'));
-    reporter.report(inFolder('b.md'));
-    reporter.report(renamed);
-    reporter.report({ ...renamed, renamedFrom: 'Other.md' });
+    for (const event of [
+      inFolder('a.md'),
+      inFolder('b.md'),
+      renamed,
+      { ...renamed, renamedFrom: 'Other.md' },
+    ]) {
+      reporter.report(event);
+      jest.runOnlyPendingTimers();
+    }
 
     expect(show).toHaveBeenCalledTimes(2);
     expect(log).toHaveBeenCalledTimes(2);
@@ -265,6 +274,7 @@ describe('UnsyncableNameReporter', () => {
     setLanguage('ru');
     const show = jest.fn<void, [string]>();
     new UnsyncableNameReporter({ show }).report({ path: 'x/a.md', name: 'x', problem });
+    jest.runOnlyPendingTimers();
 
     const message = String(show.mock.calls[0]?.[0]);
     expect(message).toContain('«x»');

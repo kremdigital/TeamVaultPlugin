@@ -109,8 +109,9 @@ export interface ObsidianWatcherOptions {
   configDir?: string;
   /**
    * Called for a file in an enabled binding that is dropped because Windows
-   * can't keep its name — on every such event: the listener decides what to
-   * repeat. Not for deletes.
+   * can't keep its name — on every such create and edit, and on a rename
+   * unless it keeps the name at fault: the listener decides what to repeat.
+   * Not for deletes.
    */
   onUnsyncableName?: (event: UnsyncableName) => void;
 }
@@ -216,12 +217,16 @@ export class ObsidianWatcher {
     const oldIgnored = isAlwaysIgnored(oldPath, this.configDir);
     const newIgnored = isAlwaysIgnored(file.path, this.configDir);
     // Renaming a note to `Why?.md` is the same delete for the team — the one
-    // case of it the user doesn't mean, so it is reported.
+    // case of it the user doesn't mean, so it is reported. A rename that
+    // keeps the name at fault changes nothing for anyone: renaming the folder
+    // `FAQ` that holds `Question 1?.md` … `Question 40?.md` (Obsidian renames
+    // each note in it) or moving `Why?.md` to another folder isn't reported,
+    // while renaming `Why?.md` to `Why??.md` is — its author tried to fix it.
     if (newIgnored) {
-      this.reportUnsyncable(
-        file.path,
-        !oldIgnored && this.inEnabledBinding(oldPath) ? oldPath : undefined,
-      );
+      const fromSynced = !oldIgnored && this.inEnabledBinding(oldPath);
+      if (fromSynced || !this.keepsRefusedName(oldPath, file.path)) {
+        this.reportUnsyncable(file.path, fromSynced ? oldPath : undefined);
+      }
     }
     if (oldIgnored && newIgnored) return;
     for (const binding of this.getBindings()) {
@@ -277,6 +282,22 @@ export class ObsidianWatcher {
     return this.getBindings().some((b) => b.enabled && isInBinding(path, b.localFolder));
   }
 
+  /**
+   * True when a rename leaves a file in an enabled binding refused for the
+   * same name as before (`FAQ/Question 1?.md` → `FAQ 2026/Question 1?.md`,
+   * `U.S./a.md` → `U.S./b.md`).
+   */
+  private keepsRefusedName(oldPath: string, newPath: string): boolean {
+    if (!this.inEnabledBinding(oldPath)) return false;
+    const before = windowsRefusal(oldPath, this.configDir);
+    const after = windowsRefusal(newPath, this.configDir);
+    return (
+      before !== null &&
+      after !== null &&
+      refusedSegment(before.name) === refusedSegment(after.name)
+    );
+  }
+
   /** Tell `onUnsyncableName` about a file the Windows rules alone keep from syncing. */
   private reportUnsyncable(path: string, renamedFrom?: string): void {
     if (!this.onUnsyncableName) return;
@@ -311,6 +332,11 @@ export class ObsidianWatcher {
       }
     }
   }
+}
+
+/** The name at fault alone — `Why?.md`, `U.S.` — out of a `WindowsRefusal.name`. */
+export function refusedSegment(name: string): string {
+  return name.slice(name.lastIndexOf('/') + 1);
 }
 
 function isFile(file: WatchableFile): boolean {
