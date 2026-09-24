@@ -36,7 +36,10 @@ import { manualStep, readme } from './docs-text';
  *
  * A fourth review found that MANUAL-TEST S16 steps 4 and 5, done as they
  * read, gave one warning where they promised two: the renames that come in
- * while a notice waits out the gap after the one before share it.
+ * while a notice waits out the gap after the one before share it. And the
+ * text meant for the CHANGELOG said the notice about a note in a folder
+ * `U.S.` says to rename the folder even for a synced note moved there, while
+ * that notice rightly says the move is a delete and to rename it again.
  */
 
 class FakeVault {
@@ -240,6 +243,7 @@ describe.each([
       folderOlder: 'rename the folder or those notes',
       note: 'Rename it to sync it with your team',
       noteOlder: 'If an older version of Team Vault already synced it,',
+      renamed: 'To your teammates the rename looks like a delete. Rename it again to sync it.',
     },
   ],
   [
@@ -249,6 +253,8 @@ describe.each([
       folderOlder: 'переименуйте папку или эти заметки',
       note: 'Переименуйте, чтобы синхронизировать с командой',
       noteOlder: 'Если заметку уже синхронизировала старая версия Team Vault',
+      renamed:
+        'Для коллег это переименование выглядит как удаление. Переименуйте ещё раз, чтобы синхронизировать.',
     },
   ],
 ] as const)('the notice about a folder with such a name (%s)', (language, text) => {
@@ -279,6 +285,26 @@ describe.each([
     expect(notices[0]).toContain(text.noteOlder);
     expect(notices[0]).not.toContain(text.folder);
   });
+
+  // The CHANGELOG says the notice names the folder and says to rename it for
+  // a note created or edited in it — not for a synced note moved into it:
+  // that note is to be moved out again, and the notice says so.
+  it.each([
+    ['a.md', 'U.S./a.md'],
+    ['Work/a.md', 'Notes./a.md'],
+  ])(
+    'speaks of the rename, not of the folder, for a synced note moved from %s to %s',
+    (from, to) => {
+      const { vault, notices } = bench();
+      vault.fire('rename', { path: to }, from);
+      jest.runOnlyPendingTimers();
+
+      expect(notices).toHaveLength(1);
+      expect(notices[0]).toContain(text.renamed);
+      expect(notices[0]).not.toContain(text.folder);
+      expect(notices[0]).not.toContain(text.folderOlder);
+    },
+  );
 });
 
 describe('what the docs say about these notices', () => {
