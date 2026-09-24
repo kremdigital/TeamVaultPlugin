@@ -33,6 +33,10 @@ import { manualStep, readme } from './docs-text';
  *     S16 step 4 expected the notice about a new note in `U.S.` "without
  *     words about deleting", while it advises deleting a leftover copy and
  *     warns how not to delete such a name on Windows.
+ *
+ * A fourth review found that MANUAL-TEST S16 steps 4 and 5, done as they
+ * read, gave one warning where they promised two: the renames that come in
+ * while a notice waits out the gap after the one before share it.
  */
 
 class FakeVault {
@@ -332,5 +336,115 @@ describe('what the docs say about these notices', () => {
       'Фразы «для коллег это переименование выглядит как удаление» в нём нет',
     );
     expect(step4).toContain('предупреждение, что на Windows такое имя нельзя удалять');
+  });
+});
+
+describe('MANUAL-TEST S16: a warning per rename, when the step waits for each', () => {
+  const DELETE = 'это переименование выглядит как удаление';
+  /** A tester's pace: a rename or a drag takes a few seconds. */
+  const PACE_MS = 3000;
+
+  /** Waits for the notice now due, as a tester waits to read it. */
+  function untilShown(b: Bench): number {
+    const before = b.notices.length;
+    jest.runOnlyPendingTimers();
+    expect(b.notices).toHaveLength(before + 1);
+    return b.shownAt[before] ?? 0;
+  }
+
+  function rename(b: Bench, from: string, to: string): void {
+    b.vault.fire('rename', { path: to }, from);
+    jest.advanceTimersByTime(PACE_MS);
+  }
+
+  const renamedFrom = (b: Bench, from: string) =>
+    b.logged.filter((e) => e['renamedFrom'] === from).length;
+
+  beforeEach(() => setLanguage('ru'));
+
+  it('step 5: `Plan.md` renamed to `Plan?.md`, back, and again', () => {
+    // Done back to back right after the notice about `Question 2??.md`, the
+    // renames of `Plan` come in while the next notice waits out the gap:
+    // they share it, though `sync.log` has a line for each.
+    const hurried = bench();
+    rename(hurried, 'FAQ 2026/Question 2?.md', 'FAQ 2026/Question 2??.md');
+    rename(hurried, 'Plan.md', 'Plan?.md');
+    rename(hurried, 'Plan?.md', 'Plan.md');
+    rename(hurried, 'Plan.md', 'Plan?.md');
+    jest.runOnlyPendingTimers();
+    expect(hurried.notices.filter((n) => n.includes(DELETE))).toHaveLength(1);
+    expect(renamedFrom(hurried, 'Plan.md')).toBe(2);
+
+    // As the step reads: wait for the notice about `Question 2??.md` to go
+    // by itself, rename `Plan` and wait for the warning, then rename it back
+    // and again.
+    const b = bench();
+    b.vault.fire('rename', { path: 'FAQ 2026/Question 2??.md' }, 'FAQ 2026/Question 2?.md');
+    untilShown(b);
+    jest.advanceTimersByTime(15_000);
+    b.vault.fire('rename', { path: 'Plan?.md' }, 'Plan.md');
+    const first = untilShown(b);
+    rename(b, 'Plan?.md', 'Plan.md');
+    rename(b, 'Plan.md', 'Plan?.md');
+    const second = untilShown(b);
+
+    const warnings = b.notices.filter((n) => n.includes(DELETE));
+    expect(warnings).toHaveLength(2);
+    for (const warning of warnings) expect(warning).toContain('«Plan?.md»');
+    const gap = second - first;
+    expect(gap).toBe(15_000);
+    expect(renamedFrom(b, 'Plan.md')).toBe(2);
+    expect(b.events.map((e) => e.type)).toEqual(['delete', 'create', 'delete']);
+
+    const step5 = manualStep('S16', 5);
+    expect(step5).not.toContain('приходит оба раза');
+    expect(step5).toContain('Дождаться, пока оно исчезнет само');
+    expect(step5).toContain('`Plan.md` в `Plan?.md` и дождаться предупреждения');
+    expect(step5).toContain(
+      `предупреждение приходит второй раз, не раньше чем через ${gap / 1000} секунд после первого`,
+    );
+    expect(step5).toContain(
+      'три переименования `Plan` сразу после `Question 2??.md` дают одно предупреждение',
+    );
+  });
+
+  it('step 4: two synced notes dragged into `U.S.`', () => {
+    // Both dragged in before the warning about the first comes: one warning.
+    const hurried = bench();
+    hurried.vault.fire('create', { path: 'U.S./Без названия.md' });
+    untilShown(hurried);
+    rename(hurried, 'a.md', 'U.S./a.md');
+    rename(hurried, 'b.md', 'U.S./b.md');
+    jest.runOnlyPendingTimers();
+    expect(hurried.notices).toHaveLength(2);
+    expect(hurried.notices.filter((n) => n.includes(DELETE))).toHaveLength(1);
+    expect(hurried.logged.filter((e) => e['renamedFrom'] !== undefined)).toHaveLength(2);
+
+    // As the step reads: the second one dragged in once the warning about
+    // the first has come.
+    const b = bench();
+    b.vault.fire('create', { path: 'U.S./Без названия.md' });
+    const folderNotice = untilShown(b);
+    rename(b, 'a.md', 'U.S./a.md');
+    const firstWarning = untilShown(b);
+    rename(b, 'b.md', 'U.S./b.md');
+    const secondWarning = untilShown(b);
+
+    expect(b.notices).toHaveLength(3);
+    expect(b.notices[0]).not.toContain(DELETE);
+    expect(b.notices[1]).toContain(DELETE);
+    expect(b.notices[2]).toContain(DELETE);
+    expect(firstWarning - folderNotice).toBe(15_000);
+    expect(secondWarning - firstWarning).toBe(15_000);
+
+    const step4 = manualStep('S16', 4);
+    expect(step4).toContain(
+      'приходит второе уведомление (не раньше чем через 15 секунд после первого)',
+    );
+    expect(step4).toContain('Дождавшись этого уведомления, перетащить в `U.S.` вторую');
+    expect(step4).toContain('тоже не раньше чем через 15 секунд после предыдущего');
+    expect(step4).toContain(
+      'Если перетащить обе, пока второе уведомление ещё не показано, предупреждение о них будет одно',
+    );
   });
 });
