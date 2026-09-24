@@ -638,3 +638,83 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     expect(setting.desc).toBe('');
   });
 });
+
+describe('plugin lifecycle — atomic-write leftovers', () => {
+  /** An element that takes every DOM call the status bar makes. */
+  function anyEl(): HTMLElement {
+    const el: HTMLElement = new Proxy(
+      {},
+      { get: (_target, key) => (key === 'then' ? undefined : () => el) },
+    ) as HTMLElement;
+    return el;
+  }
+
+  beforeEach(() => {
+    jest.useFakeTimers();
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+  });
+
+  // Obsidian starts community plugins before it indexes the vault, and awaits
+  // neither: `vault.getFiles()` is empty in `onload`. The leftover sweep ran
+  // there and never found one in a real vault.
+  it('removes a leftover once the vault is indexed', async () => {
+    const id = `team-vault-tmp-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const leftover = `note.md.tmp.${process.pid + 1}.abc123`;
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [
+        { id: 's1', name: 'Work', url: 'https://sync.example.com', apiKey: 'osk_1', addedAt: 1 },
+      ],
+      // Switched off: no engine connects anywhere.
+      bindings: [
+        {
+          id: 'binding-1',
+          serverId: 's1',
+          projectId: 'p1',
+          projectName: 'Notes',
+          localFolder: '/',
+          enabled: false,
+          lastSyncedAt: 1,
+          lastVectorClock: {},
+        },
+      ],
+      clientId: 'client-1',
+    });
+    const app = fakeApp({ seed: { [`${dir}/data.json`]: data, [leftover]: 'x', 'note.md': 'x' } });
+    let indexed: string[] = [];
+    (app.vault as unknown as { getFiles: () => { path: string }[] }).getFiles = () =>
+      indexed.map((path) => ({ path }));
+    const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    Object.assign(plugin, {
+      addSettingTab: jest.fn(),
+      registerView: jest.fn(),
+      addStatusBarItem: anyEl,
+      addCommand: jest.fn(),
+      registerEvent: jest.fn(),
+    });
+
+    const loading = plugin.onload();
+    await jest.advanceTimersByTimeAsync(5000);
+    await loading;
+    expect(app.files.has(leftover)).toBe(true);
+
+    // Obsidian has indexed the vault and laid out the workspace.
+    indexed = [leftover, 'note.md'];
+    for (const [ready] of app.layoutReady.mock.calls as [() => void][]) {
+      try {
+        ready();
+      } catch {
+        // The watchers need more of Obsidian than this fake has.
+      }
+    }
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(app.files.has(leftover)).toBe(false);
+    expect(app.files.get('note.md')).toBe('x');
+    plugin.onunload();
+    await jest.advanceTimersByTimeAsync(100);
+  });
+});

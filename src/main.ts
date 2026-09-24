@@ -147,12 +147,13 @@ export default class ObsidianSyncPlugin extends Plugin {
     // binding's local state would look orphaned — and a data.json that was
     // missing a moment ago may just be one a sync client is replacing. The
     // next start cleans up whatever is really left over.
+    let sweepTmp = false;
     if (!(await this.warnOnDuplicatePluginFolders()) && !this.firstRun) {
       // A binding data.json has but the plugin could not read is not in
       // `settings`, yet it is no orphan: its unsent changes are still queued.
       // The tmp sweep stays — it only ever looks inside known bindings.
       if (!this.skippedSettings) await this.sweepOrphanedBindingState();
-      await this.sweepOrphanedTmpArtifacts();
+      sweepTmp = true;
     }
     if (this.unloaded) return;
     this.bootstrapManager();
@@ -167,6 +168,13 @@ export default class ObsidianSyncPlugin extends Plugin {
     // plugin was off are reconciled by the connect-time catch-up, not by
     // the startup flood.
     this.app.workspace.onLayoutReady(() => this.bootstrapWatchers());
+    // It reads the vault index, which Obsidian builds only after starting the
+    // plugins: in `onload` it is still empty, and the sweep found nothing.
+    if (sweepTmp) {
+      this.app.workspace.onLayoutReady(() => {
+        if (!this.unloaded) void this.sweepOrphanedTmpArtifacts();
+      });
+    }
     this.bootstrapUi();
 
     // Kick off the manager — engines for active bindings start connecting.

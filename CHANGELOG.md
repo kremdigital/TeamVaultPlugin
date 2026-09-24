@@ -173,6 +173,11 @@ uses [Semantic Versioning](https://semver.org/).
   copy as a new file. A file deleted without a rename stayed on your disk and
   was no longer synced. Both are now removed when sync starts. You are asked
   first only when your copy has changes the server may not have.
+- Leftover temporary files from Obsidian's own saves
+  (`note.md.tmp.<number>.<hex>`, left behind when Obsidian quits in the middle
+  of a save) are now removed at startup, as intended since 0.2.10. The cleanup
+  ran before Obsidian had listed the vault's files and never found one. They
+  were never synced either way.
 - An attachment you edited and then renamed while offline now has its edit
   uploaded. The queued edit looked for the file under its old name, found
   nothing and was dropped, so the server kept the old version until the next
