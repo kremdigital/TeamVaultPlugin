@@ -307,8 +307,8 @@ const ATOMIC_TMP_PATTERN = /\.tmp\.(\d+)\.[0-9a-f]+$/i;
  */
 const SHORT_NAME_PATTERN = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
 
-/** Characters Windows can't have in a name (besides `/`, `\` and `:`). */
-const WINDOWS_FORBIDDEN_CHARS = /[*?<>"|]/;
+/** `:` and the characters Windows can't have in a name (besides `/` and `\`). */
+const WINDOWS_FORBIDDEN_CHARS = /[:*?<>"|]/;
 
 /** A control character (U+0000–U+001F) — Windows can't have one in a name either. */
 function hasControlCharacter(segment: string): boolean {
@@ -318,13 +318,20 @@ function hasControlCharacter(segment: string): boolean {
   return false;
 }
 
+/** Which Windows rule a name breaks — see `windowsNameProblem`. */
+export type WindowsNameProblem =
+  | { kind: 'character'; character: string }
+  | { kind: 'control' }
+  | { kind: 'trailing' }
+  | { kind: 'short-name' };
+
 /**
- * True for a name that Windows opens as a DIFFERENT file or folder than the
- * one it spells, or can't give a file at all — so no rule above, which
- * compares names, can vouch for it. Tested on the segment as spelled (NFC,
- * any case), since that is what NTFS compares: none of these rules has a
- * letter in it, and folding `STRAßE~1` into `strasse~1` would make it too
- * long for a short name.
+ * Why Windows can't keep `segment` as spelled, or `null` when it can: it opens
+ * a DIFFERENT file or folder than the one the name spells, or can't give a
+ * file that name at all — so no rule above, which compares names, can vouch
+ * for it. Tested on the segment as spelled (NFC, any case), since that is
+ * what NTFS compares: none of these rules has a letter in it, and folding
+ * `STRAßE~1` into `strasse~1` would make it too long for a short name.
  *
  *   - Any `:`. On NTFS `name:stream` addresses a stream of `name`, and
  *     `desktop.ini::$DATA` IS `desktop.ini`, `.obsidian::$INDEX_ALLOCATION`
@@ -350,13 +357,21 @@ function hasControlCharacter(segment: string): boolean {
  *
  * Every device refuses these names in both directions, as with the list
  * above: a name one teammate's disk can't hold is not uploaded by another.
+ * Unlike the list, such a name can be a note a user meant to share, so the
+ * Obsidian watcher reports one it drops (see `windowsRefusal`).
  */
-function isWindowsAlias(segment: string): boolean {
-  if (segment.includes(':') || WINDOWS_FORBIDDEN_CHARS.test(segment)) return true;
-  if (hasControlCharacter(segment)) return true;
-  if (segment.endsWith('.') || segment.endsWith(' ')) return true;
+export function windowsNameProblem(segment: string): WindowsNameProblem | null {
+  const character = WINDOWS_FORBIDDEN_CHARS.exec(segment)?.[0];
+  if (character !== undefined) return { kind: 'character', character };
+  if (hasControlCharacter(segment)) return { kind: 'control' };
+  if (segment.endsWith('.') || segment.endsWith(' ')) return { kind: 'trailing' };
   const shortName = SHORT_NAME_PATTERN.exec(segment);
-  return shortName !== null && (shortName[1] ?? '').length <= 8;
+  if (shortName !== null && (shortName[1] ?? '').length <= 8) return { kind: 'short-name' };
+  return null;
+}
+
+function isWindowsAlias(segment: string): boolean {
+  return windowsNameProblem(segment) !== null;
 }
 
 /** One segment against the named list (by `nameKey`), its patterns and suffixes (by `fold`). */
@@ -464,6 +479,34 @@ export function checkVaultPath(
   }
   if (opts.bindingFolder !== undefined && !isInBinding(path, opts.bindingFolder)) {
     return 'outside-binding';
+  }
+  return null;
+}
+
+/** A path refused only because Windows can't keep one of its names. */
+export interface WindowsRefusal {
+  /** The path up to and including the first such name: `Why?.md`, `U.S.`. */
+  name: string;
+  problem: WindowsNameProblem;
+}
+
+/**
+ * Why `vaultPath` is never synced when only the Windows rules refuse it (see
+ * `windowsNameProblem`), `null` when it is synced or on the list. Obsidian
+ * lets a Mac or Linux user name a note `Why?.md`, and dropped without a word,
+ * such a note left the team — renamed to it, it was deleted for everyone —
+ * while its author kept writing in it. The list is another matter: a
+ * `.trash` or a `~` backup is not meant to be shared, and saying so on every
+ * editor save would be noise.
+ */
+export function windowsRefusal(vaultPath: string, configDir?: string): WindowsRefusal | null {
+  if (checkVaultPath(vaultPath, configDir === undefined ? {} : { configDir }) !== 'invalid') {
+    return null;
+  }
+  const segments = spelledSegments(vaultPath);
+  for (let i = 0; i < segments.length; i++) {
+    const problem = windowsNameProblem(segments[i] ?? '');
+    if (problem !== null) return { name: segments.slice(0, i + 1).join('/'), problem };
   }
   return null;
 }

@@ -38,6 +38,7 @@ import { ObsidianLogStorage } from '@/integration/obsidian-log-storage';
 import { ObsidianWatchableVault } from '@/integration/obsidian-watchable-vault';
 import { UiConflictResolver } from '@/ui/modals/conflict-modal';
 import { NoticeService } from '@/ui/notices';
+import { UnsyncableNameReporter } from '@/ui/unsyncable-names';
 import { StatusBar } from '@/ui/status-bar';
 import { registerCommands } from '@/ui/commands';
 import { HISTORY_VIEW_TYPE, HistoryView } from '@/ui/views/history-view';
@@ -499,11 +500,17 @@ export default class ObsidianSyncPlugin extends Plugin {
     // would ever stop watchers attached then.
     if (this.unloaded || !this.engineManager || !this.recentlyApplied) return;
 
+    // A note named so that Windows can't keep it (`Why?.md`) is never synced;
+    // the user is told, once per name while the plugin runs.
+    const unsyncableNames = new UnsyncableNameReporter({
+      log: (message, context) => this.logger?.warn(message, context),
+    });
     this.obsidianWatcher = new ObsidianWatcher({
       bindings: () => this.settings.bindings,
       recentlyApplied: this.recentlyApplied,
       modifyDebounceMs: this.settings.debounceMs,
       configDir: this.app.vault.configDir,
+      onUnsyncableName: (event) => unsyncableNames.report(event),
     });
     const watchableVault = new ObsidianWatchableVault(this.app.vault);
     this.obsidianWatcher.start(watchableVault);

@@ -130,7 +130,9 @@ synchronizing. The status bar shows the aggregate state.
   saved before pushing the change upstream. Higher = fewer round-trips but
   laggier remote view.
 - **Notifications** — toasts for connect / disconnect / sync completion.
-  Errors and conflict notices always fire regardless.
+  Errors, conflicts and a note whose name can't be synced (see
+  [What is never synced](#what-is-never-synced)) are always notified
+  regardless.
 - **Log level** — **Errors only**, **Warnings**, **Info** (default) or
   **Debug**: what goes into `sync.log`. At **Debug** every entry is also
   mirrored to the DevTools console (`Ctrl+Shift+I`). A change applies at
@@ -192,11 +194,23 @@ with a long s.
   - names with `*`, `?`, `<`, `>`, `"`, `|` or a control character (a note
     `Why?.md`): Windows can't store them.
 
-  Obsidian on Windows refuses all of these but short names; on macOS and
-  Linux it lets you create most of them. None of them is synced on any
-  system — not even between two Macs — so that no teammate uploads a name
-  another teammate's disk can't hold. Rename such a note (`Why.md`) to sync
-  it.
+  Obsidian itself refuses `:` everywhere, and on Windows also `*`, `?`, `<`,
+  `>`, `"`, `|` and a name ending in a dot or a space; on macOS and Linux it
+  lets you create those. None of these names is synced on any system — not
+  even between two Macs — so that no teammate uploads a name another
+  teammate's disk can't hold. Unlike the rest of this list, such a name is
+  often a note you meant to share, so when you create, edit or rename one in
+  Obsidian, a notice names it and what is wrong with it (once per name while
+  the plugin runs, and in `sync.log` at `warn`). Renaming a synced note to
+  such a name works like deleting it for your teammates.
+
+  Rename the note to sync it. A note an older version already synced under
+  such a name is still on the server: rename it in the project's web
+  interface (or have an MCP agent do it), and it is renamed for everyone,
+  history included — then delete your local copy under the old name, which no
+  longer syncs. Renamed in Obsidian, it is uploaded as a new note, and the
+  old one stays on the server, where teammates on older versions still see
+  it, until someone deletes it there.
 
 The list is built in and the same on every device, so there is no setting
 for it. Such files that an older version already uploaded stay on the
@@ -261,7 +275,9 @@ Look for `[error]` lines. Common causes:
 - The binding is switched off (toggle in **Team Vault → Vaults**).
 - The file's name is on the built-in ignore list — see
   [What is never synced](#what-is-never-synced). Local files like that are
-  skipped without a log line; one the server still holds is logged as
+  skipped without a log line, except a name Windows can't keep, which gets
+  a notice and a `not synced: Windows cannot keep this name` line; one the
+  server still holds is logged as
   `refused a path supplied by the server` with `"reason":"ignored"` (or
   `"invalid"` for a name Windows can't keep as spelled) — at `warn`
   once per path while the plugin runs, and at `debug` after that.

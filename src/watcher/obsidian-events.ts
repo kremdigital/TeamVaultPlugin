@@ -1,6 +1,12 @@
 import type { VaultBinding } from '@/settings/settings';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
-import { DEFAULT_CONFIG_DIR, isAlwaysIgnored, isInBinding } from './path-utils';
+import {
+  DEFAULT_CONFIG_DIR,
+  isAlwaysIgnored,
+  isInBinding,
+  windowsRefusal,
+  type WindowsRefusal,
+} from './path-utils';
 import type { RecentlyApplied } from './recently-applied';
 
 /**
@@ -16,7 +22,9 @@ import type { RecentlyApplied } from './recently-applied';
  *     without a dot, such as `desktop.ini`, `Thumbs.db` and Office's
  *     `~$<name>` owner files, folders named like temporary files, and
  *     names Windows can't keep as spelled (`Why?.md`, a folder `Notes.`),
- *     which Obsidian allows on macOS and Linux.
+ *     which Obsidian allows on macOS and Linux. A note dropped for such a
+ *     name is reported (`onUnsyncableName`): unlike a service file, it is one
+ *     the user meant to share.
  *   - Debounce `modify` per (binding, path) — Obsidian fires several
  *     events per save (`metadata`, `links`, etc) and the engine doesn't
  *     need every microtick.
@@ -53,6 +61,17 @@ export type VaultEvent =
 
 export type VaultEventHandler = (event: VaultEvent) => void;
 
+/**
+ * A note created, edited or renamed in the vault under a name no device syncs
+ * because Windows can't keep it (see `windowsRefusal`).
+ */
+export interface UnsyncableName extends WindowsRefusal {
+  /** The file the event was about. */
+  path: string;
+  /** The synced path it was renamed from: teammates see that one deleted. */
+  renamedFrom?: string;
+}
+
 // -- Vault adapter (the bit of `app.vault` we use) ----------------------------
 
 /** A minimal stand-in for `TFile` / `TFolder`. Adapters must set
@@ -88,6 +107,12 @@ export interface ObsidianWatcherOptions {
   clearTimeout?: (handle: unknown) => void;
   /** Obsidian's config folder (`Vault.configDir`); never synced. Default `.obsidian`. */
   configDir?: string;
+  /**
+   * Called for a file in an enabled binding that is dropped because Windows
+   * can't keep its name — on every such event: the listener decides what to
+   * repeat. Not for deletes.
+   */
+  onUnsyncableName?: (event: UnsyncableName) => void;
 }
 
 // -- Watcher ------------------------------------------------------------------
@@ -100,6 +125,7 @@ export class ObsidianWatcher {
   private readonly recentlyApplied: RecentlyApplied;
   private readonly getBindings: () => VaultBinding[];
   private readonly configDir: string;
+  private readonly onUnsyncableName: ((event: UnsyncableName) => void) | undefined;
 
   /** Per-`(binding, path)` debounced fan-out. */
   private readonly modifyDebouncers = new Map<string, DebouncedFunction<[string, string]>>();
@@ -113,6 +139,7 @@ export class ObsidianWatcher {
     this.setT = options.setTimeout;
     this.clearT = options.clearTimeout;
     this.configDir = options.configDir ?? DEFAULT_CONFIG_DIR;
+    this.onUnsyncableName = options.onUnsyncableName;
   }
 
   /** Attach event listeners to the given vault. Idempotent. */
@@ -147,6 +174,7 @@ export class ObsidianWatcher {
   private onCreate(file: WatchableFile): void {
     if (!isFile(file)) return;
     if (this.recentlyApplied.take(file.path)) return;
+    this.reportUnsyncable(file.path);
     this.dispatchForBindings(file.path, (bindingId) =>
       this.fan({ type: 'create', bindingId, path: file.path, source: 'obsidian' }),
     );
@@ -178,18 +206,26 @@ export class ObsidianWatcher {
     // For the simple in-binding case we emit a single rename.
     this.recentlyApplied.take(file.path);
     this.recentlyApplied.take(oldPath);
+    // An ignored path counts as "outside the binding", so the usual mapping
+    // below does the right thing: moving a note into Obsidian's trash (that
+    // is what "Move to Obsidian trash" does — a rename into `.trash/`)
+    // becomes a delete, and dragging a note back out becomes a create.
+    // Treating it as a rename used to publish the trashed copy to everyone,
+    // and after the server started refusing `.trash` it would have queued a
+    // NACKed op forever.
+    const oldIgnored = isAlwaysIgnored(oldPath, this.configDir);
+    const newIgnored = isAlwaysIgnored(file.path, this.configDir);
+    // Renaming a note to `Why?.md` is the same delete for the team — the one
+    // case of it the user doesn't mean, so it is reported.
+    if (newIgnored) {
+      this.reportUnsyncable(
+        file.path,
+        !oldIgnored && this.inEnabledBinding(oldPath) ? oldPath : undefined,
+      );
+    }
+    if (oldIgnored && newIgnored) return;
     for (const binding of this.getBindings()) {
       if (!binding.enabled) continue;
-      // An ignored path counts as "outside the binding", so the usual mapping
-      // below does the right thing: moving a note into Obsidian's trash (that
-      // is what "Move to Obsidian trash" does — a rename into `.trash/`)
-      // becomes a delete, and dragging a note back out becomes a create.
-      // Treating it as a rename used to publish the trashed copy to everyone,
-      // and after the server started refusing `.trash` it would have queued a
-      // NACKed op forever.
-      const oldIgnored = isAlwaysIgnored(oldPath, this.configDir);
-      const newIgnored = isAlwaysIgnored(file.path, this.configDir);
-      if (oldIgnored && newIgnored) continue;
       const inOld = isInBinding(oldPath, binding.localFolder) && !oldIgnored;
       const inNew = isInBinding(file.path, binding.localFolder) && !newIgnored;
       if (inOld && inNew) {
@@ -211,6 +247,9 @@ export class ObsidianWatcher {
   private onModify(file: WatchableFile): void {
     if (!isFile(file)) return;
     if (this.recentlyApplied.take(file.path)) return;
+    // A note uploaded under such a name by an older version stops syncing
+    // after the update; the first edit is when its author can learn of it.
+    this.reportUnsyncable(file.path);
     this.dispatchForBindings(file.path, (bindingId) => {
       const key = `${bindingId}::${file.path}`;
       let d = this.modifyDebouncers.get(key);
@@ -233,6 +272,26 @@ export class ObsidianWatcher {
   }
 
   // -- Helpers ------------------------------------------------------------
+
+  private inEnabledBinding(path: string): boolean {
+    return this.getBindings().some((b) => b.enabled && isInBinding(path, b.localFolder));
+  }
+
+  /** Tell `onUnsyncableName` about a file the Windows rules alone keep from syncing. */
+  private reportUnsyncable(path: string, renamedFrom?: string): void {
+    if (!this.onUnsyncableName) return;
+    const refusal = windowsRefusal(path, this.configDir);
+    if (refusal === null || !this.inEnabledBinding(path)) return;
+    try {
+      this.onUnsyncableName({
+        ...refusal,
+        path,
+        ...(renamedFrom !== undefined ? { renamedFrom } : {}),
+      });
+    } catch {
+      // A listener error must not cost the event itself.
+    }
+  }
 
   private dispatchForBindings(path: string, action: (bindingId: string) => void): void {
     if (isAlwaysIgnored(path, this.configDir)) return;
