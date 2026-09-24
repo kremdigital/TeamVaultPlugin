@@ -206,6 +206,12 @@ const CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;
  */
 const RECHECK_DELETE = 'recheck';
 
+/**
+ * How many times one snapshot folds a disk that changed under it before it
+ * leaves the write to a later snapshot (see `writeDocSnapshot`).
+ */
+const SNAPSHOT_FOLD_ATTEMPTS = 3;
+
 export class SyncEngine {
   private readonly binding: VaultBinding;
   private readonly server: ServerConfig;
@@ -2278,26 +2284,47 @@ export class SyncEngine {
     // its own snapshot, and that one folds + writes the complete state.
     if (meta && meta.size > 0 && !this.docManager.hasState(this.binding.id, path)) return;
     if (this.docManager.hasPendingRemoteUpdates(this.binding.id, path)) return;
-    const diskText = (await this.vault.exists(path)) ? await this.vault.readText(path) : null;
-    await this.foldDiskEditsIntoDoc(path, diskText);
-    const text = this.docManager.getText(this.binding.id, path);
-    if (meta) {
-      // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
-      // watcher echo of this write must find the file already recorded.
-      meta.contentHash = await sha256Hex(text);
-      meta.size = new TextEncoder().encode(text).byteLength;
-      this.operationLog.setFileMeta(meta);
+    let diskText = await this.readDiskText(path);
+    let text: string;
+    let hash = '';
+    for (let attempt = 1; ; attempt++) {
+      await this.foldDiskEditsIntoDoc(path, diskText);
+      text = this.docManager.getText(this.binding.id, path);
+      if (meta) hash = await sha256Hex(text);
+      // Disk already matches the doc — don't rewrite the file. The catch-up
+      // used to rewrite EVERY text file on EVERY connect: a mass write storm
+      // that churned Obsidian's atomic-write temp files (the orphaned
+      // `*.tmp.<pid>.<hex>` artifacts) and left hundreds of live echo
+      // budgets in `recentlyApplied`, where they swallowed genuine external
+      // edits arriving in the same window (the silent-rollback incident).
+      if (diskText !== null && diskText === text) {
+        if (meta) {
+          this.recordSnapshotMeta(meta, text, hash);
+          await this.markFolded(meta, text, hash);
+        }
+        return;
+      }
+      // The fold and the hashing yield, and the disk may change meanwhile. A
+      // save landing now is on disk but not in `text`: the write would roll it
+      // back, and the open editor, which reloads the file, with it. A delete
+      // landing now would be undone. Look again right before the write.
+      const current = await this.readDiskText(path);
+      if (current === diskText) break;
+      // Deleted: the delete event owns the path now.
+      if (current === null) return;
+      if (attempt >= SNAPSHOT_FOLD_ATTEMPTS) {
+        // Still changing. The doc keeps the remote edits in the meantime, and
+        // a later snapshot folds whatever the disk settles on.
+        this.log.info('disk keeps changing under the snapshot, retrying later', path);
+        this.scheduleSnapshotToDisk(path);
+        return;
+      }
+      // A save: fold it three-way like any other, then check again.
+      diskText = current;
     }
-    // Disk already matches the doc — don't rewrite the file. The catch-up
-    // used to rewrite EVERY text file on EVERY connect: a mass write storm
-    // that churned Obsidian's atomic-write temp files (the orphaned
-    // `*.tmp.<pid>.<hex>` artifacts) and left hundreds of live echo
-    // budgets in `recentlyApplied`, where they swallowed genuine external
-    // edits arriving in the same window (the silent-rollback incident).
-    if (diskText !== null && diskText === text) {
-      if (meta) await this.markFolded(meta, text, meta.contentHash);
-      return;
-    }
+    // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
+    // watcher echo of this write must find the file already recorded.
+    if (meta) this.recordSnapshotMeta(meta, text, hash);
     // See `applyServerUpdateBinary` — a single overwrite can fan out into
     // Obsidian onModify + chokidar `change` OR Obsidian onModify + chokidar
     // `unlink` + `add` (atomic-rename split). Budget for the worst case so
@@ -2317,6 +2344,18 @@ export class SyncEngine {
     // recorded before a failed write would make the next fold read the old
     // disk as local deletions of everything this snapshot was bringing in.
     if (meta) await this.markFolded(meta, text, meta.contentHash);
+  }
+
+  /** The note's text on disk, `null` when there is no file. */
+  private async readDiskText(path: string): Promise<string | null> {
+    return (await this.vault.exists(path)) ? await this.vault.readText(path) : null;
+  }
+
+  /** Record `text` (hashed to `hash`) as the file's synced content. */
+  private recordSnapshotMeta(meta: IndexedMeta, text: string, hash: string): void {
+    meta.contentHash = hash;
+    meta.size = new TextEncoder().encode(text).byteLength;
+    this.operationLog.setFileMeta(meta);
   }
 
   // -- Pending queue --------------------------------------------------------

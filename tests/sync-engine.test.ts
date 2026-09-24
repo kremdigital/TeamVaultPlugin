@@ -2895,6 +2895,79 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     await flushAsync(20);
   }
 
+  /**
+   * Resolve once `check` holds. Polled between macrotasks: every microtask
+   * chain in flight has settled by then, so the engine stands at its next real
+   * yield (hashing, I/O, a timer) — however long the machine takes to get there.
+   */
+  async function waitFor(check: () => boolean, what: string, timeoutMs = 4000): Promise<void> {
+    const deadline = Date.now() + timeoutMs;
+    while (!check()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${what}`);
+      await new Promise<void>((r) => setTimeout(r, 0));
+    }
+  }
+
+  /** Wait until the fold marker records `text` as the last disk content in the doc. */
+  async function foldedAt(h: Harness, text: string): Promise<void> {
+    const { sha256Hex } = await import('@/sync/hash');
+    const hash = await sha256Hex(text);
+    await waitFor(
+      () => h.log.getFileMeta('b1', PATH)?.foldedHash === hash,
+      `the fold marker at ${JSON.stringify(text)}`,
+    );
+  }
+
+  /** The text of the engine's next write of the note. */
+  function nextWrite(h: Harness, timeoutMs = 4000): Promise<string> {
+    return new Promise<string>((resolve, reject) => {
+      const write = h.vault.writeText.bind(h.vault);
+      const timer = setTimeout(() => {
+        h.vault.writeText = write;
+        reject(new Error('timed out waiting for the note to be written'));
+      }, timeoutMs);
+      h.vault.writeText = async (path, content) => {
+        await write(path, content);
+        if (path !== PATH) return;
+        clearTimeout(timer);
+        h.vault.writeText = write;
+        resolve(content);
+      };
+    });
+  }
+
+  /**
+   * Resolves on the engine's next `connected` — after the join's catch-up,
+   * snapshots included. Arm it before the step that connects.
+   */
+  function nextConnected(h: Harness): Promise<void> {
+    return new Promise<void>((resolve) => {
+      const off = h.engine.onStatus((s) => {
+        if (s !== 'connected') return;
+        off();
+        resolve();
+      });
+    });
+  }
+
+  /**
+   * Run `change` right after each of the engine's next `times` reads of the
+   * note: the disk moves between a snapshot reading it and writing it.
+   */
+  function changeAfterReads(h: Harness, times: number, change: (n: number) => void): void {
+    const read = h.vault.readText.bind(h.vault);
+    let n = 0;
+    h.vault.readText = async (path) => {
+      const seen = await read(path);
+      if (path === PATH) {
+        n += 1;
+        if (n === times) h.vault.readText = read;
+        change(n);
+      }
+      return seen;
+    };
+  }
+
   it('a remote edit arriving after a local save survives on disk, in the doc and on the server', async () => {
     const Y = await import('yjs');
     const h = buildHarness({ snapshotMs: 0 });
@@ -2917,11 +2990,12 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
     Y.applyUpdate(serverDoc, remote);
     const emitted = h.socket().emits.length;
+    const written = nextWrite(h);
     h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
-    await flushAsync(40);
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(await written).toBe(expected);
     await drainToServer(h, serverDoc, emitted);
 
-    const expected = 'remote line\nv1\nlocal line\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
     expect(serverDoc.getText('content').toJSON()).toBe(expected);
@@ -2940,7 +3014,11 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
       fileId: 'f1',
       update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
     });
-    await new Promise((r) => setTimeout(r, 60));
+    // Its snapshot finds disk and doc agreeing and records that as the fold
+    // base. Waited for, not slept on: a slow run used to send the teammate's
+    // edit into a snapshot still in flight.
+    await foldedAt(h, 'first\nsecond\n');
+    const written = nextWrite(h);
 
     // The teammate's edit is in the doc, its snapshot write still debounced…
     const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote\n'));
@@ -2949,13 +3027,132 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     // …when the user's own save lands. A plain doc↔disk diff would delete
     // "remote" here; the fold must keep both sides.
     await saveLocally(h, 'first\nsecond\nlocal\n');
-    await new Promise((r) => setTimeout(r, 80));
-    await flushAsync(20);
+    const expected = 'remote\nfirst\nsecond\nlocal\n';
+    expect(await written).toBe(expected);
     await drainToServer(h, serverDoc);
 
-    const expected = 'remote\nfirst\nsecond\nlocal\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a save landing while a snapshot is between reading and writing the note is folded in, not written over', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await foldedAt(h, 'v1\n');
+
+    // The snapshot of a teammate's edit has just read the note when the
+    // user's save lands, and the watcher reports it. Written over, the save
+    // is gone — from the disk and from the editor, which reloads the file.
+    const saved = new Promise<void>((resolve, reject) => {
+      changeAfterReads(h, 1, () => {
+        putDisk(h, 'v1\nlocal line\n');
+        h.engine
+          .handleVaultEvent({ type: 'modify', bindingId: 'b1', path: PATH, source: 'obsidian' })
+          .then(resolve, reject);
+      });
+    });
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    // The save's event waits for the snapshot on the path lock: once it is
+    // handled, both are done.
+    await saved;
+    await drainToServer(h, serverDoc);
+
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(await h.vault.readText(PATH)).toBe(expected);
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a note deleted while its snapshot is in flight is not written back', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    // A teammate's edit made while this device was offline comes with the
+    // catch-up, and the user deletes the note right after the snapshot writing
+    // that edit out has read it. Written back, the note reappears, and the
+    // delete event then finds it on disk and drops the delete.
+    serverDoc.getText('content').insert(0, 'remote line\n');
+    const read = h.vault.readText.bind(h.vault);
+    h.vault.readText = async (path) => {
+      const seen = await read(path);
+      // The first read with the edit already in the doc is the snapshot's.
+      if (
+        path === PATH &&
+        h.doc.has('b1', PATH) &&
+        h.doc.getText('b1', PATH).startsWith('remote line')
+      ) {
+        h.vault.readText = read;
+        h.vault.files.delete(PATH);
+      }
+      return seen;
+    };
+    const connected = nextConnected(h);
+    await h.engine.start();
+    h.socket().ackOk({
+      operations: [],
+      yjsDocs: [
+        {
+          fileId: 'f1',
+          sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+          stateVector: Array.from(Y.encodeStateVector(serverDoc)),
+        },
+      ],
+    });
+    // An inline catch-up finishes each doc's snapshot before `connected`.
+    await connected;
+
+    expect(h.vault.files.has(PATH)).toBe(false);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a note that keeps changing under its snapshot is written once it settles, with every save in it', async () => {
+    const Y = await import('yjs');
+    const h = buildHarness({ snapshotMs: 0 });
+    const serverDoc = await syncedNote(h, 'v1\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await foldedAt(h, 'v1\n');
+
+    // A save lands after each of the next three reads: more saves than one
+    // snapshot folds before it leaves the write to a retry. The saves' modify
+    // events are left out: the retry must not depend on them.
+    let disk = 'v1\n';
+    changeAfterReads(h, 3, (n) => {
+      disk += `save ${n}\n`;
+      putDisk(h, disk);
+    });
+    const written = nextWrite(h);
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+
+    // The first write comes once the disk has settled, and nothing was
+    // written over a save before it.
+    const expected = 'remote line\nv1\nsave 1\nsave 2\nsave 3\n';
+    expect(await written).toBe(expected);
+    await drainToServer(h, serverDoc);
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(serverDoc.getText('content').toJSON()).toBe(expected);
     serverDoc.destroy();
     await h.engine.stop();
@@ -2980,18 +3177,20 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     expect(h.log.getFileMeta('b1', PATH)?.foldedHash).toBe(folded);
 
     // Reconnect: the file index is rebuilt from the server listing.
+    const reconnected = nextConnected(h);
     h.socket().disconnect();
     h.socket().connect();
     await flushAsync(5);
     h.socket().ackOk({ operations: [], yjsDocs: [] });
-    await flushAsync(20);
+    await reconnected;
     expect(h.log.getFileMeta('b1', PATH)?.foldedHash).toBe(folded);
 
     const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote line\n'));
     Y.applyUpdate(serverDoc, remote);
     const emitted = h.socket().emits.length;
+    const written = nextWrite(h);
     h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
-    await flushAsync(40);
+    expect(await written).toBe('remote line\nv1\nlocal line\n');
     await drainToServer(h, serverDoc, emitted);
 
     expect(await h.vault.readText(PATH)).toBe('remote line\nv1\nlocal line\n');
@@ -3003,6 +3202,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
   /** Connect with a streamed catch-up that the engine skips (disk == server). */
   async function connectSkippingNote(h: Harness, serverDoc: import('yjs').Doc): Promise<void> {
     const Y = await import('yjs');
+    const connected = nextConnected(h);
     await h.engine.start();
     h.socket().fetchResponder = () => ({
       ok: true,
@@ -3022,7 +3222,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
       ],
       done: true,
     });
-    await flushAsync(20);
+    await connected;
     expect(h.doc.has('b1', PATH)).toBe(false);
   }
 
@@ -3036,8 +3236,9 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const before = Y.encodeStateVector(serverDoc);
     serverDoc.getText('content').insert(3, 'remote line\n');
     const delta = Y.encodeStateAsUpdate(serverDoc, before);
+    const written = nextWrite(h);
     h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(delta) });
-    await flushAsync(40);
+    expect(await written).toBe('v1\nremote line\n');
 
     expect(h.socket().fetches).toEqual([{ projectId: 'p1', fileId: 'f1' }]);
     expect(await h.vault.readText(PATH)).toBe('v1\nremote line\n');
@@ -3084,11 +3285,12 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     // fetched doc still holds the base text — only the server's history does.
     serverDoc.getText('content').insert(0, 'remote line\n');
     const emitted = h.socket().emits.length;
+    const written = nextWrite(h);
     await saveLocally(h, 'v1\nlocal line\n');
-    await flushAsync(40);
+    const expected = 'remote line\nv1\nlocal line\n';
+    expect(await written).toBe(expected);
     await drainToServer(h, serverDoc, emitted);
 
-    const expected = 'remote line\nv1\nlocal line\n';
     expect(h.doc.getText('b1', PATH)).toBe(expected);
     expect(await h.vault.readText(PATH)).toBe(expected);
     expect(serverDoc.getText('content').toJSON()).toBe(expected);
@@ -3102,7 +3304,13 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     putDisk(h, 'created\n');
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
-    await flushAsync(10);
+    // The initial push offers the note first, and that create stays
+    // unanswered. Waited for, so the create answered below is the event's own.
+    await waitFor(
+      () => h.socket().emits.some((e) => e.event === 'file:create'),
+      'the initial push to offer the note',
+    );
+    const offered = h.socket().emits.length;
 
     const create = h.engine.handleVaultEvent({
       type: 'create',
@@ -3110,7 +3318,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
       path: PATH,
       source: 'obsidian',
     });
-    await flushAsync(10);
+    await waitFor(() => h.socket().emits.length > offered, 'the file:create emit');
     expect(h.socket().emits.at(-1)?.event).toBe('file:create');
     h.socket().ackOk({ outcome: { fileId: 'f1', path: PATH } });
     await create;
@@ -3174,6 +3382,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     const local = 'A\nB\nC\n';
     putDisk(h, local);
 
+    const connected = nextConnected(h);
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
     await flushAsync(10);
@@ -3190,7 +3399,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
       ],
       done: true,
     });
-    await flushAsync(40);
+    await connected;
 
     // Same outcome as before 0.3.2 for this case: the disk copy wins, once.
     expect(h.apiCalls.some((c) => c.url.includes('/versions'))).toBe(false);
