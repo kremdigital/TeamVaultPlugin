@@ -298,8 +298,8 @@ describe('the warning that a rename is a delete for the team', () => {
     expect(logged.map((e) => e['renamedFrom'])).toEqual(['Trip/n1.md', 'Trip/n2.md', 'Trip/n3.md']);
   });
 
-  it('is not repeated for a note renamed back and then to that name again', () => {
-    const { vault, events, notices } = bench();
+  it('comes again for a note renamed back and then to that name again', () => {
+    const { vault, events, notices, logged } = bench();
 
     vault.fire('rename', { path: 'Why?.md' }, 'Trip.md');
     jest.runOnlyPendingTimers();
@@ -308,8 +308,11 @@ describe('the warning that a rename is a delete for the team', () => {
     vault.fire('rename', { path: 'Why?.md' }, 'Trip.md');
     jest.runOnlyPendingTimers();
 
+    // Uploaded anew in between, the note is deleted for the team twice.
     expect(events.map((e) => e.type)).toEqual(['delete', 'create', 'delete']);
-    expect(notices).toHaveLength(1);
+    expect(notices).toHaveLength(2);
+    for (const notice of notices) expect(notice).toContain('the rename looks like a delete');
+    expect(logged.map((e) => e['renamedFrom'])).toEqual(['Trip.md', 'Trip.md']);
   });
 
   it('makes a later plain notice about the same name unnecessary', () => {

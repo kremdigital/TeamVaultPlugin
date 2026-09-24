@@ -241,7 +241,7 @@ describe('UnsyncableNameReporter', () => {
     });
   });
 
-  it('tells a name once while the plugin runs, and a rename once per synced note', () => {
+  it('tells a name once while the plugin runs, and every rename of a synced note to it', () => {
     const show = jest.fn();
     const log = jest.fn();
     const reporter = new UnsyncableNameReporter({ show, log });
@@ -255,7 +255,7 @@ describe('UnsyncableNameReporter', () => {
       inFolder('a.md'),
       inFolder('b.md'),
       renamed,
-      // Renamed back and to the bad name again: the user knows by now.
+      // Renamed back and to the bad name again: another delete for the team.
       renamed,
       // Another synced note given that name: another delete for the team.
       { ...renamed, renamedFrom: 'Other.md' },
@@ -264,8 +264,8 @@ describe('UnsyncableNameReporter', () => {
       jest.runOnlyPendingTimers();
     }
 
-    expect(show).toHaveBeenCalledTimes(3);
-    expect(log).toHaveBeenCalledTimes(3);
+    expect(show).toHaveBeenCalledTimes(4);
+    expect(log).toHaveBeenCalledTimes(4);
   });
 
   it.each([
@@ -282,7 +282,8 @@ describe('UnsyncableNameReporter', () => {
     const message = String(show.mock.calls[0]?.[0]);
     expect(message).toContain('«x»');
     expect(message).toContain(text);
-    expect(message).toContain('Переименуйте, чтобы синхронизировать');
+    // `x` is the folder the note is in.
+    expect(message).toContain('Переименуйте папку, чтобы синхронизировать её заметки');
     expect(message).not.toContain('удаление');
   });
 });

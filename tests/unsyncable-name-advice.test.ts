@@ -23,7 +23,7 @@ import type { VaultBinding } from '@/settings/settings';
  *     for the whole team;
  *   - the notice that groups names called short names ones that "don't work
  *     on Windows" without saying why (Windows keeps them; they may open
- *     another file), and counted `Why?.md` in two folders as two names;
+ *     another file);
  *   - moving `Work/Why?.md` into the folder of another binding, `Team`, was
  *     taken for a rename that changes nothing and said nothing, though the
  *     note is meant for the other project's team and won't reach it.
@@ -236,7 +236,7 @@ describe('the notice that groups several names', () => {
     expect(message).not.toContain("don't work on Windows");
   });
 
-  it('counts a name at fault once, whatever folders it is in', () => {
+  it('counts the names it shows: `Why?.md` in two folders is two notes to rename', () => {
     const { vault, notices, logged } = bench();
 
     vault.fire('rename', { path: 'Why?.md' }, 'Trip.md');
@@ -244,7 +244,7 @@ describe('the notice that groups several names', () => {
     jest.runOnlyPendingTimers();
 
     expect(notices).toHaveLength(1);
-    expect(notices[0]).toContain('(names: 1)');
+    expect(notices[0]).toContain('(names: 2)');
     expect(notices[0]).toContain('those renames look like deletes');
     expect(logged.map((e) => e['renamedFrom'])).toEqual(['Trip.md', 'Work/Plan.md']);
 

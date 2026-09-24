@@ -212,8 +212,9 @@ with a long s.
   nothing changes for your teammates; moving it into the folder of another
   binding (one an older version made) is. Renaming or moving a synced note to
   such a name works like deleting it for your teammates: a notice says so for
-  each such note, even if the name was reported before, and `sync.log` names
-  the note it was.
+  every such rename, even if the name was reported before or the same note
+  was renamed so earlier (renames close together share one notice), and
+  `sync.log` gets a line for each, naming the note it was.
 
   Rename the note to sync it. A note an older version already synced under
   such a name is still on the server: rename it in the project's web
