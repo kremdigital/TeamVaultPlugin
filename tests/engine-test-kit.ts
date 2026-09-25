@@ -232,7 +232,9 @@ export const FOREIGN_DB = 'obsidian-vault-cache';
  * y-indexeddb stand-in: one database per name, kept across releases and
  * restarts (a new `DocManager` on the same instance). Like the real one, a
  * store loads asynchronously and applies what it holds with itself as the
- * origin, keeps a small key/value area, and `clearData` deletes the database.
+ * origin, stores the doc's own state when it opens (an update the doc got
+ * before is kept, one it gets in between is not written twice), keeps a small
+ * key/value area, and `clearData` deletes the database.
  * The registry lists and deletes databases by name, as the renderer's
  * `indexedDB` does for every vault on the machine.
  *
@@ -280,12 +282,18 @@ export class FakeIndexedDb {
     }
     const store = db;
     let destroyed = false;
+    let opened = false;
     const onUpdate = (update: Uint8Array, origin: unknown): void => {
-      if (!destroyed && origin !== persistence) store.updates.push(update);
+      if (!destroyed && opened && origin !== persistence) store.updates.push(update);
     };
     const persistence: DocPersistence = {
       whenSynced: Promise.resolve().then(() => {
         if (destroyed) return;
+        // What the doc got before its database opened is stored now, as
+        // y-indexeddb does (`beforeApplyUpdatesCallback`): its update listener
+        // writes nothing until then.
+        opened = true;
+        if (doc.store.clients.size > 0) store.updates.push(Y.encodeStateAsUpdate(doc));
         Y.transact(
           doc,
           () => {
@@ -473,6 +481,11 @@ export interface Harness {
   routes: Map<string, Responder>;
   /** What the server lists — read at request time. */
   serverFiles: ApiFile[];
+  /**
+   * Tombstones: listed, with `deletedAt` set, only when asked for
+   * (`?includeDeleted=true`), next to {@link serverFiles}.
+   */
+  deletedFiles: ApiFile[];
   statuses: EngineStatus[];
   modal: {
     binary: Deferred<BinaryConflictResolution>;
@@ -543,6 +556,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   // Filled in below; the routes and the modal read it when they are called.
   const state = {
     serverFiles: [] as ApiFile[],
+    deletedFiles: [] as ApiFile[],
     statuses: [] as EngineStatus[],
     modal: {
       binary: deferred<BinaryConflictResolution>(),
@@ -552,7 +566,9 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   const h = state as Partial<Harness> & typeof state;
 
   routes.set('GET /api/projects/p1/files', () => listing(h.serverFiles));
-  routes.set('GET /api/projects/p1/files?includeDeleted=true', () => listing(h.serverFiles));
+  routes.set('GET /api/projects/p1/files?includeDeleted=true', () =>
+    listing([...h.serverFiles, ...h.deletedFiles]),
+  );
   routes.set('PUT /blobs', () => json({ ok: true }));
 
   const route = async (method: string, url: string): Promise<RequestUrlResponse> => {
@@ -820,13 +836,18 @@ const SERVED = new Set([
  * The server's side of file operations, enough to see what a client makes of
  * its own and its teammates' changes. Like `Project/server` (`handleMove`,
  * `applyMove`): a RENAME or MOVE is applied by file id without a precondition
- * on the source path, a collision stores the file under
- * `<name>.conflict-<clientId>`, and the operation is broadcast to the whole
+ * on the source path, a collision stores the file under the first free
+ * `<name>.conflict-<clientId>[-n]`, and the operation is broadcast to the whole
  * room — the sender included — right before the ack. CREATE, DELETE and a
- * binary UPDATE are applied the same way, without file contents.
+ * binary UPDATE are applied the same way, without file contents. A CREATE on a
+ * name taken by a file with the same content is that file (an idempotent
+ * replay); one on a tombstone brings its id back.
  *
  * Nothing is answered until {@link FakeServer.pump}: the test decides when
- * the server gets to work. The listing (`h.serverFiles`) follows every change.
+ * the server gets to work. The listing (`h.serverFiles`, tombstones in
+ * `h.deletedFiles`) follows every change, and every operation goes to the
+ * {@link FakeServer.journal} the catch-up is taken from
+ * ({@link FakeServer.catchupFor}).
  */
 export class FakeServer {
   readonly files = new Map<string, ServerFileRecord>();
@@ -835,6 +856,11 @@ export class FakeServer {
    * `delete f1`, `update f1`.
    */
   readonly applied: string[] = [];
+  /**
+   * The operation log: every operation applied, in order, each with the
+   * vector clock and log id its broadcast carried.
+   */
+  readonly journal: ServerOperation[] = [];
   private readonly served = new WeakSet<Emit>();
   private seq = 0;
 
@@ -862,6 +888,23 @@ export class FakeServer {
   pathOf(id: string): string | null {
     const file = this.files.get(id);
     return file && !file.deleted ? file.path : null;
+  }
+
+  /**
+   * The operations of the catch-up `project:join` answers a client whose
+   * vector clock is `clock` (by default what the harness's engine last
+   * persisted): every one with a counter the clock has not reached. `window`
+   * looks only at the journal's first rows, as a server before the
+   * whole-journal catch-up did (500 rows; `0` for a longer journal).
+   */
+  catchupFor(
+    clock: Record<string, number> = this.harness.log.getBindingState('b1')?.lastVectorClock ?? {},
+    opts: { window?: number } = {},
+  ): ServerOperation[] {
+    const rows = opts.window === undefined ? this.journal : this.journal.slice(0, opts.window);
+    return rows.filter((row) =>
+      Object.entries(row.vectorClock).some(([client, n]) => n > (clock[client] ?? 0)),
+    );
   }
 
   /**
@@ -935,9 +978,16 @@ export class FakeServer {
         file.size = p.size ?? 0;
         this.applied.push(`update ${file.id}`);
         this.publish();
+        const log = this.log(p.clientId);
+        this.record(log, 'UPDATE', file.path, null, {
+          fileId: file.id,
+          contentHash: file.contentHash,
+          size: file.size,
+          fileType: file.fileType,
+        });
         this.broadcast(
           'file:updated-binary',
-          { fileId: file.id, contentHash: file.contentHash, log: this.log(p.clientId) },
+          { fileId: file.id, contentHash: file.contentHash, log },
           p.clientId,
         );
         e.ack({ ok: true, outcome: { kind: 'updated', fileId: file.id } });
@@ -952,7 +1002,9 @@ export class FakeServer {
         file.deleted = true;
         this.applied.push(`delete ${file.id}`);
         this.publish();
-        this.broadcast('file:deleted', { fileId: file.id, log: this.log(p.clientId) }, p.clientId);
+        const log = this.log(p.clientId);
+        this.record(log, 'DELETE', file.path, null, { fileId: file.id });
+        this.broadcast('file:deleted', { fileId: file.id, log }, p.clientId);
         e.ack({ ok: true, outcome: { kind: 'deleted', fileId: file.id } });
         return;
       }
@@ -969,6 +1021,7 @@ export class FakeServer {
     if (!file || file.deleted) return { error: 'file_not_found' };
     let outcome: unknown;
     let stored = requested;
+    const from = file.path;
     if (file.path === requested) {
       outcome = { kind: 'no_op', reason: 'same_path' };
     } else {
@@ -976,7 +1029,9 @@ export class FakeServer {
         (f) => f !== file && !f.deleted && f.path === requested,
       );
       if (taken) {
-        stored = conflictName(requested, clientId);
+        // A row there is taken over when it is a tombstone or this very file.
+        stored = this.conflictPath(requested, clientId, (f) => f.deleted || f.id === id);
+        this.dropTombstoneAt(stored);
         outcome = {
           kind: 'conflict_create_renamed',
           fileId: id,
@@ -990,13 +1045,15 @@ export class FakeServer {
       file.path = stored;
       this.publish();
     }
+    const log = this.log(clientId);
+    this.record(log, opType, from, stored, { fileId: id });
     this.broadcast(
       opType === 'RENAME' ? 'file:renamed' : 'file:moved',
       {
         fileId: id,
         newPath: this.format === 'current' ? stored : requested,
         outcome,
-        log: this.log(clientId),
+        log,
       },
       clientId,
     );
@@ -1041,7 +1098,35 @@ export class FakeServer {
     file.deleted = true;
     this.applied.push(`delete ${id}`);
     this.publish();
-    this.broadcast('file:deleted', { fileId: id, log: this.log('device-2') }, 'device-2');
+    const log = this.log('device-2');
+    this.record(log, 'DELETE', file.path, null, { fileId: id });
+    this.broadcast('file:deleted', { fileId: id, log }, 'device-2');
+  }
+
+  /**
+   * A teammate (`device-2`) uploads a new version of attachment `id`; the
+   * broadcast reaches the engine. Returns the new content hash.
+   */
+  async teammateUpdate(id: string, content: ArrayBuffer): Promise<string> {
+    const file = this.files.get(id);
+    if (!file || file.deleted) throw new Error(`no file ${id}`);
+    file.contentHash = await sha256Hex(content);
+    file.size = content.byteLength;
+    this.applied.push(`update ${id}`);
+    this.publish();
+    const log = this.log('device-2');
+    this.record(log, 'UPDATE', file.path, null, {
+      fileId: id,
+      contentHash: file.contentHash,
+      size: file.size,
+      fileType: file.fileType,
+    });
+    this.broadcast(
+      'file:updated-binary',
+      { fileId: id, contentHash: file.contentHash, log },
+      'device-2',
+    );
+    return file.contentHash;
   }
 
   private create(
@@ -1057,14 +1142,23 @@ export class FakeServer {
     const live = [...this.files.values()].find((f) => !f.deleted && f.path === path);
     let outcome: unknown;
     let added: { id: string; revived: boolean } | null = null;
+    let fileId: string;
+    let at = path;
+    let revived = false;
     if (live && live.contentHash === p.contentHash) {
-      outcome = { kind: 'created', fileId: live.id, path };
+      fileId = live.id;
+      outcome = { kind: 'created', fileId, path };
     } else {
-      const at = live ? conflictName(path, p.clientId) : path;
-      const tomb = [...this.files.values()].find((f) => f.deleted && f.path === at);
-      const id = tomb?.id ?? `s${++this.seq}`;
-      this.files.set(id, {
-        id,
+      // A row on the conflict name is taken over when it is a tombstone or
+      // holds this very content: the same CREATE retried after a lost ack.
+      at = live
+        ? this.conflictPath(path, p.clientId, (f) => f.deleted || f.contentHash === p.contentHash)
+        : path;
+      const row = [...this.files.values()].find((f) => f.path === at);
+      revived = row?.deleted === true;
+      fileId = row?.id ?? `s${++this.seq}`;
+      this.files.set(fileId, {
+        id: fileId,
         path: at,
         fileType: p.fileType ?? 'TEXT',
         contentHash: p.contentHash ?? '',
@@ -1073,15 +1167,64 @@ export class FakeServer {
       });
       this.applied.push(`create ${at}`);
       this.publish();
-      added = { id, revived: tomb !== undefined };
+      if (row === undefined || revived) added = { id: fileId, revived };
       outcome = live
-        ? { kind: 'conflict_create_renamed', fileId: id, originalPath: path, finalPath: at }
-        : { kind: 'created', fileId: id, path: at };
+        ? { kind: 'conflict_create_renamed', fileId, originalPath: path, finalPath: at }
+        : { kind: 'created', fileId, path: at };
     }
     const log = this.log(p.clientId);
+    this.record(log, 'CREATE', at, null, {
+      fileId,
+      fileType: p.fileType ?? 'TEXT',
+      contentHash: p.contentHash ?? '',
+      size: p.size ?? 0,
+      originalPath: path,
+      ...(revived && this.format === 'current' ? { revived: true } : {}),
+    });
     this.broadcast('file:created', { result: { outcome, log }, log }, p.clientId);
     if (added !== null) this.onCreate?.(added.id, p.data, added.revived);
     return outcome;
+  }
+
+  /**
+   * The server's `pickConflictPath`: the first `<path>.conflict-<clientId>[-n]`
+   * without a row, or with one that `usable` takes over.
+   */
+  private conflictPath(
+    path: string,
+    clientId: string,
+    usable: (row: ServerFileRecord) => boolean,
+  ): string {
+    for (let attempt = 1; ; attempt++) {
+      const candidate = conflictName(path, clientId, attempt);
+      const row = [...this.files.values()].find((f) => f.path === candidate);
+      if (row === undefined || usable(row)) return candidate;
+    }
+  }
+
+  /** A tombstone at `path` gives way to a file renamed there (the server's `dropTombstoneAt`). */
+  private dropTombstoneAt(path: string): void {
+    for (const [id, f] of this.files) if (f.deleted && f.path === path) this.files.delete(id);
+  }
+
+  /** Add an applied operation to the {@link journal}. */
+  private record(
+    log: { id: string; vectorClock: Record<string, number>; createdAt: string },
+    opType: ServerOperation['opType'],
+    filePath: string,
+    newPath: string | null,
+    payload: Record<string, unknown>,
+  ): void {
+    this.journal.push({
+      id: log.id,
+      opType,
+      filePath,
+      newPath,
+      authorId: 'u1',
+      vectorClock: log.vectorClock,
+      payload,
+      createdAt: log.createdAt,
+    });
   }
 
   private broadcast(event: string, payload: Record<string, unknown>, clientId: string): void {
@@ -1103,6 +1246,12 @@ export class FakeServer {
     this.harness.serverFiles = [...this.files.values()]
       .filter((f) => !f.deleted)
       .map((f) => serverFile(f.id, f.path, f.fileType, f.contentHash, f.size));
+    this.harness.deletedFiles = [...this.files.values()]
+      .filter((f) => f.deleted)
+      .map((f) => ({
+        ...serverFile(f.id, f.path, f.fileType, f.contentHash, f.size),
+        deletedAt: '2026-01-02',
+      }));
   }
 }
 
@@ -1248,8 +1397,10 @@ export class ServerDocs {
 }
 
 /** The server's `appendConflictSuffix`. */
-function conflictName(path: string, clientId: string): string {
-  const tag = clientId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'unknown';
+function conflictName(path: string, clientId: string, attempt = 1): string {
+  const tag =
+    (clientId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'unknown') +
+    (attempt > 1 ? `-${attempt}` : '');
   const dot = path.lastIndexOf('.');
   const slash = path.lastIndexOf('/');
   if (dot > slash) return `${path.slice(0, dot)}.conflict-${tag}${path.slice(dot)}`;
