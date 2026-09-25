@@ -1023,6 +1023,17 @@ export class FakeServer {
     return outcome.fileId;
   }
 
+  /** A teammate (`device-2`) uploads an attachment to `path`; the broadcast reaches the engine. */
+  async teammateUpload(path: string, content: ArrayBuffer): Promise<string> {
+    const outcome = this.create(path, {
+      clientId: 'device-2',
+      fileType: 'BINARY',
+      contentHash: await sha256Hex(content),
+      size: content.byteLength,
+    }) as { fileId: string };
+    return outcome.fileId;
+  }
+
   /** A teammate (`device-2`) deletes file `id`; the broadcast reaches the engine. */
   teammateDelete(id: string): void {
     const file = this.files.get(id);

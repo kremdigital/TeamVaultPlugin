@@ -69,7 +69,7 @@ describe('SyncEngine — a session that starts offline', () => {
     await userRename(h, 'b.md', 'c.md');
 
     expect(queued(h)).toEqual([
-      ['DELETE', 'a.md', null, { fileId: 'f1' }],
+      ['DELETE', 'a.md', null, expect.objectContaining({ fileId: 'f1' })],
       ['RENAME', 'b.md', 'c.md', { fileId: 'f2' }],
     ]);
     // Out of the records at once, as when the engine had connected before.
@@ -115,7 +115,7 @@ describe('SyncEngine — a session that starts offline', () => {
     await userRename(next, 'b.md', 'c.md');
 
     expect(queued(next)).toEqual([
-      ['DELETE', 'a.md', null, { fileId: 'f1' }],
+      ['DELETE', 'a.md', null, expect.objectContaining({ fileId: 'f1' })],
       ['RENAME', 'b.md', 'c.md', { fileId: 'f2' }],
     ]);
     expect(recorded(next)).toEqual(['c.md']);

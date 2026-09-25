@@ -241,6 +241,13 @@ const CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;
 const RECHECK_DELETE = 'recheck';
 
 /**
+ * Payload of a queued DELETE: the content hashes this device last knew the
+ * file by (see `settleOvertakenQueue`). Local to the queue, like
+ * {@link RECHECK_DELETE}.
+ */
+const LAST_SYNCED = 'lastSynced';
+
+/**
  * How many times one snapshot folds a disk that changed under it before it
  * leaves the write to a later snapshot (see `writeDocSnapshot`).
  */
@@ -408,6 +415,9 @@ export class SyncEngine {
    * {@link notesRecreated} and {@link checkLineage}.
    */
   private recreated = new Set<string>();
+
+  /** The listing of this connect's index refresh, by id. */
+  private lastListing = new Map<string, ApiFile>();
 
   /**
    * Notes whose history here has been checked against the server's in this
@@ -768,6 +778,10 @@ export class SyncEngine {
       this.throwIfStopped();
       // Before any catch-up doc is applied: see `checkLineage`.
       this.recreated = notesRecreated(result.ok ? result.operations : []);
+      // Before any catch-up doc or operation lands: the files the queue's
+      // operations were made to may be gone from under their ids.
+      await this.settleOvertakenQueue();
+      this.throwIfStopped();
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -1447,6 +1461,7 @@ export class SyncEngine {
     const listed = await this.api.getProjectFiles(this.binding.projectId);
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
+    this.lastListing = new Map(listed.map((f) => [f.id, f]));
     // A chain of renames back to where it started is no rename at all: read
     // as one, it "won" over a teammate's rename of the note, which was then
     // skipped — and the drain sent nothing (see `collapseQueuedRenames`).
@@ -1842,6 +1857,135 @@ export class SyncEngine {
       await this.dropDoc(this.docManager, record.serverFileId, path);
       this.throwIfStopped();
     }
+  }
+
+  /**
+   * Queued operations whose file the server no longer has under their id.
+   * A queued operation carries only the id, and a teammate who deletes a file
+   * and creates one under its name gets that id back: the server revives the
+   * tombstone. Sent, the operation hit the teammate's new file — a delete
+   * removed it for the whole team, a rename renamed it, an attachment edit
+   * wrote the old attachment's bytes over it.
+   *
+   * The catch-up shows such a file deleted and created again (see
+   * {@link notesRecreated}). It can leave that out — a server that lists
+   * operations from the first 500 of a project's journal leaves every later
+   * one out — so a delete is also held back when the listing shows content
+   * this device never had for the file: changed by a teammate since, or made
+   * anew. A teammate's edit to a note deleted here offline then brings the
+   * note back, rather than going away with it; a new note with the content
+   * of the deleted one (two empty "Untitled") is still deleted.
+   *
+   * Every queued operation of such a file is dropped, and the file the server
+   * has comes back here (see {@link takeBackOvertaken}).
+   */
+  private async settleOvertakenQueue(): Promise<void> {
+    const ops = this.operationLog.dequeueOperations(this.binding.id);
+    const overtaken = new Set<string>();
+    for (const op of ops) {
+      const fileId = queuedFileId(op.payload);
+      if (fileId === '' || op.opType === 'CREATE' || !this.lastListing.has(fileId)) continue;
+      if (this.recreated.has(fileId)) {
+        overtaken.add(fileId);
+      } else if (op.opType === 'DELETE') {
+        const known = lastSyncedHashes(op.payload);
+        const now = this.lastListing.get(fileId)?.contentHash ?? '';
+        if (known !== null && !known.includes(now)) overtaken.add(fileId);
+      }
+    }
+    if (overtaken.size === 0) return;
+    const dropped = ops.filter(
+      (op) => op.opType !== 'CREATE' && overtaken.has(queuedFileId(op.payload)),
+    );
+    this.operationLog.markSent(dropped.map((op) => op.id));
+    for (const fileId of overtaken) {
+      const listed = this.lastListing.get(fileId);
+      if (listed === undefined) continue;
+      this.log.warn('queued changes to a file deleted or changed on the server since; not sent', {
+        fileId,
+        path: listed.path,
+        ops: dropped.filter((op) => queuedFileId(op.payload) === fileId).map((op) => op.opType),
+      });
+      await this.takeBackOvertaken(listed);
+      this.throwIfStopped();
+    }
+  }
+
+  /**
+   * The file the server has under the id of queued operations just dropped
+   * (see {@link settleOvertakenQueue}) comes back here, under its listed name.
+   * What this device still has of the file those operations were about — its
+   * copy under the name a queued rename gave it, an attachment edited in
+   * place — goes when the server had that content, and otherwise stays as a
+   * file of its own: unindexed, the connect's first upload sends it.
+   */
+  private async takeBackOvertaken(listed: ApiFile): Promise<void> {
+    const fileId = listed.id;
+    // Its queued rename is gone: the catch-up's renames apply again.
+    this.renamedHere.delete(fileId);
+    const meta = this.fileIndex.byId.get(fileId);
+    if (meta !== undefined) await this.letGoOfOldCopy(meta, listed.path);
+    const path = listed.path;
+    const shadow = { path, fileType: listed.fileType };
+    if (!this.isLocalName(path)) {
+      this.outOfScope.set(fileId, shadow);
+      return;
+    }
+    const holder = this.nameHolder(path);
+    if (holder !== undefined) {
+      this.outOfScope.set(fileId, shadow);
+      this.waitForName({ kind: 'create', fileId, path, fileType: listed.fileType }, holder);
+      return;
+    }
+    if (await this.vault.exists(path)) {
+      // A file of this device's own is there now, created after the one it
+      // deleted: the next connect sorts the two out.
+      this.log.info('a file taken back from the server finds its name taken here', { path });
+      this.outOfScope.set(fileId, shadow);
+      return;
+    }
+    this.throwIfStopped();
+    this.indexListedFile(listed, this.fileIndex.byPath, this.fileIndex.byId, null);
+    // A note's text comes with the catch-up; an attachment is downloaded.
+    if (listed.fileType === 'BINARY') {
+      await this.applyServerCreate({ id: fileId, path, fileType: listed.fileType });
+    }
+  }
+
+  /**
+   * See {@link takeBackOvertaken}: the index, `state.json` and history this
+   * device has of `meta` go, and its copy on disk with them when the server
+   * had that content. A copy with content the server never had stays, set
+   * aside under a conflict name when the file coming back takes its name.
+   */
+  private async letGoOfOldCopy(meta: IndexedMeta, comingTo: string): Promise<void> {
+    const path = meta.relativePath;
+    const localHash = await this.hashFile(this.vault, path);
+    const serverHad =
+      localHash === null ||
+      localHash === meta.contentHash ||
+      (meta.fileType === 'TEXT' && (await this.serverHadVersion(meta.fileId, localHash)));
+    this.throwIfStopped();
+    await this.commitLocal(async (io) => {
+      if (this.fileIndex.byId.get(meta.fileId) === meta) this.fileIndex.byId.delete(meta.fileId);
+      if (this.fileIndex.byPath.get(path) === meta) this.fileIndex.byPath.delete(path);
+      this.forgetRecord(io.log, meta.fileId, path);
+      await this.dropDoc(io.docs, meta.fileId, path);
+      if (!(await io.vault.exists(path))) return;
+      if (serverHad && (await this.hashFile(io.vault, path)) === localHash) {
+        this.log.info('removing the local copy of a file the server has anew', { path });
+        io.echo.mark(path, ECHO_COUNT_DELETE);
+        await io.vault.delete(path);
+        return;
+      }
+      if (path !== comingTo) return;
+      const aside = buildConflictPath(path, this.now());
+      this.log.warn('a file the server has anew had local edits; kept aside', { path, aside });
+      io.echo.mark(path, ECHO_COUNT_RENAME);
+      io.echo.mark(aside, ECHO_COUNT_RENAME);
+      await io.vault.ensureParentFolder(aside);
+      await this.renameOnDisk(io, path, aside);
+    });
   }
 
   /** Whether this binding syncs `path` as a name of its own. */
@@ -2412,13 +2556,14 @@ export class SyncEngine {
    * erase the file for the whole team.
    */
   private holdLocalDelete(path: string, opts: { checked: boolean }): HeldChange {
-    const fileId = this.fileIndex.byPath.get(path)?.fileId ?? '';
+    const meta = this.fileIndex.byPath.get(path);
+    const payload = deletePayload(meta?.fileId ?? '', meta);
     return this.hold(
       'watcher',
       'DELETE',
       path,
       null,
-      opts.checked ? { fileId } : { fileId, [RECHECK_DELETE]: true },
+      opts.checked ? payload : { ...payload, [RECHECK_DELETE]: true },
     );
   }
 
@@ -2434,7 +2579,7 @@ export class SyncEngine {
     const meta = this.fileIndex.byPath.get(path);
     let fileId = meta?.fileId ?? '';
     // Checked: from here on `stop()` hands it over as a plain DELETE.
-    if (change) change.payload = { fileId };
+    if (change) change.payload = deletePayload(fileId, meta);
     // The path may be absent from the local index (a folder-delete child, or
     // a stale index). Resolve the id from the server's live file list before
     // giving up — otherwise the DELETE is queued with an empty fileId and is
@@ -2443,7 +2588,7 @@ export class SyncEngine {
       fileId = await this.resolveServerFileId(path);
       this.throwIfStopped();
     }
-    if (change) change.payload = { fileId };
+    if (change) change.payload = deletePayload(fileId, meta);
     if (fileId) this.deletedIds.add(fileId);
     if (this.socket.isConnected() && fileId) {
       const ack = await this.emitDelete({
@@ -2482,7 +2627,7 @@ export class SyncEngine {
       this.log.debug('local delete: no server fileId, nothing to propagate', path);
       return;
     }
-    this.queue('DELETE', path, null, { fileId });
+    this.queue('DELETE', path, null, deletePayload(fileId, meta));
     await this.forgetDeletedHere(fileId, path);
     this.forgetWaiting(fileId);
     await this.releaseName(path);
@@ -5596,6 +5741,29 @@ function notesRecreated(ops: readonly ServerOperation[]): Set<string> {
     else if (op.opType === 'CREATE' && deleted.delete(fileId)) recreated.add(fileId);
   }
   return recreated;
+}
+
+/**
+ * The payload of a local delete of `fileId`: with the hashes `meta`, the
+ * file's record, last knew its content by (see `settleOvertakenQueue`).
+ */
+function deletePayload(fileId: string, meta: FileMeta | undefined): Record<string, unknown> {
+  if (meta === undefined) return { fileId };
+  const known = [meta.contentHash, meta.foldedHash].filter(
+    (hash): hash is string => typeof hash === 'string' && hash !== '',
+  );
+  return { fileId, [LAST_SYNCED]: [...new Set(known)] };
+}
+
+/**
+ * The hashes a queued DELETE carries (see {@link deletePayload}); `null` for
+ * one queued by an older build, or parsed back from `state.json` malformed.
+ */
+function lastSyncedHashes(payload: Record<string, unknown>): string[] | null {
+  const value = payload[LAST_SYNCED];
+  if (!Array.isArray(value) || value.length === 0) return null;
+  const hashes = value.filter((hash): hash is string => typeof hash === 'string' && hash !== '');
+  return hashes.length === value.length ? hashes : null;
 }
 
 /**
