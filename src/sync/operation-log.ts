@@ -87,6 +87,14 @@ export interface BindingState {
   lastSyncedAt: number;
 }
 
+/**
+ * How many operations applied live a binding remembers (see
+ * {@link OperationLog.noteAppliedLive}). The oldest go first: on a server
+ * that gives only the journal's first rows, an operation past them is never
+ * returned, and the list would grow without end.
+ */
+export const APPLIED_LIVE_MAX = 1000;
+
 /** Per-collection row counts removed by {@link OperationLog.purgeBinding}. */
 export interface PurgeResult {
   pendingOperations: number;
@@ -134,6 +142,8 @@ interface BindingBucket {
   pending: PendingOperation[];
   files: Map<string, FileMeta>;
   state: BindingState | null;
+  /** Ids of operations applied live (see {@link OperationLog.noteAppliedLive}); oldest first. */
+  appliedLive: string[];
 }
 
 export class OperationLog {
@@ -254,6 +264,11 @@ export class OperationLog {
     const bucket = this.bindings.get(bindingId);
     if (!bucket) return [];
     return bucket.pending.map((op) => ({ ...op, payload: { ...op.payload } }));
+  }
+
+  /** Whether operation `opId` is still queued for a binding. */
+  isPending(bindingId: string, opId: number): boolean {
+    return this.bindings.get(bindingId)?.pending.some((op) => op.id === opId) ?? false;
   }
 
   /** Number of pending operations for one binding, or across all of them. */
@@ -383,6 +398,45 @@ export class OperationLog {
     this.touch();
   }
 
+  // -- operations applied live ------------------------------------------------
+
+  /**
+   * Remember that the server operation `id` (its log row) was applied on this
+   * device from its live broadcast. Live broadcasts do not move the vector
+   * clock — a catch-up that is not whole would take the operations it left
+   * out for seen — so a later `project:join` catch-up returns the operation
+   * again; the engine uses this to tell it from one that happened while it
+   * was away.
+   */
+  noteAppliedLive(bindingId: string, id: string): void {
+    const bucket = this.bucket(bindingId);
+    if (bucket.appliedLive.includes(id)) return;
+    bucket.appliedLive.push(id);
+    if (bucket.appliedLive.length > APPLIED_LIVE_MAX) {
+      bucket.appliedLive.splice(0, bucket.appliedLive.length - APPLIED_LIVE_MAX);
+    }
+    this.touch();
+  }
+
+  /** The operations {@link noteAppliedLive} remembers for a binding. */
+  appliedLiveIds(bindingId: string): Set<string> {
+    return new Set(this.bindings.get(bindingId)?.appliedLive ?? []);
+  }
+
+  /**
+   * Forget operations applied live that no catch-up returns again: the ones
+   * a catch-up returned (the clock took them in), and, after a catch-up of the
+   * whole journal, every one remembered before it (see `SyncEngine`).
+   */
+  forgetAppliedLive(bindingId: string, ids: ReadonlySet<string>): void {
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket || bucket.appliedLive.length === 0) return;
+    const kept = bucket.appliedLive.filter((id) => !ids.has(id));
+    if (kept.length === bucket.appliedLive.length) return;
+    bucket.appliedLive = kept;
+    this.touch();
+  }
+
   // -- cross-collection maintenance -------------------------------------------
 
   /**
@@ -507,7 +561,7 @@ export class OperationLog {
   private bucket(bindingId: string): BindingBucket {
     let bucket = this.bindings.get(bindingId);
     if (!bucket) {
-      bucket = { pending: [], files: new Map(), state: null };
+      bucket = { pending: [], files: new Map(), state: null, appliedLive: [] };
       this.bindings.set(bindingId, bucket);
     }
     return bucket;
@@ -533,6 +587,7 @@ export class OperationLog {
               lastSyncedAt: bucket.state.lastSyncedAt,
             }
           : null,
+        ...(bucket.appliedLive.length > 0 ? { appliedLive: bucket.appliedLive } : {}),
       };
     }
     return { version: FORMAT_VERSION, nextOpId: this.nextOpId, bindings };
@@ -573,6 +628,13 @@ export class OperationLog {
           lastVectorClock: toVectorClock(rawBucket.state.lastVectorClock),
           lastSyncedAt: toNumber(rawBucket.state.lastSyncedAt, 0),
         };
+      }
+
+      if (Array.isArray(rawBucket.appliedLive)) {
+        for (const id of rawBucket.appliedLive) {
+          if (typeof id === 'string' && id !== '') bucket.appliedLive.push(id);
+        }
+        bucket.appliedLive.splice(0, Math.max(0, bucket.appliedLive.length - APPLIED_LIVE_MAX));
       }
 
       // A bucket that turned out to hold nothing readable shouldn't make the

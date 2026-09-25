@@ -103,6 +103,8 @@ type RenameListener = (file: WatchableFile, oldPath: string) => void;
 
 export class MemoryVault implements VaultAdapter {
   files = new Map<string, ArrayBuffer>();
+  /** `true` once {@link caseInsensitiveDisk} made it so. */
+  isCaseInsensitive = (): boolean => false;
   private readonly renameListeners = new Set<RenameListener>();
   /**
    * The slice of `app.vault` an `ObsidianWatcher` listens on. Only `rename`
@@ -223,6 +225,66 @@ export class MemoryVault implements VaultAdapter {
     if (!buf) throw new Error(`missing file ${path}`);
     return buf;
   }
+}
+
+/**
+ * Make `vault` a disk that takes names differing only in case for one file,
+ * as Obsidian's `FileSystemAdapter` on Windows or macOS sees it: a name is
+ * found whatever its case, a write keeps the case the file has, a create or a
+ * rename onto a name another file has fails, and a case-only rename changes
+ * the case. The files map keeps each file under the case it has on disk.
+ */
+export function caseInsensitiveDisk(vault: MemoryVault): void {
+  const key = (p: string): string => p.toLowerCase();
+  const find = (p: string): string | undefined =>
+    [...vault.files.keys()].find((k) => key(k) === key(p));
+  const at = (p: string): ArrayBuffer => {
+    const k = find(p);
+    const buf = k === undefined ? undefined : vault.files.get(k);
+    if (!buf) throw new Error(`ENOENT ${p}`);
+    return buf;
+  };
+  const listeners = (vault as unknown as { renameListeners: Set<RenameListener> }).renameListeners;
+  vault.isCaseInsensitive = (): boolean => true;
+  vault.exists = (p) => Promise.resolve(find(p) !== undefined);
+  vault.readBinary = (p) => Promise.resolve(at(p));
+  vault.readText = (p) => Promise.resolve(new TextDecoder().decode(at(p)));
+  vault.writeText = (p, c) => {
+    vault.files.set(find(p) ?? p, encode(c));
+    return Promise.resolve();
+  };
+  vault.writeBinary = (p, c) => {
+    vault.files.set(find(p) ?? p, c);
+    return Promise.resolve();
+  };
+  vault.createText = (p, c) => {
+    if (find(p) !== undefined) return Promise.reject(new Error('exists'));
+    vault.files.set(p, encode(c));
+    return Promise.resolve();
+  };
+  vault.createBinary = (p, c) => {
+    if (find(p) !== undefined) return Promise.reject(new Error('exists'));
+    vault.files.set(p, c);
+    return Promise.resolve();
+  };
+  vault.delete = (p) => {
+    const k = find(p);
+    if (k !== undefined) vault.files.delete(k);
+    return Promise.resolve();
+  };
+  vault.rename = (from, to) => {
+    if (from === to) return Promise.resolve();
+    if (find(to) !== undefined && key(from) !== key(to)) {
+      return Promise.reject(new Error('Destination file already exists!'));
+    }
+    const k = find(from);
+    if (k === undefined) return Promise.reject(new Error(`ENOENT ${from}`));
+    const buf = vault.files.get(k) as ArrayBuffer;
+    vault.files.delete(k);
+    vault.files.set(to, buf);
+    for (const cb of [...listeners]) cb({ path: to, kind: 'file' }, from);
+    return Promise.resolve();
+  };
 }
 
 /** A database of Obsidian's own, listed next to the plugin's (see {@link FakeIndexedDb}). */
@@ -946,6 +1008,7 @@ export class FakeServer {
   private answer(e: Emit): void {
     const p = e.payload as {
       clientId: string;
+      vectorClock?: Record<string, number>;
       fileId?: string;
       filePath: string;
       newPath?: string;
@@ -961,6 +1024,7 @@ export class FakeServer {
           p.newPath ?? '',
           p.clientId,
           e.event === 'file:rename' ? 'RENAME' : 'MOVE',
+          p.vectorClock,
         );
         e.ack('error' in result ? { ok: false, error: result.error } : { ok: true, ...result });
         return;
@@ -978,7 +1042,7 @@ export class FakeServer {
         file.size = p.size ?? 0;
         this.applied.push(`update ${file.id}`);
         this.publish();
-        const log = this.log(p.clientId);
+        const log = this.log(p.clientId, p.vectorClock);
         this.record(log, 'UPDATE', file.path, null, {
           fileId: file.id,
           contentHash: file.contentHash,
@@ -1002,7 +1066,7 @@ export class FakeServer {
         file.deleted = true;
         this.applied.push(`delete ${file.id}`);
         this.publish();
-        const log = this.log(p.clientId);
+        const log = this.log(p.clientId, p.vectorClock);
         this.record(log, 'DELETE', file.path, null, { fileId: file.id });
         this.broadcast('file:deleted', { fileId: file.id, log }, p.clientId);
         e.ack({ ok: true, outcome: { kind: 'deleted', fileId: file.id } });
@@ -1016,6 +1080,7 @@ export class FakeServer {
     requested: string,
     clientId: string,
     opType: 'RENAME' | 'MOVE',
+    sentClock?: Record<string, number>,
   ): { outcome: unknown } | { error: string } {
     const file = this.files.get(id);
     if (!file || file.deleted) return { error: 'file_not_found' };
@@ -1045,7 +1110,7 @@ export class FakeServer {
       file.path = stored;
       this.publish();
     }
-    const log = this.log(clientId);
+    const log = this.log(clientId, sentClock);
     this.record(log, opType, from, stored, { fileId: id });
     this.broadcast(
       opType === 'RENAME' ? 'file:renamed' : 'file:moved',
@@ -1133,6 +1198,7 @@ export class FakeServer {
     path: string,
     p: {
       clientId: string;
+      vectorClock?: Record<string, number>;
       fileType?: 'TEXT' | 'BINARY';
       contentHash?: string;
       size?: number;
@@ -1172,7 +1238,7 @@ export class FakeServer {
         ? { kind: 'conflict_create_renamed', fileId, originalPath: path, finalPath: at }
         : { kind: 'created', fileId, path: at };
     }
-    const log = this.log(p.clientId);
+    const log = this.log(p.clientId, p.vectorClock);
     this.record(log, 'CREATE', at, null, {
       fileId,
       fileType: p.fileType ?? 'TEXT',
@@ -1233,13 +1299,27 @@ export class FakeServer {
     socket.fire(event, this.format === 'current' ? { ...payload, clientId } : payload);
   }
 
-  private log(clientId: string): {
+  /**
+   * The log entry of an operation: a teammate's gets a counter of its own; a
+   * client's gets the clock it sent with its counter one up, as the server
+   * stores it (`increment(raw.vectorClock, raw.clientId)`). So the catch-up
+   * returns a client's latest operation, and not the ones before it, which
+   * its next bump covers.
+   */
+  private log(
+    clientId: string,
+    sent?: Record<string, number>,
+  ): {
     id: string;
     vectorClock: Record<string, number>;
     createdAt: string;
   } {
     this.seq += 1;
-    return { id: `l${this.seq}`, vectorClock: { [clientId]: this.seq }, createdAt: '2026-01-01' };
+    const vectorClock =
+      sent === undefined
+        ? { [clientId]: this.seq }
+        : { ...sent, [clientId]: (sent[clientId] ?? 0) + 1 };
+    return { id: `l${this.seq}`, vectorClock, createdAt: '2026-01-01' };
   }
 
   private publish(): void {

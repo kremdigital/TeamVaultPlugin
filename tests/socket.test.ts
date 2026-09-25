@@ -207,6 +207,8 @@ describe('SocketClient — emits', () => {
       projectId: 'p1',
       sinceVectorClock: { node1: 5 },
       streamYjs: true,
+      // The whole-journal catch-up (see `OPERATIONS_CATCHUP`).
+      operationsCatchup: 2,
     });
     socket().ackLast({ ok: true, operations: [], yjsDocs: [] });
     await expect(promise).resolves.toEqual({ ok: true, operations: [], yjsDocs: [] });

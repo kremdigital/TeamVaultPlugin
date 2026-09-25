@@ -64,6 +64,13 @@ export class ObsidianVaultAdapter implements VaultAdapter {
     await ensureDir(this.vault, dir);
   }
 
+  isCaseInsensitive(): boolean {
+    // `FileSystemAdapter.insensitive`: set from the platform, then tested on
+    // the vault's own disk when the adapter is built (it writes
+    // `.OBSIDIANTEST` and looks for `.obsidiantest`). Not in the typings.
+    return (this.vault.adapter as unknown as { insensitive?: unknown }).insensitive === true;
+  }
+
   async list(folderPath: string): Promise<string[]> {
     // `vault.getFiles()` returns every TFile in the vault as vault-relative
     // paths. Folders are filtered out by virtue of the type. We then narrow

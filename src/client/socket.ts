@@ -56,10 +56,32 @@ export interface YjsDocSnapshot {
   stateVector?: number[];
 }
 
+/**
+ * The op-log catch-up this client asks `project:join` for (`operationsCatchup`):
+ * every operation its vector clock has not seen, from the whole journal. The
+ * engine checks each one against where files are now, and does not apply
+ * again what it applied from a live broadcast, so a catch-up of the whole
+ * journal is safe for it. Without the flag a server gives the old window of
+ * the journal's first 500 rows, where a project with a longer journal gets no
+ * new operations at all. A server that predates the flag ignores it and gives
+ * that window (see `sync-protocol.md`, «Подключение»).
+ */
+export const OPERATIONS_CATCHUP = 2;
+
 export type JoinResult =
   | {
       ok: true;
       operations: ServerOperation[];
+      /**
+       * {@link OPERATIONS_CATCHUP} when `operations` is the whole-journal
+       * catch-up asked for; absent from a server that gave the old window.
+       */
+      operationsCatchup?: number;
+      /**
+       * The client had more unseen operations than one catch-up carries:
+       * `operations` holds the newest of them, the older ones were left out.
+       */
+      operationsTruncated?: boolean;
       /** Inline catch-up (legacy / non-streaming servers). */
       yjsDocs?: YjsDocSnapshot[];
       /** Set when the server is streaming the catch-up via `yjs:catchup`. */
@@ -462,6 +484,7 @@ export class SocketClient {
       projectId,
       sinceVectorClock,
       streamYjs,
+      operationsCatchup: OPERATIONS_CATCHUP,
     });
   }
 

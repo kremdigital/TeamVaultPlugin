@@ -46,4 +46,11 @@ export interface VaultAdapter {
    * doesn't know about yet.
    */
   list(folderPath: string): Promise<string[]>;
+
+  /**
+   * Whether the disk takes names that differ only in case for one file
+   * (Windows, macOS by default): `A.md` opens `a.md`. Absent or `false`: two
+   * such names are two files.
+   */
+  isCaseInsensitive?(): boolean;
 }

@@ -1,4 +1,4 @@
-import { OperationLog, type FileMeta } from '@/sync/operation-log';
+import { APPLIED_LIVE_MAX, OperationLog, type FileMeta } from '@/sync/operation-log';
 import type { LogStorage } from '@/utils/file-log-sink';
 import { stubWindow } from './window-stub';
 
@@ -681,5 +681,49 @@ describe('OperationLog — persistence', () => {
     log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
     await expect(log.flush()).resolves.toBeUndefined();
     expect(log.pendingCount('b1')).toBe(1);
+  });
+});
+
+describe('OperationLog — operations applied live', () => {
+  it('remembers each operation once, per binding', () => {
+    const log = makeLog();
+    log.noteAppliedLive('b1', 'l1');
+    log.noteAppliedLive('b1', 'l1');
+    log.noteAppliedLive('b2', 'l2');
+    expect([...log.appliedLiveIds('b1')]).toEqual(['l1']);
+    expect([...log.appliedLiveIds('b2')]).toEqual(['l2']);
+    expect([...log.appliedLiveIds('b3')]).toEqual([]);
+  });
+
+  it('forgets the ones it is told to', () => {
+    const log = makeLog();
+    for (const id of ['l1', 'l2', 'l3']) log.noteAppliedLive('b1', id);
+    log.forgetAppliedLive('b1', new Set(['l1', 'l3', 'l9']));
+    expect([...log.appliedLiveIds('b1')]).toEqual(['l2']);
+  });
+
+  it(`keeps the newest ${APPLIED_LIVE_MAX}`, () => {
+    const log = makeLog();
+    for (let i = 1; i <= APPLIED_LIVE_MAX + 5; i++) log.noteAppliedLive('b1', `l${i}`);
+    const ids = log.appliedLiveIds('b1');
+    expect(ids.size).toBe(APPLIED_LIVE_MAX);
+    expect(ids.has('l5')).toBe(false);
+    expect(ids.has('l6')).toBe(true);
+    expect(ids.has(`l${APPLIED_LIVE_MAX + 5}`)).toBe(true);
+  });
+
+  it('survives a reload, and goes with the binding', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.updateLastVectorClock('b1', { d1: 1 });
+    log.noteAppliedLive('b1', 'l7');
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect([...reopened.appliedLiveIds('b1')]).toEqual(['l7']);
+    reopened.noteAppliedLive('b1', 'l8');
+    reopened.purgeBinding('b1');
+    expect([...reopened.appliedLiveIds('b1')]).toEqual([]);
   });
 });
