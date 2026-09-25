@@ -461,6 +461,12 @@ export class SyncEngine {
   private readonly renameCount = new Map<string, number>();
 
   /**
+   * Files deleted on this device, by id, in this engine's lifetime — see
+   * {@link refreshFileIndex}.
+   */
+  private readonly deletedIds = new Set<string>();
+
+  /**
    * Notes created on this device whose `file:create` has been sent and not
    * acknowledged yet, by path, with how many — see {@link emitCreate}. The
    * server broadcasts the create to its sender too, before the ack.
@@ -1409,15 +1415,33 @@ export class SyncEngine {
   }
 
   private async refreshFileIndex(): Promise<void> {
+    const renamesBefore = new Map(this.renameCount);
+    const deletesBefore = new Set(this.deletedIds);
     const listed = await this.api.getProjectFiles(this.binding.projectId);
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
+    // A chain of renames back to where it started is no rename at all: read
+    // as one, it "won" over a teammate's rename of the note, which was then
+    // skipped — and the drain sent nothing (see `collapseQueuedRenames`).
+    this.collapseQueuedRenames();
     // Deleted here while offline: gone, as far as this device is concerned.
     const deletedHere = this.queuedDeletes();
     await this.forgetQueuedDeletes(deletedHere);
+    // Deleted here while the listing was on its way: sent at once, after the
+    // listing was taken. Indexed again from it, the note was written back to
+    // disk by the catch-up, and stayed there, never synced again.
+    for (const fileId of this.deletedIds) if (!deletesBefore.has(fileId)) deletedHere.add(fileId);
     const files = listed.filter((f) => !deletedHere.has(f.id));
     // Renamed here while offline: the queue is what says where these are.
     const here = this.queuedRenames(deletedHere);
+    // Renamed here while the listing was on its way: the socket is up, so the
+    // rename went out at once, after the listing was taken. Taken for a
+    // teammate's rename back to the old name, it was undone on disk.
+    for (const [fileId, count] of this.renameCount) {
+      if (renamesBefore.get(fileId) === count || deletedHere.has(fileId)) continue;
+      const at = this.fileIndex.byId.get(fileId)?.relativePath;
+      if (at !== undefined && this.isLocalName(at)) here.set(fileId, at);
+    }
     this.renamedHere = here;
     const away = this.renamedWhileAway(files, here);
     this.renamesLeft.clear();
@@ -2393,6 +2417,7 @@ export class SyncEngine {
       this.throwIfStopped();
     }
     if (change) change.payload = { fileId };
+    if (fileId) this.deletedIds.add(fileId);
     if (this.socket.isConnected() && fileId) {
       const ack = await this.emitDelete({
         projectId: this.binding.projectId,
