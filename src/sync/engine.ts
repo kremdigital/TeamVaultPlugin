@@ -494,6 +494,14 @@ export class SyncEngine {
   private readonly lineageChecked = new Set<string>();
 
   /**
+   * Notes whose history was started anew from the server's broadcasts since
+   * this connect's `project:join` went out (see {@link startDoc}): created or
+   * revived by a teammate, or created here. The catch-up's doc of such a note
+   * is left out (see {@link applyCatchupDoc}).
+   */
+  private readonly startedSinceJoin = new Set<string>();
+
+  /**
    * Notes whose store held another file's history, by id → that file's id:
    * the history was started anew (see {@link afterDocOpen}), and the copy on
    * disk is still that file's until {@link checkLineage} settles it.
@@ -913,6 +921,7 @@ export class SyncEngine {
       // Operations applied live before this join: the server's catch-up comes
       // after each of them (see `forgetAppliedLive` below).
       const liveBeforeJoin = this.operationLog.appliedLiveIds(this.binding.id);
+      this.startedSinceJoin.clear();
       const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
@@ -1120,24 +1129,49 @@ export class SyncEngine {
    * without this round-trip offline ops stay stuck client-side forever and the
    * server treats every subsequent live edit as a no-op replay (parent structs
    * missing).
+   *
+   * Not for a note whose history was started anew from the server's
+   * broadcasts since the join went out (see {@link startedSinceJoin}): each
+   * change to it since reaches this device live, and the catch-up's doc of it
+   * may be older than that. The server encodes each batch as it sends it, and
+   * one encoded before a teammate deleted the note and created it again under
+   * its name holds the deleted note's history — on a server that replaces the
+   * history on revival (every one before 0.3.8's), a history of its own. The
+   * engine keeps batches that come before the listing, and a slow listing of
+   * a large vault lets the revival's broadcasts through first. Applied after
+   * them, the old history was taken for the note's, the new one was deleted,
+   * and the deleted note's text came back to disk; the next edit here went to
+   * the server on the old history, and once the two histories met there, the
+   * note's text was doubled for the whole team.
    */
   private async applyCatchupDoc(snap: YjsDocSnapshot): Promise<void> {
     const meta = this.fileIndex.byId.get(snap.fileId);
     if (!meta) return;
+    // Deleted, or started anew, since the doc was picked up. (Renamed, it
+    // took the doc along, and `meta` names the new path.)
+    const overtaken = (): boolean =>
+      this.fileIndex.byId.get(snap.fileId) !== meta || this.startedSinceJoin.has(snap.fileId);
+    if (this.startedSinceJoin.has(snap.fileId)) {
+      this.log.debug('catch-up doc of a note started anew since the join left out', {
+        path: meta.relativePath,
+      });
+      return;
+    }
     if (await this.catchupDocIsRedundant(meta, snap)) return;
     // The offline doc store (y-indexeddb) loads asynchronously. Applying the
     // server's state to a doc that hasn't finished loading computes a bogus
     // push-back diff and snapshots a local-history-less merge over the file
     // on disk — a silent rollback.
     await this.openDoc(meta);
-    // Deleted while the store loaded. (Renamed, it took the doc along, and
-    // `meta` names the new path.)
-    if (this.fileIndex.byId.get(snap.fileId) !== meta) return;
+    if (overtaken()) return;
     const update = Uint8Array.from(snap.sync1);
-    await this.withPathLock(meta.relativePath, async () => {
+    const checked = await this.withPathLock(meta.relativePath, async (): Promise<boolean> => {
+      if (overtaken()) return false;
       await this.checkLineage(meta, this.docPathOf(meta), update);
       await this.noteDiskAgreement(meta);
+      return true;
     });
+    if (!checked || overtaken()) return;
     this.rememberBaseBeforeRemote(meta);
     this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
     this.skippedDocs.delete(meta.fileId);
@@ -2878,7 +2912,10 @@ export class SyncEngine {
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(fileId, meta);
     this.operationLog.setFileMeta(meta);
-    if (fileType === 'TEXT') await this.startDoc(fileId, path);
+    if (fileType === 'TEXT') {
+      this.startedSinceJoin.add(fileId);
+      await this.startDoc(fileId, path);
+    }
   }
 
   /**
@@ -3048,11 +3085,13 @@ export class SyncEngine {
   }
 
   /**
-   * A whole folder was deleted in Obsidian. Obsidian emits one delete for the
-   * `TFolder` (never one per child), and the chokidar `unlink` events for the
-   * children are unreliable under a burst of hundreds. So enumerate every
-   * indexed path under the folder and delete each one explicitly — that is
-   * what makes a folder delete propagate durably to the server.
+   * A whole folder was deleted in Obsidian. Obsidian emits a delete for each
+   * file in it and then one for the folder, but a child's can be missed — the
+   * watcher swallows it as the echo of this plugin's own write a moment
+   * before — and the chokidar `unlink` events for the children are unreliable
+   * under a burst of hundreds. So enumerate every indexed path under the
+   * folder and delete each one explicitly — that is what makes a folder
+   * delete propagate durably to the server.
    */
   private async handleLocalFolderDelete(folderPath: string): Promise<void> {
     if (!isInBinding(folderPath, this.binding.localFolder)) return;
@@ -3077,10 +3116,10 @@ export class SyncEngine {
     const held = children.map((path) => this.holdLocalDelete(path, { checked: true }));
     try {
       for (const change of held) {
-        // Obsidian delivered one event (the folder); the per-child unlinks come
-        // from chokidar, and the FS-watcher's Obsidian-dedupe only registered the
-        // folder path. Pre-mark each child so its chokidar `unlink` echo is
-        // swallowed instead of dispatching a second, racing handleLocalDelete.
+        // Obsidian's delete of each child came before the folder's; a chokidar
+        // `unlink` of a child can still follow. Pre-mark each child so that
+        // echo is swallowed instead of dispatching a second, racing
+        // handleLocalDelete.
         this.recentlyApplied.mark(change.filePath);
         await this.handleLocalDelete(change.filePath, change);
       }
@@ -4244,12 +4283,9 @@ export class SyncEngine {
         // server, the binary download will 404 and crash the catch-up.
         const meta = this.fileIndex.byId.get(fileId);
         if (!meta) break;
-        // A note's text comes with its doc, in this same catch-up. A server
-        // before 0.3.8's lists the UPDATE of a note written through REST or
-        // MCP; replayed as an attachment's, its bytes were downloaded and
-        // compared over the merge of the doc — a "content conflict" whose
-        // every answer did worse than the merge.
-        if (meta.fileType === 'TEXT') break;
+        // A note's text comes with its doc, in this same catch-up: its UPDATE,
+        // which a server before 0.3.8's lists, is left alone (see
+        // `applyServerUpdateBinary`).
         // A later update of the file in this catch-up brings what the server
         // has now; this one's version is gone (see `supersededOps`).
         if (catchup.superseded.has(op)) break;
@@ -4338,6 +4374,14 @@ export class SyncEngine {
    * {@link applyServerUpdateBinary}): with an edit made here meanwhile, the
    * user is asked. Left to the queue, that edit went out over the teammate's
    * version, which was lost for everyone.
+   *
+   * Not one this device is deleting (see {@link deletingHere}): its copy is
+   * missing because the user deleted it. A folder delete sends its files'
+   * deletes one ack at a time, and each file leaves the index only with its
+   * own ack. Downloaded again, the files not sent yet were back on disk when
+   * their turn came, and a delete of a file still on disk is not sent (see
+   * `sendLocalDelete`): the folder came back here, and its files stayed on the
+   * server for the whole team.
    */
   private async reconcileAttachments(): Promise<void> {
     for (const meta of [...this.fileIndex.byId.values()]) {
@@ -4346,13 +4390,13 @@ export class SyncEngine {
       if (listed === undefined) continue;
       // Deleted since the pass began: not brought back.
       if (this.fileIndex.byId.get(meta.fileId) !== meta) continue;
+      if (this.deletingHere(meta.fileId, meta.relativePath)) continue;
       try {
         if (!(await this.vault.exists(meta.relativePath))) {
-          await this.applyServerCreate({
-            id: meta.fileId,
-            path: meta.relativePath,
-            fileType: 'BINARY',
-          });
+          await this.applyServerCreate(
+            { id: meta.fileId, path: meta.relativePath, fileType: 'BINARY' },
+            { restore: true },
+          );
         } else if (listed.contentHash !== meta.contentHash) {
           await this.applyServerUpdateBinary(meta.fileId, listed.contentHash);
         }
@@ -4365,8 +4409,24 @@ export class SyncEngine {
   }
 
   /**
+   * Whether the user has deleted file `fileId` at `path` here and the delete
+   * is under way: held (a folder delete holds every file of the folder, and
+   * sends one at a time), or sent and not acknowledged yet. Once acknowledged
+   * or queued, the file is out of the index.
+   */
+  private deletingHere(fileId: string, path: string): boolean {
+    if (this.ownDeletes.has(fileId)) return true;
+    for (const change of this.held) {
+      if (change.opType === 'DELETE' && change.filePath === path) return true;
+    }
+    return false;
+  }
+
+  /**
    * `released`: the name was free when {@link releaseName} let the file in.
-   * `foreign`: see {@link WaitingForName}.
+   * `foreign`: see {@link WaitingForName}. `restore`: an attachment this device
+   * has, missing from its disk (see {@link reconcileAttachments}) — not
+   * written when the user has deleted it by the time its download is in.
    */
   private async applyServerCreate(
     payload: {
@@ -4374,7 +4434,7 @@ export class SyncEngine {
       path: string;
       fileType: FileType;
     },
-    opts: { released?: boolean; foreign?: boolean } = {},
+    opts: { released?: boolean; foreign?: boolean; restore?: boolean } = {},
   ): Promise<void> {
     // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
     // (the stale-CREATE guard requires it). Reuse that entry — resetting
@@ -4465,7 +4525,12 @@ export class SyncEngine {
       // the clock — the whole project, for a new device — got a doc and a
       // database at once, and the catch-up could no longer skip a note whose
       // disk matched the server (see `catchupDocIsRedundant`).
-      if (!known) await this.startDoc(payload.id, path);
+      if (!known) {
+        // Its content comes with the update that follows the broadcast; one
+        // let into its name comes from the server's doc (see `releaseName`).
+        if (opts.released !== true) this.startedSinceJoin.add(payload.id);
+        await this.startDoc(payload.id, path);
+      }
       await setAside;
     } else {
       await setAside;
@@ -4480,6 +4545,14 @@ export class SyncEngine {
       // Meta and file go together — a meta recorded for a file that never
       // reached the disk would look like a synced copy.
       await this.commitLocal(async (io) => {
+        // Deleted by the user while it came down: gone from the index with
+        // the delete's ack, or still on its way.
+        if (
+          opts.restore === true &&
+          (this.fileIndex.byId.get(payload.id) !== meta || this.deletingHere(payload.id, path))
+        ) {
+          return;
+        }
         // Same ordering as `applyServerUpdateBinary` — meta first, then the
         // disk write, so the watcher echo's hash compare short-circuits.
         meta.size = buf.byteLength;
@@ -4535,6 +4608,20 @@ export class SyncEngine {
   private async applyServerUpdateBinary(fileId: string, versionHash?: string): Promise<void> {
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
+    // A note's text comes through its doc, never as bytes. A server before
+    // 0.3.8's broadcasts `file:updated-binary` for a note when a 0.3.x client
+    // answers "Keep local" about it, and lists such an UPDATE, or one written
+    // through REST or MCP, in the catch-up. Taken as an attachment's, the
+    // note's bytes were downloaded and written over the disk beside its doc,
+    // or compared with the disk: a "Content conflict" prompt whose every
+    // answer did worse than the merge of the doc — and "Keep local" sent the
+    // note's bytes on as an attachment update.
+    if (meta.fileType === 'TEXT') {
+      this.log.debug('attachment update of a note ignored; its text comes with its doc', {
+        path: meta.relativePath,
+      });
+      return;
+    }
     // Before the download: a refused path shouldn't cost a multi-megabyte
     // transfer. An entry can predate the gate — it comes back from
     // `state.json` written by an older build.
@@ -4548,6 +4635,13 @@ export class SyncEngine {
     const newBuf = await this.downloadFile(fileId);
     this.throwIfStopped();
     const newHash = await sha256Hex(newBuf);
+    // The server still has what this device last synced: nothing is written.
+    // The copy here is that version, or an edit of it made since, which is the
+    // newer one and goes out with the queue — written over, the edit was lost,
+    // and its queued update then found the bytes "unchanged" and sent nothing.
+    // Or the copy is gone, deleted here: written back, a version this device
+    // had already let go of came back to its disk.
+    if (newHash === meta.contentHash) return;
     /** Where `keep-both` parks the local edits. */
     let aside: string | null = null;
 
@@ -4555,11 +4649,6 @@ export class SyncEngine {
     // Stopped anywhere up to the write below, nothing has changed yet: the
     // next catch-up replays this UPDATE and starts over.
     if (await this.vault.exists(meta.relativePath)) {
-      // The server still has what this device last synced: the copy here is
-      // that version, or an edit of it made since, which is the newer one and
-      // goes out with the queue. Written over, the edit was lost — and its
-      // queued update then found the bytes "unchanged" and sent nothing.
-      if (newHash === meta.contentHash) return;
       const localBuf = await this.vault.readBinary(meta.relativePath);
       const localHash = await sha256Hex(localBuf);
       const conflict = detectBinaryConflict({
@@ -6278,6 +6367,16 @@ export class SyncEngine {
           if (!(await this.vault.exists(path))) {
             return { ok: false, retryable: false, error: 'local_file_missing' };
           }
+          // A note's edit goes through its doc, never as an attachment
+          // update: sent so, the note's bytes went to the server beside its
+          // doc, and every client of the project took them for an attachment
+          // version. Should the queue hold one (`state.json` outlives the
+          // build that wrote it), the save is folded in as any save is.
+          if (this.fileIndex.byId.get(fileId)?.fileType === 'TEXT') {
+            await this.handleLocalModify(path, 'queue');
+            this.throwIfStopped();
+            return { ok: true };
+          }
           const data = await this.vault.readBinary(path);
           // Hash the bytes being sent, not the stale enqueue-time snapshot
           // — same reasoning as the CREATE case above.
@@ -6625,6 +6724,15 @@ function textOf(state: Uint8Array): string {
  * replaced the history and marked nothing. Either way the file under the id
  * is a new one.
  *
+ * A marked CREATE is enough without its DELETE. A catch-up cut short to its
+ * newest operations (`operationsTruncated`) can leave the DELETE out, and
+ * that server continues the history: without the mark, what this device had
+ * done to the deleted note and never sent was merged into the new one.
+ * Without the mark, and without the DELETE, nothing is concluded: a server
+ * that gives the window of the journal's first rows leaves both out, and the
+ * histories themselves tell then (see `DocManager.lineageOf`) — that server
+ * starts a revived note's history anew.
+ *
  * Not when this device applied the CREATE live (`appliedLive`): the note it
  * has is that new one already, and what it did to it since — an edit, a
  * rename, a delete, made offline — is about the new note. Taken for a note
@@ -6638,12 +6746,14 @@ function notesRecreated(
   const deleted = new Set<string>();
   const recreated = new Set<string>();
   for (const op of ops) {
-    const payload = (op.payload ?? {}) as { fileId?: unknown };
+    const payload = (op.payload ?? {}) as { fileId?: unknown; revived?: unknown };
     const fileId = typeof payload.fileId === 'string' ? payload.fileId : '';
     if (fileId === '') continue;
-    if (op.opType === 'DELETE') deleted.add(fileId);
-    else if (op.opType === 'CREATE' && deleted.delete(fileId) && !appliedLive.has(op.id)) {
-      recreated.add(fileId);
+    if (op.opType === 'DELETE') {
+      deleted.add(fileId);
+    } else if (op.opType === 'CREATE') {
+      const revived = deleted.delete(fileId) || payload.revived === true;
+      if (revived && !appliedLive.has(op.id)) recreated.add(fileId);
     }
   }
   return recreated;

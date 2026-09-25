@@ -182,11 +182,15 @@ export class ObsidianWatcher {
   }
 
   private onDelete(file: WatchableFile): void {
-    // Obsidian fires a single `delete` for a `TFolder` (never one per child),
-    // and chokidar `unlink` events for the children are unreliable under a
-    // burst. So instead of dropping folder deletes, forward them with an
-    // `isFolder` marker — the engine expands them into per-child deletes
-    // against its file index, the only reliable source of the children.
+    // A folder deleted in Obsidian fires a `delete` for every file and folder
+    // in it, then one for the folder (1.13.7 `app.js`: `reconcileDeletion`
+    // removes each entry under the folder's path, and each removal is a
+    // `delete`). A child's may still be missed: swallowed as the echo of a
+    // write this plugin made to it a moment before (`recentlyApplied`), and
+    // chokidar `unlink` events are unreliable under a burst. So the folder's
+    // own delete is forwarded too, with an `isFolder` marker — the engine
+    // expands it into per-child deletes against its file index, the only
+    // reliable source of the children.
     const folder = !isFile(file);
     if (!folder && this.recentlyApplied.take(file.path)) return;
     this.dispatchForBindings(file.path, (bindingId) =>
