@@ -192,7 +192,13 @@ describe('SyncEngine — a note renamed while away to a name this client never w
 
   it('on "restore", takes the server’s broadcast of the move back for its own', async () => {
     const entries: LogEntry[] = [];
-    const h = buildHarness({ logger: new Logger('debug', { write: (e) => entries.push(e) }) });
+    const h = buildHarness({
+      logger: new Logger('debug', {
+        write: (e) => {
+          entries.push(e);
+        },
+      }),
+    });
     await remember(h, 'v1\nunsent\n');
     const b = await teammateNote(h);
     h.serverFiles = [serverFile('f1', 'note?.md', 'TEXT', await sha256Hex('v1\n'), 3), b.listed];

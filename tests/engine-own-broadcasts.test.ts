@@ -111,7 +111,13 @@ describe('SyncEngine — operations of another device that uses this device’s 
   // until the next connect.
   it('applies them as a teammate’s: nothing of the kind is on its way from here', async () => {
     const entries: LogEntry[] = [];
-    const h = buildHarness({ logger: new Logger('debug', { write: (e) => entries.push(e) }) });
+    const h = buildHarness({
+      logger: new Logger('debug', {
+        write: (e) => {
+          entries.push(e);
+        },
+      }),
+    });
     for (const [path, id] of [
       ['a.md', 'f1'],
       ['c.md', 'f3'],
