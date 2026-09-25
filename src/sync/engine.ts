@@ -2124,9 +2124,14 @@ export class SyncEngine {
       });
       this.throwIfStopped();
       if (ack.ok) {
-        this.fileIndex.byPath.delete(path);
-        this.fileIndex.byId.delete(fileId);
-        this.operationLog.deleteFileMeta(this.binding.id, path);
+        // Only what is still this file's: a note renamed onto the name here
+        // while the delete was on its way is recorded there at once (see
+        // `handleLocalRename`). Wiped unconditionally, its record went, its
+        // next save was uploaded as a new file, and its history was deleted.
+        if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
+          this.fileIndex.byId.delete(fileId);
+        }
+        this.forgetPath(this.operationLog, fileId, path);
         // A concurrent remote yjs:update may have scheduled a debounced disk
         // snapshot for this path: cancelled, or it would recreate the
         // just-deleted file. The doc and its store go too: left in place, they
@@ -2229,6 +2234,8 @@ export class SyncEngine {
     this.localRenames.set(fileId, (this.localRenames.get(fileId) ?? 0) + 1);
     this.noteNamesGiven(fileId, oldPath, newPath);
     let docMoved: Promise<void> = Promise.resolve();
+    /** What the server made of the rename, once it has acknowledged it. */
+    let acked: { outcome: unknown } | null = null;
     try {
       // The note is under its new name on disk already, so it is recorded
       // there at once — whether the server hears of the rename now or from
@@ -2255,15 +2262,18 @@ export class SyncEngine {
         this.throwIfStopped();
         if (ack.ok) {
           this.persistVectorClock();
-          return;
+          acked = { outcome: (ack as { outcome?: unknown }).outcome };
         }
       }
-      this.queue('RENAME', oldPath, newPath, { fileId });
+      if (acked === null) this.queue('RENAME', oldPath, newPath, { fileId });
     } finally {
       this.settle(change);
+      // Acknowledged: a teammate's rename broadcast from here on was applied
+      // on the server after this one, and is followed.
       this.forgetLocalRename(fileId);
       await docMoved;
     }
+    if (acked !== null) await this.followStoredRename(fileId, acked.outcome);
   }
 
   /** A local rename of `fileId` is acknowledged or queued: see {@link localRenames}. */
@@ -2744,20 +2754,7 @@ export class SyncEngine {
   ): Promise<void> {
     const stored = storedRenamePath(newPath, outcome);
     if (author === this.clientId) {
-      const conflict = conflictPlacement(outcome);
-      const meta = this.fileIndex.byId.get(fileId);
-      if (
-        conflict !== null &&
-        meta !== undefined &&
-        meta.relativePath === conflict.asked &&
-        conflict.stored !== conflict.asked
-      ) {
-        this.log.info('own rename stored under a conflict name', {
-          path: meta.relativePath,
-          stored: conflict.stored,
-        });
-        await this.applyServerRename(fileId, conflict.stored);
-      }
+      await this.followStoredRename(fileId, outcome);
       return;
     }
     if (this.renamePendingHere(fileId)) {
@@ -2766,6 +2763,29 @@ export class SyncEngine {
     }
     if (author === undefined && this.leftNames.get(fileId)?.has(stored)) return;
     await this.applyServerRename(fileId, stored);
+  }
+
+  /**
+   * A rename this device sent that the server stored under a conflict name
+   * (the name was taken there by a file this device had not heard of yet):
+   * the note follows it there. Called with the outcome of the broadcast of
+   * this device's own rename (see {@link handleServerRename}) and with the
+   * ack's: a server that does not send `clientId` is heard only through the
+   * ack — its broadcast arrives while the rename is on its way, and is left
+   * alone. Left at the name asked for, the note stayed there until the next
+   * connect, and the file the server has under that name did not reach this
+   * device until then.
+   */
+  private async followStoredRename(fileId: string, outcome: unknown): Promise<void> {
+    const conflict = conflictPlacement(outcome);
+    if (conflict === null || conflict.stored === conflict.asked) return;
+    const meta = this.fileIndex.byId.get(fileId);
+    if (meta === undefined || meta.relativePath !== conflict.asked) return;
+    this.log.info('own rename stored under a conflict name', {
+      path: meta.relativePath,
+      stored: conflict.stored,
+    });
+    await this.applyServerRename(fileId, conflict.stored);
   }
 
   /** Whether a rename of `fileId` made here is on its way to the server or queued. */
@@ -3087,6 +3107,20 @@ export class SyncEngine {
   private async applyServerDelete(fileId: string): Promise<void> {
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
+    const holder = this.fileIndex.byPath.get(meta.relativePath);
+    if (holder !== undefined && holder.fileId !== fileId) {
+      // The name has gone to another file since: a note renamed onto it here
+      // while this file's delete, made here too, was on its way — a server
+      // that does not send `clientId` broadcasts that delete back before its
+      // ack. The copy under the name is the other file's: taken for this
+      // one, it was deleted, or the user was asked whether to delete it.
+      await this.commitLocal(async (io) => {
+        if (this.fileIndex.byId.get(fileId) === meta) this.fileIndex.byId.delete(fileId);
+        this.forgetRecord(io.log, fileId, meta.relativePath);
+        await this.dropDoc(io.docs, fileId, meta.relativePath);
+      });
+      return;
+    }
     // Deleting is a write too: a stale index entry naming the config folder
     // must not let the server erase files there.
     if (!this.allowServerPath(meta.relativePath, 'delete')) return;
@@ -3253,7 +3287,6 @@ export class SyncEngine {
       return;
     }
     const oldPath = meta.relativePath;
-    if (oldPath === newPath) return;
     // The source is metadata rather than a fresh server string, but metadata
     // can come from `state.json` written by a build without the gate.
     if (!this.allowServerPath(oldPath, 'rename source', { requireBinding: false })) return;
@@ -3269,12 +3302,26 @@ export class SyncEngine {
     // move would land in a doc nobody reads again. And under the new name's
     // lock: a save or snapshot there waits for the history to arrive.
     const renamedHere = this.renameCount.get(fileId) ?? 0;
+    let movedMeanwhile = false;
     await this.withPathLocks([oldPath, newPath], () => {
       // Renamed on this device while this waited: that rename reaches the
       // server after this one, and wins there.
       if ((this.renameCount.get(fileId) ?? 0) !== renamedHere) return Promise.resolve();
+      // Moved by another rename from the server while this waited (or the
+      // index was rebuilt): the names looked up above are stale. Taken as
+      // they were, a rename back to where the note had been was dropped as
+      // already done, and a second rename to the name the note had just got
+      // took the note's copy there for another file with the same content —
+      // and deleted it.
+      if (this.fileIndex.byId.get(fileId) !== meta || meta.relativePath !== oldPath) {
+        movedMeanwhile = true;
+        return Promise.resolve();
+      }
+      if (oldPath === newPath) return Promise.resolve();
       return this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
     });
+    // Looked up again, under the names the note has now.
+    if (movedMeanwhile) await this.applyServerRename(fileId, newPath);
   }
 
   /**
@@ -3368,6 +3415,9 @@ export class SyncEngine {
   private async moveLocalCopySteps(io: LocalIO, meta: IndexedMeta, newPath: string): Promise<void> {
     const { fileId } = meta;
     const oldPath = meta.relativePath;
+    // Nothing to move. Taken for a move, the file was found at its
+    // destination already — itself — and deleted as a duplicate.
+    if (oldPath === newPath) return;
     /** Where the file stepped aside to, if it did. */
     let spare: string | null = null;
     if (await io.vault.exists(oldPath)) {
@@ -4245,6 +4295,8 @@ export class SyncEngine {
    * the file was deleted in.
    */
   private async replayPending(op: {
+    /** The queue entry's id; absent for an operation not taken from the queue. */
+    id?: number;
     opType: OperationType;
     filePath: string;
     newPath: string | null;
@@ -4464,20 +4516,24 @@ export class SyncEngine {
               : await this.socket.emitFileMove(payload);
           this.throwIfStopped();
           if (ack.ok) {
+            // Out of the queue at once: the server has applied it, so a
+            // teammate's rename of the file broadcast from now on came after
+            // it and is followed (see `renamePendingHere`), not left to it.
+            if (op.id !== undefined) this.operationLog.markSent([op.id]);
             // The index has the file under the name it has here already (see
             // `queuedRenames`). One still under the queued source — a queue
             // entry the index refresh did not take up — moves now, so the
             // post-drain initial-push pass recognises the file at its new path
             // instead of re-uploading it. If the server actually
             // conflict-renamed (a genuine concurrent rename onto the same
-            // target), the broadcast `renamed` event reconciles `fileIndex`
-            // to the real path (see `handleServerRename`).
+            // target), the note follows it to the real path.
             const meta = this.fileIndex.byId.get(fileId);
             if (meta && meta.relativePath === op.filePath) {
               await this.withPathLocks([op.filePath, newPath], () =>
                 this.commitLocal((io) => this.relocate(io, meta, newPath)),
               );
             }
+            await this.followStoredRename(fileId, (ack as { outcome?: unknown }).outcome);
           }
           return ackToOutcome(ack);
         }
