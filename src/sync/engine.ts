@@ -4,6 +4,8 @@ import type { ApiFile } from '@/client/types';
 import {
   SocketClient,
   type Ack,
+  type FileCreatePayload,
+  type FileDeletePayload,
   type FileEvent as SocketFileEvent,
   type FileUpdateBinaryPayload,
   type ServerOperation,
@@ -450,15 +452,17 @@ export class SyncEngine {
   private readonly renameCount = new Map<string, number>();
 
   /**
-   * Names this device gave a file and then renamed it away from, by id,
-   * since the last connect. A server that does not say who sent a rename
-   * broadcasts this device's own renames back: one that arrives after its
-   * ack names a name the file has already left. See {@link handleServerRename}.
+   * Notes created on this device whose `file:create` has been sent and not
+   * acknowledged yet, by path, with how many — see {@link emitCreate}. The
+   * server broadcasts the create to its sender too, before the ack.
    */
-  private readonly leftNames = new Map<string, Set<string>>();
+  private readonly ownCreates = new Map<string, number>();
 
-  /** Names this device gave a file by its renames, since the last connect. */
-  private readonly givenNames = new Map<string, Set<string>>();
+  /** Deletes sent and not acknowledged yet, by file id — see {@link emitDelete}. */
+  private readonly ownDeletes = new Map<string, number>();
+
+  /** Whether a broadcast under this device's client id it did not send was logged. */
+  private twinReported = false;
 
   /**
    * Notes renamed on this device whose history has not moved to the new
@@ -700,11 +704,12 @@ export class SyncEngine {
       this.yjsFetchUnavailable = false;
       this.freedHere.clear();
       // A broadcast from before the disconnect never arrives now, and neither
-      // does the ack of a rename sent on the old connection: left counted as
-      // on its way, it kept every teammate's rename of the file from applying.
-      this.givenNames.clear();
-      this.leftNames.clear();
+      // does the ack of an operation sent on the old connection: left counted
+      // as on its way, a rename kept every teammate's rename of the file from
+      // applying, and a create or delete took a teammate's for this device's.
       this.localRenames.clear();
+      this.ownCreates.clear();
+      this.ownDeletes.clear();
       // Arm the streamed-catch-up completion signal before the join so a fast
       // server stream can't resolve before we're waiting on it.
       const catchupDone = new Promise<void>((resolve) => {
@@ -1964,7 +1969,7 @@ export class SyncEngine {
         // Binary bytes are staged over REST; text rides inline (small).
         const data = await this.stageBinaryBlob(fileType, hash, buffer);
         this.throwIfStopped();
-        const ack = await this.socket.emitFileCreate({
+        const ack = await this.emitCreate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
           vectorClock: this.bumpClock(),
@@ -2331,7 +2336,7 @@ export class SyncEngine {
     }
     if (change) change.payload = { fileId };
     if (this.socket.isConnected() && fileId) {
-      const ack = await this.socket.emitFileDelete({
+      const ack = await this.emitDelete({
         projectId: this.binding.projectId,
         clientId: this.clientId,
         vectorClock: this.bumpClock(),
@@ -2448,7 +2453,6 @@ export class SyncEngine {
     const change = this.hold('watcher', 'RENAME', oldPath, newPath, { fileId });
     this.renameCount.set(fileId, (this.renameCount.get(fileId) ?? 0) + 1);
     this.localRenames.set(fileId, (this.localRenames.get(fileId) ?? 0) + 1);
-    this.noteNamesGiven(fileId, oldPath, newPath);
     let docMoved: Promise<void> = Promise.resolve();
     /** What the server made of the rename, once it has acknowledged it. */
     let acked: { outcome: unknown } | null = null;
@@ -2494,21 +2498,7 @@ export class SyncEngine {
 
   /** A local rename of `fileId` is acknowledged or queued: see {@link localRenames}. */
   private forgetLocalRename(fileId: string): void {
-    const left = (this.localRenames.get(fileId) ?? 0) - 1;
-    if (left > 0) this.localRenames.set(fileId, left);
-    else this.localRenames.delete(fileId);
-  }
-
-  /** Remember that this device renamed `fileId` from `from` to `to` — see {@link leftNames}. */
-  private noteNamesGiven(fileId: string, from: string, to: string): void {
-    const given = this.givenNames.get(fileId) ?? new Set<string>();
-    if (given.has(from)) {
-      const left = this.leftNames.get(fileId) ?? new Set<string>();
-      left.add(from);
-      this.leftNames.set(fileId, left);
-    }
-    given.add(to);
-    this.givenNames.set(fileId, given);
+    countDown(this.localRenames, fileId);
   }
 
   /**
@@ -2894,9 +2884,8 @@ export class SyncEngine {
     try {
       // The server sends each operation to its sender too, before the ack.
       // This device's own: the ack does what is left to do.
-      if (event.clientId === this.clientId && event.type !== 'renamed' && event.type !== 'moved') {
-        return;
-      }
+      const own = this.isOwnBroadcast(event);
+      if (own && event.type !== 'renamed' && event.type !== 'moved') return;
       // From a server that does not say who sent it: an attachment upload
       // this device has on its way. Taken for a teammate's, the version just
       // uploaded was downloaded again and written over a newer one saved
@@ -2938,13 +2927,81 @@ export class SyncEngine {
           break;
         case 'renamed':
         case 'moved':
-          await this.handleServerRename(event.fileId, event.newPath, event.outcome, event.clientId);
+          await this.handleServerRename(event.fileId, event.newPath, event.outcome, own);
           break;
       }
     } catch (err) {
       // Cut short by `stop()` — not a failure to apply.
       if (this.hasStopped) return;
       this.setStatus('error', describeError(err, 'apply_failed'));
+    }
+  }
+
+  /**
+   * Whether a file broadcast is this device's own: it carries this device's
+   * client id, and the operation is on its way from here — sent and not
+   * acknowledged yet, which is when the server broadcasts it back.
+   *
+   * The id alone does not tell. A vault copied to another computer along with
+   * its `data.json` takes the id with it, and the copy's operations came back
+   * as this device's own: its new notes, deletes and renames did not reach
+   * this device until the next connect. A broadcast under this device's id
+   * that it has nothing on its way for is the other device's, and is applied.
+   */
+  private isOwnBroadcast(event: SocketFileEvent): boolean {
+    if (event.clientId !== this.clientId) return false;
+    let sent: boolean;
+    switch (event.type) {
+      case 'created': {
+        const outcome = (event.result as { outcome?: { path?: unknown; originalPath?: unknown } })
+          ?.outcome;
+        const asked = outcome?.path ?? outcome?.originalPath;
+        sent = typeof asked === 'string' && this.ownCreates.has(asked);
+        break;
+      }
+      case 'deleted':
+        sent = this.ownDeletes.has(event.fileId);
+        break;
+      case 'updated-binary':
+        sent = this.binaryUploads.get(event.fileId)?.includes(event.contentHash) === true;
+        break;
+      case 'renamed':
+      case 'moved':
+        sent = this.renamePendingHere(event.fileId);
+        break;
+    }
+    if (!sent && !this.twinReported) {
+      this.twinReported = true;
+      this.log.warn(
+        'a file event carries this device’s client id, but this device did not send it: another device uses the same id (a vault copied along with its data.json?)',
+        { type: event.type },
+      );
+    }
+    return sent;
+  }
+
+  /**
+   * `file:create`, with its path in {@link ownCreates} until the ack comes
+   * (or the emit fails).
+   */
+  private async emitCreate(payload: FileCreatePayload): Promise<Ack> {
+    const path = payload.filePath;
+    this.ownCreates.set(path, (this.ownCreates.get(path) ?? 0) + 1);
+    try {
+      return await this.socket.emitFileCreate(payload);
+    } finally {
+      countDown(this.ownCreates, path);
+    }
+  }
+
+  /** `file:delete`, with its file id in {@link ownDeletes} until the ack comes. */
+  private async emitDelete(payload: FileDeletePayload): Promise<Ack> {
+    const { fileId } = payload;
+    this.ownDeletes.set(fileId, (this.ownDeletes.get(fileId) ?? 0) + 1);
+    try {
+      return await this.socket.emitFileDelete(payload);
+    } finally {
+      countDown(this.ownDeletes, fileId);
     }
   }
 
@@ -2960,15 +3017,17 @@ export class SyncEngine {
    * Obsidian's echo of that move, the server renamed the note `b ↔ c` for
    * good. So:
    *
-   *   - This device's own rename, by `clientId`, is left alone: the note is
-   *     where this device put it, or where it has moved it since. Unless the
-   *     server stored it under a conflict name, where it follows.
+   *   - This device's own rename (`own`, see {@link isOwnBroadcast}) is left
+   *     alone: the note is where this device put it, or where it has moved it
+   *     since. Unless the server stored it under a conflict name, where it
+   *     follows.
    *   - A rename of a file whose own rename is queued or on its way here is
    *     left alone too: the server applies that one after it, and it wins.
    *     From a server that does not send `clientId`, this is also how this
-   *     device's own renames are told apart — they are on their way when the
-   *     broadcast arrives — and one delivered after its ack names a name
-   *     the file has left here (see {@link leftNames}).
+   *     device's own renames are told apart: the server broadcasts a rename
+   *     before it acknowledges it, on the same connection, so the broadcast
+   *     always finds it on its way. One that finds no rename on its way is a
+   *     teammate's — a rename back to a name the note had here earlier too.
    *   - A rename is applied under the name the server stored the file at.
    *     A server without `clientId` broadcast the name asked for, even when
    *     it stored the file under a conflict name; `outcome` has that one.
@@ -2977,10 +3036,10 @@ export class SyncEngine {
     fileId: string,
     newPath: string,
     outcome: unknown,
-    author: string | undefined,
+    own: boolean,
   ): Promise<void> {
     const stored = storedRenamePath(newPath, outcome);
-    if (author === this.clientId) {
+    if (own) {
       await this.followStoredRename(fileId, outcome);
       return;
     }
@@ -2988,7 +3047,6 @@ export class SyncEngine {
       this.log.debug('server rename left to a local rename of the same file', { fileId, stored });
       return;
     }
-    if (author === undefined && this.leftNames.get(fileId)?.has(stored)) return;
     await this.applyServerRename(fileId, stored);
   }
 
@@ -3482,7 +3540,7 @@ export class SyncEngine {
         try {
           const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
           this.throwIfStopped();
-          const ack = await this.socket.emitFileCreate({
+          const ack = await this.emitCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
@@ -3783,14 +3841,21 @@ export class SyncEngine {
     const path = meta.relativePath;
     if (!this.socket.isConnected()) return;
     try {
-      const ack = await this.socket.emitFileRename({
-        projectId: this.binding.projectId,
-        clientId: this.clientId,
-        vectorClock: this.bumpClock(),
-        fileId: meta.fileId,
-        filePath: movedTo,
-        newPath: path,
-      });
+      // On its way from here: its broadcast is this device's own.
+      this.localRenames.set(meta.fileId, (this.localRenames.get(meta.fileId) ?? 0) + 1);
+      let ack: Ack;
+      try {
+        ack = await this.socket.emitFileRename({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          vectorClock: this.bumpClock(),
+          fileId: meta.fileId,
+          filePath: movedTo,
+          newPath: path,
+        });
+      } finally {
+        this.forgetLocalRename(meta.fileId);
+      }
       this.throwIfStopped();
       if (!ack.ok) {
         this.log.warn('could not move a renamed file back', { path, movedTo, error: ack.error });
@@ -4787,7 +4852,7 @@ export class SyncEngine {
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
           this.throwIfStopped();
-          const ack = await this.socket.emitFileCreate({
+          const ack = await this.emitCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
@@ -4890,7 +4955,7 @@ export class SyncEngine {
             );
             return { ok: false, retryable: false, error: 'no_file_id' };
           }
-          const ack = await this.socket.emitFileDelete({
+          const ack = await this.emitDelete({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
@@ -4921,7 +4986,6 @@ export class SyncEngine {
             return { ok: false, retryable: false, error: 'missing_target' };
           }
           const newPath = op.newPath;
-          this.noteNamesGiven(fileId, op.filePath, newPath);
           const payload = {
             projectId: this.binding.projectId,
             clientId: this.clientId,
@@ -5195,6 +5259,13 @@ function queuedFileId(payload: Record<string, unknown>): string {
 /** A queued RENAME or MOVE. */
 function isQueuedMove(op: { opType: OperationType }): boolean {
   return op.opType === 'RENAME' || op.opType === 'MOVE';
+}
+
+/** Take one off `key`'s count in `counts`, dropping it at zero. */
+function countDown(counts: Map<string, number>, key: string): void {
+  const left = (counts.get(key) ?? 0) - 1;
+  if (left > 0) counts.set(key, left);
+  else counts.delete(key);
 }
 
 /** Key of a rename in {@link SyncEngine.renamingOnDisk}. */
