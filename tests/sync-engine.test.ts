@@ -298,7 +298,6 @@ describe('SyncEngine — local create', () => {
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
 
-    const lastBefore = h.socket().emits.length - 1;
     const promise = h.engine.handleVaultEvent({
       type: 'create',
       bindingId: 'b1',
@@ -306,15 +305,18 @@ describe('SyncEngine — local create', () => {
       source: 'obsidian',
     });
     // Wait for the chain of awaits inside handleLocalCreate (read + hash)
-    // to surface the actual emit before we ack it.
+    // to surface the actual emit before we ack it. The connect's first upload
+    // offers the file too: one create goes out, and the event waits for it.
     await flushAsync();
-    const emit = h.socket().emits[lastBefore + 1];
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(1);
+    const emit = creates[0];
     expect(emit?.event).toBe('file:create');
     const payload = emit?.args[0] as { filePath: string; data: number[]; fileType: string };
     expect(payload.filePath).toBe('note.md');
     expect(payload.fileType).toBe('TEXT');
     expect(payload.data).toEqual([104, 101, 108, 108, 111]); // "hello"
-    h.socket().ackOk({ outcome: 'created' });
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'note.md' } });
     await promise;
   });
 });
@@ -2521,7 +2523,6 @@ describe('SyncEngine — правки внешним агентом (source: fs)
     h.socket().ackOk({ operations: [], yjsDocs: [] });
     await flushAsync();
 
-    const before = h.socket().emits.length;
     const promise = h.engine.handleVaultEvent({
       type: 'create',
       bindingId: 'b1',
@@ -2529,13 +2530,16 @@ describe('SyncEngine — правки внешним агентом (source: fs)
       source: 'fs',
     });
     await flushAsync();
-    const emit = h.socket().emits[before];
+    // Первая загрузка подключения тоже предлагает файл: уходит один create, событие ждёт его.
+    const creates = h.socket().emits.filter((e) => e.event === 'file:create');
+    expect(creates).toHaveLength(1);
+    const emit = creates[0];
     expect(emit?.event).toBe('file:create');
     const payload = emit?.args[0] as { filePath: string; fileType: string; data: number[] };
     expect(payload.filePath).toBe('агент/заметка.md');
     expect(payload.fileType).toBe('TEXT');
     expect(new TextDecoder().decode(new Uint8Array(payload.data))).toBe('текст');
-    h.socket().ackOk({ outcome: 'created' });
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: 'агент/заметка.md' } });
     await promise;
   });
 
@@ -3453,27 +3457,15 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     putDisk(h, 'created\n');
     await h.engine.start();
     h.socket().ackOk({ operations: [], yjsDocs: [] });
-    // The initial push offers the note first, and that create stays
-    // unanswered. Waited for, so the create answered below is the event's own.
+    // The initial push offers the note first. The create event that comes
+    // meanwhile waits for that create instead of sending a second one.
     await waitFor(
       () => h.socket().emits.some((e) => e.event === 'file:create'),
       'the initial push to offer the note',
     );
     const offered = h.socket().emits.length;
-
-    const create = h.engine.handleVaultEvent({
-      type: 'create',
-      bindingId: 'b1',
-      path: PATH,
-      source: 'obsidian',
-    });
-    await waitFor(() => h.socket().emits.length > offered, 'the file:create emit');
-    expect(h.socket().emits.at(-1)?.event).toBe('file:create');
-    h.socket().ackOk({ outcome: { fileId: 'f1', path: PATH } });
-    await create;
-
     // The server seeds its doc from the created bytes; the seed broadcast
-    // hasn't reached this client when the user edits again.
+    // does not reach this client before the user edits again.
     const serverDoc = new Y.Doc();
     serverDoc.getText('content').insert(0, 'created\n');
     h.socket().fetchResponder = () => ({
@@ -3481,6 +3473,20 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
       sync1: Array.from(Y.encodeStateAsUpdate(serverDoc)),
       stateVector: Array.from(Y.encodeStateVector(serverDoc)),
     });
+
+    const create = h.engine.handleVaultEvent({
+      type: 'create',
+      bindingId: 'b1',
+      path: PATH,
+      source: 'obsidian',
+    });
+    await flushAsync();
+    expect(h.socket().emits).toHaveLength(offered);
+    expect(h.socket().emits.at(-1)?.event).toBe('file:create');
+    h.socket().ackOk({ outcome: { fileId: 'f1', path: PATH } });
+    await create;
+    expect(h.socket().emits.filter((e) => e.event === 'file:create')).toHaveLength(1);
+
     const emitted = h.socket().emits.length;
     await saveLocally(h, 'created\nand edited\n');
     await drainToServer(h, serverDoc, emitted);

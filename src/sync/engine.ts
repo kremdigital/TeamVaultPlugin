@@ -474,6 +474,13 @@ export class SyncEngine {
   private twinReported = false;
 
   /**
+   * Local creates under way, by path, from the event until the file is
+   * recorded, queued, or found to be gone — and renames into a path waiting
+   * for such a create (see {@link renameAfterCreate}).
+   */
+  private readonly creating = new Map<string, Promise<void>>();
+
+  /**
    * Files the server has under a name another file still holds here, by the
    * name — see {@link waitForName}. Rebuilt on each connect.
    */
@@ -1962,6 +1969,15 @@ export class SyncEngine {
     // The copy of a file renamed away while this device was away, waiting for
     // its question (see `retiredAway`): uploaded, it came back as a new file.
     if (this.isRetiredCopy(path)) return;
+    // A create of this name under way here, or a rename into it waiting for
+    // one (see `renameAfterCreate`): the file is recorded once it is done.
+    const underway = this.creating.get(path);
+    if (underway !== undefined) await underway;
+    await this.createLocal(path, from);
+  }
+
+  /** {@link handleLocalCreate} past its checks: send the create, or the save of a known file. */
+  private async createLocal(path: string, from: LocalSource): Promise<void> {
     if (this.fileIndex.byPath.has(path)) {
       // The server already knows about this — treat as a modify.
       await this.handleLocalModify(path, from);
@@ -1969,10 +1985,17 @@ export class SyncEngine {
     }
     const fileType = classifyFileType(path);
     const change = this.hold(from, 'CREATE', path, null, { fileType });
+    const run = this.sendLocalCreate(path, fileType, change);
+    const tracked = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.creating.set(path, tracked);
     try {
-      await this.sendLocalCreate(path, fileType, change);
+      await run;
     } finally {
       this.settle(change);
+      if (this.creating.get(path) === tracked) this.creating.delete(path);
     }
   }
 
@@ -2476,6 +2499,11 @@ export class SyncEngine {
       meta = this.fileIndex.byPath.get(oldPath);
     }
     if (meta === undefined) {
+      const created = this.creating.get(oldPath);
+      if (created !== undefined) {
+        await this.renameAfterCreate(created, oldPath, newPath);
+        return;
+      }
       // Known under the new name already: this rename has been applied.
       if (this.fileIndex.byPath.has(newPath)) return;
       // A file this device never synced: under its new name it is a new file.
@@ -2484,7 +2512,56 @@ export class SyncEngine {
       await this.handleLocalCreate(newPath);
       return;
     }
-    const target = meta;
+    await this.renameRecorded(meta, oldPath, newPath);
+  }
+
+  /**
+   * A note created here renamed before the server acknowledged its create: a
+   * template that renames the note it has just made (Templater's
+   * `tp.file.rename`), a title typed in on a slow connection. The rename
+   * waits for the create, and goes out as the rename of the note the server
+   * has. A create or save under the new name meanwhile waits for it in turn.
+   *
+   * It used to go out at once as a second create, under the new name: the
+   * ack of the first recorded the note under the old name, where the disk had
+   * nothing, the whole team got the note twice, and the next start wrote the
+   * old name back to disk.
+   */
+  private async renameAfterCreate(
+    created: Promise<void>,
+    oldPath: string,
+    newPath: string,
+  ): Promise<void> {
+    const run = (async (): Promise<void> => {
+      await created;
+      const meta = this.fileIndex.byPath.get(oldPath);
+      if (meta !== undefined) {
+        await this.renameRecorded(meta, oldPath, newPath);
+        return;
+      }
+      // Not created (queued offline, refused, found gone): the note is new
+      // under its new name, and the create queued under the old one finds
+      // nothing there.
+      await this.createLocal(newPath, 'watcher');
+    })();
+    const tracked = run.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.creating.set(newPath, tracked);
+    try {
+      await run;
+    } finally {
+      if (this.creating.get(newPath) === tracked) this.creating.delete(newPath);
+    }
+  }
+
+  /** {@link handleLocalRename} of a file this device has a record of: `target`. */
+  private async renameRecorded(
+    target: IndexedMeta,
+    oldPath: string,
+    newPath: string,
+  ): Promise<void> {
     const { fileId } = target;
     // Renamed here after the server's rename it waited to apply: this one
     // reaches the server after it, and wins there.

@@ -1215,7 +1215,9 @@ export class ServerDocs {
         ? new TextDecoder().decode(data)
         : ArrayBuffer.isView(data)
           ? new TextDecoder().decode(data)
-          : '';
+          : Array.isArray(data)
+            ? new TextDecoder().decode(Uint8Array.from(data as number[]))
+            : '';
     const stored = this.docs.get(id);
     if (revived && stored && !this.opts.replaceOnRevive) {
       const t = stored.getText('content');
