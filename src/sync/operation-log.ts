@@ -284,6 +284,26 @@ export class OperationLog {
     return false;
   }
 
+  /**
+   * Change a queued operation in place, keeping its place in the queue: its
+   * path, or its payload (replaced whole). `false` when no such operation is
+   * queued.
+   */
+  amendOperation(
+    opId: number,
+    amend: { filePath?: string; payload?: Record<string, unknown> },
+  ): boolean {
+    for (const bucket of this.bindings.values()) {
+      const op = bucket.pending.find((p) => p.id === opId);
+      if (!op) continue;
+      if (amend.filePath !== undefined) op.filePath = amend.filePath;
+      if (amend.payload !== undefined) op.payload = { ...amend.payload };
+      this.touch({ immediate: true });
+      return true;
+    }
+    return false;
+  }
+
   markSent(opIds: readonly number[]): void {
     if (opIds.length === 0) return;
     const drop = new Set(opIds);

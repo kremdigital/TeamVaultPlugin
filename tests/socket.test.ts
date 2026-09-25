@@ -242,6 +242,58 @@ describe('SocketClient — emits', () => {
     await expect(promise).resolves.toEqual({ ok: true, changed: true });
   });
 
+  it('rejects an emit whose connection drops before the ack', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const rename = client.emitFileRename({
+      projectId: 'p1',
+      clientId: 'device-1',
+      fileId: 'f1',
+      filePath: 'a.md',
+      newPath: 'b.md',
+    });
+    // socket.io drops a plain ack callback on disconnect: it is never called.
+    socket().disconnect();
+    await expect(rename).rejects.toThrow('disconnected');
+    // A late answer changes nothing.
+    socket().ackLast({ ok: true });
+    await expect(rename).rejects.toThrow('disconnected');
+  });
+
+  it('waits for the ack of an emit made while disconnected once the socket reconnects', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    socket().disconnect();
+    // socket.io buffers it and sends it on the next connect.
+    const create = client.emitFileDelete({
+      projectId: 'p1',
+      clientId: 'device-1',
+      fileId: 'f1',
+      filePath: 'a.md',
+    });
+    socket().connect();
+    socket().ackLast({ ok: true, outcome: { kind: 'deleted', fileId: 'f1' } });
+    await expect(create).resolves.toMatchObject({ ok: true });
+    // Sent now: the next drop rejects what is still waiting.
+    const next = client.emitFileDelete({
+      projectId: 'p1',
+      clientId: 'device-1',
+      fileId: 'f2',
+      filePath: 'b.md',
+    });
+    socket().disconnect();
+    await expect(next).rejects.toThrow('disconnected');
+  });
+
+  it('rejects every waiting emit when the client disconnects', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    socket().disconnect();
+    const buffered = client.joinProject('p1');
+    client.disconnect();
+    await expect(buffered).rejects.toThrow('disconnected');
+  });
+
   it('rejects if emit is called before connect', async () => {
     const client = new SocketClient({ server, clientId, factory });
     await expect(client.joinProject('p1')).rejects.toThrow('socket_not_connected');

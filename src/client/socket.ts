@@ -242,6 +242,13 @@ export interface SocketClientOptions {
 
 type EventCb<T = unknown> = (data: T) => void;
 
+/** An emit waiting for its ack; see {@link SocketClient.emitWithAck}. */
+interface PendingAck {
+  reject(err: Error): void;
+  /** Out on a connection: its ack is lost if that connection drops. */
+  sent: boolean;
+}
+
 export class SocketClient {
   private readonly factory: SocketFactory;
   private readonly url: string;
@@ -258,6 +265,8 @@ export class SocketClient {
   private fileEventCbs = new Set<EventCb<FileEvent>>();
   private yjsCbs = new Set<EventCb<YjsUpdateMessage>>();
   private yjsCatchupCbs = new Set<EventCb<YjsCatchupBatch>>();
+  /** Emits waiting for their acks — see {@link emitWithAck}. */
+  private readonly pendingAcks = new Set<PendingAck>();
 
   constructor(options: SocketClientOptions) {
     this.factory = options.factory ?? defaultFactory;
@@ -301,11 +310,14 @@ export class SocketClient {
     this.socket = socket;
 
     socket.on('connect', () => {
+      // socket.io sends what was emitted while disconnected once it connects.
+      for (const pending of this.pendingAcks) pending.sent = true;
       for (const cb of this.connectCbs) cb();
     });
     socket.on('disconnect', (reason: unknown) => {
       const r = typeof reason === 'string' ? reason : 'unknown';
       for (const cb of this.disconnectCbs) cb(r);
+      this.failPendingAcks((pending) => pending.sent);
     });
     socket.on('connect_error', (err: unknown) => {
       // socket.io hands over an Error; anything else keeps a readable message
@@ -408,6 +420,8 @@ export class SocketClient {
       this.socket.disconnect();
       this.socket = null;
     }
+    // Nothing emitted on this socket is sent or answered any more.
+    this.failPendingAcks(() => true);
   }
 
   // -- Subscriptions --------------------------------------------------------
@@ -526,14 +540,41 @@ export class SocketClient {
     return envelope;
   }
 
+  /**
+   * Emit and resolve with the server's ack. Rejects with `disconnected` when
+   * the connection the emit went out on drops before the ack came: the server
+   * never answers it on the next one, and socket.io drops a plain ack callback
+   * on disconnect without calling it. Waiting for it held the caller forever —
+   * a note created and renamed right away was never renamed, and the drain of
+   * the offline queue stopped for the session. What the server did with it is
+   * unknown then: the caller queues the operation, and its replay is one the
+   * server takes again.
+   *
+   * An emit made while disconnected is sent once the socket connects, and
+   * waits for its ack from then on.
+   */
   private emitWithAck<T>(event: string, payload: unknown): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (!this.socket) {
         reject(new Error('socket_not_connected'));
         return;
       }
-      this.socket.emit(event, payload, (ack: T) => resolve(ack));
+      const pending: PendingAck = { reject, sent: this.socket.connected };
+      this.pendingAcks.add(pending);
+      this.socket.emit(event, payload, (ack: T) => {
+        if (!this.pendingAcks.delete(pending)) return;
+        resolve(ack);
+      });
     });
+  }
+
+  /** Reject the acks {@link emitWithAck} waits for that `which` picks. */
+  private failPendingAcks(which: (pending: PendingAck) => boolean): void {
+    for (const pending of [...this.pendingAcks]) {
+      if (!which(pending)) continue;
+      this.pendingAcks.delete(pending);
+      pending.reject(new Error('disconnected'));
+    }
   }
 
   private fan<T>(set: Set<EventCb<T>>, value: T): void {

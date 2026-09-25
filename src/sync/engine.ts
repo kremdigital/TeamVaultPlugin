@@ -194,7 +194,28 @@ interface FileMetaIndex {
  */
 type WaitingForName =
   | { kind: 'rename'; fileId: string; path: string }
-  | { kind: 'create'; fileId: string; path: string; fileType: FileType };
+  | {
+      kind: 'create';
+      fileId: string;
+      path: string;
+      fileType: FileType;
+      /**
+       * Known to be another device's: its broadcast named another client, or
+       * came before this device had sent its own create of the name.
+       */
+      foreign?: boolean;
+    };
+
+/**
+ * What a create of this device's came to (see `SyncEngine.recordCreateAck`):
+ * the id the server gave the file, and whether that is a file of another
+ * device's with the same content, which the server gave back instead of
+ * making a new one (`merged`).
+ */
+interface CreatedHere {
+  fileId: string;
+  merged: boolean;
+}
 
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
 interface RenamedWhileAway {
@@ -246,6 +267,21 @@ const RECHECK_DELETE = 'recheck';
  * {@link RECHECK_DELETE}.
  */
 const LAST_SYNCED = 'lastSynced';
+
+/**
+ * Payload of a queued CREATE: the content hashes it went out with to a
+ * server that may have applied it without its ack reaching this device (the
+ * connection dropped, the engine stopped). See `SyncEngine.adoptLandedCreates`.
+ * Local to the queue, like {@link RECHECK_DELETE}.
+ */
+const SENT_HASHES = 'sentHashes';
+
+/**
+ * Payload of a queued CREATE whose note was renamed here after it went out
+ * (see {@link SENT_HASHES}): the name it went out under. The entry itself is
+ * under the note's name now.
+ */
+const SENT_AT = 'sentAt';
 
 /**
  * How many times one snapshot folds a disk that changed under it before it
@@ -502,10 +538,18 @@ export class SyncEngine {
 
   /**
    * Local creates under way, by path, from the event until the file is
-   * recorded, queued, or found to be gone — and renames into a path waiting
-   * for such a create (see {@link renameAfterCreate}).
+   * recorded, queued, or found to be gone — a replay of a queued create
+   * included — and renames into a path waiting for such a create (see
+   * {@link renameAfterCreate}). Each resolves with what the create came to.
    */
-  private readonly creating = new Map<string, Promise<void>>();
+  private readonly creating = new Map<string, Promise<CreatedHere | null>>();
+
+  /**
+   * Names of notes created here and renamed before their create was
+   * acknowledged (see {@link renameAfterCreate}): the copy is under the new
+   * name already.
+   */
+  private readonly renamedAfterCreate = new Set<string>();
 
   /**
    * Files the server has under a name another file still holds here, by the
@@ -855,6 +899,9 @@ export class SyncEngine {
       this.catchupResolve = null;
       // Cut short by `stop()` — not a sync failure.
       if (this.hasStopped) return;
+      // Cut short by the connection dropping: the status says so already, and
+      // the next connect starts over.
+      if (!this.socketLink.isConnected()) return;
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
   }
@@ -992,11 +1039,9 @@ export class SyncEngine {
       Uint8Array.from(serverStateVector),
     );
     if (missing.length > 2) {
-      void this.socket.emitYjsUpdate({
-        projectId: this.binding.projectId,
-        fileId: meta.fileId,
-        update: missing,
-      });
+      this.socket
+        .emitYjsUpdate({ projectId: this.binding.projectId, fileId: meta.fileId, update: missing })
+        .catch(() => undefined);
     }
   }
 
@@ -1462,6 +1507,9 @@ export class SyncEngine {
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
+    // Before anything reads the queue: a create that reached the server
+    // without its ack is this device's file.
+    this.adoptLandedCreates(listed);
     // A chain of renames back to where it started is no rename at all: read
     // as one, it "won" over a teammate's rename of the note, which was then
     // skipped — and the drain sent nothing (see `collapseQueuedRenames`).
@@ -1592,6 +1640,64 @@ export class SyncEngine {
         continue;
       }
       this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId);
+    }
+  }
+
+  /**
+   * Queued creates that reached the server without their ack reaching this
+   * device (see {@link SENT_HASHES}): the listing has a file under the name
+   * one went out under, with the content it went out with. That file is this
+   * device's note, and is recorded as such — at the name the note has here,
+   * with a rename queued from the name it went out under when it was renamed
+   * since (see {@link followQueuedCreate}). The queued creates then go out as
+   * saves of it.
+   *
+   * Taken for another device's, it waited for a name this device held (see
+   * `waitForName`), and the queued create went out again: with an edit made
+   * since, as a conflict copy of the note for the whole team; renamed since,
+   * as a second note under the new name.
+   */
+  private adoptLandedCreates(listed: readonly ApiFile[]): void {
+    const recorded = new Set(
+      this.operationLog.listFileMeta(this.binding.id).map((meta) => meta.serverFileId),
+    );
+    for (const op of this.operationLog.dequeueOperations(this.binding.id)) {
+      if (op.opType !== 'CREATE') continue;
+      const hashes = sentHashes(op.payload);
+      if (hashes.length === 0) continue;
+      const sentAt = typeof op.payload[SENT_AT] === 'string' ? op.payload[SENT_AT] : op.filePath;
+      const f = listed.find((file) => file.path === sentAt && hashes.includes(file.contentHash));
+      if (f === undefined || recorded.has(f.id)) continue;
+      const local = op.filePath;
+      if (!this.isLocalName(local) || this.operationLog.getFileMeta(this.binding.id, local)) {
+        continue;
+      }
+      this.log.info('a create sent from here reached the server before its ack was lost', {
+        path: local,
+        sentAt,
+        fileId: f.id,
+      });
+      recorded.add(f.id);
+      // What it went out with is what the server seeded the file from: the
+      // base for the edits made since.
+      this.operationLog.setFileMeta({
+        bindingId: this.binding.id,
+        relativePath: local,
+        serverFileId: f.id,
+        contentHash: f.contentHash,
+        size: f.size,
+        fileType: f.fileType,
+        lastSyncedAt: Date.now(),
+        ...(f.fileType === 'TEXT' ? { foldedHash: f.contentHash } : {}),
+      });
+      if (local !== sentAt) {
+        this.operationLog.enqueueOperation(this.binding.id, {
+          opType: 'RENAME',
+          filePath: sentAt,
+          newPath: local,
+          payload: { fileId: f.id },
+        });
+      }
     }
   }
 
@@ -2196,16 +2302,30 @@ export class SyncEngine {
     }
     const fileType = classifyFileType(path);
     const change = this.hold(from, 'CREATE', path, null, { fileType });
-    const run = this.sendLocalCreate(path, fileType, change);
-    const tracked = run.then(
-      () => undefined,
-      () => undefined,
+    try {
+      await this.trackCreate(path, () => this.sendLocalCreate(path, fileType, change));
+    } finally {
+      this.settle(change);
+    }
+  }
+
+  /**
+   * Run a create of `path`, known in {@link creating} while it runs: a save,
+   * a create or a rename of the name meanwhile waits for it.
+   */
+  private async trackCreate(
+    path: string,
+    run: () => Promise<CreatedHere | null>,
+  ): Promise<CreatedHere | null> {
+    const task = run();
+    const tracked = task.then(
+      (created) => created,
+      () => null,
     );
     this.creating.set(path, tracked);
     try {
-      await run;
+      return await task;
     } finally {
-      this.settle(change);
       if (this.creating.get(path) === tracked) this.creating.delete(path);
     }
   }
@@ -2214,17 +2334,19 @@ export class SyncEngine {
     path: string,
     fileType: FileType,
     change: HeldChange | null,
-  ): Promise<void> {
+  ): Promise<CreatedHere | null> {
     // Stale-create guard: if the file isn't actually on disk anymore,
     // this event is leftover from an atomic-rename write (chokidar saw
     // the intermediate `add` but the file moved away again before we got
     // here). Emitting would upload empty bytes and tip the server into a
     // conflict-rename round-trip.
-    if (!(await this.vault.exists(path))) return;
+    if (!(await this.vault.exists(path))) return null;
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
     const payload = { fileType, contentHash: hash, size: buffer.byteLength };
     if (change) change.payload = payload;
+    /** Out to the server, answered or not: it may have applied it. */
+    let sent = false;
 
     // Join-window guard: between socket connect and the fileIndex refresh
     // the index can't tell a NEW file from a server-known one — emitting
@@ -2238,6 +2360,9 @@ export class SyncEngine {
         // Binary bytes are staged over REST; text rides inline (small).
         const data = await this.stageBinaryBlob(fileType, hash, buffer);
         this.throwIfStopped();
+        sent = true;
+        // Queued from here on, the entry says it went out (see `SENT_HASHES`).
+        if (change) change.payload = { ...payload, [SENT_HASHES]: [hash] };
         const ack = await this.emitCreate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
@@ -2255,7 +2380,7 @@ export class SyncEngine {
           // that follows would treat the file as new and try to BINARY-
           // download it (404), and the next CREATE pass on this path would
           // re-upload (creating server-side conflict-renamed copies).
-          await this.recordCreateAck(
+          const created = await this.recordCreateAck(
             path,
             (ack as { outcome?: unknown }).outcome,
             fileType,
@@ -2263,8 +2388,10 @@ export class SyncEngine {
             buffer.byteLength,
           );
           this.persistVectorClock();
-          return;
+          return created;
         }
+        // Refused: nothing of it is on the server.
+        sent = false;
       } catch {
         this.throwIfStopped();
         // Staging upload or emit failed (offline / server error) — fall through
@@ -2273,7 +2400,8 @@ export class SyncEngine {
       }
     }
     // Offline (or NACK) — queue and bail; the engine will replay on reconnect.
-    this.queue('CREATE', path, null, payload);
+    this.queue('CREATE', path, null, sent ? { ...payload, [SENT_HASHES]: [hash] } : payload);
+    return null;
   }
 
   /**
@@ -2287,6 +2415,17 @@ export class SyncEngine {
    * out again with the next save and the next connect's first upload, one more
    * conflict copy on the server each time, and the file the server has under
    * the name never came in.
+   *
+   * Two more cases. The note renamed right after it was created (see
+   * {@link renameAfterCreate}) is under its new name already: it is recorded
+   * at the conflict name, and its rename goes out from there. Recorded
+   * nowhere, it went out again as a second create under the new name. And the
+   * conflict name already recorded under this very id is the same create,
+   * applied before the ack of an earlier try was lost: the copy under the
+   * name asked for is a second copy of it, and goes (see
+   * {@link dropSecondCopy}). Left there, the name was never given to the file
+   * the server has under it, and after a restart that file took the copy for
+   * its own: its text was replaced by this note's for everyone.
    */
   private async recordCreateAck(
     path: string,
@@ -2294,18 +2433,39 @@ export class SyncEngine {
     fileType: FileType,
     contentHash: string,
     size: number,
-  ): Promise<void> {
+  ): Promise<CreatedHere | null> {
     const o = outcome as { fileId?: unknown; path?: unknown } | null | undefined;
     const fileId = typeof o?.fileId === 'string' ? o.fileId : '';
-    if (fileId === '') return;
+    if (fileId === '') return null;
     if (typeof o?.path === 'string' && o.path !== '') {
+      const merged = this.knownAsAnothers(fileId, o.path);
       await this.recordCreatedFile(fileId, o.path, fileType, contentHash, size);
-      return;
+      if (merged && this.fileIndex.byId.get(fileId)?.relativePath === o.path) {
+        await this.materializeMerged(fileId, o.path, fileType);
+      }
+      return { fileId, merged };
     }
     const conflict = conflictPlacement(outcome);
-    if (conflict === null || conflict.asked !== path || conflict.stored === path) return;
+    if (conflict === null || conflict.asked !== path || conflict.stored === path) return null;
     const stored = conflict.stored;
-    if (!this.allowServerPath(stored, 'create ack')) return;
+    if (!this.allowServerPath(stored, 'create ack')) return null;
+    if (this.fileIndex.byPath.get(stored)?.fileId === fileId) {
+      await this.dropSecondCopy(path, stored);
+      return { fileId, merged: false };
+    }
+    if (
+      this.renamedAfterCreate.has(path) &&
+      !this.fileIndex.byPath.has(stored) &&
+      !(await this.vault.exists(path))
+    ) {
+      this.log.info('own create stored under a conflict name; renamed here already', {
+        path,
+        stored,
+      });
+      await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
+      await this.releaseName(path);
+      return { fileId, merged: false };
+    }
     const moved = await this.withPathLocks([path, stored], () =>
       this.commitLocal(async (io) => {
         if (this.fileIndex.byPath.has(path) || this.fileIndex.byPath.has(stored)) return false;
@@ -2318,9 +2478,78 @@ export class SyncEngine {
         return true;
       }),
     );
-    if (!moved) return;
+    if (!moved) return null;
     await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
     await this.releaseName(path);
+    return { fileId, merged: false };
+  }
+
+  /**
+   * Whether the file `fileId` the server gave a create of this device's at
+   * `path` was another device's before: listed when this device connected, or
+   * broadcast as another device's create while this one was on its way (see
+   * {@link applyServerCreate}). The server answers a create of a name taken by
+   * a file with the same content with that file.
+   */
+  private knownAsAnothers(fileId: string, path: string): boolean {
+    if (this.lastListing.has(fileId)) return true;
+    const waiting = this.waitingForName.get(path);
+    return waiting?.kind === 'create' && waiting.fileId === fileId && waiting.foreign === true;
+  }
+
+  /**
+   * Another device's file the server gave back for a create of this device's
+   * with the same content (see {@link knownAsAnothers}), recorded at `path`:
+   * the copy here may have been renamed away meanwhile (see
+   * {@link renameAfterCreate}), and the file is then written out from the
+   * server — its broadcast and first update came while it was not recorded.
+   */
+  private async materializeMerged(fileId: string, path: string, fileType: FileType): Promise<void> {
+    if (await this.vault.exists(path)) return;
+    if (fileType === 'TEXT') {
+      this.skippedDocs.add(fileId);
+      this.scheduleSnapshotToDisk(path);
+      return;
+    }
+    await this.applyServerUpdateBinary(fileId);
+  }
+
+  /**
+   * A create sent again from `path` that the server stored at the conflict
+   * name `stored`, where this device already has the file: the same create,
+   * applied before an earlier ack was lost (see {@link recordCreateAck}). The
+   * copy under `path` goes when it holds what is at `stored` — or moves there
+   * when the copy at `stored` has not been written yet — and the name is free
+   * for the file the server has under it.
+   */
+  private async dropSecondCopy(path: string, stored: string): Promise<void> {
+    const freed = await this.withPathLocks([path, stored], () =>
+      this.commitLocal(async (io) => {
+        if (this.fileIndex.byPath.has(path)) return false;
+        if (!(await io.vault.exists(path))) return true;
+        const here = await this.hashFile(io.vault, path);
+        if (!(await io.vault.exists(stored))) {
+          this.log.info('own create applied before its ack was lost; moving the copy', {
+            path,
+            stored,
+          });
+          io.echo.mark(path, ECHO_COUNT_RENAME);
+          io.echo.mark(stored, ECHO_COUNT_RENAME);
+          await io.vault.ensureParentFolder(stored);
+          await this.renameOnDisk(io, path, stored);
+          return true;
+        }
+        if (here === null || here !== (await this.hashFile(io.vault, stored))) return false;
+        this.log.info('own create applied before its ack was lost; removing the second copy', {
+          path,
+          stored,
+        });
+        io.echo.mark(path, ECHO_COUNT_DELETE);
+        await io.vault.delete(path);
+        return true;
+      }),
+    );
+    if (freed) await this.releaseName(path);
   }
 
   /**
@@ -2343,6 +2572,10 @@ export class SyncEngine {
     // `state.json`, which every later disk write reads — so it passes the
     // same gate.
     if (!this.allowServerPath(path, 'create ack')) return;
+    // Its broadcast may have come first and been kept waiting (see
+    // `applyServerCreate`): it is this file, recorded now.
+    this.outOfScope.delete(fileId);
+    this.forgetWaiting(fileId);
     const meta: FileMeta & { fileId: string } = {
       bindingId: this.binding.id,
       relativePath: path,
@@ -2651,13 +2884,21 @@ export class SyncEngine {
     if (change) change.payload = deletePayload(fileId, meta);
     if (fileId) this.deletedIds.add(fileId);
     if (this.socket.isConnected() && fileId) {
-      const ack = await this.emitDelete({
-        projectId: this.binding.projectId,
-        clientId: this.clientId,
-        vectorClock: this.bumpClock(),
-        fileId,
-        filePath: path,
-      });
+      let ack: Ack;
+      try {
+        ack = await this.emitDelete({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          vectorClock: this.bumpClock(),
+          fileId,
+          filePath: path,
+        });
+      } catch {
+        // The connection dropped before the ack: queued below. A delete the
+        // server did apply is a delete of a tombstone when replayed.
+        this.throwIfStopped();
+        ack = { ok: false, error: 'disconnected' };
+      }
       this.throwIfStopped();
       if (ack.ok) {
         // Only what is still this file's: a note renamed onto the name here
@@ -2785,32 +3026,57 @@ export class SyncEngine {
    * old name back to disk.
    */
   private async renameAfterCreate(
-    created: Promise<void>,
+    created: Promise<CreatedHere | null>,
     oldPath: string,
     newPath: string,
   ): Promise<void> {
-    const run = (async (): Promise<void> => {
-      await created;
-      const meta = this.fileIndex.byPath.get(oldPath);
-      if (meta !== undefined) {
-        await this.renameRecorded(meta, oldPath, newPath);
-        return;
-      }
-      // Not created (queued offline, refused, found gone): the note is new
-      // under its new name, and the create queued under the old one finds
-      // nothing there.
-      await this.createLocal(newPath, 'watcher');
-    })();
-    const tracked = run.then(
-      () => undefined,
-      () => undefined,
-    );
-    this.creating.set(newPath, tracked);
+    this.renamedAfterCreate.add(oldPath);
     try {
-      await run;
+      await this.trackCreate(newPath, async (): Promise<CreatedHere | null> => {
+        const result = await created;
+        // By the id the create came back with, not by the name: another
+        // device's file may be indexed under the old name by now. Only a file
+        // this device made is renamed; one the server gave back for the same
+        // content (two empty "Untitled") keeps its name.
+        const meta =
+          result !== null && !result.merged ? this.fileIndex.byId.get(result.fileId) : undefined;
+        if (meta !== undefined) {
+          if (meta.relativePath !== newPath) {
+            await this.renameRecorded(meta, meta.relativePath, newPath);
+          }
+          return result;
+        }
+        // Queued after it went out, its ack lost: it may be on the server under
+        // the old name. The entry follows the note, and says where it went
+        // (see `adoptLandedCreates`).
+        if (result === null && this.followQueuedCreate(oldPath, newPath)) return null;
+        // Not created (queued offline, refused, found gone): the note is new
+        // under its new name, and the create queued under the old one finds
+        // nothing there.
+        await this.createLocal(newPath, 'watcher');
+        return null;
+      });
     } finally {
-      if (this.creating.get(newPath) === tracked) this.creating.delete(newPath);
+      this.renamedAfterCreate.delete(oldPath);
     }
+  }
+
+  /**
+   * A note renamed from `oldPath` to `newPath` whose create is queued after
+   * it went out (see {@link SENT_HASHES}): the entry moves to the new name
+   * and keeps the name it went out under. `false` when there is no such entry.
+   */
+  private followQueuedCreate(oldPath: string, newPath: string): boolean {
+    const entry = this.operationLog
+      .dequeueOperations(this.binding.id)
+      .filter((op) => op.opType === 'CREATE' && op.filePath === oldPath)
+      .pop();
+    if (entry === undefined || sentHashes(entry.payload).length === 0) return false;
+    const sentAt = typeof entry.payload[SENT_AT] === 'string' ? entry.payload[SENT_AT] : oldPath;
+    return this.operationLog.amendOperation(entry.id, {
+      filePath: newPath,
+      payload: { ...entry.payload, [SENT_AT]: sentAt },
+    });
   }
 
   /** {@link handleLocalRename} of a file this device has a record of: `target`. */
@@ -2847,18 +3113,25 @@ export class SyncEngine {
       // The history follows, under both names' locks.
       docMoved = this.moveRenamedDoc(target, oldPath, newPath);
       if (this.socket.isConnected()) {
-        const ack = await this.socket.emitFileRename({
-          projectId: this.binding.projectId,
-          clientId: this.clientId,
-          vectorClock: this.bumpClock(),
-          fileId,
-          filePath: oldPath,
-          newPath,
-        });
-        this.throwIfStopped();
-        if (ack.ok) {
-          this.persistVectorClock();
-          acked = { outcome: (ack as { outcome?: unknown }).outcome };
+        try {
+          const ack = await this.socket.emitFileRename({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            vectorClock: this.bumpClock(),
+            fileId,
+            filePath: oldPath,
+            newPath,
+          });
+          this.throwIfStopped();
+          if (ack.ok) {
+            this.persistVectorClock();
+            acked = { outcome: (ack as { outcome?: unknown }).outcome };
+          }
+        } catch {
+          // The connection dropped before the ack: queued, and the replay is a
+          // rename to where the server may have the file already — a no-op.
+          this.throwIfStopped();
+          this.log.debug('rename emit failed; queueing', { oldPath, newPath });
         }
       }
       if (acked === null) this.queue('RENAME', oldPath, newPath, { fileId });
@@ -2992,11 +3265,11 @@ export class SyncEngine {
     this.unwire(path);
     const off = this.docManager.onLocalUpdate(this.binding.id, path, (update) => {
       if (!this.socket.isConnected()) return; // y-indexeddb keeps it; reconnect resends.
-      void this.socket.emitYjsUpdate({
-        projectId: this.binding.projectId,
-        fileId,
-        update,
-      });
+      // Lost with the connection, the update is in y-indexeddb: the next
+      // catch-up pushes it back.
+      this.socket
+        .emitYjsUpdate({ projectId: this.binding.projectId, fileId, update })
+        .catch(() => undefined);
     });
     // Subscribing creates a doc not cached yet, and `onDocAcquired` wires it
     // right there, inside the call: that nested wiring goes, or every edit of
@@ -3289,14 +3562,22 @@ export class SyncEngine {
           )?.outcome;
           if (!outcome?.fileId || !outcome?.path) break;
           if (this.fileIndex.byId.has(outcome.fileId)) break;
-          await this.applyServerCreate({
-            id: outcome.fileId,
-            path: outcome.path,
-            // Server doesn't ship the file type; classify locally. Good
-            // enough for the markdown / text vs. binary split we care
-            // about here.
-            fileType: classifyFileType(outcome.path),
-          });
+          await this.applyServerCreate(
+            {
+              id: outcome.fileId,
+              path: outcome.path,
+              // Server doesn't ship the file type; classify locally. Good
+              // enough for the markdown / text vs. binary split we care
+              // about here.
+              fileType: classifyFileType(outcome.path),
+            },
+            // Another client's, or before this device sent a create of the
+            // name: not its own, which a server without `clientId` sends
+            // back too.
+            {
+              foreign: event.clientId !== undefined || !this.ownCreates.has(outcome.path),
+            },
+          );
           break;
         }
         case 'updated-binary':
@@ -3637,11 +3918,18 @@ export class SyncEngine {
     }
   }
 
-  private async applyServerCreate(payload: {
-    id: string;
-    path: string;
-    fileType: FileType;
-  }): Promise<void> {
+  /**
+   * `released`: the name was free when {@link releaseName} let the file in.
+   * `foreign`: see {@link WaitingForName}.
+   */
+  private async applyServerCreate(
+    payload: {
+      id: string;
+      path: string;
+      fileType: FileType;
+    },
+    opts: { released?: boolean; foreign?: boolean } = {},
+  ): Promise<void> {
     // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
     // (the stale-CREATE guard requires it). Reuse that entry — resetting
     // its contentHash/size to zero would break every downstream three-way
@@ -3658,6 +3946,32 @@ export class SyncEngine {
     // Mirror of the refreshFileIndex filter for live events: never
     // materialise a throw-away artifact another client uploaded.
     if (!this.allowServerPath(path, 'create')) return;
+    if (
+      !known &&
+      opts.released !== true &&
+      (this.creating.has(path) || this.ownCreates.has(path))
+    ) {
+      // This device is creating a file under the name, not recorded yet: its
+      // own create coming back from a server without `clientId`, or another
+      // device's the server applied first. Indexed now, it took the copy here
+      // for its own, and the first snapshot folded that copy into it — its
+      // text replaced for everyone. It waits for the create's ack: this
+      // device's file is recorded then, under the name or the conflict name
+      // the server gave it, and the name is let go (see `recordCreateAck`).
+      this.log.info('a file the server has under a name being created here waits for it', {
+        fileId: payload.id,
+        path,
+      });
+      this.outOfScope.set(payload.id, { path, fileType: payload.fileType });
+      this.waitingForName.set(path, {
+        kind: 'create',
+        fileId: payload.id,
+        path,
+        fileType: payload.fileType,
+        foreign: opts.foreign === true,
+      });
+      return;
+    }
     const holder = known ? undefined : this.nameHolder(path);
     if (holder !== undefined) {
       // Another file's copy is under the name here (see `waitForName`): taken
@@ -4238,7 +4552,10 @@ export class SyncEngine {
     if (this.fileIndex.byId.has(move.fileId) || !this.outOfScope.has(move.fileId)) return;
     this.log.info('a file moves into the name it waited for', move);
     this.outOfScope.delete(move.fileId);
-    await this.applyServerCreate({ id: move.fileId, path: move.path, fileType: move.fileType });
+    await this.applyServerCreate(
+      { id: move.fileId, path: move.path, fileType: move.fileType },
+      { released: true },
+    );
     if (move.fileType !== 'TEXT' || this.fileIndex.byId.get(move.fileId) === undefined) return;
     // Its content never reached this device — the catch-up, or the update
     // that follows a new note's broadcast, found it out of the index: pulled
@@ -5411,30 +5728,40 @@ export class SyncEngine {
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
           this.throwIfStopped();
-          const ack = await this.emitCreate({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            vectorClock: this.bumpClock(),
-            filePath: op.filePath,
-            fileType,
-            contentHash,
-            size: data.byteLength,
-            ...(inlineData !== undefined ? { data: inlineData } : {}),
-          });
-          this.throwIfStopped();
-          if (ack.ok) {
+          // Known in `creating` like a live create: a save or a rename of the
+          // note while this one waits for its ack waits for it. Taken for a
+          // note the server has never heard of, a save went out as a second
+          // create — a conflict copy for everyone — and a rename left the old
+          // name on the server.
+          const sent: { ack?: Ack } = {};
+          await this.trackCreate(op.filePath, async () => {
+            // Out from here, answered or not (see `SENT_HASHES`).
+            if (op.id !== undefined) this.noteCreateSent(op.id, op.payload, contentHash);
+            const ack = await this.emitCreate({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              vectorClock: this.bumpClock(),
+              filePath: op.filePath,
+              fileType,
+              contentHash,
+              size: data.byteLength,
+              ...(inlineData !== undefined ? { data: inlineData } : {}),
+            });
+            sent.ack = ack;
+            this.throwIfStopped();
+            if (!ack.ok) return null;
             // Keep `fileIndex` authoritative so the initial-push pass that
             // runs right after the drain skips this file instead of
             // re-uploading it.
-            await this.recordCreateAck(
+            return this.recordCreateAck(
               op.filePath,
               (ack as { outcome?: unknown }).outcome,
               fileType,
               contentHash,
               data.byteLength,
             );
-          }
-          return ackToOutcome(ack);
+          });
+          return ackToOutcome(sent.ack ?? { ok: false, error: 'no_ack' });
         }
         case 'UPDATE': {
           const fileId = queuedFileId(op.payload);
@@ -5587,6 +5914,15 @@ export class SyncEngine {
         error: err instanceof Error ? err.message : 'unknown',
       };
     }
+  }
+
+  /** Record in queued CREATE `opId` that it went out with `hash` (see {@link SENT_HASHES}). */
+  private noteCreateSent(opId: number, payload: Record<string, unknown>, hash: string): void {
+    const hashes = sentHashes(payload);
+    if (hashes.includes(hash)) return;
+    this.operationLog.amendOperation(opId, {
+      payload: { ...payload, [SENT_HASHES]: [...hashes, hash] },
+    });
   }
 
   /** Where file `fileId` is now, by the index; `queued` when it is not indexed. */
@@ -5821,6 +6157,13 @@ function lastSyncedHashes(payload: Record<string, unknown>): string[] | null {
   if (!Array.isArray(value) || value.length === 0) return null;
   const hashes = value.filter((hash): hash is string => typeof hash === 'string' && hash !== '');
   return hashes.length === value.length ? hashes : null;
+}
+
+/** The hashes a queued CREATE went out with (see {@link SENT_HASHES}); none when it did not. */
+function sentHashes(payload: Record<string, unknown>): string[] {
+  const value = payload[SENT_HASHES];
+  if (!Array.isArray(value)) return [];
+  return value.filter((hash): hash is string => typeof hash === 'string' && hash !== '');
 }
 
 /**
