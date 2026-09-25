@@ -17,8 +17,14 @@
  * longer project nothing new: attachments are checked against the listing
  * then, or a new one never came and an edit made offline went out over a
  * teammate's newer version.
+ *
+ * Also: a revival applied live while the device connected, or followed by
+ * enough attachment updates applied live, was forgotten and taken for one made
+ * while the device was away; each replayed update of an attachment downloaded
+ * the file again; and an attachment whose download failed never came.
  */
 import { sha256Hex } from '@/sync/hash';
+import { APPLIED_LIVE_MAX } from '@/sync/operation-log';
 import type { ServerOperation } from '@/client/socket';
 import {
   FOREIGN_DB,
@@ -28,6 +34,7 @@ import {
   buildHarness,
   bytes,
   connect,
+  deferred,
   encode,
   flushAsync,
   json,
@@ -390,6 +397,185 @@ describe.each(MATRIX)(
   },
 );
 
+/** The listing of the project's files, taken at each connect. */
+const LISTING = 'GET /api/projects/p1/files';
+
+/**
+ * {@link revivedLive}, applied while this device connects: after the server
+ * answered the join with its catch-up, before the listing came. The catch-up
+ * of that connect does not have the two operations, and the next one does.
+ * A server that gives the whole journal sends client ids and continues the
+ * note's history when it revives it.
+ */
+async function revivedWhileConnecting(): Promise<{
+  h: Harness;
+  server: FakeServer;
+  docs: ServerDocs;
+}> {
+  const { h, server, docs } = await withNotes('current', [['f4', 'U.md', 'old\n']]);
+  await drop(h);
+  const listing = h.routes.get(LISTING);
+  if (listing === undefined) throw new Error('no listing route');
+  const slow = deferred<void>();
+  h.routes.set(LISTING, () => slow.promise.then(() => listing()));
+  h.socket().connect();
+  await flushAsync();
+  h.socket()
+    .pending('project:join')
+    .ack(joinAck(docs, 'whole journal', server.catchupFor()));
+  await flushAsync(10);
+  server.teammateDelete('f4');
+  await flushAsync(20);
+  await server.teammateCreate('U.md', 'new\n');
+  await flushAsync(40);
+  h.routes.set(LISTING, listing);
+  slow.resolve();
+  await docs.drive();
+  expect(docs.live()).toEqual(['U.md=new\n']);
+  expect(disk(h)).toEqual(['U.md=new\n']);
+  // The next catch-up has them.
+  expect(server.catchupFor().map((o) => `${o.opType} ${o.filePath}`)).toEqual([
+    'DELETE U.md',
+    'CREATE U.md',
+  ]);
+  await drop(h);
+  return { h, server, docs };
+}
+
+describe('SyncEngine — a note deleted and created again while this device connects', () => {
+  it('merges an edit made offline since into the note', async () => {
+    const { h, server, docs } = await revivedWhileConnecting();
+    h.vault.files.set('U.md', encode('new\nmine\n'));
+    await event(h, 'modify', 'U.md');
+
+    await reconnect(h, server, docs, 'whole journal');
+
+    expect(docs.live()).toEqual(['U.md=new\nmine\n']);
+    expect(disk(h)).toEqual(['U.md=new\nmine\n']);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('sends a rename made offline since', async () => {
+    const { h, server, docs } = await revivedWhileConnecting();
+    await userRename(h, 'U.md', 'T.md');
+
+    await reconnect(h, server, docs, 'whole journal');
+
+    expect(docs.live()).toEqual(['T.md=new\n']);
+    expect(disk(h)).toEqual(['T.md=new\n']);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('sends a delete made offline since', async () => {
+    const { h, server, docs } = await revivedWhileConnecting();
+    h.vault.files.delete('U.md');
+    await event(h, 'delete', 'U.md');
+
+    await reconnect(h, server, docs, 'whole journal');
+
+    expect(server.pathOf('f4')).toBeNull();
+    expect(disk(h)).toEqual([]);
+    await h.engine.stop();
+  });
+});
+
+describe.each(['current', 'legacy'] as const)(
+  'SyncEngine — attachment updates applied live after a note deleted and created again, %s broadcasts',
+  (format) => {
+    it('do not push the note’s revival out of what the device remembers', async () => {
+      const h = buildHarness();
+      const server = new FakeServer(h, format);
+      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+      await remember(h, 'U.md', 'f4', 'old\n');
+      await docs.add('f4', 'U.md', 'old\n');
+      const v0 = encode('v0');
+      let served = v0;
+      h.routes.set('GET /api/projects/p1/files/i1', () => bytes(served));
+      server.add({
+        id: 'i1',
+        path: 'board.png',
+        fileType: 'BINARY',
+        contentHash: await sha256Hex(v0),
+        size: v0.byteLength,
+      });
+      h.vault.files.set('board.png', v0);
+      h.log.setFileMeta({
+        bindingId: 'b1',
+        relativePath: 'board.png',
+        serverFileId: 'i1',
+        contentHash: await sha256Hex(v0),
+        size: v0.byteLength,
+        fileType: 'BINARY',
+        lastSyncedAt: 1,
+      });
+      await connect(h, { yjsDocs: docs.snapshots() });
+      await docs.drive();
+
+      server.teammateDelete('f4');
+      await flushAsync(40);
+      await server.teammateCreate('U.md', 'new\n');
+      await docs.drive();
+      // Other operations applied live since: the list is nearly full.
+      for (let i = 1; i <= APPLIED_LIVE_MAX - 3; i++) h.log.noteAppliedLive('b1', `later-${i}`);
+      // A teammate saves a canvas, again and again.
+      for (let i = 1; i <= 3; i++) {
+        served = encode(`board v${i}`);
+        await server.teammateUpdate('i1', served);
+        await flushAsync(40);
+      }
+      expect(h.vault.text('board.png')).toBe('board v3');
+
+      await drop(h);
+      h.vault.files.set('U.md', encode('new\nmine\n'));
+      await event(h, 'modify', 'U.md');
+      await reconnect(h, server, docs, 'whole journal');
+
+      expect(docs.live()).toEqual(['U.md=new\nmine\n', 'board.png=?']);
+      expect(disk(h)).toEqual(['U.md=new\nmine\n', 'board.png=board v3']);
+      expect(h.socket().created()).toEqual([]);
+      await h.engine.stop();
+    });
+  },
+);
+
+describe.each(MATRIX)(
+  'SyncEngine — an attachment a teammate saved again and again, replayed, %s broadcasts, %s',
+  (format, form) => {
+    it.each([
+      ['applied live', 0],
+      ['made while this device was away', 1],
+    ] as const)('is downloaded as often as it is new here (%s: %i)', async (when, downloads) => {
+      const { h, server, docs } = await withNotes(format, [['f1', 'a.md', 'A\n']]);
+      let served = encode('board v0');
+      h.routes.set('GET /api/projects/p1/files/s1', () => bytes(served));
+      expect(await server.teammateUpload('board.canvas', served)).toBe('s1');
+      await flushAsync(40);
+      expect(h.vault.text('board.canvas')).toBe('board v0');
+      const fetched = (): number =>
+        h.requests.filter((r) => r.path === '/api/projects/p1/files/s1').length;
+
+      if (when === 'made while this device was away') await drop(h);
+      for (let i = 1; i <= 4; i++) {
+        served = encode(`board v${i}`);
+        await server.teammateUpdate('s1', served);
+        await flushAsync(40);
+      }
+      if (when === 'applied live') await drop(h);
+      const before = fetched();
+
+      expect(server.catchupFor().filter((o) => o.opType === 'UPDATE')).toHaveLength(4);
+      await reconnect(h, server, docs, form);
+
+      expect(fetched() - before).toBe(downloads);
+      expect(h.vault.text('board.canvas')).toBe('board v4');
+      expect(modals(h)).toEqual([]);
+      await h.engine.stop();
+    });
+  },
+);
+
 describe('SyncEngine — what a catch-up replays for files already in sync', () => {
   it('opens no doc for the CREATE of a note whose disk matches the server', async () => {
     const idb = new FakeIndexedDb();
@@ -496,6 +682,113 @@ describe.each(['current', 'legacy'] as const)(
 
       expect(h.vault.text('pic.png')).toBe('their picture');
       expect(h.socket().created()).toEqual([]);
+      await h.engine.stop();
+    });
+
+    it.each(['a reconnect', 'a restart'] as const)(
+      'downloads it after %s when the download failed at the connect before',
+      async (then) => {
+        const { h, server, docs } = await withNotes(format, [['f1', 'a.md', 'A\n']]);
+        await drop(h);
+        const pic = encode('their picture');
+        let down = true;
+        const serve = (): ReturnType<typeof bytes> =>
+          down ? json({ error: 'bad gateway' }, 502) : bytes(pic);
+        h.routes.set('GET /api/projects/p1/files/s1', serve);
+        expect(await server.teammateUpload('pic.png', pic)).toBe('s1');
+
+        h.socket().connect();
+        await flushAsync();
+        h.socket()
+          .pending('project:join')
+          .ack(joinAck(docs, 'first rows', []));
+        await docs.drive();
+        expect(h.vault.text('pic.png')).toBeNull();
+        // Recorded from the listing all the same.
+        expect(h.log.getFileMeta('b1', 'pic.png')?.serverFileId).toBe('s1');
+
+        down = false;
+        let next = h;
+        if (then === 'a reconnect') {
+          await drop(h);
+          h.socket().connect();
+          await flushAsync();
+          h.socket()
+            .pending('project:join')
+            .ack(joinAck(docs, 'first rows', []));
+          await docs.drive();
+        } else {
+          await h.engine.stop();
+          next = buildHarness({ predecessor: h });
+          next.routes.set('GET /api/projects/p1/files/s1', serve);
+          server.attach(next);
+          docs.attach(next);
+          await connect(next, { yjsDocs: docs.snapshots() });
+          await docs.drive();
+        }
+
+        expect(next.vault.text('pic.png')).toBe('their picture');
+        expect(next.socket().created()).toEqual([]);
+        await next.engine.stop();
+      },
+    );
+
+    it('downloads one an older version recorded without downloading it', async () => {
+      const h = buildHarness();
+      const server = new FakeServer(h, format);
+      const docs = new ServerDocs(server, h);
+      const pic = encode('their picture');
+      h.routes.set('GET /api/projects/p1/files/i9', () => bytes(pic));
+      const hash = await sha256Hex(pic);
+      server.add({ id: 'i9', path: 'pic.png', fileType: 'BINARY', contentHash: hash, size: 13 });
+      // 0.3.7 indexed it from the listing and never got its CREATE.
+      h.log.setFileMeta({
+        bindingId: 'b1',
+        relativePath: 'pic.png',
+        serverFileId: 'i9',
+        contentHash: hash,
+        size: 13,
+        fileType: 'BINARY',
+        lastSyncedAt: 1,
+      });
+
+      await connect(h);
+      await docs.drive();
+
+      expect(h.vault.text('pic.png')).toBe('their picture');
+      expect(h.socket().created()).toEqual([]);
+      await h.engine.stop();
+    });
+
+    it('does not bring back one a teammate deleted while the others came down', async () => {
+      const { h, server, docs } = await withNotes(format, [['f1', 'a.md', 'A\n']]);
+      await drop(h);
+      const one = encode('one');
+      const two = encode('two');
+      const slow = deferred<void>();
+      const first = await server.teammateUpload('one.png', one);
+      const second = await server.teammateUpload('two.png', two);
+      h.routes.set(`GET /api/projects/p1/files/${first}`, () =>
+        slow.promise.then(() => bytes(one)),
+      );
+      h.routes.set(`GET /api/projects/p1/files/${second}`, () => bytes(two));
+
+      h.socket().connect();
+      await flushAsync();
+      h.socket()
+        .pending('project:join')
+        .ack(joinAck(docs, 'first rows', []));
+      await flushAsync(40);
+      // `one.png` is on its way down; the teammate deletes `two.png` meanwhile.
+      server.teammateDelete(second);
+      await flushAsync(40);
+      slow.resolve();
+      await docs.drive();
+
+      expect(h.vault.text('one.png')).toBe('one');
+      expect(h.vault.text('two.png')).toBeNull();
+      expect(h.requests.filter((r) => r.path === `/api/projects/p1/files/${second}`)).toEqual([]);
+      expect(h.engine.getFileIdForPath('two.png')).toBeNull();
       await h.engine.stop();
     });
 

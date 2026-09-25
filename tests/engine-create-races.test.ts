@@ -1,8 +1,9 @@
 /**
  * Creates of this device's that meet another file on the way: a save or a
  * rename while a create replayed from the offline queue waits for its ack, a
- * teammate's create of the same name the server applies first, and a note
- * renamed right after its create when a teammate took its name meanwhile.
+ * teammate's create of the same name the server applies first, a note renamed
+ * right after its create when a teammate took its name meanwhile, and one
+ * made under the name of a note deleted since the connect.
  *
  * Before: the save and the rename found no record of the replayed note and
  * went out as a second create (a conflict copy, or the note under both names,
@@ -35,6 +36,22 @@ function records(h: Harness): string[] {
     .listFileMeta('b1')
     .map((m) => `${m.serverFileId}:${m.relativePath}`)
     .sort();
+}
+
+/** A note on disk and in `state.json` as last synced. */
+async function remember(h: Harness, path: string, fileId: string, text: string): Promise<void> {
+  const hash = await sha256Hex(text);
+  h.vault.files.set(path, encode(text));
+  h.log.setFileMeta({
+    bindingId: 'b1',
+    relativePath: path,
+    serverFileId: fileId,
+    contentHash: hash,
+    size: encode(text).byteLength,
+    fileType: 'TEXT',
+    lastSyncedAt: 1,
+    foldedHash: hash,
+  });
 }
 
 /** Every live file on the server as `id:path`. */
@@ -277,6 +294,88 @@ describe('SyncEngine — a note renamed right after its create, a teammate made 
     await h.engine.stop();
   });
 });
+
+/**
+ * A note listed at the connect and deleted since, here or by a teammate; a new
+ * note made under its name and renamed right away (Templater). The server
+ * brings the tombstone back under its old id for the create: the note is this
+ * device's new one. Taken for the listed note, another device's, it went out a
+ * second time under the new name, and the old name was written back to disk:
+ * the team got the note twice.
+ */
+describe.each(['current', 'legacy'] as const)(
+  'SyncEngine — a note renamed right after its create, under the name of a note deleted since the connect, %s broadcasts',
+  (format) => {
+    it.each(['here', 'here, offline before the connect', 'by a teammate'] as const)(
+      'goes out as the rename of the note the server brought back (deleted %s)',
+      async (by) => {
+        const h = buildHarness();
+        const server = new FakeServer(h, format);
+        const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+        await remember(h, 'Untitled.md', 'f1', 'scratch\n');
+        await docs.add('f1', 'Untitled.md', 'scratch\n');
+        await connect(h, { yjsDocs: docs.snapshots() });
+        await docs.drive();
+
+        if (by !== 'by a teammate') {
+          const offline = by === 'here, offline before the connect';
+          if (offline) {
+            h.socket().disconnect();
+            await flushAsync();
+          }
+          h.vault.files.delete('Untitled.md');
+          const deleted = h.engine.handleVaultEvent({
+            bindingId: 'b1',
+            type: 'delete',
+            path: 'Untitled.md',
+            source: 'obsidian',
+          });
+          await docs.drive();
+          await deleted;
+          if (offline) {
+            // The listing has the note; the queue sends its delete.
+            h.socket().connect();
+            await flushAsync();
+            h.socket()
+              .pending('project:join')
+              .ack({ ok: true, operations: server.catchupFor(), yjsDocs: docs.snapshots() });
+            await docs.drive();
+          }
+        } else {
+          server.teammateDelete('f1');
+          await flushAsync(40);
+        }
+        expect(disk(h)).toEqual([]);
+
+        h.vault.files.set('Untitled.md', encode('# Meeting\n'));
+        const created = create(h, 'Untitled.md');
+        await flushAsync(3);
+        await h.vault.rename('Untitled.md', 'Meeting.md');
+        await flushAsync(3);
+        await docs.drive();
+        await created;
+        await h.settle();
+        await docs.drive();
+
+        expect(server.applied).toEqual([
+          'delete f1',
+          'create Untitled.md',
+          'f1 Untitled.md -> Meeting.md',
+        ]);
+        expect(docs.live()).toEqual(['Meeting.md=# Meeting\n']);
+        expect(disk(h)).toEqual(['Meeting.md=# Meeting\n']);
+
+        const next = await restart(h, server, docs);
+        expect(next.socket().created()).toEqual([]);
+        expect(docs.live()).toEqual(['Meeting.md=# Meeting\n']);
+        expect(disk(next)).toEqual(['Meeting.md=# Meeting\n']);
+        await next.engine.stop();
+      },
+      // A connect, a create and a restart, each driven to the end.
+      60_000,
+    );
+  },
+);
 
 describe.each(['current', 'legacy'] as const)(
   'SyncEngine — Restore on server for a note a teammate deleted while this device was away, %s broadcasts',

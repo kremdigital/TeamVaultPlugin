@@ -221,7 +221,7 @@ interface CreatedHere {
 
 /** What {@link SyncEngine.applyServerOperation} knows of the whole catch-up. */
 interface Catchup {
-  /** Renames and moves a later one of the same file in the catch-up supersedes. */
+  /** Renames, moves and updates a later one of the same file in the catch-up supersedes. */
   superseded: ReadonlySet<ServerOperation>;
   /** File id → every path the catch-up's renames and moves of it start from. */
   renamedFrom: ReadonlyMap<string, ReadonlySet<string>>;
@@ -476,6 +476,14 @@ export class SyncEngine {
 
   /** The listing of this connect's index refresh, by id. */
   private lastListing = new Map<string, ApiFile>();
+
+  /**
+   * Files of {@link lastListing} deleted since it was taken, by id: here (the
+   * delete sent, or queued before the listing) or on the server. A create of
+   * this device's the server answers with one of them brought its tombstone
+   * back: the file is this device's new one (see {@link knownAsAnothers}).
+   */
+  private readonly deletedSinceListing = new Set<string>();
 
   /**
    * Notes whose history here has been checked against the server's in this
@@ -901,6 +909,10 @@ export class SyncEngine {
       // observe the emit immediately and the server starts streaming ASAP;
       // refresh the file index in parallel. `streamYjs: true` asks the server
       // to deliver the catch-up as batched `yjs:catchup` events.
+      //
+      // Operations applied live before this join: the server's catch-up comes
+      // after each of them (see `forgetAppliedLive` below).
+      const liveBeforeJoin = this.operationLog.appliedLiveIds(this.binding.id);
       const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
@@ -932,7 +944,7 @@ export class SyncEngine {
 
       // Apply server-side operations the client missed.
       const catchup: Catchup = {
-        superseded: supersededRenames(result.operations),
+        superseded: supersededOps(result.operations),
         renamedFrom: renameSources(result.operations),
         appliedLive,
       };
@@ -988,10 +1000,16 @@ export class SyncEngine {
 
       this.persistVectorClock();
       // What the clock took in, no catch-up returns again: the operations this
-      // one returned, and after a whole one, every operation it did not.
+      // one returned, and after a whole one, every operation applied live
+      // before the join — the server's catch-up came after them. Not one
+      // applied live since, while the join and the listing were on their way:
+      // the server may have made it after its catch-up, and the next one
+      // returns it. Forgotten, it was taken for one made while this device was
+      // away (a note deleted and made again: an edit made to it offline went
+      // into a conflict copy, a rename or delete of it was not sent).
       const seen = new Set(result.operations.map((op) => op.id));
       if (result.operationsCatchup === OPERATIONS_CATCHUP && result.operationsTruncated !== true) {
-        for (const id of appliedLive) seen.add(id);
+        for (const id of liveBeforeJoin) seen.add(id);
       }
       this.operationLog.forgetAppliedLive(this.binding.id, seen);
       this.setStatus('connected');
@@ -1635,6 +1653,7 @@ export class SyncEngine {
     // A listing that lands after `stop()` must not rewrite the log's file meta.
     this.throwIfStopped();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
+    this.deletedSinceListing.clear();
     // Before anything reads the queue: a create that reached the server
     // without its ack is this device's file.
     this.adoptLandedCreates(listed);
@@ -1649,6 +1668,7 @@ export class SyncEngine {
     // listing was taken. Indexed again from it, the note was written back to
     // disk by the catch-up, and stayed there, never synced again.
     for (const fileId of this.deletedIds) if (!deletesBefore.has(fileId)) deletedHere.add(fileId);
+    for (const fileId of deletedHere) this.deletedSinceListing.add(fileId);
     const files = listed.filter((f) => !deletedHere.has(f.id));
     // Renamed here while offline: the queue is what says where these are.
     const here = this.queuedRenames(deletedHere);
@@ -2749,9 +2769,16 @@ export class SyncEngine {
    * broadcast as another device's create while this one was on its way (see
    * {@link applyServerCreate}). The server answers a create of a name taken by
    * a file with the same content with that file.
+   *
+   * Not a listed file deleted since (see {@link deletedSinceListing}): the
+   * server brings a tombstone back under its old id for a create of its name,
+   * and the file is this device's new one. Taken for another device's, a note
+   * renamed right after it was created here ("Untitled" deleted, made again,
+   * renamed by a template) went out a second time under its new name, and the
+   * old name was written back to disk: the team got the note twice.
    */
   private knownAsAnothers(fileId: string, path: string): boolean {
-    if (this.lastListing.has(fileId)) return true;
+    if (this.lastListing.has(fileId) && !this.deletedSinceListing.has(fileId)) return true;
     const waiting = this.waitingForName.get(path);
     return waiting?.kind === 'create' && waiting.fileId === fileId && waiting.foreign === true;
   }
@@ -3149,7 +3176,10 @@ export class SyncEngine {
       this.throwIfStopped();
     }
     if (change) change.payload = deletePayload(fileId, meta);
-    if (fileId) this.deletedIds.add(fileId);
+    if (fileId) {
+      this.deletedIds.add(fileId);
+      this.deletedSinceListing.add(fileId);
+    }
     if (this.socket.isConnected() && fileId) {
       let ack: Ack;
       try {
@@ -3859,8 +3889,15 @@ export class SyncEngine {
    * `OperationLog.noteAppliedLive`): the next catch-up returns its operation
    * again, and it is not taken for one that happened while this device was
    * away (see {@link applyServerOperation} and {@link notesRecreated}).
+   *
+   * Only the operations the catch-up looks up so: creates, renames and moves.
+   * An attachment update replayed finds its version synced here by its hash,
+   * and a delete replayed finds nothing to delete. Remembered all the same,
+   * the updates of an attachment a teammate kept saving (a canvas, by the
+   * hundred a day) pushed the rest out of the list (see `APPLIED_LIVE_MAX`).
    */
   private noteAppliedLive(event: SocketFileEvent): void {
+    if (event.type !== 'created' && event.type !== 'renamed' && event.type !== 'moved') return;
     const log = event.log as Partial<ServerLogEntry> | undefined;
     if (typeof log?.id !== 'string' || log.id === '') return;
     this.operationLog.noteAppliedLive(this.binding.id, log.id);
@@ -4213,6 +4250,9 @@ export class SyncEngine {
         // compared over the merge of the doc — a "content conflict" whose
         // every answer did worse than the merge.
         if (meta.fileType === 'TEXT') break;
+        // A later update of the file in this catch-up brings what the server
+        // has now; this one's version is gone (see `supersededOps`).
+        if (catchup.superseded.has(op)) break;
         await this.applyServerUpdateBinary(
           fileId,
           typeof payload.contentHash === 'string' ? payload.contentHash : undefined,
@@ -4288,27 +4328,31 @@ export class SyncEngine {
    * to its newest operations. An attachment reaches this device only through
    * its CREATE or UPDATE — neither the listing nor the docs carry its bytes.
    *
-   * One new to this device (see {@link newHere}) and missing here is
-   * downloaded: its CREATE was left out, and it never came. One the server
-   * has changed since this device synced it goes through the update of its
-   * new version (see {@link applyServerUpdateBinary}): with an edit made
-   * here meanwhile, the user is asked. Left to the queue, that edit went out
-   * over the teammate's version, which was lost for everyone.
+   * One missing here is downloaded: its CREATE was left out, and it never
+   * came. Not only one new to this device (see {@link newHere}): the index
+   * refresh records a listed file at once, so one whose download failed (a
+   * server error, the connection lost, Pause) was not new at the next
+   * connect and never came — nor did one an older version recorded without
+   * downloading it. One the server has changed since this device synced it
+   * goes through the update of its new version (see
+   * {@link applyServerUpdateBinary}): with an edit made here meanwhile, the
+   * user is asked. Left to the queue, that edit went out over the teammate's
+   * version, which was lost for everyone.
    */
   private async reconcileAttachments(): Promise<void> {
     for (const meta of [...this.fileIndex.byId.values()]) {
       if (meta.fileType !== 'BINARY') continue;
       const listed = this.lastListing.get(meta.fileId);
       if (listed === undefined) continue;
+      // Deleted since the pass began: not brought back.
+      if (this.fileIndex.byId.get(meta.fileId) !== meta) continue;
       try {
         if (!(await this.vault.exists(meta.relativePath))) {
-          if (this.newHere.has(meta.fileId)) {
-            await this.applyServerCreate({
-              id: meta.fileId,
-              path: meta.relativePath,
-              fileType: 'BINARY',
-            });
-          }
+          await this.applyServerCreate({
+            id: meta.fileId,
+            path: meta.relativePath,
+            fileType: 'BINARY',
+          });
         } else if (listed.contentHash !== meta.contentHash) {
           await this.applyServerUpdateBinary(meta.fileId, listed.contentHash);
         }
@@ -4626,6 +4670,7 @@ export class SyncEngine {
 
   private async applyServerDelete(fileId: string): Promise<void> {
     this.forgetWaiting(fileId);
+    this.deletedSinceListing.add(fileId);
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
     const holder = this.fileIndex.byPath.get(meta.relativePath);
@@ -6719,24 +6764,37 @@ function renameSources(ops: readonly ServerOperation[]): Map<string, Set<string>
 }
 
 /**
- * The renames and moves of a catch-up that a later one of the same file
- * supersedes. The operations come in the order the server applied them.
+ * The operations of a catch-up that a later one of the same kind of the same
+ * file supersedes: renames and moves, and updates. The operations come in the
+ * order the server applied them.
+ *
+ * An update superseded so brought a version the server no longer has: its
+ * download fetches the file as it is now, the bytes the last update brings.
+ * Downloaded for each, an attachment a teammate saved ten times was fetched
+ * nine times at the next connect, the same bytes each time — also when this
+ * device had them already, from the saves it applied live.
  */
-function supersededRenames(ops: readonly ServerOperation[]): Set<ServerOperation> {
-  const fileIdOf = (op: ServerOperation): string | null => {
-    if (op.opType !== 'RENAME' && op.opType !== 'MOVE') return null;
+function supersededOps(ops: readonly ServerOperation[]): Set<ServerOperation> {
+  const keyOf = (op: ServerOperation): string | null => {
+    const kind =
+      op.opType === 'RENAME' || op.opType === 'MOVE'
+        ? 'move'
+        : op.opType === 'UPDATE'
+          ? 'update'
+          : null;
+    if (kind === null) return null;
     const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
-    return typeof fileId === 'string' && fileId !== '' ? fileId : null;
+    return typeof fileId === 'string' && fileId !== '' ? `${kind}:${fileId}` : null;
   };
   const last = new Map<string, ServerOperation>();
   for (const op of ops) {
-    const fileId = fileIdOf(op);
-    if (fileId !== null) last.set(fileId, op);
+    const key = keyOf(op);
+    if (key !== null) last.set(key, op);
   }
   const superseded = new Set<ServerOperation>();
   for (const op of ops) {
-    const fileId = fileIdOf(op);
-    if (fileId !== null && last.get(fileId) !== op) superseded.add(op);
+    const key = keyOf(op);
+    if (key !== null && last.get(key) !== op) superseded.add(op);
   }
   return superseded;
 }
