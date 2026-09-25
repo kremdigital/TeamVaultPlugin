@@ -542,6 +542,40 @@ describe('SyncEngine — the lineage check leaves the normal flows alone', () =>
     await h.engine.stop();
   });
 
+  it('a note deleted and created again under its name while this device is online', async () => {
+    const idb = new FakeIndexedDb();
+    const h = buildHarness({ docs: idb.manager() });
+    const old = serverDocWith('old text\n');
+    await remember(h, 'a.md', 'f1', 'old text\n', 'old text\nedit\n');
+    h.serverFiles = [serverFile('f1', 'a.md', 'TEXT', await sha256Hex('old text\n'), 9)];
+    await connect(h, { yjsDocs: [snapshotOf(old, 'f1')] });
+    await flushAsync(40);
+    applySent(h, old, 'f1');
+    expect(old.getText('content').toJSON()).toBe('old text\nedit\n');
+    const mark = h.socket().emits.length;
+
+    // Deleted, then revived under the same id with a history of its own.
+    h.socket().fire('file:deleted', { fileId: 'f1', log: eventLog });
+    await flushAsync(20);
+    const revived = serverDocWith('new note\n');
+    h.socket().fire('file:created', {
+      result: { outcome: { fileId: 'f1', path: 'a.md' } },
+      log: eventLog,
+    });
+    await flushAsync(20);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(revived)),
+    });
+    await flushAsync(40);
+    applySent(h, revived, 'f1', mark);
+
+    expect(revived.getText('content').toJSON()).toBe('new note\n');
+    expect(h.vault.text('a.md')).toBe('new note\n');
+    expect(conflictCopies(h)).toEqual([]);
+    await h.engine.stop();
+  });
+
   it('a server that collected garbage since', async () => {
     const idb = new FakeIndexedDb();
     const d0 = serverDocWith('A\nB\nC\n');
