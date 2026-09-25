@@ -296,6 +296,14 @@ export class SyncEngine {
   private readonly movedAway = new Map<string, string>();
 
   /**
+   * Copies of files deleted while this device was away that `initialPush`
+   * has not settled yet — checked, removed, or asked about: path → the
+   * deleted file's id. A file created again under such a name keeps the copy
+   * aside first (see {@link applyServerCreate}).
+   */
+  private readonly awayCopies = new Map<string, string>();
+
+  /**
    * Files renamed while this device was away whose rename the last file index
    * refresh could not apply — see `applyRenamesWhileAway`. By id; the catch-up
    * leaves their RENAME alone until the next connect.
@@ -1140,8 +1148,50 @@ export class SyncEngine {
       this.log.debug('initialPush: tombstone lookup failed; deferring upload pass');
       return;
     }
-    const tombstoned = tombstones.paths;
     const deletedAway = this.deletedWhileAway(tombstones.ids, pending);
+    // Copies the server had go first, without a question — before anything
+    // here waits: the list is not looked at again. Acted on after the uploads
+    // and a question about another copy, it deleted a note created again
+    // under the name meanwhile, and the first snapshot of that note had
+    // folded the stale copy into it.
+    const asks: Array<{ record: FileMeta; serverHash: string }> = [];
+    for (const [path, away] of deletedAway) this.awayCopies.set(path, away.record.serverFileId);
+    try {
+      for (const away of deletedAway.values()) {
+        this.throwIfStopped();
+        try {
+          if ((await this.dropDeletedWhileAway(away.record, away.serverHash, false)) === 'ask') {
+            asks.push(away);
+          }
+        } catch {
+          this.throwIfStopped();
+          // Left as it is: the next connect finds the record again.
+        }
+      }
+      await this.uploadNewFiles(paths, pending, tombstones.paths, deletedAway);
+      for (const away of asks) {
+        this.throwIfStopped();
+        try {
+          await this.dropDeletedWhileAway(away.record, away.serverHash, true);
+        } catch {
+          this.throwIfStopped();
+          // Left as it is: the next connect finds the record again.
+        }
+      }
+    } finally {
+      for (const [path, away] of deletedAway) {
+        if (this.awayCopies.get(path) === away.record.serverFileId) this.awayCopies.delete(path);
+      }
+    }
+  }
+
+  /** The upload pass of {@link initialPush}. */
+  private async uploadNewFiles(
+    paths: readonly string[],
+    pending: ReadonlySet<string>,
+    tombstoned: ReadonlySet<string>,
+    deletedAway: ReadonlyMap<string, unknown>,
+  ): Promise<void> {
     for (const path of paths) {
       this.throwIfStopped();
       // Watcher events are filtered upstream, but this pass walks the raw
@@ -1150,8 +1200,8 @@ export class SyncEngine {
       if (this.isIgnoredLocalPath(path)) continue;
       if (this.fileIndex.byPath.has(path)) continue;
       if (pending.has(path)) continue;
-      // Deleted on the server while this device was away: removed below, not
-      // uploaded again.
+      // Deleted on the server while this device was away: removed, or asked
+      // about, not uploaded again.
       if (deletedAway.has(path)) continue;
       if (tombstoned.has(path) && !this.freedHere.has(path)) {
         this.log.debug('initialPush: skipping server-tombstoned path', path);
@@ -1163,15 +1213,6 @@ export class SyncEngine {
         this.throwIfStopped();
         // Per-file failures are swallowed — the watcher / next reconnect
         // will surface them again.
-      }
-    }
-    for (const away of deletedAway.values()) {
-      this.throwIfStopped();
-      try {
-        await this.dropDeletedWhileAway(away.record, away.serverHash);
-      } catch {
-        this.throwIfStopped();
-        // Left as it is: the next connect finds the record again.
       }
     }
   }
@@ -1217,22 +1258,30 @@ export class SyncEngine {
    * edited on this device differs from it for good, and every such note a
    * teammate deleted meanwhile used to ask, one dialog after another, about
    * edits the server had long had.
+   *
+   * `ask: false` leaves a copy the user must be asked about as it is and
+   * returns `'ask'`. A file indexed under the copy's name or id since owns
+   * the copy (see `dropLocalCopy`).
    */
-  private async dropDeletedWhileAway(record: FileMeta, serverHash: string): Promise<void> {
+  private async dropDeletedWhileAway(
+    record: FileMeta,
+    serverHash: string,
+    ask: boolean,
+  ): Promise<'done' | 'ask'> {
     const path = record.relativePath;
-    this.log.info('removing the local copy of a file deleted while this device was away', {
-      path,
-    });
-    const localHash = await this.hashFile(this.vault, path);
-    const serverHad =
-      localHash !== null &&
-      localHash !== record.contentHash &&
-      (localHash === serverHash ||
-        (record.fileType === 'TEXT' &&
-          (await this.serverHadVersion(record.serverFileId, localHash))));
-    await this.dropLocalCopy({ ...record, fileId: record.serverFileId }, null, {
+    if (ask) {
+      this.log.info('asking about the copy of a file deleted while this device was away', { path });
+    } else {
+      this.log.info('removing the local copy of a file deleted while this device was away', {
+        path,
+      });
+    }
+    const serverHad = await this.serverHadCopy(record, serverHash);
+    return this.dropLocalCopy({ ...record, fileId: record.serverFileId }, null, {
       pushedBack: false,
-      ...(serverHad ? { serverHad: localHash } : {}),
+      ask,
+      away: true,
+      ...(serverHad !== null ? { serverHad } : {}),
     });
   }
 
@@ -3081,14 +3130,28 @@ export class SyncEngine {
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(payload.id, meta);
 
+    // The copy of a file deleted while away, which the user is being asked
+    // about, is on disk under this name: kept aside first. Taken for this
+    // file's, a note's first snapshot folded it in without a base — its text
+    // over the new note's, for everyone — and a binary counted it as synced.
+    // Under the path's lock, taken now: the snapshot of the note's first
+    // update waits for it.
+    const setAside =
+      !known && this.awayCopies.has(path)
+        ? this.withPathLock(path, () => this.keepAwayCopyAside(path))
+        : null;
+
     // Pull initial bytes — Yjs takes over for text after the first
     // snapshot, but the file on disk needs to exist.
     if (payload.fileType === 'TEXT') {
       // New here: a doc under this name is another note's history. A catch-up
-      // CREATE of a file the listing gave us keeps the doc it has.
+      // CREATE of a file the listing gave us keeps the doc it has. Dropped
+      // right away, before the update that follows the event lands on it.
       if (known) this.wire(payload.id, path);
       else await this.startDoc(payload.id, path);
+      await setAside;
     } else {
+      await setAside;
       // Catch-up replays can fire applyServerCreate for a binary file the
       // client already has on disk (synced earlier). `createBinary` throws
       // on existing paths, so just bail — meta is already up-to-date from
@@ -3111,6 +3174,38 @@ export class SyncEngine {
         await io.vault.ensureParentFolder(path);
         await io.vault.createBinary(path, buf);
       });
+    }
+  }
+
+  /**
+   * Move the copy at `path` of a file deleted while away aside, under a
+   * conflict name (see {@link applyServerCreate}): it may hold edits the
+   * server never got, which is why the user is asked about it. The question
+   * finds the name taken and decides nothing; the next connect's first upload
+   * sends the copy as a file of its own.
+   */
+  private async keepAwayCopyAside(path: string): Promise<void> {
+    try {
+      await this.commitLocal(async (io) => {
+        if (!(await io.vault.exists(path))) return;
+        const aside = buildConflictPath(path, this.now());
+        this.log.warn('a file was created again under the name of a copy being asked about', {
+          path,
+          aside,
+        });
+        io.echo.mark(path, ECHO_COUNT_RENAME);
+        io.echo.mark(aside, ECHO_COUNT_RENAME);
+        await io.vault.ensureParentFolder(aside);
+        await this.renameOnDisk(io, path, aside);
+      });
+    } catch (err) {
+      // Stopped, or the file is locked: the question still sees the copy.
+      if (!this.hasStopped) {
+        this.log.warn('could not keep a copy aside', {
+          path,
+          error: describeError(err, 'rename_failed'),
+        });
+      }
     }
   }
 
@@ -3266,18 +3361,32 @@ export class SyncEngine {
    * The local copy of a file that has left what this client syncs: deleted on
    * the server (`movedTo` null), or renamed there to `movedTo`, a name this
    * client never writes (see {@link retireMovedAway}).
+   *
+   * `ask: false` leaves a copy that may hold unsent edits as it is and returns
+   * `'ask'`: the caller asks later, once nothing else waits on it. `away`: the
+   * copy is of a file deleted while this device was away, which the index no
+   * longer has (see {@link deletedWhileAway}). A file indexed under its name
+   * or its id since — the note revived, or created anew under the name — owns
+   * the copy now, and it is left to that file: checked in each local phase,
+   * after every wait.
    */
   private async dropLocalCopy(
     meta: IndexedMeta,
     movedTo: string | null,
-    opts: { pushedBack: boolean; serverHad?: string } = { pushedBack: true },
-  ): Promise<void> {
+    opts: { pushedBack: boolean; serverHad?: string; ask?: boolean; away?: boolean } = {
+      pushedBack: true,
+    },
+  ): Promise<'done' | 'ask'> {
+    const taken = (): boolean =>
+      opts.away === true &&
+      (this.fileIndex.byId.has(meta.fileId) || this.fileIndex.byPath.has(meta.relativePath));
     // One local phase, from the check to the delete. A delete stopped before
     // it reaches the disk is not replayed: the next catch-up no longer finds
     // the file in the listing and has nothing to apply it to, so the local
     // copy would stay behind, never synced again. Only a conflict leaves the
     // phase — to ask the user, which can take any time.
     const conflict = await this.commitLocal(async (io) => {
+      if (taken()) return null;
       // Delete-vs-update guard: if the local file still exists and has
       // uncommitted edits, ask the user before clobbering them.
       if (await io.vault.exists(meta.relativePath)) {
@@ -3295,7 +3404,8 @@ export class SyncEngine {
       await this.removeLocalCopy(io, meta, movedTo);
       return null;
     });
-    if (!conflict) return;
+    if (!conflict) return 'done';
+    if (opts.ask === false) return 'ask';
 
     const { localBuf, localHash } = conflict;
     if (movedTo !== null) this.movedAway.set(meta.fileId, movedTo);
@@ -3304,6 +3414,9 @@ export class SyncEngine {
       localSize: localBuf.byteLength,
     });
     this.throwIfStopped();
+    // Another file holds the name now; the copy, if still there, is its own
+    // business (see `applyServerCreate`).
+    if (taken()) return 'done';
     if (movedTo !== null) {
       // Where the server has the file now: a later rename to another name we
       // never write moves it on, one to a name we sync ends the question.
@@ -3311,13 +3424,13 @@ export class SyncEngine {
       this.movedAway.delete(meta.fileId);
       // Renamed to a name we sync while the user was deciding: that rename
       // took the local copy along, and nothing is left to decide.
-      if (away === undefined) return;
+      if (away === undefined) return 'done';
       if (resolution === 'restore-server') {
         await this.restoreMovedAway(meta, away);
-        return;
+        return 'done';
       }
       await this.commitLocal((io) => this.removeLocalCopy(io, meta, away));
-      return;
+      return 'done';
     }
     if (resolution === 'restore-server') {
       // Push the local content as a fresh CREATE so the server
@@ -3364,10 +3477,11 @@ export class SyncEngine {
         }
       }
       // Don't drop the local copy — we want the file to stay.
-      return;
+      return 'done';
     }
     // 'delete-local'.
     await this.commitLocal((io) => this.removeLocalCopy(io, meta));
+    return 'done';
   }
 
   /**
@@ -3515,6 +3629,20 @@ export class SyncEngine {
       newPath,
     });
     await this.dropLocalCopy(meta, newPath);
+  }
+
+  /**
+   * The hash of the local copy of `meta` when the server had that content:
+   * `serverHash` (what it has now) or, for a note, a version in its history.
+   * A note's `contentHash` moves only when a snapshot writes the file, so a
+   * note edited here once differs from it for good. `null` otherwise.
+   */
+  private async serverHadCopy(meta: FileMeta, serverHash: string): Promise<string | null> {
+    const localHash = await this.hashFile(this.vault, meta.relativePath);
+    if (localHash === null || localHash === meta.contentHash) return null;
+    if (localHash === serverHash) return localHash;
+    if (meta.fileType !== 'TEXT') return null;
+    return (await this.serverHadVersion(meta.serverFileId, localHash)) ? localHash : null;
   }
 
   /**
