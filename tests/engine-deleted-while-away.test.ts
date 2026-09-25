@@ -7,15 +7,20 @@
  * as a new file: the deleted note came back for the whole team. Not renamed,
  * the copy stayed on disk, never synced again.
  */
+import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
 import {
+  FakeIndexedDb,
   buildHarness,
   connect,
+  dbNameOf,
   encode,
   flushAsync,
   json,
   op,
+  serverDocWith,
   serverFile,
+  snapshotOf,
   type Harness,
 } from './engine-test-kit';
 
@@ -104,6 +109,86 @@ describe('SyncEngine — a file deleted on the server while this device was away
     await flushAsync(20);
     expect(h.socket().created()).toEqual(['a.md']);
     expect(h.vault.text('a.md')).toBe('A\noffline\n');
+    await h.engine.stop();
+  });
+
+  it('on "restore", starts the note from the server’s doc, so edits not sent before come back once', async () => {
+    const idb = new FakeIndexedDb();
+    // The note's history here: its text from the server, and a line folded
+    // while offline, never sent.
+    const old = serverDocWith('A\n');
+    const local = new Y.Doc();
+    Y.applyUpdate(local, Y.encodeStateAsUpdate(old));
+    local.getText('content').insert(2, 'offline\n');
+    idb.dbs.set(dbNameOf('a.md'), {
+      updates: [Y.encodeStateAsUpdate(local)],
+      custom: new Map([['team-vault-file-id', 'f1']]),
+    });
+    const h = buildHarness({ docs: idb.manager() });
+    const hash = await remember(h, 'A\noffline\n', 'A\noffline\n');
+    h.serverFiles = [];
+    tombstone(h, 'a.md', hash);
+    await connect(h, { operations: [op('DELETE', 'a.md', null, { fileId: 'f1' }, 1)] });
+    await flushAsync(20);
+
+    h.modal.del.resolve('restore-server');
+    await flushAsync(20);
+    // The server revives f1 from this copy.
+    h.socket()
+      .pending('file:create', 'a.md')
+      .ack({
+        ok: true,
+        outcome: { kind: 'created', fileId: 'f1', path: 'a.md' },
+      });
+    await flushAsync(20);
+    expect(h.engine.getFileIdForPath('a.md')).toBe('f1');
+    expect(idb.deleted).toContain(dbNameOf('a.md'));
+
+    // A server that continues the history on revival: the old text deleted,
+    // the copy's text inserted on top.
+    const revived = new Y.Doc();
+    Y.applyUpdate(revived, Y.encodeStateAsUpdate(old));
+    const text = revived.getText('content');
+    text.delete(0, text.length);
+    text.insert(0, 'A\noffline\n');
+    h.serverFiles = [serverFile('f1', 'a.md', 'TEXT', await sha256Hex('A\noffline\n'), 10)];
+    h.routes.set('GET /api/projects/p1/files?includeDeleted=true', () => json({ files: [] }));
+    const mark = h.socket().emits.length;
+    h.socket().disconnect();
+    h.socket().connect();
+    await flushAsync();
+    h.socket()
+      .pending('project:join')
+      .ack({ ok: true, operations: [], yjsDocs: [snapshotOf(revived, 'f1')] });
+    await flushAsync(40);
+    // The next save brings the note's doc up.
+    h.vault.files.set('a.md', encode('A\noffline\nmore\n'));
+    const saving = h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'a.md',
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+    for (const f of h.socket().fetches.splice(0)) {
+      f.answer({
+        ok: true,
+        sync1: Array.from(Y.encodeStateAsUpdate(revived)),
+        stateVector: Array.from(Y.encodeStateVector(revived)),
+      });
+    }
+    await saving;
+    await flushAsync(20);
+    for (const e of h.socket().emits.slice(mark)) {
+      const p = e.payload as { fileId?: string; update?: Uint8Array | number[] };
+      if (e.event === 'yjs:update' && p.fileId === 'f1' && p.update) {
+        Y.applyUpdate(revived, Uint8Array.from(p.update));
+      }
+    }
+
+    expect(revived.getText('content').toJSON()).toBe('A\noffline\nmore\n');
+    expect(h.vault.text('a.md')).toBe('A\noffline\nmore\n');
+    expect(h.socket().created()).toEqual(['a.md']);
     await h.engine.stop();
   });
 

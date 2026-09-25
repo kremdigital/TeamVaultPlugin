@@ -3330,7 +3330,7 @@ export class SyncEngine {
         try {
           const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
           this.throwIfStopped();
-          await this.socket.emitFileCreate({
+          const ack = await this.socket.emitFileCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
@@ -3340,12 +3340,34 @@ export class SyncEngine {
             size: localBuf.byteLength,
             ...(data !== undefined ? { data } : {}),
           });
+          this.throwIfStopped();
+          const outcome = ack.ok
+            ? (ack as { outcome?: { fileId?: string; path?: string } }).outcome
+            : undefined;
+          if (outcome?.fileId && outcome.path) {
+            // The server revived the file under its id from this copy, the way
+            // a note created here starts: recorded from the ack, its doc and
+            // store dropped — by the exact name — for the server's. Kept, the
+            // note's history here met the server's again on the next connect:
+            // a server that continues the history on revival has this copy's
+            // text in it once more, and the edits not sent before came back
+            // doubled; one that replaces it merged the two. And unindexed, the
+            // next save went out as a second CREATE.
+            await this.recordCreatedFile(
+              outcome.fileId,
+              outcome.path,
+              meta.fileType,
+              localHash,
+              localBuf.byteLength,
+            );
+            this.persistVectorClock();
+          }
         } catch {
           this.throwIfStopped();
           this.log.debug('restore-server push failed; reconcile on reconnect', meta.relativePath);
         }
       }
-      // Don't drop local state — we want the file to stay.
+      // Don't drop the local copy — we want the file to stay.
       return;
     }
     // 'delete-local'.
