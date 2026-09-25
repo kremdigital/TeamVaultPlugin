@@ -2212,14 +2212,22 @@ describe('SyncEngine — disk preservation (mass-rollback regression)', () => {
     putDisk(h, newText);
 
     // A git checkout while the engine was offline looks like a fresh create
-    // to the watcher — the op queues because the socket is down.
+    // to the watcher. An engine that knows the note from `state.json` takes
+    // it for an edit, and the catch-up folds it in; one that did not — a
+    // session that started offline, before 0.3.8 — queued a CREATE, and that
+    // queue is still what an older build leaves behind.
     await h.engine.handleVaultEvent({
       type: 'create',
       bindingId: 'b1',
       path: 'note.md',
       source: 'fs',
     });
-    expect(h.log.pendingCount('b1')).toBe(1);
+    expect(h.log.pendingCount('b1')).toBe(0);
+    h.log.enqueueOperation('b1', {
+      opType: 'CREATE',
+      filePath: 'note.md',
+      payload: { fileType: 'TEXT' },
+    });
 
     await h.engine.start();
     // The real server streams every text doc's state during catch-up —

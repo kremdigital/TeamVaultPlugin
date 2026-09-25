@@ -88,6 +88,24 @@ describe('OperationLog — pending operations', () => {
     expect(log.dequeueOperations('b1')[0]?.filePath).toBe('c.md');
   });
 
+  it('retargetOperation moves a queued rename’s destination in place', () => {
+    const log = makeLog();
+    const rename = log.enqueueOperation('b1', {
+      opType: 'RENAME',
+      filePath: 'a.md',
+      newPath: 'b.md',
+      payload: { fileId: 'f1' },
+    });
+    const create = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    expect(log.retargetOperation(rename.id, 'c.md')).toBe(true);
+    expect(log.retargetOperation(create.id, 'x.md')).toBe(false);
+    expect(log.retargetOperation(999, 'x.md')).toBe(false);
+    expect(log.dequeueOperations('b1').map((o) => [o.opType, o.filePath, o.newPath])).toEqual([
+      ['RENAME', 'a.md', 'c.md'],
+      ['CREATE', 'a.md', null],
+    ]);
+  });
+
   it('markSent is a no-op for an empty array', () => {
     const log = makeLog();
     log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });

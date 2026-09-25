@@ -77,24 +77,41 @@ export interface YjsCatchupBatch {
   done: boolean;
 }
 
-export type FileEvent =
-  | { type: 'created'; result: unknown; log: ServerLogEntry }
-  | { type: 'updated-binary'; fileId: string; contentHash: string; log: ServerLogEntry }
-  | { type: 'deleted'; fileId: string; log: ServerLogEntry }
-  | {
-      type: 'renamed';
-      fileId: string;
-      newPath: string;
-      outcome: unknown;
-      log: ServerLogEntry;
-    }
-  | {
-      type: 'moved';
-      fileId: string;
-      newPath: string;
-      outcome: unknown;
-      log: ServerLogEntry;
-    };
+/**
+ * Who made the change a file event reports: the `clientId` of the device
+ * whose operation it was. The server broadcasts an operation to the whole
+ * project room, its sender included, and a client recognises its own by this
+ * field. Absent from servers that predate it.
+ */
+export interface FileEventOrigin {
+  clientId?: string;
+}
+
+export type FileEvent = FileEventOrigin &
+  (
+    | { type: 'created'; result: unknown; log: ServerLogEntry }
+    | { type: 'updated-binary'; fileId: string; contentHash: string; log: ServerLogEntry }
+    | { type: 'deleted'; fileId: string; log: ServerLogEntry }
+    | {
+        type: 'renamed';
+        fileId: string;
+        /**
+         * Where the server put the file. Servers that predate `clientId` sent
+         * the path the client asked for, even when a collision made the
+         * server store the file under a conflict name; `outcome` has that.
+         */
+        newPath: string;
+        outcome: unknown;
+        log: ServerLogEntry;
+      }
+    | {
+        type: 'moved';
+        fileId: string;
+        newPath: string;
+        outcome: unknown;
+        log: ServerLogEntry;
+      }
+  );
 
 export interface YjsUpdateMessage {
   fileId: string;
@@ -113,6 +130,12 @@ export type YjsFetchResult =
 
 /** How long {@link SocketClient.fetchYjsDoc} waits for the ack. */
 export const YJS_FETCH_TIMEOUT_MS = 15_000;
+
+/** The `clientId` a file event carries, when it is a non-empty string. */
+function originOf(data: object): FileEventOrigin {
+  const clientId = (data as { clientId?: unknown }).clientId;
+  return typeof clientId === 'string' && clientId !== '' ? { clientId } : {};
+}
 
 // -- Outgoing payloads --------------------------------------------------------
 
@@ -296,7 +319,12 @@ export class SocketClient {
     socket.on('file:created', (raw: unknown) => {
       const data = raw as { result: unknown; log: ServerLogEntry } | undefined;
       if (!data) return;
-      this.fan(this.fileEventCbs, { type: 'created', result: data.result, log: data.log });
+      this.fan(this.fileEventCbs, {
+        type: 'created',
+        result: data.result,
+        log: data.log,
+        ...originOf(data),
+      });
     });
     socket.on('file:updated-binary', (raw: unknown) => {
       const data = raw as { fileId: string; contentHash: string; log: ServerLogEntry } | undefined;
@@ -306,12 +334,18 @@ export class SocketClient {
         fileId: data.fileId,
         contentHash: data.contentHash,
         log: data.log,
+        ...originOf(data),
       });
     });
     socket.on('file:deleted', (raw: unknown) => {
       const data = raw as { fileId: string; log: ServerLogEntry } | undefined;
       if (!data) return;
-      this.fan(this.fileEventCbs, { type: 'deleted', fileId: data.fileId, log: data.log });
+      this.fan(this.fileEventCbs, {
+        type: 'deleted',
+        fileId: data.fileId,
+        log: data.log,
+        ...originOf(data),
+      });
     });
     socket.on('file:renamed', (raw: unknown) => {
       const data = raw as
@@ -324,6 +358,7 @@ export class SocketClient {
         newPath: data.newPath,
         outcome: data.outcome,
         log: data.log,
+        ...originOf(data),
       });
     });
     socket.on('file:moved', (raw: unknown) => {
@@ -337,6 +372,7 @@ export class SocketClient {
         newPath: data.newPath,
         outcome: data.outcome,
         log: data.log,
+        ...originOf(data),
       });
     });
 

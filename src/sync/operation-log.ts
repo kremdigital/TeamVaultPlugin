@@ -266,6 +266,24 @@ export class OperationLog {
     return this.bindings.get(bindingId)?.pending.length ?? 0;
   }
 
+  /**
+   * Point a queued RENAME or MOVE at another destination, keeping its place in
+   * the queue: a chain of renames of one file is sent as one (see
+   * `SyncEngine.collapseQueuedRenames`). `false` when no such operation is
+   * queued.
+   */
+  retargetOperation(opId: number, newPath: string): boolean {
+    for (const bucket of this.bindings.values()) {
+      const op = bucket.pending.find((p) => p.id === opId);
+      if (!op) continue;
+      if (op.opType !== 'RENAME' && op.opType !== 'MOVE') return false;
+      op.newPath = newPath;
+      this.touch({ immediate: true });
+      return true;
+    }
+    return false;
+  }
+
   markSent(opIds: readonly number[]): void {
     if (opIds.length === 0) return;
     const drop = new Set(opIds);
