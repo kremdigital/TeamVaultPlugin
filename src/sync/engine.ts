@@ -191,6 +191,8 @@ interface RenamedWhileAway {
   meta: IndexedMeta;
   /** Where the server has it now. */
   to: string;
+  /** The content the server has, by the listing. */
+  serverHash: string;
 }
 
 /**
@@ -294,6 +296,15 @@ export class SyncEngine {
    * where the server has the file now.
    */
   private readonly movedAway = new Map<string, string>();
+
+  /**
+   * Files renamed while this device was away to a name this client never
+   * writes, whose local copy may hold edits the server never got: by id. The
+   * index refresh leaves them out of the index and asks about them once the
+   * engine is connected (see {@link askAboutRetiredWhileAway}); `state.json`
+   * keeps their record meanwhile, so a restart asks again.
+   */
+  private readonly retiredAway = new Map<string, { meta: IndexedMeta; serverHash: string }>();
 
   /**
    * Copies of files deleted while this device was away that `initialPush`
@@ -1118,7 +1129,11 @@ export class SyncEngine {
       // retried on the next reconnect. `initialPush` itself skips paths
       // that are still queued.
     }
-    await this.initialPush();
+    try {
+      await this.initialPush();
+    } finally {
+      await this.askAboutRetiredWhileAway();
+    }
   }
 
   /**
@@ -1215,6 +1230,12 @@ export class SyncEngine {
         // will surface them again.
       }
     }
+  }
+
+  /** Whether `path` holds the copy of a file waiting for its question (see {@link retiredAway}). */
+  private isRetiredCopy(path: string): boolean {
+    for (const { meta } of this.retiredAway.values()) if (meta.relativePath === path) return true;
+    return false;
   }
 
   /**
@@ -1367,6 +1388,7 @@ export class SyncEngine {
     this.renamedHere = here;
     const away = this.renamedWhileAway(files, here);
     this.renamesLeft.clear();
+    this.retiredAway.clear();
     const occupied = await this.clearStaleCopies(files, away, here);
     this.outOfScope.clear();
     this.newHere.clear();
@@ -1437,8 +1459,9 @@ export class SyncEngine {
     await this.applyRenamesWhileAway(away);
     for (const f of deferred) {
       // A rename that could not be applied keeps its old path — and with it
-      // the file there, until the next connect tries again.
-      if (this.fileIndex.byPath.has(f.path)) {
+      // the file there, until the next connect tries again. So does a copy
+      // waiting for its question (see `retiredAway`).
+      if (this.fileIndex.byPath.has(f.path) || this.isRetiredCopy(f.path)) {
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         continue;
       }
@@ -1535,7 +1558,11 @@ export class SyncEngine {
         configDir: this.configDir,
       });
       if (from !== null) continue;
-      moves.set(f.id, { meta: { ...last, fileId: f.id, fileType: f.fileType }, to: f.path });
+      moves.set(f.id, {
+        meta: { ...last, fileId: f.id, fileType: f.fileType },
+        to: f.path,
+        serverHash: f.contentHash,
+      });
     }
     return moves;
   }
@@ -1783,6 +1810,7 @@ export class SyncEngine {
       fileId,
       from: move.meta.relativePath,
       to: move.to,
+      serverHash: move.serverHash,
       /** Stepped aside once already (see below). */
       aside: false,
     }));
@@ -1822,7 +1850,12 @@ export class SyncEngine {
         move.aside = true;
         const spare = await this.spareMovePath(this.vault, move.from);
         this.throwIfStopped();
-        if (await this.tryMoveWhileAway(move.fileId, move.from, spare, { aside: true })) {
+        if (
+          await this.tryMoveWhileAway(move.fileId, move.from, spare, {
+            aside: true,
+            serverHash: '',
+          })
+        ) {
           move.from = spare;
         } else {
           pending.splice(pending.indexOf(move), 1);
@@ -1834,7 +1867,11 @@ export class SyncEngine {
       if (!move) return;
       pending.splice(free, 1);
       this.log.info('file renamed while this device was away', { from: move.from, to: move.to });
-      if (!(await this.tryMoveWhileAway(move.fileId, move.from, move.to, { aside: false }))) {
+      const moved = await this.tryMoveWhileAway(move.fileId, move.from, move.to, {
+        aside: false,
+        serverHash: move.serverHash,
+      });
+      if (!moved) {
         leave(move);
       }
     }
@@ -1850,7 +1887,7 @@ export class SyncEngine {
     fileId: string,
     from: string,
     to: string,
-    opts: { aside: boolean },
+    opts: { aside: boolean; serverHash: string },
   ): Promise<boolean> {
     const meta = this.fileIndex.byId.get(fileId);
     if (meta?.relativePath === from) {
@@ -1860,7 +1897,7 @@ export class SyncEngine {
             this.commitLocal((io) => this.moveLocalCopy(io, meta, to)),
           );
         } else {
-          await this.applyServerRename(fileId, to);
+          await this.applyServerRename(fileId, to, { serverHash: opts.serverHash });
         }
       } catch (err) {
         this.throwIfStopped();
@@ -1872,6 +1909,9 @@ export class SyncEngine {
       }
       this.throwIfStopped();
     }
+    // Its copy waits for a question under the old name (see `retiredAway`):
+    // nothing moves into that name meanwhile.
+    if (this.retiredAway.has(fileId)) return false;
     return this.fileIndex.byId.get(fileId)?.relativePath !== from;
   }
 
@@ -1879,6 +1919,9 @@ export class SyncEngine {
 
   private async handleLocalCreate(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
+    // The copy of a file renamed away while this device was away, waiting for
+    // its question (see `retiredAway`): uploaded, it came back as a new file.
+    if (this.isRetiredCopy(path)) return;
     if (this.fileIndex.byPath.has(path)) {
       // The server already knows about this — treat as a modify.
       await this.handleLocalModify(path, from);
@@ -3533,7 +3576,16 @@ export class SyncEngine {
     await this.dropDoc(io.docs, meta.fileId, path);
   }
 
-  private async applyServerRename(fileId: string, newPath: string): Promise<void> {
+  /**
+   * `away`: a rename made while this device was away, applied by the index
+   * refresh (see {@link applyRenamesWhileAway}), with what the listing says the
+   * server has of the file.
+   */
+  private async applyServerRename(
+    fileId: string,
+    newPath: string,
+    away?: { serverHash: string },
+  ): Promise<void> {
     // Hard checks first — they hold wherever the file ends up. The binding is
     // NOT one of them: a rename is the server telling us a file we already
     // sync has moved, and refusing it would leave our copy behind for
@@ -3545,13 +3597,15 @@ export class SyncEngine {
       // file has left what this client syncs. A path that is garbage instead
       // (`../x`, `/etc/x`) changes nothing here.
       if (refused === 'ignored' || refused === 'invalid') {
-        await this.retireMovedAway(fileId, newPath);
+        await this.retireMovedAway(fileId, newPath, away);
       }
       return;
     }
     // Back to a name we sync while the user is still asked about the local
-    // copy (see `dropLocalCopy`): the move below takes that copy along.
+    // copy (see `dropLocalCopy`), or before the question came (see
+    // `retiredAway`): the move below takes that copy along.
     this.movedAway.delete(fileId);
+    this.reindexRetired(fileId);
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) {
       await this.adoptRenamedFile(fileId, newPath);
@@ -3608,7 +3662,11 @@ export class SyncEngine {
    * uploaded it as a new file, bringing the old name back for everyone. It is
    * never moved to `newPath` either: that could be the config folder.
    */
-  private async retireMovedAway(fileId: string, newPath: string): Promise<void> {
+  private async retireMovedAway(
+    fileId: string,
+    newPath: string,
+    away?: { serverHash: string },
+  ): Promise<void> {
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) {
       // Not a file we sync; keep its shadow entry current (see `outOfScope`).
@@ -3628,7 +3686,30 @@ export class SyncEngine {
       path: meta.relativePath,
       newPath,
     });
-    await this.dropLocalCopy(meta, newPath);
+    if (away === undefined) {
+      await this.dropLocalCopy(meta, newPath);
+      return;
+    }
+    // Renamed while away: applied by the index refresh, and a question there
+    // held the whole connect — the index, the catch-up, every other note —
+    // until it was answered. Asked about once connected, and only about a copy
+    // the server never had: the catch-up pushed nothing back for it.
+    const serverHad = await this.serverHadCopy(meta, away.serverHash);
+    const asked = await this.dropLocalCopy(meta, newPath, {
+      pushedBack: false,
+      ask: false,
+      ...(serverHad !== null ? { serverHad } : {}),
+    });
+    if (asked === 'done') return;
+    // Out of the index until then: the catch-up neither writes the note nor
+    // folds its copy, and the name is not given to another file. Known by id,
+    // so a rename back to a name we sync finds it.
+    this.retiredAway.set(fileId, { meta, serverHash: away.serverHash });
+    if (this.fileIndex.byPath.get(meta.relativePath) === meta) {
+      this.fileIndex.byPath.delete(meta.relativePath);
+    }
+    if (this.fileIndex.byId.get(fileId) === meta) this.fileIndex.byId.delete(fileId);
+    this.outOfScope.set(fileId, { path: newPath, fileType: meta.fileType });
   }
 
   /**
@@ -3643,6 +3724,50 @@ export class SyncEngine {
     if (localHash === serverHash) return localHash;
     if (meta.fileType !== 'TEXT') return null;
     return (await this.serverHadVersion(meta.serverFileId, localHash)) ? localHash : null;
+  }
+
+  /**
+   * A file renamed while away whose question waits (see {@link retiredAway})
+   * goes back into the index under its old name — renamed back to a name we
+   * sync, or when the question comes. `false` when it was not waiting, or
+   * another file holds the name now.
+   */
+  private reindexRetired(fileId: string): boolean {
+    const retired = this.retiredAway.get(fileId);
+    if (retired === undefined) return false;
+    this.retiredAway.delete(fileId);
+    const { meta } = retired;
+    if (this.fileIndex.byId.has(fileId) || this.fileIndex.byPath.has(meta.relativePath)) {
+      return false;
+    }
+    this.outOfScope.delete(fileId);
+    this.fileIndex.byPath.set(meta.relativePath, meta);
+    this.fileIndex.byId.set(fileId, meta);
+    return true;
+  }
+
+  /**
+   * Ask about the copies of files renamed while away to a name this client
+   * never writes (see {@link retiredAway}), now that the engine is connected:
+   * the question a live rename asks (see {@link dropLocalCopy}). Where the
+   * server has the file then is the name it moved on to.
+   */
+  private async askAboutRetiredWhileAway(): Promise<void> {
+    for (const [fileId, { meta, serverHash }] of [...this.retiredAway]) {
+      this.throwIfStopped();
+      const movedTo = this.outOfScope.get(fileId)?.path;
+      if (!this.reindexRetired(fileId) || movedTo === undefined) continue;
+      try {
+        const serverHad = await this.serverHadCopy(meta, serverHash);
+        await this.dropLocalCopy(meta, movedTo, {
+          pushedBack: false,
+          ...(serverHad !== null ? { serverHad } : {}),
+        });
+      } catch {
+        this.throwIfStopped();
+        // Left as it is: the next connect finds the rename again.
+      }
+    }
   }
 
   /**
