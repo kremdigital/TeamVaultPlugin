@@ -282,6 +282,46 @@ describe('SyncEngine — a note deleted and created again under its name while t
     expect(h.socket().created()).toEqual([copy]);
     await h.engine.stop();
   });
+
+  it('writes the new note over a copy the server’s history has, whatever the fold marker says', async () => {
+    const idb = new FakeIndexedDb();
+    const old = serverDocWith('A\n');
+    store(
+      idb,
+      'a.md',
+      continued(old, (t) => t.insert(2, 'mine\n')),
+      'f1',
+    );
+    const h = buildHarness({ docs: idb.manager() });
+    // Saved and sent, then versioned by the server; the marker still names
+    // the text before (a rename made here sets it back so).
+    await remember(h, 'a.md', 'f1', 'A\n', 'A\nmine\n');
+    const versions = await Promise.all(
+      ['A\n', 'A\nmine\n'].map(async (text, i) => ({
+        id: `v${i}`,
+        contentHash: await sha256Hex(text),
+        size: text.length,
+        createdAt: '2026-01-01',
+        authorId: 'u2',
+        fileId: 'f1',
+      })),
+    );
+    h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions }));
+    const revived = serverDocWith(NEW);
+    h.serverFiles = [serverFile('f1', 'a.md', 'TEXT', await sha256Hex(NEW), NEW.length)];
+
+    await connect(h, {
+      operations: deletedAndCreated('a.md', 'f1'),
+      yjsDocs: [snapshotOf(revived, 'f1')],
+    });
+    await flushAsync(60);
+    applySent(h, revived, 'f1');
+
+    expect(h.vault.text('a.md')).toBe(NEW);
+    expect(revived.getText('content').toJSON()).toBe(NEW);
+    expect(conflictCopies(h)).toEqual([]);
+    await h.engine.stop();
+  });
 });
 
 describe('SyncEngine — a note revived by a server that continues its history', () => {

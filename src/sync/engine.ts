@@ -375,8 +375,7 @@ export class SyncEngine {
   /**
    * Notes whose server doc this connect's catch-up shows replaced: deleted and
    * created again under their id by a server that builds a new history on
-   * revival — see {@link historiesReplaced}. Until the first lineage check of
-   * each (see {@link checkLineage}).
+   * revival — see {@link historiesReplaced} and {@link checkLineage}.
    */
   private replacedHistories = new Set<string>();
 
@@ -993,10 +992,7 @@ export class SyncEngine {
       },
     );
     this.throwIfStopped();
-    if (found === null) return;
-    // Checked: whatever lands in the doc from now on is the new history's.
-    this.replacedHistories.delete(meta.fileId);
-    if (!found.discarded) return;
+    if (found === null || !found.discarded) return;
     this.log.warn('a note’s offline history is not the server’s; starting it from the server', {
       path: meta.relativePath,
       fileId: meta.fileId,
