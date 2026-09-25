@@ -246,6 +246,38 @@ describe('ObsidianWatcher — rename', () => {
       },
     ]);
   });
+
+  // Obsidian fires a vault `rename` for every `adapter.rename`, the plugin's
+  // own included (app.js 1.13.7: `FileSystemAdapter.rename` → `renamed` →
+  // `Vault.onChange` → `rename`). Passed on, the step of a case-only rename
+  // through `Note.moving-<ts>.md` went to the server as the user's rename.
+  it('drops the echo of a rename the plugin made itself, and only that pair', () => {
+    const ra = new RecentlyApplied();
+    const { vault, events } = buildWatcher([binding()], { recentlyApplied: ra });
+    // What the engine does around its own rename: both names marked for the
+    // watchers, the pair registered.
+    ra.mark('Note.md', 2);
+    ra.mark('Note.moving-1.md', 2);
+    ra.expectRename('Note.md', 'Note.moving-1.md');
+
+    vault.fire('rename', { path: 'Note.moving-1.md', kind: 'file' }, 'Note.md');
+    expect(events).toEqual([]);
+    // Obsidian's share of the path budgets is spent; chokidar's is left.
+    expect(ra.take('Note.md')).toBe(true);
+    expect(ra.take('Note.md')).toBe(false);
+
+    // The same file renamed by the user right after: passed on.
+    vault.fire('rename', { path: 'Other.md', kind: 'file' }, 'Note.moving-1.md');
+    expect(events).toEqual([
+      {
+        type: 'rename',
+        bindingId: 'b1',
+        oldPath: 'Note.moving-1.md',
+        newPath: 'Other.md',
+        source: 'obsidian',
+      },
+    ]);
+  });
 });
 
 describe('ObsidianWatcher — lifecycle', () => {

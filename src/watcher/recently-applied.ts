@@ -26,11 +26,30 @@
  * Markers expire on a TTL (default 2 s). That's long enough that vault
  * events arriving on the next tick still see them, but short enough that
  * a stuck marker doesn't permanently silence a real edit.
+ *
+ * A path marker only says "an event about this path is ours"; the Obsidian
+ * watcher used to take both markers of a rename and dispatch it anyway. For
+ * a rename the plugin makes itself there is an exact key: the pair of names.
+ * Obsidian echoes every `adapter.rename` as a vault `rename` event — in the
+ * same call, before the rename's promise resolves (`FileSystemAdapter.rename`
+ * triggers `renamed`, `Vault.onChange` turns it into `rename`) — and a sync
+ * engine that took that echo for the user's own rename sent it to the server:
+ * the spare name a case-only rename steps through (`Note.moving-<ts>.md`)
+ * became the note's name for the whole team, and two swapped names renamed
+ * each other back and forth forever. {@link expectRename} registers the pair
+ * before the rename, {@link takeRename} drops exactly that echo.
  */
 
 export interface RecentlyAppliedOptions {
   /** TTL in ms before a marked path is automatically forgotten. */
   ttlMs?: number;
+  /**
+   * TTL in ms of an expected rename (see {@link RecentlyApplied.expectRename}).
+   * Longer than a path marker's: Obsidian queues adapter calls, so a rename may
+   * wait behind a large write, and the pair is removed as soon as the rename
+   * returns anyway. Default 60 s.
+   */
+  renameTtlMs?: number;
   /** Test seam for clock injection. */
   now?: () => number;
 }
@@ -43,12 +62,63 @@ interface Entry {
 
 export class RecentlyApplied {
   private readonly ttlMs: number;
+  private readonly renameTtlMs: number;
   private readonly now: () => number;
   private readonly entries = new Map<string, Entry>();
+  /** Expected rename echoes, keyed by {@link renameKey}. */
+  private readonly renames = new Map<string, Entry>();
 
   constructor(options: RecentlyAppliedOptions = {}) {
     this.ttlMs = options.ttlMs ?? 2000;
+    this.renameTtlMs = options.renameTtlMs ?? 60_000;
     this.now = options.now ?? Date.now;
+  }
+
+  /**
+   * Register the vault `rename` event Obsidian will fire for a rename the
+   * plugin is about to make, `from` → `to` exactly as passed to the adapter.
+   * Call right before the rename, and {@link forgetRename} once it returned.
+   */
+  expectRename(from: string, to: string): void {
+    const key = renameKey(from, to);
+    const existing = this.renames.get(key);
+    const expiresAt = this.now() + this.renameTtlMs;
+    if (existing && existing.expiresAt > this.now()) {
+      existing.count += 1;
+      existing.expiresAt = expiresAt;
+      return;
+    }
+    this.renames.set(key, { count: 1, expiresAt });
+  }
+
+  /**
+   * True (and consumed) when the rename `from` → `to` is one the plugin made
+   * itself (see {@link expectRename}). Only the exact pair: a user's rename of
+   * the same file to another name, or of another file, is not matched.
+   */
+  takeRename(from: string, to: string): boolean {
+    const key = renameKey(from, to);
+    const entry = this.renames.get(key);
+    if (!entry) return false;
+    if (entry.expiresAt <= this.now()) {
+      this.renames.delete(key);
+      return false;
+    }
+    entry.count -= 1;
+    if (entry.count <= 0) this.renames.delete(key);
+    return true;
+  }
+
+  /**
+   * Drop one expected echo of `from` → `to` that did not come: the rename
+   * failed, or the adapter did not know the file and fired nothing.
+   */
+  forgetRename(from: string, to: string): void {
+    const key = renameKey(from, to);
+    const entry = this.renames.get(key);
+    if (!entry) return;
+    entry.count -= 1;
+    if (entry.count <= 0) this.renames.delete(key);
   }
 
   /**
@@ -116,5 +186,10 @@ export class RecentlyApplied {
 
   clear(): void {
     this.entries.clear();
+    this.renames.clear();
   }
+}
+
+function renameKey(from: string, to: string): string {
+  return `${from}\u0000${to}`;
 }

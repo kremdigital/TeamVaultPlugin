@@ -85,8 +85,41 @@ describe('RecentlyApplied', () => {
     const r = new RecentlyApplied();
     r.mark('a.md');
     r.mark('b.md');
+    r.expectRename('a.md', 'b.md');
     r.clear();
     expect(r.has('a.md')).toBe(false);
     expect(r.has('b.md')).toBe(false);
+    expect(r.takeRename('a.md', 'b.md')).toBe(false);
+  });
+});
+
+describe('RecentlyApplied — expected renames', () => {
+  it('matches the exact pair once, and nothing else', () => {
+    const r = new RecentlyApplied();
+    r.expectRename('Note.md', 'note.md');
+    expect(r.takeRename('note.md', 'Note.md')).toBe(false);
+    expect(r.takeRename('Note.md', 'NOTE.md')).toBe(false);
+    expect(r.takeRename('Note.md', 'note.md')).toBe(true);
+    expect(r.takeRename('Note.md', 'note.md')).toBe(false);
+  });
+
+  it('forgets an echo that did not come, and expires', () => {
+    let now = 0;
+    const r = new RecentlyApplied({ renameTtlMs: 100, now: () => now });
+    r.expectRename('a.md', 'b.md');
+    r.forgetRename('a.md', 'b.md');
+    expect(r.takeRename('a.md', 'b.md')).toBe(false);
+    r.expectRename('a.md', 'b.md');
+    now = 150;
+    expect(r.takeRename('a.md', 'b.md')).toBe(false);
+  });
+
+  it('counts the same pair registered twice', () => {
+    const r = new RecentlyApplied();
+    r.expectRename('a.md', 'b.md');
+    r.expectRename('a.md', 'b.md');
+    expect(r.takeRename('a.md', 'b.md')).toBe(true);
+    expect(r.takeRename('a.md', 'b.md')).toBe(true);
+    expect(r.takeRename('a.md', 'b.md')).toBe(false);
   });
 });

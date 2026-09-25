@@ -205,8 +205,18 @@ export class ObsidianWatcher {
     // Both paths are checked separately — a rename out of a binding becomes
     // a delete at oldPath; a rename into a binding becomes a create at newPath.
     // For the simple in-binding case we emit a single rename.
+    //
+    // The path markers are Obsidian's share of the budget a plugin write
+    // claims for both names; chokidar's `unlink` and `add` take the rest.
     this.recentlyApplied.take(file.path);
     this.recentlyApplied.take(oldPath);
+    // A rename the plugin made itself: Obsidian fires this event for every
+    // `adapter.rename`, before the call returns. Passed on, it went back to
+    // the server as the user's rename — the spare name a case-only rename
+    // steps through became the note's name for the whole team, and two names
+    // swapped while away renamed each other forever. Only the exact pair the
+    // plugin registered; a user's rename of the same file is passed on.
+    if (this.recentlyApplied.takeRename(oldPath, file.path)) return;
     // An ignored path counts as "outside the binding", so the usual mapping
     // below does the right thing: moving a note into Obsidian's trash (that
     // is what "Move to Obsidian trash" does — a rename into `.trash/`)
