@@ -3,7 +3,9 @@ import { ApiClient, ApiError } from '@/client/api';
 import type { ApiFile } from '@/client/types';
 import {
   SocketClient,
+  type Ack,
   type FileEvent as SocketFileEvent,
+  type FileUpdateBinaryPayload,
   type ServerOperation,
   type YjsUpdateMessage,
   type YjsDocSnapshot,
@@ -402,6 +404,15 @@ export class SyncEngine {
    * this one, so it is not applied here (see {@link handleServerRename}).
    */
   private readonly localRenames = new Map<string, number>();
+
+  /**
+   * Attachment uploads on their way to the server, by file id: the content
+   * hashes sent and not acknowledged yet. A server that does not send
+   * `clientId` broadcasts this device's own upload back to it before the ack;
+   * one that names a hash on its way is recognised by it (see
+   * {@link handleServerFileEvent}).
+   */
+  private readonly binaryUploads = new Map<string, string[]>();
 
   /**
    * How many times each file has been renamed on this device, by id. A
@@ -1865,6 +1876,25 @@ export class SyncEngine {
     return undefined;
   }
 
+  /**
+   * `file:update-binary`, with its hash in {@link binaryUploads} until the
+   * ack comes (or the emit fails).
+   */
+  private async emitBinaryUpdate(payload: FileUpdateBinaryPayload): Promise<Ack> {
+    const { fileId, contentHash } = payload;
+    const sending = this.binaryUploads.get(fileId) ?? [];
+    sending.push(contentHash);
+    this.binaryUploads.set(fileId, sending);
+    try {
+      return await this.socket.emitFileUpdateBinary(payload);
+    } finally {
+      const left = this.binaryUploads.get(fileId) ?? [];
+      const i = left.indexOf(contentHash);
+      if (i >= 0) left.splice(i, 1);
+      if (left.length === 0) this.binaryUploads.delete(fileId);
+    }
+  }
+
   /** `PUT /blobs/:hash`, cancelled by `stop()` — see {@link lifetime}. */
   private uploadBlob(contentHash: string, buffer: ArrayBuffer): Promise<void> {
     return this.api.uploadBlob(this.binding.projectId, contentHash, buffer, {
@@ -1970,7 +2000,7 @@ export class SyncEngine {
         // Binary bytes go to the REST staging area; the socket op is metadata-only.
         await this.uploadBlob(hash, buffer);
         this.throwIfStopped();
-        const ack = await this.socket.emitFileUpdateBinary({
+        const ack = await this.emitBinaryUpdate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
           vectorClock: this.bumpClock(),
@@ -2681,6 +2711,17 @@ export class SyncEngine {
       if (event.clientId === this.clientId && event.type !== 'renamed' && event.type !== 'moved') {
         return;
       }
+      // From a server that does not say who sent it: an attachment upload
+      // this device has on its way. Taken for a teammate's, the version just
+      // uploaded was downloaded again and written over a newer one saved
+      // meanwhile.
+      if (
+        event.type === 'updated-binary' &&
+        event.clientId === undefined &&
+        this.binaryUploads.get(event.fileId)?.includes(event.contentHash) === true
+      ) {
+        return;
+      }
       switch (event.type) {
         case 'created': {
           // Server broadcasts `{ result: { outcome, log }, log }`. Pull
@@ -3020,7 +3061,7 @@ export class SyncEngine {
             try {
               await this.uploadBlob(localHash, localBuf);
               this.throwIfStopped();
-              await this.socket.emitFileUpdateBinary({
+              await this.emitBinaryUpdate({
                 projectId: this.binding.projectId,
                 clientId: this.clientId,
                 vectorClock: this.bumpClock(),
@@ -4424,7 +4465,7 @@ export class SyncEngine {
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
           this.throwIfStopped();
-          const ack = await this.socket.emitFileUpdateBinary({
+          const ack = await this.emitBinaryUpdate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
             vectorClock: this.bumpClock(),
