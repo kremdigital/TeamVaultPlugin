@@ -393,6 +393,14 @@ edits in `…conflict-<ts>.<ext>`.
   `.<name>.icloud` placeholder. Team Vault reads that as the note being
   deleted and deletes it for the whole team. Move the vault out of iCloud
   Drive or turn the optimization off.
+- Names that differ only in letter case (`A.md` next to `a.md`, `Notes/`
+  and `notes/`) are two files on the server and on Linux, but one on Windows
+  and macOS. When a teammate on Linux, the web editor or MCP makes such a
+  second name, it doesn't come to a Windows or Mac vault while the first one
+  is there; neither file's text changes. A folder a teammate renames only in
+  letter case keeps its old case on a Windows or Mac disk: its notes stay
+  synced, and a note you create in it goes to the server under the folder's
+  old case.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.
