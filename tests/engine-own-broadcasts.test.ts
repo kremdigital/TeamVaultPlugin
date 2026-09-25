@@ -17,6 +17,7 @@
  */
 import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
+import { Logger, type LogEntry } from '@/utils/logger';
 import {
   FakeServer,
   buildHarness,
@@ -109,7 +110,8 @@ describe('SyncEngine — operations of another device that uses this device’s 
   // other computer's new notes, deletes and renames did not reach this one
   // until the next connect.
   it('applies them as a teammate’s: nothing of the kind is on its way from here', async () => {
-    const h = buildHarness();
+    const entries: LogEntry[] = [];
+    const h = buildHarness({ logger: new Logger('debug', { write: (e) => entries.push(e) }) });
     for (const [path, id] of [
       ['a.md', 'f1'],
       ['c.md', 'f3'],
@@ -165,6 +167,8 @@ describe('SyncEngine — operations of another device that uses this device’s 
     expect(h.engine.getFileIdForPath('n.md')).toBe('f2');
     expect(h.engine.getFileIdForPath('c.md')).toBeNull();
     expect(h.engine.getStatus()).toBe('connected');
+    // Said once in sync.log, not once per event.
+    expect(entries.filter((e) => e.message.includes('uses the same id'))).toHaveLength(1);
     await h.engine.stop();
   });
 });

@@ -12,6 +12,7 @@
  */
 import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
+import { Logger, type LogEntry } from '@/utils/logger';
 import {
   buildHarness,
   deferred,
@@ -186,6 +187,34 @@ describe('SyncEngine — a note renamed while away to a name this client never w
     expect(h.engine.getFileIdForPath('note.md')).toBe('f1');
     expect(h.vault.text('note.md')).toBe('v1\nunsent\n');
     expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('on "restore", takes the server’s broadcast of the move back for its own', async () => {
+    const entries: LogEntry[] = [];
+    const h = buildHarness({ logger: new Logger('debug', { write: (e) => entries.push(e) }) });
+    await remember(h, 'v1\nunsent\n');
+    const b = await teammateNote(h);
+    h.serverFiles = [serverFile('f1', 'note?.md', 'TEXT', await sha256Hex('v1\n'), 3), b.listed];
+    h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: [] }));
+
+    await start(h, b.doc);
+    h.modal.del.resolve('restore-server');
+    await flushAsync(20);
+    // Broadcast to the whole room, this device included, before the ack.
+    h.socket().fire('file:renamed', {
+      fileId: 'f1',
+      newPath: 'note.md',
+      requestedPath: 'note.md',
+      outcome: { kind: 'renamed', fileId: 'f1', from: 'note?.md', to: 'note.md' },
+      clientId: 'device-1',
+      log: eventLog,
+    });
+    h.socket().pending('file:rename').ack({ ok: true });
+    await flushAsync(20);
+
+    expect(entries.filter((e) => e.message.includes('uses the same id'))).toEqual([]);
+    expect(h.vault.text('note.md')).toBe('v1\nunsent\n');
     await h.engine.stop();
   });
 
