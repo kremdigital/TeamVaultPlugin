@@ -385,3 +385,92 @@ describe('DocManager — move', () => {
     expect(dm.getText('b1', 'b.md')).toBe('mine\n');
   });
 });
+
+describe('DocManager — lineageOf and startOver', () => {
+  it('only reports a history that is not the file’s: it is deleted by startOver', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'a.md', 'old note\n', 'f1');
+    const dm = idb.manager();
+    await dm.open('b1', 'a.md', 'f1');
+
+    await expect(
+      dm.lineageOf('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(rebuilt('old note\n'))),
+    ).resolves.toEqual({ related: false, owner: 'f1', text: 'old note\n' });
+    await flushAsync();
+    // Nothing gone yet: the caller settles the copy on disk first.
+    expect(idb.deleted).toEqual([]);
+    expect(dm.getText('b1', 'a.md')).toBe('old note\n');
+
+    await dm.startOver('b1', 'a.md', 'f1');
+    await flushAsync();
+    expect(idb.deleted).toEqual([dbNameOf('a.md')]);
+    expect(dm.getText('b1', 'a.md')).toBe('');
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
+  });
+
+  it('takes a history for the deleted note’s when the note was created again, shared or not', async () => {
+    const idb = new FakeIndexedDb();
+    const server = seed(idb, 'a.md', 'old note\n', 'f1');
+    const dm = idb.manager();
+    await dm.open('b1', 'a.md', 'f1');
+    // A server that continues the history on revival: the new text over the old.
+    const revived = continued(server, '');
+    revived.getText('content').delete(0, revived.getText('content').length);
+    revived.getText('content').insert(0, 'new note\n');
+
+    await expect(dm.lineageOf('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(revived))).resolves.toEqual(
+      { related: true },
+    );
+    await expect(
+      dm.lineageOf('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(revived), { replaced: true }),
+    ).resolves.toMatchObject({ related: false, text: 'old note\n' });
+  });
+
+  it('does not take an empty server doc for the file’s when the server had text for it', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'Untitled.md', 'old draft\n', 'f1');
+    const dm = idb.manager();
+    await dm.open('b1', 'Untitled.md', 'f1');
+    const empty = Y.encodeStateAsUpdate(new Y.Doc());
+
+    await expect(
+      dm.lineageOf('b1', 'Untitled.md', 'f1', empty, { hadText: false }),
+    ).resolves.toEqual({ related: true });
+    await expect(
+      dm.lineageOf('b1', 'Untitled.md', 'f1', empty, { hadText: true }),
+    ).resolves.toMatchObject({ related: false, text: 'old draft\n' });
+  });
+
+  it('keeps an empty note typed into on both sides, when the server had no text for it', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'Todo.md', 'B line\n', 'f1');
+    const dm = idb.manager();
+    await dm.open('b1', 'Todo.md', 'f1');
+    const theirs = Y.encodeStateAsUpdate(rebuilt('A line\n'));
+
+    await expect(dm.lineageOf('b1', 'Todo.md', 'f1', theirs, { hadText: false })).resolves.toEqual({
+      related: true,
+    });
+    // Had the server text for it, the history here is another one.
+    await expect(
+      dm.lineageOf('b1', 'Todo.md', 'f1', theirs, { hadText: true }),
+    ).resolves.toMatchObject({ related: false });
+    await expect(
+      dm.lineageOf('b1', 'Todo.md', 'f1', theirs, { hadText: false, replaced: true }),
+    ).resolves.toMatchObject({ related: false });
+  });
+
+  it('keeps an unstamped history out, whatever the server had', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'Todo.md', 'an older note\n');
+    const dm = idb.manager();
+    await dm.open('b1', 'Todo.md', 'f2');
+
+    await expect(
+      dm.lineageOf('b1', 'Todo.md', 'f2', Y.encodeStateAsUpdate(rebuilt('A line\n')), {
+        hadText: false,
+        recorded: true,
+      }),
+    ).resolves.toMatchObject({ related: false, owner: null });
+  });
+});

@@ -163,6 +163,19 @@ export interface LineageResult {
 
 const SAME_LINEAGE: LineageResult = { discarded: false, owner: null, text: null };
 
+/** What {@link DocManager.lineageOf} found. */
+export type LineageCheck =
+  | { related: true }
+  | {
+      related: false;
+      /** Whose that history was, by its stamp; `null` when it had none. */
+      owner: string | null;
+      /** The text it holds. */
+      text: string;
+    };
+
+const RELATED: LineageCheck = { related: true };
+
 /** What {@link DocManager.move} found and did. */
 export interface MoveResult {
   /**
@@ -367,7 +380,7 @@ export class DocManager {
 
   /**
    * Before the server's doc of file `fileId` (`server`, its full state as an
-   * update) is merged into the doc open at `filePath`: make sure the history
+   * update) is merged into the doc open at `filePath`: whether the history
    * there descends from the server's. Two histories of one note that do not
    * are independent insertions of its text, and merged, the note holds its
    * text twice — for the whole team once the merge is pushed back. The server
@@ -380,57 +393,99 @@ export class DocManager {
    * the beginning of the same history. A server that collects garbage keeps
    * each client in its state vector, so that holds after it, too.
    *
-   * With nothing in the server's doc, there is nothing to compare: edits made
-   * here to an empty note, not sent yet, are the file's, and so is the
-   * history under the name when it is stamped for the file — or when it is not
-   * stamped but the caller's records have the file under this name
-   * (`recorded`; a store from before 0.3.8). Unless the server replaced the
-   * note's history meanwhile (`replaced`: the catch-up showed the note deleted
-   * and created again under its id by a server that replaces histories on
-   * revival). An unstamped history under a name the file is new at is what a
-   * build before 0.3.8 left there when another note moved away.
+   * Unless the note was deleted and created again under its id since this
+   * device last synced it (`replaced`: the catch-up shows both). A server that
+   * continues the history on revival lays the new note over the deleted one's
+   * history, and what this device did to the deleted note and never sent —
+   * edits typed offline, a save made while Obsidian was closed — merged into
+   * the new note for the whole team. The history here is the deleted note's.
    *
-   * A history that is not the file's is deleted with its store, by the exact
-   * name, and the doc started anew and stamped — subscribers stay; the result
-   * carries the text it held. One that is gets stamped. A doc without
-   * operations is stamped and kept. `null` when no doc is open under the name:
-   * nothing was checked, and nothing is opened for it.
+   * With nothing in the server's doc there is nothing to compare. Edits made
+   * here to an empty note, not sent yet, are the file's, and so is the history
+   * under the name when it is stamped for the file — or when it is not stamped
+   * but the caller's records have the file under this name (`recorded`; a
+   * store from before 0.3.8). An unstamped history under a name the file is new
+   * at is what a build before 0.3.8 left there when another note moved away.
+   * Not when the caller's records say the server had text for the note
+   * (`hadText`): a doc with no operation at all never held any, so the server
+   * built it anew — a note created again empty under a deleted one's name
+   * ("Untitled"), on a server that replaces the history and whose catch-up does
+   * not show it.
+   *
+   * With operations on both sides and no client in common, the history here is
+   * still the file's when it is stamped for it and the caller's records say
+   * the server had no text (`hadText: false`): an empty note typed into here
+   * and there while this device was offline. Both histories start from the
+   * same empty doc.
+   *
+   * `null` when no doc is open under the name: nothing was checked, and
+   * nothing is opened for it. A history found to be the file's is stamped for
+   * it; so is a doc without operations. Nothing else changes: a history that
+   * is not the file's is deleted by {@link startOver}, once the caller has
+   * settled the copy on disk that holds it.
    */
-  verifyLineage(
+  lineageOf(
     bindingId: string,
     filePath: string,
     fileId: string,
     server: Uint8Array,
-    opts: { replaced?: boolean; recorded?: boolean } = {},
-  ): Promise<LineageResult | null> {
+    opts: { replaced?: boolean; recorded?: boolean; hadText?: boolean } = {},
+  ): Promise<LineageCheck | null> {
     return this.serially([this.cacheKey(bindingId, filePath)], async () => {
       if (!this.cache.has(this.cacheKey(bindingId, filePath))) return null;
       const entry = this.acquire(bindingId, filePath);
       // Not loaded in time: used as it is, as `open` does.
-      if (!(await this.settle(entry))) return SAME_LINEAGE;
+      if (!(await this.settle(entry))) return RELATED;
       const owner = entry.owner;
       if (!hasHistory(entry.doc)) {
         if (owner === null) this.claim(entry, fileId);
-        return SAME_LINEAGE;
+        return RELATED;
       }
-      if (owner === null || owner === fileId) {
+      if ((owner === null || owner === fileId) && opts.replaced !== true) {
         const serverClients = clientsOf(Y.decodeStateVector(Y.encodeStateVectorFromUpdate(server)));
         const related =
           serverClients.size === 0
-            ? opts.replaced !== true && (owner === fileId || opts.recorded === true)
-            : [...entry.doc.store.clients.keys()].some((client) => serverClients.has(client));
+            ? opts.hadText !== true && (owner === fileId || opts.recorded === true)
+            : [...entry.doc.store.clients.keys()].some((client) => serverClients.has(client)) ||
+              (owner === fileId && opts.hadText === false);
         if (related) {
           if (owner === null) this.claim(entry, fileId);
-          return SAME_LINEAGE;
+          return RELATED;
         }
       }
-      const text = entry.ytext.toJSON();
+      return { related: false, owner, text: entry.ytext.toJSON() };
+    });
+  }
+
+  /**
+   * Delete the history under `filePath` with its store, by the exact name, and
+   * start the doc anew, stamped for `fileId`. Its subscribers stay.
+   */
+  startOver(bindingId: string, filePath: string, fileId: string): Promise<void> {
+    return this.serially([this.cacheKey(bindingId, filePath)], async () => {
       await this.clear(bindingId, filePath, { keepSubscribers: true });
       const fresh = this.acquire(bindingId, filePath, false);
       await this.settle(fresh);
       this.claim(fresh, fileId);
-      return { discarded: true, owner, text };
     });
+  }
+
+  /**
+   * {@link lineageOf}, and a history found not to be the file's deleted at
+   * once ({@link startOver}); the result carries the text it held.
+   */
+  async verifyLineage(
+    bindingId: string,
+    filePath: string,
+    fileId: string,
+    server: Uint8Array,
+    opts: { replaced?: boolean; recorded?: boolean; hadText?: boolean } = {},
+  ): Promise<LineageResult | null> {
+    const found = await this.lineageOf(bindingId, filePath, fileId, server, opts);
+    if (found === null) return null;
+    if (found.related) return SAME_LINEAGE;
+    await this.startOver(bindingId, filePath, fileId);
+    return { discarded: true, owner: found.owner, text: found.text };
   }
 
   /**

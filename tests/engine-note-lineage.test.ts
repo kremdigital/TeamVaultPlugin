@@ -27,6 +27,7 @@ import {
   buildHarness,
   connect,
   dbNameOf,
+  deferred,
   encode,
   eventLog,
   flushAsync,
@@ -325,7 +326,10 @@ describe('SyncEngine — a note deleted and created again under its name while t
 });
 
 describe('SyncEngine — a note revived by a server that continues its history', () => {
-  it('is merged as the one history it is: the new text, nothing set aside', async () => {
+  // The catch-up shows the note deleted and created again: the history here
+  // is the deleted note's, even though the server's continues it. With
+  // nothing unsent here, the note simply starts from the server's doc.
+  it('starts from the server’s doc: the new text, nothing set aside', async () => {
     const idb = new FakeIndexedDb();
     const old = serverDocWith('OLD\n');
     store(idb, 'a.md', old, 'f1');
@@ -348,12 +352,83 @@ describe('SyncEngine — a note revived by a server that continues its history',
 
     expect(h.vault.text('a.md')).toBe('NEW\n');
     expect(revived.getText('content').toJSON()).toBe('NEW\n');
-    expect(idb.deleted).toEqual([]);
+    expect(idb.deleted).toEqual([dbNameOf('a.md')]);
+    expect(idb.textOf(dbNameOf('a.md'))).toBe('NEW\n');
     expect(conflictCopies(h)).toEqual([]);
+    expect(h.socket().created()).toEqual([]);
     await h.engine.stop();
   });
 
-  it('brings edits made here to an empty note into the new one, as the protocol has it', async () => {
+  it('keeps edits of the deleted note the server never got in a copy next to the new one', async () => {
+    const idb = new FakeIndexedDb();
+    const old = serverDocWith('old text\n');
+    // Typed offline and saved: in the store and on disk, never sent.
+    store(
+      idb,
+      'Untitled.md',
+      continued(old, (t) => t.insert(t.length, 'unsent line\n')),
+      'f1',
+    );
+    const h = buildHarness({ docs: idb.manager() });
+    await remember(h, 'Untitled.md', 'f1', 'old text\n', 'old text\nunsent line\n');
+    const meta = h.log.getFileMeta('b1', 'Untitled.md');
+    if (!meta) throw new Error('no meta');
+    h.log.setFileMeta({ ...meta, foldedHash: await sha256Hex('old text\nunsent line\n') });
+    noVersions(h, 'f1');
+    // A teammate deleted it and created a new Untitled.md over its history.
+    const revived = continued(old, (t) => {
+      t.delete(0, t.length);
+      t.insert(0, 'S2 text\n');
+    });
+    h.serverFiles = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex('S2 text\n'), 8)];
+
+    await connect(h, {
+      operations: deletedAndCreated('Untitled.md', 'f1', true),
+      yjsDocs: [snapshotOf(revived, 'f1')],
+    });
+    await flushAsync(60);
+    applySent(h, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('S2 text\n');
+    expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
+    const copies = conflictCopies(h);
+    expect(copies).toHaveLength(1);
+    const [copy] = copies;
+    expect(h.vault.text(copy ?? '')).toBe('old text\nunsent line\n');
+    expect(h.socket().created()).toEqual([copy]);
+    await h.engine.stop();
+  });
+
+  it('keeps a save made while Obsidian was closed in a copy next to the new one', async () => {
+    const idb = new FakeIndexedDb();
+    const old = serverDocWith('old text\n');
+    store(idb, 'Untitled.md', old, 'f1');
+    const h = buildHarness({ docs: idb.manager() });
+    // On disk only: the store never saw it.
+    await remember(h, 'Untitled.md', 'f1', 'old text\n', 'old text\nexternal line\n');
+    noVersions(h, 'f1');
+    const revived = continued(old, (t) => {
+      t.delete(0, t.length);
+      t.insert(0, 'S2 text\n');
+    });
+    h.serverFiles = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex('S2 text\n'), 8)];
+
+    await connect(h, {
+      operations: deletedAndCreated('Untitled.md', 'f1', true),
+      yjsDocs: [snapshotOf(revived, 'f1')],
+    });
+    await flushAsync(60);
+    applySent(h, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('S2 text\n');
+    expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
+    const copies = conflictCopies(h);
+    expect(copies).toHaveLength(1);
+    expect(h.vault.text(copies[0] ?? '')).toBe('old text\nexternal line\n');
+    await h.engine.stop();
+  });
+
+  it('keeps edits made here to an empty note out of the new one too', async () => {
     const idb = new FakeIndexedDb();
     // An empty note, typed into while offline.
     const typed = new Y.Doc();
@@ -368,6 +443,8 @@ describe('SyncEngine — a note revived by a server that continues its history',
     const revived = new Y.Doc();
     h.serverFiles = [serverFile('f1', 'a.md', 'TEXT', await sha256Hex(''), 0)];
 
+    noVersions(h, 'f1');
+
     await connect(h, {
       operations: deletedAndCreated('a.md', 'f1', true),
       yjsDocs: [snapshotOf(revived, 'f1')],
@@ -375,9 +452,11 @@ describe('SyncEngine — a note revived by a server that continues its history',
     await flushAsync(40);
     applySent(h, revived, 'f1');
 
-    expect(revived.getText('content').toJSON()).toBe('typed\n');
-    expect(h.vault.text('a.md')).toBe('typed\n');
-    expect(conflictCopies(h)).toEqual([]);
+    expect(revived.getText('content').toJSON()).toBe('');
+    expect(h.vault.text('a.md')).toBe('');
+    const copies = conflictCopies(h);
+    expect(copies).toHaveLength(1);
+    expect(h.vault.text(copies[0] ?? '')).toBe('typed\n');
     await h.engine.stop();
   });
 });
@@ -701,4 +780,248 @@ describe('SyncEngine — state.json lost, offline stores from before 0.3.8 intac
       await h.engine.stop();
     },
   );
+});
+
+describe('SyncEngine — the lineage check without the catch-up’s word', () => {
+  // A server's catch-up can leave the DELETE and CREATE out: the one in
+  // production lists operations from the first 500 of the project's journal,
+  // and every project past that gets none. The histories have to tell.
+  it.each([
+    ['under its name (Ctrl+N)', 'Untitled.md'],
+    ['renamed since (a title typed in)', 'Meeting.md'],
+  ])('keeps the deleted note’s text out of an empty new note %s', async (_label, path) => {
+    const idb = new FakeIndexedDb();
+    store(idb, 'Untitled.md', serverDocWith('old draft\n'), 'f1');
+    const h = buildHarness({ docs: idb.manager() });
+    await remember(h, 'Untitled.md', 'f1', 'old draft\n');
+    // Created again empty by a server that replaces the history: its doc
+    // has no operation at all.
+    const revived = new Y.Doc();
+    h.serverFiles = [serverFile('f1', path, 'TEXT', await sha256Hex(''), 0)];
+
+    await connect(h, { yjsDocs: [snapshotOf(revived, 'f1')] });
+    await flushAsync(60);
+    applySent(h, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('');
+    expect(h.vault.text(path)).toBe('');
+    expect(conflictCopies(h)).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('merges an empty note typed into here while offline and by a teammate meanwhile', async () => {
+    const idb = new FakeIndexedDb();
+    // Created empty and synced; the server's doc has no operation.
+    const serverDoc = new Y.Doc();
+    const h1 = buildHarness({ docs: idb.manager() });
+    await remember(h1, 'Todo.md', 'f1', '');
+    h1.serverFiles = [serverFile('f1', 'Todo.md', 'TEXT', await sha256Hex(''), 0)];
+    await connect(h1, { yjsDocs: [snapshotOf(serverDoc, 'f1')] });
+    await flushAsync(20);
+    // Offline, the user types into it.
+    h1.socket().disconnect();
+    await flushAsync(10);
+    h1.vault.files.set('Todo.md', encode('B line\n'));
+    await h1.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Todo.md',
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+    await h1.engine.stop();
+
+    // A teammate typed into it meanwhile.
+    serverDoc.getText('content').insert(0, 'A line\n');
+    const h2 = buildHarness({ predecessor: h1, docs: idb.manager() });
+    h2.serverFiles = [serverFile('f1', 'Todo.md', 'TEXT', await sha256Hex('A line\n'), 7)];
+    noVersions(h2, 'f1');
+    await connect(h2, { yjsDocs: [snapshotOf(serverDoc, 'f1')] });
+    await flushAsync(60);
+    applySent(h2, serverDoc, 'f1');
+
+    const merged = serverDoc.getText('content').toJSON();
+    expect(merged).toContain('A line\n');
+    expect(merged).toContain('B line\n');
+    expect(h2.vault.text('Todo.md')).toBe(merged);
+    expect(conflictCopies(h2)).toEqual([]);
+    expect(h2.socket().created()).toEqual([]);
+    await h2.engine.stop();
+  });
+
+  it('checks the history before a teammate’s edit that comes ahead of the note’s catch-up', async () => {
+    const idb = new FakeIndexedDb();
+    store(idb, 'Untitled.md', serverDocWith('old draft\n'), 'f1');
+    const h = buildHarness({ docs: idb.manager() });
+    await remember(h, 'Untitled.md', 'f1', 'old draft\n');
+    const revived = new Y.Doc();
+    h.serverFiles = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex(''), 0)];
+
+    await h.engine.start();
+    h.socket()
+      .pending('project:join')
+      .ack({ ok: true, operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(40);
+    // The teammate types into the new note while the catch-up streams.
+    remoteEdit(h, revived, 'f1', 'hi\n');
+    await flushAsync(20);
+    answerFetches(h, revived);
+    await flushAsync(40);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [snapshotOf(revived, 'f1')],
+      done: true,
+    });
+    await flushAsync(60);
+    applySent(h, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('hi\n');
+    expect(h.vault.text('Untitled.md')).toBe('hi\n');
+    await h.engine.stop();
+  });
+
+  it('keeps unsent edits when sync stops while the copy on disk is looked into', async () => {
+    const idb = new FakeIndexedDb();
+    const old = serverDocWith('old text\n');
+    store(
+      idb,
+      'Untitled.md',
+      continued(old, (t) => t.insert(t.length, 'unsent line\n')),
+      'f1',
+    );
+    const h1 = buildHarness({ docs: idb.manager() });
+    await remember(h1, 'Untitled.md', 'f1', 'old text\n', 'old text\nunsent line\n');
+    const meta = h1.log.getFileMeta('b1', 'Untitled.md');
+    if (!meta) throw new Error('no meta');
+    h1.log.setFileMeta({ ...meta, foldedHash: await sha256Hex('old text\nunsent line\n') });
+    // Replaced by a server that builds a new history on revival.
+    const revived = serverDocWith('S2 text\n');
+    const listed = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex('S2 text\n'), 8)];
+    h1.serverFiles = listed;
+    const versions = deferred<void>();
+    let asked = 0;
+    h1.routes.set('GET /api/projects/p1/files/f1/versions', async () => {
+      asked += 1;
+      await versions.promise;
+      return json({ versions: [] });
+    });
+    const recreated = deletedAndCreated('Untitled.md', 'f1');
+
+    await connect(h1, { operations: recreated, yjsDocs: [snapshotOf(revived, 'f1')] });
+    for (let i = 0; i < 50 && asked === 0; i++) await flushAsync(2);
+    expect(asked).toBe(1);
+    // Pause sync, a reload, Obsidian closed — right now.
+    await h1.engine.stop();
+    versions.resolve();
+    await flushAsync(10);
+    // Nothing is decided yet: the history and the disk are as they were.
+    expect(idb.textOf(dbNameOf('Untitled.md'))).toBe('old text\nunsent line\n');
+    expect(h1.vault.text('Untitled.md')).toBe('old text\nunsent line\n');
+
+    const h2 = buildHarness({ predecessor: h1, docs: idb.manager() });
+    h2.serverFiles = listed;
+    noVersions(h2, 'f1');
+    await connect(h2, { operations: recreated, yjsDocs: [snapshotOf(revived, 'f1')] });
+    await flushAsync(60);
+    applySent(h2, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('S2 text\n');
+    expect(h2.vault.text('Untitled.md')).toBe('S2 text\n');
+    const copies = conflictCopies(h2);
+    expect(copies).toHaveLength(1);
+    expect(h2.vault.text(copies[0] ?? '')).toBe('old text\nunsent line\n');
+    await h2.engine.stop();
+  });
+});
+
+describe('SyncEngine — the lineage check, again on each connect', () => {
+  it('checks a history checked on the connect before, when a teammate’s edit comes first', async () => {
+    const idb = new FakeIndexedDb();
+    const old = serverDocWith('old draft\n');
+    store(idb, 'Untitled.md', old, 'f1');
+    const h = buildHarness({ docs: idb.manager() });
+    await remember(h, 'Untitled.md', 'f1', 'old draft\n', 'old draft\nmine\n');
+    h.serverFiles = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex('old draft\n'), 10)];
+    // The first connect checks the note's history and merges the save in.
+    await connect(h, { yjsDocs: [snapshotOf(old, 'f1')] });
+    await flushAsync(40);
+    applySent(h, old, 'f1');
+    expect(old.getText('content').toJSON()).toBe('old draft\nmine\n');
+    const mark = h.socket().emits.length;
+
+    // Offline for a while: a teammate deletes the note and creates it again
+    // empty, on a server that replaces the history.
+    h.socket().disconnect();
+    await flushAsync(10);
+    const revived = new Y.Doc();
+    h.serverFiles = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex(''), 0)];
+    h.socket().connect();
+    await flushAsync();
+    h.socket()
+      .pending('project:join')
+      .ack({ ok: true, operations: [], yjsStream: true, yjsCount: 1 });
+    await flushAsync(40);
+    remoteEdit(h, revived, 'f1', 'hi\n');
+    await flushAsync(20);
+    answerFetches(h, revived);
+    await flushAsync(40);
+    h.socket().fire('yjs:catchup', {
+      projectId: 'p1',
+      docs: [snapshotOf(revived, 'f1')],
+      done: true,
+    });
+    await flushAsync(60);
+    applySent(h, revived, 'f1', mark);
+
+    expect(revived.getText('content').toJSON()).toBe('hi\n');
+    expect(h.vault.text('Untitled.md')).toBe('hi\n');
+    await h.engine.stop();
+  });
+
+  it('keeps the deleted note’s edits out of an empty new note when sync stops midway', async () => {
+    const idb = new FakeIndexedDb();
+    store(
+      idb,
+      'Untitled.md',
+      continued(serverDocWith('old draft\n'), (t) => t.insert(t.length, 'unsent\n')),
+      'f1',
+    );
+    const h1 = buildHarness({ docs: idb.manager() });
+    await remember(h1, 'Untitled.md', 'f1', 'old draft\n', 'old draft\nunsent\n');
+    const meta = h1.log.getFileMeta('b1', 'Untitled.md');
+    if (!meta) throw new Error('no meta');
+    h1.log.setFileMeta({ ...meta, foldedHash: await sha256Hex('old draft\nunsent\n') });
+    // Created again empty, and the catch-up does not say so.
+    const revived = new Y.Doc();
+    const listed = [serverFile('f1', 'Untitled.md', 'TEXT', await sha256Hex(''), 0)];
+    h1.serverFiles = listed;
+    const versions = deferred<void>();
+    let asked = 0;
+    h1.routes.set('GET /api/projects/p1/files/f1/versions', async () => {
+      asked += 1;
+      await versions.promise;
+      return json({ versions: [] });
+    });
+
+    await connect(h1, { yjsDocs: [snapshotOf(revived, 'f1')] });
+    for (let i = 0; i < 50 && asked === 0; i++) await flushAsync(2);
+    expect(asked).toBe(1);
+    await h1.engine.stop();
+    versions.resolve();
+    await flushAsync(10);
+
+    const h2 = buildHarness({ predecessor: h1, docs: idb.manager() });
+    h2.serverFiles = listed;
+    noVersions(h2, 'f1');
+    await connect(h2, { yjsDocs: [snapshotOf(revived, 'f1')] });
+    await flushAsync(60);
+    applySent(h2, revived, 'f1');
+
+    expect(revived.getText('content').toJSON()).toBe('');
+    expect(h2.vault.text('Untitled.md')).toBe('');
+    const copies = conflictCopies(h2);
+    expect(copies).toHaveLength(1);
+    expect(h2.vault.text(copies[0] ?? '')).toBe('old draft\nunsent\n');
+    await h2.engine.stop();
+  });
 });

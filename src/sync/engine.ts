@@ -403,11 +403,22 @@ export class SyncEngine {
   private renamedHere = new Map<string, string>();
 
   /**
-   * Notes whose server doc this connect's catch-up shows replaced: deleted and
-   * created again under their id by a server that builds a new history on
-   * revival — see {@link historiesReplaced} and {@link checkLineage}.
+   * Files this connect's catch-up shows deleted and then created again under
+   * their id (the server revives a tombstone under its old id) — see
+   * {@link notesRecreated} and {@link checkLineage}.
    */
-  private replacedHistories = new Set<string>();
+  private recreated = new Set<string>();
+
+  /**
+   * Notes whose history here has been checked against the server's in this
+   * connect (see {@link checkLineage}), or started anew in it. A teammate's
+   * edit to any other note waits for that check (see
+   * {@link handleServerYjsUpdate}).
+   */
+  private readonly lineageChecked = new Set<string>();
+
+  /** Teammates' edits waiting for their note's lineage check, by file id. */
+  private readonly liveUpdatesWaiting = new Map<string, YjsUpdateMessage[]>();
 
   /**
    * Notes the last index refresh put under a name this device has no record
@@ -731,6 +742,9 @@ export class SyncEngine {
       this.pendingCatchup = [];
       this.yjsFetchUnavailable = false;
       this.freedHere.clear();
+      // The server's docs may have changed while this device was away: each
+      // note's history is checked again (see `checkLineage`).
+      this.lineageChecked.clear();
       // A broadcast from before the disconnect never arrives now, and neither
       // does the ack of an operation sent on the old connection: left counted
       // as on its way, a rename kept every teammate's rename of the file from
@@ -753,7 +767,7 @@ export class SyncEngine {
       const [result] = await Promise.all([joinPromise, filesPromise]);
       this.throwIfStopped();
       // Before any catch-up doc is applied: see `checkLineage`.
-      this.replacedHistories = historiesReplaced(result.ok ? result.operations : []);
+      this.recreated = notesRecreated(result.ok ? result.operations : []);
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -1025,7 +1039,19 @@ export class SyncEngine {
    * without a stamp: the next note under the name took it for its own. Only
    * the histories themselves tell whether they are one.
    *
-   * The copy on disk is then the old history's (see {@link setAsideOldCopy}).
+   * A note deleted and created again under its id since this device last
+   * synced it, as the catch-up shows (see {@link notesRecreated}), is a new
+   * note whatever its history: what this device did to the deleted one and
+   * never sent is not merged into it, on a server that continues the history
+   * on revival either.
+   *
+   * The copy on disk is then the old history's (see {@link setAsideOldCopy}),
+   * and it is settled before the history goes. The other way round, a stop
+   * in between — Pause sync, a reload, Obsidian closed while the server's
+   * version history was looked up — left the disk with edits the server
+   * never got, a fold marker saying they were folded, and no history holding
+   * them: the next start wrote the server's text over them.
+   *
    * Callers hold the note's path lock.
    */
   private async checkLineage(
@@ -1033,18 +1059,16 @@ export class SyncEngine {
     docPath: string,
     server: Uint8Array,
   ): Promise<void> {
-    const found = await this.docManager.verifyLineage(
-      this.binding.id,
-      docPath,
-      meta.fileId,
-      server,
-      {
-        replaced: this.replacedHistories.has(meta.fileId),
-        recorded: !this.newHere.has(meta.fileId),
-      },
-    );
+    const found = await this.docManager.lineageOf(this.binding.id, docPath, meta.fileId, server, {
+      replaced: this.recreated.has(meta.fileId),
+      recorded: !this.newHere.has(meta.fileId),
+      // Whether the server had text for the note when this device last synced it.
+      hadText: meta.size > 0,
+    });
     this.throwIfStopped();
-    if (found === null || !found.discarded) return;
+    if (found === null) return;
+    this.lineageChecked.add(meta.fileId);
+    if (found.related) return;
     this.log.warn('a note’s offline history is not the server’s; starting it from the server', {
       path: meta.relativePath,
       fileId: meta.fileId,
@@ -1052,15 +1076,18 @@ export class SyncEngine {
     });
     this.foldBases.delete(meta.fileId);
     const serverText = textOf(server);
+    await this.setAsideOldCopy(meta, serverText);
+    await this.docManager.startOver(this.binding.id, docPath, meta.fileId);
     // The size recorded is the old history's. It tells whether the server has
     // content for the note, and a note emptied that way waited for content
-    // forever: its snapshot never wrote the empty text over the old one.
+    // forever: its snapshot never wrote the empty text over the old one. Moved
+    // only now: a stop before the history is gone must find the old size, or
+    // the next start took an empty server doc for this note's own.
     const size = new TextEncoder().encode(serverText).byteLength;
     if (meta.size !== size) {
       meta.size = size;
       if (this.fileIndex.byId.get(meta.fileId) === meta) this.operationLog.setFileMeta(meta);
     }
-    await this.setAsideOldCopy(meta, serverText);
   }
 
   /**
@@ -2790,6 +2817,8 @@ export class SyncEngine {
    * history was lost, and the new note's subscription left with it.
    */
   private async startDoc(fileId: string, path: string): Promise<void> {
+    // Nothing of another history is kept: its updates need no check.
+    this.lineageChecked.add(fileId);
     if (this.historyLeaving(path, fileId)) {
       await this.withPathLock(path, () => Promise.resolve());
     }
@@ -3243,9 +3272,69 @@ export class SyncEngine {
       );
       return;
     }
+    if (!this.lineageChecked.has(meta.fileId) && this.canFetch()) {
+      this.applyAfterLineageCheck(meta, msg);
+      return;
+    }
     this.rememberBaseBeforeRemote(meta, docPath);
     this.docManager.applyRemoteUpdate(this.binding.id, docPath, msg.update);
     this.scheduleSnapshotToDisk(meta.relativePath);
+  }
+
+  /**
+   * A teammate's edit to a note whose history here has not been checked
+   * against the server's in this connect (see {@link checkLineage}): most
+   * often one the catch-up skipped because the disk matched the server. The
+   * history is checked first, against the server's doc fetched for it, and
+   * the edit applied after; edits arriving meanwhile wait in order.
+   *
+   * Applied at once, the edit gave the history here a client in common with
+   * the server's, and the check that followed took them for one history: a
+   * note deleted and created again under its name while this device was away
+   * got the deleted note's text back, for the whole team, as soon as a
+   * teammate typed into it during the catch-up.
+   */
+  private applyAfterLineageCheck(meta: IndexedMeta, msg: YjsUpdateMessage): void {
+    const waiting = this.liveUpdatesWaiting.get(meta.fileId);
+    if (waiting !== undefined) {
+      waiting.push(msg);
+      return;
+    }
+    const queue = [msg];
+    this.liveUpdatesWaiting.set(meta.fileId, queue);
+    const check = this.checkLineageLive(meta.fileId).catch((err: unknown) => {
+      if (!this.hasStopped) {
+        this.log.debug('lineage check before a teammate’s edit failed', meta.relativePath, err);
+      }
+    });
+    this.detach(
+      check.then(() => {
+        this.liveUpdatesWaiting.delete(meta.fileId);
+        if (this.hasStopped) return;
+        // Checked, or it could not be: either way the edits go in now.
+        this.lineageChecked.add(meta.fileId);
+        for (const waited of queue) this.handleServerYjsUpdate(waited);
+      }),
+    );
+  }
+
+  /** The check of {@link applyAfterLineageCheck}: the server's doc, fetched and merged in. */
+  private async checkLineageLive(fileId: string): Promise<void> {
+    const meta = this.fileIndex.byId.get(fileId);
+    if (meta === undefined) return;
+    const fetched = await this.fetchServerDoc(meta);
+    if (fetched === null) return;
+    await this.withPathLock(this.docPathOf(meta), async () => {
+      const current = this.fileIndex.byId.get(fileId);
+      if (current === undefined) return;
+      await this.openDoc(current);
+      await this.applyFetchedDoc(current, fetched);
+    });
+  }
+
+  /** Whether `yjs:fetch` can be asked now. */
+  private canFetch(): boolean {
+    return this.socket.isConnected() && !this.yjsFetchUnavailable;
   }
 
   /**
@@ -4623,7 +4712,15 @@ export class SyncEngine {
   }
 
   private async hydrate(meta: IndexedMeta): Promise<void> {
-    if (!this.socket.isConnected() || this.yjsFetchUnavailable) return;
+    const fetched = await this.fetchServerDoc(meta);
+    if (fetched !== null) await this.applyFetchedDoc(meta, fetched);
+  }
+
+  /** The server's doc of a note, by `yjs:fetch`; `null` when it cannot be had. */
+  private async fetchServerDoc(
+    meta: IndexedMeta,
+  ): Promise<{ sync1: number[]; stateVector?: number[] } | null> {
+    if (!this.canFetch()) return null;
     const result = await this.socket.fetchYjsDoc(this.binding.projectId, meta.fileId);
     this.throwIfStopped();
     if (!result.ok) {
@@ -4631,8 +4728,19 @@ export class SyncEngine {
       // later save wait out the timeout again before the next connect.
       if (result.error === 'timeout') this.yjsFetchUnavailable = true;
       this.log.debug('yjs:fetch failed', meta.relativePath, result.error);
-      return;
+      return null;
     }
+    return result;
+  }
+
+  /**
+   * Merge a fetched server doc (see {@link fetchServerDoc}) into a note's doc,
+   * its lineage checked first. Callers hold the note's path lock.
+   */
+  private async applyFetchedDoc(
+    meta: IndexedMeta,
+    result: { sync1: number[]; stateVector?: number[] },
+  ): Promise<void> {
     // The file may have been deleted or renamed while the request was out. A
     // rename made here may still be carrying the doc over: it is under the
     // old name until then.
@@ -5470,26 +5578,24 @@ function textOf(state: Uint8Array): string {
 }
 
 /**
- * Notes the catch-up shows deleted and then created again under their id by
- * a server that replaced their history doing so. A server that continues the
- * history marks such a CREATE `revived: true` (see `sync-protocol.md`,
- * "CREATE на существующий tombstone"); one before that marked nothing.
+ * Files the catch-up shows deleted and then created again under their id:
+ * the server revives a tombstone under its old id. A server that continues a
+ * note's history on revival marks such a CREATE `revived: true` (see
+ * `sync-protocol.md`, "CREATE на существующий tombstone"); one before that
+ * replaced the history and marked nothing. Either way the file under the id
+ * is a new one.
  */
-function historiesReplaced(ops: readonly ServerOperation[]): Set<string> {
+function notesRecreated(ops: readonly ServerOperation[]): Set<string> {
   const deleted = new Set<string>();
-  const replaced = new Set<string>();
+  const recreated = new Set<string>();
   for (const op of ops) {
-    const payload = (op.payload ?? {}) as { fileId?: unknown; revived?: unknown };
+    const payload = (op.payload ?? {}) as { fileId?: unknown };
     const fileId = typeof payload.fileId === 'string' ? payload.fileId : '';
     if (fileId === '') continue;
-    if (op.opType === 'DELETE') {
-      deleted.add(fileId);
-    } else if (op.opType === 'CREATE' && deleted.delete(fileId)) {
-      if (payload.revived === true) replaced.delete(fileId);
-      else replaced.add(fileId);
-    }
+    if (op.opType === 'DELETE') deleted.add(fileId);
+    else if (op.opType === 'CREATE' && deleted.delete(fileId)) recreated.add(fileId);
   }
-  return replaced;
+  return recreated;
 }
 
 /**
