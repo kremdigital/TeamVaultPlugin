@@ -42,28 +42,32 @@ uses [Semantic Versioning](https://semver.org/).
   team. When you create, edit or rename such a note in Obsidian, a notice
   names it and says what is wrong with the name, even with notifications off,
   and `sync.log` gets a `warn` line for it (unless Log level is Errors only).
-  A notice comes once per name while the plugin runs, wherever the name turns
-  up; names reported within a moment of each other (a link update across many
-  notes, a folder copied into the vault) share one notice, and while a notice
-  is up, the next one waits for it to go. Renaming the folder above such a
-  note, or moving the note within its binding, gives no notice. Renaming or
-  moving a synced note to such a name works like deleting it for your
-  teammates: a notice says so for each such note, and `sync.log` names the
-  note it was. A note an older version already synced under such a name stays
-  on the server; to sync it again, rename it in the project's web interface
-  or through MCP (renaming it in Obsidian uploads it as a new note and leaves
-  the old one on the server). Teammates on older versions then see it
-  renamed. Anyone on this version who already has a copy under the old name
-  keeps it, no longer synced: on a Mac or Linux for any such name, and on
-  Windows too for a name that ends in a dot or a space or a short name such
-  as `Draft~1.md`, which older versions wrote there as spelled. Copy any edits
-  made in that copy since the update over to the renamed note, then delete
-  the copy; the notice says so too. On Windows, don't delete a copy whose name
-  ends in a dot or a space in File Explorer, or in Obsidian while **Deleted
-  files** is set to **Move to system trash** (the default): Windows drops the
-  dot or space and deletes the synced file or folder named without it, for
-  the whole team. "What is never synced" in the README gives safe ways to
-  delete it.
+  For a note you create or edit in a folder with such a name, such as `U.S.`,
+  the notice names the folder and says to rename the folder. Apart from the
+  renames below, a notice comes once per name while the plugin runs, wherever
+  the name turns up. Names reported within a moment of each other (a link
+  update across many notes, a folder copied into the vault) share one notice,
+  and a notice comes no sooner than 15 seconds after the one before, taking in
+  whatever was reported meanwhile. Renaming the folder above such a note, or
+  moving the note within its binding, gives no notice. Renaming or moving a
+  synced note to such a name works like deleting it for your teammates: a
+  notice says so for every such rename, even of a note renamed so before
+  (renames close together share one notice), and `sync.log` gets a line for
+  each, naming the note it was. A note an older version already synced under
+  such a name stays on the server; to sync it again, rename it in the
+  project's web interface or through MCP (renaming it in Obsidian uploads it
+  as a new note and leaves the old one on the server). Teammates on older
+  versions then see it renamed. Anyone on this version who already has a copy
+  under the old name keeps it, no longer synced: on a Mac or Linux for any
+  such name, and on Windows too for a name that ends in a dot or a space or a
+  short name such as `Draft~1.md`, which older versions wrote there as
+  spelled. Copy any edits made in that copy since the update over to the
+  renamed note, then delete the copy; the notice says so too. On Windows,
+  don't delete a copy whose name ends in a dot or a space in File Explorer, or
+  in Obsidian while **Deleted files** is set to **Move to system trash** (the
+  default): Windows drops the dot or space and deletes the synced file or
+  folder named without it, for the whole team. "What is never synced" in the
+  README gives safe ways to delete it.
 
 ### Fixed
 
@@ -153,20 +157,43 @@ uses [Semantic Versioning](https://semver.org/).
   started from it, and Obsidian reuses "Untitled" for every new note. The old
   note's text got mixed into the new one and went to the server for the whole
   team. Each history now belongs to its note: it moves with the note and is
-  deleted with it. A leftover history from an earlier version is discarded
-  when another note takes the name.
-- **A note you deleted while offline stays deleted.** The delete went out when
-  you reconnected, but the sync that runs first had already written the note
-  back to disk. There it stayed, no longer synced. A new note you saved under
-  the same name meanwhile was taken for the deleted one. Its text went to the
-  server as the deleted note's, and the new note itself was never uploaded.
-  Now a note leaves Team Vault's records as soon as you delete it, and a new
-  note under its name is uploaded as a new note.
-- **A note you renamed while offline no longer comes back under its old
-  name.** The sync that ran before the rename was sent wrote the note back
-  under its old name, and that copy was then uploaded as a second note. A new
-  note saved under the old name meanwhile was taken for the renamed one. The
-  note is now recorded under its new name right away.
+  deleted with it. A leftover history from an earlier version is discarded when
+  another note takes the name.
+  - A teammate may delete a note and create a new one under its name while you
+    are offline. The new note then no longer gets the deleted note's text back
+    when you reconnect, empty new notes included.
+  - Edits you made to the deleted note that never reached the server are kept
+    next to it as `Name.conflict-<time>.md` and uploaded as a note of their own.
+- **A note you deleted while offline stays deleted.** This now also works when
+  you open Obsidian without a network connection, and after **Pause sync** and
+  **Resume sync** without one. The delete went out when you reconnected, but the
+  sync that runs first had already written the note back to disk. There it
+  stayed, no longer synced. A new note you saved under the same name meanwhile
+  was taken for the deleted one. Its text went to the server as the deleted
+  note's, and the new note itself was never uploaded. Now a note leaves Team
+  Vault's records as soon as you delete it, and a new note under its name is
+  uploaded as a new note. In a session that started offline, the delete used not
+  to go out at all. There is one exception: when a teammate changed the note
+  while you were offline, or deleted it and created a new note under its name,
+  your delete is not sent. Their note comes back to your vault. If you saved a
+  new note under the same name in the meantime, yours is kept as
+  `Name.conflict-<device>.md`. Before, the delete removed the teammate's note
+  for the whole team.
+- **A note you renamed while offline no longer comes back under its old name.**
+  This now also works when you open Obsidian without a network connection, and
+  when you rename a note more than once before you reconnect. Several renames of
+  one note are sent as one. A note renamed and then renamed back sends nothing,
+  so a teammate's rename of it still applies. The sync that ran before the
+  rename was sent wrote the note back under its old name, and that copy was then
+  uploaded as a second note. A new note saved under the old name meanwhile was
+  taken for the renamed one. The note is now recorded under its new name right
+  away.
+  - If a teammate gave the name to another note meanwhile, by renaming or
+    creating it, the server stores yours as `Name.conflict-<device>.md` and your
+    note moves there. The teammate's note keeps the name and comes to your
+    vault. Before, the two notes' texts could end up swapped or duplicated for
+    the whole team.
+  - A rename made while sync is connecting is no longer undone on your disk.
 - **A file a teammate deleted while you were offline no longer comes back, and
   no longer stays behind on your disk.** A file renamed and then deleted came
   back under its old name for the whole team: the next start uploaded your
@@ -192,7 +219,56 @@ uses [Semantic Versioning](https://semver.org/).
   you are asked first, and **Restore on server** moves the file back to its
   name. Before, your copy stayed under the old name and was uploaded again as
   a new file on the next connect. If the file is later renamed back to a name
-  that syncs, it returns.
+  that syncs, it returns. When the rename happened while you were offline, the
+  question now comes once sync has connected, and the rest of your vault syncs
+  in the meantime. A copy the server already has is removed without a
+  question.
+- **Renames Team Vault makes on your disk are no longer sent to the server as
+  yours.** Obsidian reports every rename in the vault, including the ones Team
+  Vault makes to apply a teammate's changes, and Team Vault took them for
+  renames you made. When you chose **Keep both** for an attachment, the
+  attachment was renamed on the server, for the whole team, to the name of the
+  copy kept aside.
+- **A note you save or rename again right after renaming it is no longer
+  uploaded as a second note.** Until the server confirmed a rename, a save under
+  the new name was uploaded as a new note. A second rename (for example, a
+  template plugin that renames a note and then moves it) went out without saying
+  which note it was, and the next connect uploaded the note again.
+- **A new note renamed right after you create it is no longer uploaded twice.**
+  This happens with Templater's `tp.file.rename`, or when you type a title on a
+  slow connection. The rename now waits for the server to confirm the note and
+  goes out as a rename, so the team no longer gets the note under both names and
+  the old name no longer comes back after a restart.
+- **A note you create while offline under a name a teammate used meanwhile no
+  longer overwrites theirs.** Yours is kept as `Name.conflict-<device>.md` and
+  theirs keeps the name. Before, your text replaced theirs for the whole team,
+  and every save of yours added another conflict copy on the server.
+- **A rename, attachment edit or delete made offline no longer hits the new file
+  a teammate created under the same name.** The server gives a file created
+  again under a deleted file's name the same id. A change queued for the old
+  file used to rename the teammate's new file, write the old attachment over it,
+  or delete it for everyone. Now such a change is not sent, and the teammate's
+  file comes to your vault. A copy of yours with changes the server never had is
+  kept as a file of its own.
+- **After Restore on server, your next save no longer uploads the file again as
+  a new file.** This is the answer to a delete made while you were offline.
+  Edits you had not sent before no longer come back doubled.
+- **An attachment saved twice in a row no longer goes back to the first version
+  on your disk.** The server sends every change back to the device that made it
+  too, and Team Vault took its own upload for a teammate's: it downloaded the
+  first version again and wrote it over the second.
+- When the server stores your rename under another name because a teammate took
+  the name first (`Note.conflict-<device>.md`), your note now moves there right
+  away. Before, it stayed under the name you gave it until the next connect, and
+  the teammate's file with that name did not arrive until then.
+- A note deleted while sync is connecting no longer comes back to your disk,
+  unsynced.
+- **A vault copied to another computer together with its `data.json` no longer
+  misses the copy's changes.** Both copies send under one client id, and each
+  took the other's new notes, deletes and renames for its own until the next
+  connect. They now apply right away, and `sync.log` says that another device
+  uses the same id. The README's Troubleshooting section explains how to give
+  the copy an id of its own.
 
 ## [0.3.7] — 2026-09-23
 
