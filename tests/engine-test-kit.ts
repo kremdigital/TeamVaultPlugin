@@ -35,6 +35,7 @@ import {
   type IdbRegistry,
   type PersistenceFactory,
 } from '@/crdt/doc-manager';
+import { applyTextDiff } from '@/crdt/text-diff';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import {
   ObsidianWatcher,
@@ -885,6 +886,15 @@ export interface ServerFileRecord {
  */
 export type BroadcastFormat = 'current' | 'legacy';
 
+/** How the {@link FakeServer} answers `project:join`: see {@link FakeServer.joinAnswer}. */
+export type CatchupForm = 'whole journal' | 'first rows' | 'cut short';
+
+/** The `fileId` of a journal row's payload, `''` when it has none. */
+function fileIdOf(op: ServerOperation): string {
+  const id = (op.payload as { fileId?: unknown } | null)?.fileId;
+  return typeof id === 'string' ? id : '';
+}
+
 /** The operations a client sends that the {@link FakeServer} answers. */
 const SERVED = new Set([
   'file:rename',
@@ -967,6 +977,44 @@ export class FakeServer {
     return rows.filter((row) =>
       Object.entries(row.vectorClock).some(([client, n]) => n > (clock[client] ?? 0)),
     );
+  }
+
+  /**
+   * The answer to `project:join` in one of the server's catch-up forms (see
+   * `sync-protocol.md`, «Подключение»), for the vector clock the harness's
+   * engine last persisted:
+   *
+   *   - `whole journal`: every operation the clock has not seen, and the echo
+   *     `operationsCatchup: 2` — what a server that knows the flag answers;
+   *   - `first rows`: the unseen ones among the journal's first `rows` rows
+   *     (500 on a real server), without the echo — every server before it;
+   *   - `cut short`: the newest `rows` unseen ones, with the echo and
+   *     `operationsTruncated` when that left some out.
+   *
+   * The UPDATE rows of notes (a write through REST or MCP) come only in the
+   * first rows: a server that knows the flag leaves them out of both forms.
+   */
+  joinAnswer(
+    form: CatchupForm,
+    opts: { rows?: number; yjsDocs?: YjsDocSnapshot[] } = {},
+  ): Record<string, unknown> {
+    const docs = { yjsDocs: opts.yjsDocs ?? [] };
+    if (form === 'first rows') {
+      const window = opts.rows === undefined ? {} : { window: opts.rows };
+      return { ok: true, operations: this.catchupFor(undefined, window), ...docs };
+    }
+    const unseen = this.catchupFor().filter(
+      (op) => op.opType !== 'UPDATE' || this.files.get(fileIdOf(op))?.fileType !== 'TEXT',
+    );
+    const kept =
+      form === 'cut short' ? unseen.slice(Math.max(0, unseen.length - (opts.rows ?? 1))) : unseen;
+    return {
+      ok: true,
+      operations: kept,
+      operationsCatchup: 2,
+      ...(kept.length < unseen.length ? { operationsTruncated: true } : {}),
+      ...docs,
+    };
   }
 
   /**
@@ -1166,6 +1214,28 @@ export class FakeServer {
     const log = this.log('device-2');
     this.record(log, 'DELETE', file.path, null, { fileId: id });
     this.broadcast('file:deleted', { fileId: id, log }, 'device-2');
+  }
+
+  /**
+   * A teammate writes note `id` through REST or MCP (`write_note`) with
+   * `text`: the file takes its hash, and the journal gets the UPDATE the
+   * server logs — `fileType` in its payload from a server of the `current`
+   * format, none from one before. No file event goes out: the REST bridge
+   * sends none for a note. The doc is {@link ServerDocs.restWrite}'s.
+   */
+  async restWrite(id: string, text: string): Promise<void> {
+    const file = this.files.get(id);
+    if (!file || file.deleted) throw new Error(`no file ${id}`);
+    file.contentHash = await sha256Hex(text);
+    file.size = encode(text).byteLength;
+    this.applied.push(`write ${id}`);
+    this.publish();
+    this.record(this.log('rest:u2'), 'UPDATE', file.path, null, {
+      fileId: id,
+      contentHash: file.contentHash,
+      size: file.size,
+      ...(this.format === 'current' ? { fileType: file.fileType } : {}),
+    });
   }
 
   /**
@@ -1378,6 +1448,27 @@ export class ServerDocs {
       contentHash: await sha256Hex(text),
       size: encode(text).byteLength,
     });
+  }
+
+  /**
+   * A teammate writes note `id` through REST or MCP (`write_note`): the doc
+   * takes `text` as a diff, as the server writes it, and the change goes to
+   * the room as a `yjs:update`; the file and the journal follow (see
+   * {@link FakeServer.restWrite}).
+   */
+  async restWrite(id: string, text: string): Promise<void> {
+    const doc = this.docs.get(id);
+    if (!doc || this.server.pathOf(id) === null) throw new Error(`no note ${id}`);
+    const seen = Y.encodeStateVector(doc);
+    applyTextDiff(doc.getText('content'), text);
+    const socket = this.harness.socketIfBuilt();
+    if (socket?.connected) {
+      socket.fire('yjs:update', {
+        fileId: id,
+        update: Array.from(Y.encodeStateAsUpdate(doc, seen)),
+      });
+    }
+    await this.server.restWrite(id, text);
   }
 
   /** The text of note `id` on the server; `null` when it is deleted or has no doc. */
