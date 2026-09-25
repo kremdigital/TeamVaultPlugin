@@ -28,6 +28,7 @@ import {
   encode,
   flushAsync,
   remoteEdit,
+  serverFile,
   type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
@@ -221,3 +222,96 @@ describe.each(['current', 'legacy'] as const)(
     });
   },
 );
+
+describe('SyncEngine — the listing on a case-insensitive disk', () => {
+  // Each listed name is checked against the index for another file under it
+  // in another case. Folding every indexed name for every listed one blocked
+  // Obsidian for over half a second at each connect with a thousand notes.
+  it('folds and looks up each name a bounded number of times, not once per indexed name', async () => {
+    const h = buildHarness();
+    caseInsensitiveDisk(h.vault);
+    const n = 1000;
+    const bytes = encode('x');
+    const hash = await sha256Hex(bytes);
+    const listed: Array<ReturnType<typeof serverFile>> = [];
+    for (let i = 0; i < n; i++) {
+      const path = `Folder ${i % 40}/Picture ${i}.png`;
+      h.vault.files.set(path, bytes);
+      h.log.setFileMeta({
+        bindingId: 'b1',
+        relativePath: path,
+        serverFileId: `f${i}`,
+        contentHash: hash,
+        size: bytes.byteLength,
+        fileType: 'BINARY',
+        lastSyncedAt: 1,
+      });
+      listed.push(serverFile(`f${i}`, path, 'BINARY', hash, bytes.byteLength));
+    }
+    h.serverFiles = listed;
+
+    // Folding a name normalizes it twice, and the connect's path checks fold
+    // each name a few dozen times in all: linear in the vault. A fold of every
+    // indexed name per listed one is half a million folds here.
+    const normalize = jest.spyOn(String.prototype, 'normalize');
+    // And the index is not scanned for a name no other one shares in some
+    // case: each listed name is looked up a few times, not once per indexed
+    // name.
+    const keys = jest.spyOn(h.engine as unknown as { caseKey(path: string): string }, 'caseKey');
+    try {
+      await connect(h);
+      await flushAsync(20);
+      expect(normalize.mock.calls.length).toBeLessThan(100 * n);
+      expect(keys.mock.calls.length).toBeLessThan(10 * n);
+    } finally {
+      normalize.mockRestore();
+      keys.mockRestore();
+    }
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  // Every file a teammate moves is checked for another file here under its
+  // new name in another case: a scan of the index, whose names are folded
+  // once, not at each scan.
+  it('moves files a teammate renames without folding every indexed name for each', async () => {
+    const h = buildHarness();
+    caseInsensitiveDisk(h.vault);
+    const server = new FakeServer(h, 'current');
+    const n = 1000;
+    const moved = 100;
+    const bytes = encode('x');
+    const hash = await sha256Hex(bytes);
+    for (let i = 0; i < n; i++) {
+      const path = `Folder ${i % 40}/Picture ${i}.png`;
+      h.vault.files.set(path, bytes);
+      h.log.setFileMeta({
+        bindingId: 'b1',
+        relativePath: path,
+        serverFileId: `f${i}`,
+        contentHash: hash,
+        size: bytes.byteLength,
+        fileType: 'BINARY',
+        lastSyncedAt: 1,
+      });
+      server.add({ id: `f${i}`, path, fileType: 'BINARY', contentHash: hash, size: 1 });
+    }
+    await connect(h);
+    await flushAsync(20);
+
+    // A fold of every indexed name per move is two hundred thousand
+    // normalizations here.
+    const normalize = jest.spyOn(String.prototype, 'normalize');
+    try {
+      for (let i = 0; i < moved; i++) server.teammateRename(`f${i}`, `Moved/Picture ${i}.png`);
+      await flushAsync(60);
+      expect(normalize.mock.calls.length).toBeLessThan(200 * moved);
+    } finally {
+      normalize.mockRestore();
+    }
+    expect(h.vault.files.has('Moved/Picture 0.png')).toBe(true);
+    expect(h.vault.files.has(`Moved/Picture ${moved - 1}.png`)).toBe(true);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+});

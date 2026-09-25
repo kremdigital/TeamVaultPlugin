@@ -287,6 +287,9 @@ const LAST_SYNCED = 'lastSynced';
  */
 const DOC_STATE = 'docState';
 
+/** How many paths {@link SyncEngine.caseKey} remembers the key of before it starts over. */
+const CASE_KEYS_MAX = 50_000;
+
 /**
  * Payload of a queued CREATE: the content hashes it went out with to a
  * server that may have applied it without its ack reaching this device (the
@@ -488,6 +491,9 @@ export class SyncEngine {
    * disk is still that file's until {@link checkLineage} settles it.
    */
   private readonly foreignHistory = new Map<string, string>();
+
+  /** Path → its {@link pathKey}, for the case scans of the index (see {@link caseKey}). */
+  private readonly caseKeys = new Map<string, string>();
 
   /** Teammates' edits waiting for their note's lineage check, by file id. */
   private readonly liveUpdatesWaiting = new Map<string, YjsUpdateMessage[]>();
@@ -824,6 +830,24 @@ export class SyncEngine {
   }
 
   /**
+   * {@link pathKey} of `path`, remembered. The case scans of the index
+   * (`nameHolder`, `spelledHere`, the listing's `caseRival`) compare a name
+   * with every indexed one; folding each of them every time, the listing of a
+   * vault of a thousand notes blocked Obsidian for over half a second at each
+   * connect on Windows and macOS, and a vault five times larger for a quarter
+   * of a minute.
+   */
+  private caseKey(path: string): string {
+    let key = this.caseKeys.get(path);
+    if (key === undefined) {
+      if (this.caseKeys.size >= CASE_KEYS_MAX) this.caseKeys.clear();
+      key = pathKey(path);
+      this.caseKeys.set(path, key);
+    }
+    return key;
+  }
+
+  /**
    * The name this device records the file at `path` by. On a disk that takes
    * names differing only in case for one file, a file can be on disk under
    * another case than its name on the server: a teammate renamed its folder
@@ -836,10 +860,10 @@ export class SyncEngine {
    */
   private spelledHere(path: string): string {
     if (this.fileIndex.byPath.has(path) || !this.caseInsensitive()) return path;
-    const key = pathKey(path);
+    const key = this.caseKey(path);
     let found: string | undefined;
     for (const indexed of this.fileIndex.byPath.keys()) {
-      if (pathKey(indexed) !== key) continue;
+      if (this.caseKey(indexed) !== key) continue;
       if (found !== undefined) return path;
       found = indexed;
     }
@@ -1660,6 +1684,12 @@ export class SyncEngine {
     // Old paths of the files renamed while away: whatever the listing shows
     // there now is indexed once our copy has moved out (see `deferred`).
     const vacating = new Set([...away.values()].map((move) => move.meta.relativePath));
+    // Names more than one file below may be indexed under in some case: only
+    // under those can a listed file meet another one (see `caseRival`).
+    const sharedKeys = this.sharedCaseKeys([
+      ...files.map((f) => f.path),
+      ...[...away.values()].map((move) => move.meta.relativePath),
+    ]);
     const deferred: ApiFile[] = [];
     const byPath = new Map<string, FileMeta & { fileId: string }>();
     const byId = new Map<string, FileMeta & { fileId: string }>();
@@ -1731,7 +1761,7 @@ export class SyncEngine {
       }
       // On a disk that takes names differing only in case for one file, one
       // file per such name: the one this device has there (see `nameHolder`).
-      const rival = this.caseRival(f, byPath);
+      const rival = this.caseRival(f, byPath, sharedKeys);
       if (rival !== undefined) {
         // The one indexed first gives way when this device has no record of
         // it and has one of `f` under its name.
@@ -1772,15 +1802,41 @@ export class SyncEngine {
 
   /**
    * On a disk that takes names differing only in case for one file: the file
-   * of `byPath` under the name of listed file `f` in another case.
+   * of `byPath` under the name of listed file `f` in another case. `shared`:
+   * see {@link sharedCaseKeys}; a name outside it has no such file, and the
+   * index is not scanned for it — for every listed file, that cost the time
+   * of a scan per name in the vault.
    */
-  private caseRival(f: ApiFile, byPath: ReadonlyMap<string, IndexedMeta>): IndexedMeta | undefined {
+  private caseRival(
+    f: ApiFile,
+    byPath: ReadonlyMap<string, IndexedMeta>,
+    shared: ReadonlySet<string>,
+  ): IndexedMeta | undefined {
     if (!this.caseInsensitive()) return undefined;
-    const key = pathKey(f.path);
+    const key = this.caseKey(f.path);
+    if (!shared.has(key)) return undefined;
     for (const [path, meta] of byPath) {
-      if (path !== f.path && pathKey(path) === key && meta.fileId !== f.id) return meta;
+      if (path !== f.path && this.caseKey(path) === key && meta.fileId !== f.id) return meta;
     }
     return undefined;
+  }
+
+  /**
+   * On a disk that takes names differing only in case for one file: the
+   * {@link pathKey}s two or more of `paths` share, spelled differently. Empty
+   * on any other disk.
+   */
+  private sharedCaseKeys(paths: readonly string[]): Set<string> {
+    const shared = new Set<string>();
+    if (!this.caseInsensitive()) return shared;
+    const first = new Map<string, string>();
+    for (const path of paths) {
+      const key = this.caseKey(path);
+      const seen = first.get(key);
+      if (seen === undefined) first.set(key, path);
+      else if (seen !== path) shared.add(key);
+    }
+    return shared;
   }
 
   /** Whether `state.json` has file `fileId` under `path`: the copy there is its. */
@@ -2980,7 +3036,7 @@ export class SyncEngine {
     for (const path of this.fileIndex.byPath.keys()) {
       if (
         isInBinding(path, folderPath) ||
-        (folderKey !== null && isInBinding(pathKey(path), folderKey))
+        (folderKey !== null && isInBinding(this.caseKey(path), folderKey))
       ) {
         children.push(path);
       }
@@ -4877,9 +4933,9 @@ export class SyncEngine {
     const holder = this.fileIndex.byPath.get(path);
     if (holder !== undefined) return holder === self ? undefined : holder;
     if (!this.caseInsensitive()) return undefined;
-    const key = pathKey(path);
+    const key = this.caseKey(path);
     for (const meta of this.fileIndex.byPath.values()) {
-      if (meta !== self && pathKey(meta.relativePath) === key) return meta;
+      if (meta !== self && this.caseKey(meta.relativePath) === key) return meta;
     }
     return undefined;
   }
@@ -4891,9 +4947,9 @@ export class SyncEngine {
   private waitingFor(path: string): WaitingForName | undefined {
     const move = this.waitingForName.get(path);
     if (move !== undefined || !this.caseInsensitive()) return move;
-    const key = pathKey(path);
+    const key = this.caseKey(path);
     for (const [waiting, other] of this.waitingForName) {
-      if (pathKey(waiting) === key) return other;
+      if (this.caseKey(waiting) === key) return other;
     }
     return undefined;
   }
