@@ -148,6 +148,21 @@ export interface OpenResult {
 
 const KEPT: OpenResult = { discarded: false, owner: null };
 
+/** What {@link DocManager.verifyLineage} found. */
+export interface LineageResult {
+  /**
+   * The history in the doc did not descend from the server's doc: deleted,
+   * and the doc started anew.
+   */
+  discarded: boolean;
+  /** Whose that history was, by its stamp; `null` when it had none. */
+  owner: string | null;
+  /** The text that history held, when discarded; `null` otherwise. */
+  text: string | null;
+}
+
+const SAME_LINEAGE: LineageResult = { discarded: false, owner: null, text: null };
+
 /** What {@link DocManager.move} found and did. */
 export interface MoveResult {
   /**
@@ -318,29 +333,28 @@ export class DocManager {
    * {@link clear}); this is the check behind them, for a step cut short (the
    * app quit between two writes).
    *
-   * The first file to open a doc stamps it with its id, in memory and in the
-   * store. A doc stamped for another file is deleted and started anew — its
+   * A doc stamped for another file is deleted and started anew — its
    * subscribers stay — and the result says whose it was, so the caller can
-   * stop relying on what it had folded into it. A doc without a stamp is
-   * taken as the file's own when `adoptUnstamped` (the default): every store
-   * from before 0.3.8 is such a store, and it may hold edits the server has
-   * not got yet. Without it, an unstamped history is discarded like another
-   * file's — see {@link claimStored}. A store that did not load in time is
-   * used as it is, unstamped, the way docs were used before.
+   * stop relying on what it had folded into it. An empty doc is stamped for
+   * the file at once, in memory and in the store: whatever lands in it from
+   * now on is the file's.
+   *
+   * A history without a stamp is used as the file's own, but not stamped:
+   * every store from before 0.3.8 is such a store, and it may hold edits the
+   * server has not got yet — or be what a build before 0.3.8 left under the
+   * name when another note moved away from it. Which of the two it is, only
+   * the server's doc tells: the stamp comes with {@link verifyLineage}. A
+   * store that did not load in time is used as it is, the way docs were used
+   * before.
    */
-  open(
-    bindingId: string,
-    filePath: string,
-    fileId: string,
-    opts: { adoptUnstamped?: boolean } = {},
-  ): Promise<OpenResult> {
+  open(bindingId: string, filePath: string, fileId: string): Promise<OpenResult> {
     return this.serially([this.cacheKey(bindingId, filePath)], async () => {
       const entry = this.acquire(bindingId, filePath);
       if (!(await this.settle(entry))) return KEPT;
       const owner = entry.owner;
       if (owner === fileId) return KEPT;
-      if (owner === null && (opts.adoptUnstamped !== false || !hasHistory(entry.doc))) {
-        this.claim(entry, fileId);
+      if (owner === null) {
+        if (!hasHistory(entry.doc)) this.claim(entry, fileId);
         return KEPT;
       }
       await this.clear(bindingId, filePath, { keepSubscribers: true });
@@ -352,29 +366,71 @@ export class DocManager {
   }
 
   /**
-   * {@link open} for a file this device has no record of under `filePath` —
-   * new to it there. A history under that name is then not the file's,
-   * stamped or not, unless it is stamped for this very file: a build before
-   * 0.3.8 left the history of a note renamed or deleted away under its old
-   * name, unstamped, and the next note under the name took it for its own —
-   * mixed text, pushed to the whole team.
+   * Before the server's doc of file `fileId` (`server`, its full state as an
+   * update) is merged into the doc open at `filePath`: make sure the history
+   * there descends from the server's. Two histories of one note that do not
+   * are independent insertions of its text, and merged, the note holds its
+   * text twice — for the whole team once the merge is pushed back. The server
+   * builds such a history when it revives a deleted note under its old id
+   * (up to the server that continues it instead), when a project is seeded
+   * again, and when it seeds a doc it lost from the note's file.
    *
-   * Opens a store only when the renderer lists one under the name (or the
-   * doc is cached): a first sync opens no store at all, and a runtime that
-   * can't list databases skips the check rather than open one per file.
-   * `null` when nothing was opened.
+   * They share a history when the doc holds operations of at least one client
+   * the server's doc has operations of: every client's operations start from
+   * the beginning of the same history. A server that collects garbage keeps
+   * each client in its state vector, so that holds after it, too.
+   *
+   * With nothing in the server's doc, there is nothing to compare: edits made
+   * here to an empty note, not sent yet, are the file's, and so is the
+   * history under the name when it is stamped for the file — or when it is not
+   * stamped but the caller's records have the file under this name
+   * (`recorded`; a store from before 0.3.8). Unless the server replaced the
+   * note's history meanwhile (`replaced`: the catch-up showed the note deleted
+   * and created again under its id by a server that replaces histories on
+   * revival). An unstamped history under a name the file is new at is what a
+   * build before 0.3.8 left there when another note moved away.
+   *
+   * A history that is not the file's is deleted with its store, by the exact
+   * name, and the doc started anew and stamped — subscribers stay; the result
+   * carries the text it held. One that is gets stamped. A doc without
+   * operations is stamped and kept. `null` when no doc is open under the name:
+   * nothing was checked, and nothing is opened for it.
    */
-  async claimStored(
+  verifyLineage(
     bindingId: string,
     filePath: string,
     fileId: string,
-  ): Promise<OpenResult | null> {
-    const name = this.dbName(bindingId, filePath);
-    if (!this.cache.has(this.cacheKey(bindingId, filePath)) && !this.opened.has(name)) {
-      const names = await this.listedNames();
-      if (names === null || !names.has(name)) return null;
-    }
-    return this.open(bindingId, filePath, fileId, { adoptUnstamped: false });
+    server: Uint8Array,
+    opts: { replaced?: boolean; recorded?: boolean } = {},
+  ): Promise<LineageResult | null> {
+    return this.serially([this.cacheKey(bindingId, filePath)], async () => {
+      if (!this.cache.has(this.cacheKey(bindingId, filePath))) return null;
+      const entry = this.acquire(bindingId, filePath);
+      // Not loaded in time: used as it is, as `open` does.
+      if (!(await this.settle(entry))) return SAME_LINEAGE;
+      const owner = entry.owner;
+      if (!hasHistory(entry.doc)) {
+        if (owner === null) this.claim(entry, fileId);
+        return SAME_LINEAGE;
+      }
+      if (owner === null || owner === fileId) {
+        const serverClients = clientsOf(Y.decodeStateVector(Y.encodeStateVectorFromUpdate(server)));
+        const related =
+          serverClients.size === 0
+            ? opts.replaced !== true && (owner === fileId || opts.recorded === true)
+            : [...entry.doc.store.clients.keys()].some((client) => serverClients.has(client));
+        if (related) {
+          if (owner === null) this.claim(entry, fileId);
+          return SAME_LINEAGE;
+        }
+      }
+      const text = entry.ytext.toJSON();
+      await this.clear(bindingId, filePath, { keepSubscribers: true });
+      const fresh = this.acquire(bindingId, filePath, false);
+      await this.settle(fresh);
+      this.claim(fresh, fileId);
+      return { discarded: true, owner, text };
+    });
   }
 
   /**
@@ -981,6 +1037,13 @@ export class DocManager {
 /** Whether a doc holds any integrated operation. */
 function hasHistory(doc: Y.Doc): boolean {
   return doc.store.clients.size > 0;
+}
+
+/** The clients a state vector has operations of. */
+function clientsOf(stateVector: Map<number, number>): Set<number> {
+  const clients = new Set<number>();
+  for (const [client, clock] of stateVector) if (clock > 0) clients.add(client);
+  return clients;
 }
 
 /** Whether a doc holds remote updates it could not integrate yet. */

@@ -22,7 +22,7 @@ function seed(idb: FakeIndexedDb, path: string, text: string, owner?: string): Y
 }
 
 describe('DocManager — open', () => {
-  it('takes an unstamped store for the file and stamps it', async () => {
+  it('uses an unstamped history as the file’s own, and leaves the stamp to the lineage check', async () => {
     const idb = new FakeIndexedDb();
     seed(idb, 'a.md', 'mine\n');
     const dm = idb.manager();
@@ -31,6 +31,19 @@ describe('DocManager — open', () => {
     await flushAsync();
 
     expect(dm.getText('b1', 'a.md')).toBe('mine\n');
+    // Its own, or what another note left under the name: only the server's
+    // doc tells (see `verifyLineage`).
+    expect(dm.ownerOf('b1', 'a.md')).toBeNull();
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.has(OWNER)).toBe(false);
+  });
+
+  it('stamps an empty store for the file at once', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+
+    await dm.open('b1', 'a.md', 'f1');
+    await flushAsync();
+
     expect(dm.ownerOf('b1', 'a.md')).toBe('f1');
     expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
   });
@@ -69,40 +82,160 @@ describe('DocManager — open', () => {
   });
 });
 
-describe('DocManager — claimStored (a file new to this device under the name)', () => {
-  it('discards an unstamped history: another note left it there', async () => {
-    const idb = new FakeIndexedDb();
-    seed(idb, 'a.md', 'left behind\n');
-    const dm = idb.manager();
+/** A doc that continues the history of `base`, with `line` appended. */
+function continued(base: Y.Doc, line: string): Y.Doc {
+  const doc = new Y.Doc();
+  Y.applyUpdate(doc, Y.encodeStateAsUpdate(base));
+  const text = doc.getText('content');
+  text.insert(text.length, line);
+  return doc;
+}
 
-    await expect(dm.claimStored('b1', 'a.md', 'f3')).resolves.toEqual({
-      discarded: true,
-      owner: null,
-    });
+/** The same text inserted anew: what a server builds when it replaces a history. */
+function rebuilt(text: string): Y.Doc {
+  const doc = new Y.Doc();
+  doc.getText('content').insert(0, text);
+  return doc;
+}
+
+describe('DocManager — verifyLineage (before the server’s doc is merged in)', () => {
+  it('keeps, and stamps, an unstamped history that shares the server’s', async () => {
+    const idb = new FakeIndexedDb();
+    const server = seed(idb, 'a.md', 'A\n');
+    const dm = idb.manager();
+    await dm.open('b1', 'a.md', 'f1');
+    const ahead = continued(server, 'teammate\n');
+
+    await expect(
+      dm.verifyLineage('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(ahead)),
+    ).resolves.toEqual({ discarded: false, owner: null, text: null });
     await flushAsync();
 
-    expect(dm.getText('b1', 'a.md')).toBe('');
-    expect(idb.deleted).toEqual([dbNameOf('a.md')]);
-    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f3');
+    expect(dm.getText('b1', 'a.md')).toBe('A\n');
+    expect(idb.deleted).toEqual([]);
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
   });
 
-  it('keeps a history stamped for the file itself', async () => {
+  it.each([
+    ['stamped for the file', 'f1'],
+    ['unstamped', undefined],
+  ])(
+    'starts anew over an independent history (%s), deleting only its database',
+    async (_label, owner) => {
+      const idb = new FakeIndexedDb();
+      seed(idb, 'a.md', 'old note\n', owner);
+      idb.dbs.set('team-vault-b2-a.md', { updates: [], custom: new Map() });
+      const dm = idb.manager();
+      const sent: Uint8Array[] = [];
+      dm.onLocalUpdate('b1', 'a.md', (u) => sent.push(u));
+      await dm.open('b1', 'a.md', 'f1');
+      const server = rebuilt('old note\n');
+
+      await expect(
+        dm.verifyLineage('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(server)),
+      ).resolves.toEqual({ discarded: true, owner: owner ?? null, text: 'old note\n' });
+      await flushAsync();
+
+      expect(dm.getText('b1', 'a.md')).toBe('');
+      expect(idb.deleted).toEqual([dbNameOf('a.md')]);
+      expect(idb.dbs.has('team-vault-b2-a.md')).toBe(true);
+      expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
+      // Merged now, the note holds its text once; later edits still go out.
+      Y.applyUpdate(server, dm.encodeStateAsUpdate('b1', 'a.md'));
+      expect(server.getText('content').toJSON()).toBe('old note\n');
+      expect(sent).toEqual([]);
+      dm.setText('b1', 'a.md', 'new\n');
+      expect(sent).toHaveLength(1);
+    },
+  );
+
+  it('keeps a history the server has collected garbage in since', async () => {
     const idb = new FakeIndexedDb();
-    seed(idb, 'a.md', 'mine\n', 'f3');
+    const server = seed(idb, 'a.md', 'A\nB\nC\n', 'f1');
     const dm = idb.manager();
+    await dm.open('b1', 'a.md', 'f1');
+    // Deleted on the server, which stores its doc anew: the deleted content
+    // is gone, its client stays in the state vector.
+    server.getText('content').delete(0, 4);
+    const compacted = new Y.Doc();
+    Y.applyUpdate(compacted, Y.mergeUpdates([Y.encodeStateAsUpdate(server)]));
 
-    await expect(dm.claimStored('b1', 'a.md', 'f3')).resolves.toEqual({
-      discarded: false,
-      owner: null,
-    });
-
-    expect(dm.getText('b1', 'a.md')).toBe('mine\n');
+    await expect(
+      dm.verifyLineage('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(compacted)),
+    ).resolves.toMatchObject({ discarded: false });
     expect(idb.deleted).toEqual([]);
   });
 
-  it('opens no store where none is listed', async () => {
+  describe('with nothing in the server’s doc', () => {
+    const empty = Y.encodeStateAsUpdate(new Y.Doc());
+
+    it('keeps a history stamped for the file: edits made here to an empty note', async () => {
+      const idb = new FakeIndexedDb();
+      seed(idb, 'a.md', 'typed offline\n', 'f1');
+      const dm = idb.manager();
+      await dm.open('b1', 'a.md', 'f1');
+
+      await expect(dm.verifyLineage('b1', 'a.md', 'f1', empty)).resolves.toMatchObject({
+        discarded: false,
+      });
+      expect(dm.getText('b1', 'a.md')).toBe('typed offline\n');
+    });
+
+    it('keeps an unstamped one the file is recorded under: a store from before 0.3.8', async () => {
+      const idb = new FakeIndexedDb();
+      seed(idb, 'a.md', 'typed offline\n');
+      const dm = idb.manager();
+      await dm.open('b1', 'a.md', 'f1');
+
+      await expect(
+        dm.verifyLineage('b1', 'a.md', 'f1', empty, { recorded: true }),
+      ).resolves.toMatchObject({ discarded: false });
+      await flushAsync();
+      expect(dm.getText('b1', 'a.md')).toBe('typed offline\n');
+      expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
+    });
+
+    it('starts anew over one the server replaced on a revival', async () => {
+      const idb = new FakeIndexedDb();
+      seed(idb, 'a.md', 'deleted note\n', 'f1');
+      const dm = idb.manager();
+      await dm.open('b1', 'a.md', 'f1');
+
+      await expect(
+        dm.verifyLineage('b1', 'a.md', 'f1', empty, { replaced: true }),
+      ).resolves.toMatchObject({ discarded: true, text: 'deleted note\n' });
+      expect(dm.getText('b1', 'a.md')).toBe('');
+    });
+
+    it('starts anew over an unstamped one: nothing proves it is the file’s', async () => {
+      const idb = new FakeIndexedDb();
+      seed(idb, 'Untitled.md', 'an older note\n');
+      const dm = idb.manager();
+      await dm.open('b1', 'Untitled.md', 'f2');
+
+      await expect(dm.verifyLineage('b1', 'Untitled.md', 'f2', empty)).resolves.toMatchObject({
+        discarded: true,
+        owner: null,
+      });
+      expect(dm.getText('b1', 'Untitled.md')).toBe('');
+    });
+  });
+
+  it('stamps and keeps a doc without operations', async () => {
     const idb = new FakeIndexedDb();
-    seed(idb, 'other.md', 'x\n');
+    const dm = idb.manager();
+    dm.getText('b1', 'a.md');
+
+    await expect(
+      dm.verifyLineage('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(rebuilt('X\n'))),
+    ).resolves.toMatchObject({ discarded: false });
+    await flushAsync();
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f1');
+  });
+
+  it('opens nothing where no doc is open', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'a.md', 'stored\n');
     const opened: string[] = [];
     const dm = new DocManager({
       persistenceFactory: (name, doc) => {
@@ -112,7 +245,9 @@ describe('DocManager — claimStored (a file new to this device under the name)'
       idb: idb.registry,
     });
 
-    await expect(dm.claimStored('b1', 'a.md', 'f3')).resolves.toBeNull();
+    await expect(
+      dm.verifyLineage('b1', 'a.md', 'f1', Y.encodeStateAsUpdate(rebuilt('X\n'))),
+    ).resolves.toBeNull();
 
     expect(opened).toEqual([]);
     expect(dm.has('b1', 'a.md')).toBe(false);

@@ -373,10 +373,20 @@ export class SyncEngine {
   private renamedHere = new Map<string, string>();
 
   /**
-   * Notes the index refresh put under a name this device has no record of
-   * them at — see {@link claimNewDocs}. Filled by `indexListedFile`.
+   * Notes whose server doc this connect's catch-up shows replaced: deleted and
+   * created again under their id by a server that builds a new history on
+   * revival — see {@link historiesReplaced}. Until the first lineage check of
+   * each (see {@link checkLineage}).
    */
-  private newDocs: IndexedMeta[] = [];
+  private replacedHistories = new Set<string>();
+
+  /**
+   * Notes the last index refresh put under a name this device has no record
+   * of them at (see `indexListedFile`). An unstamped history under that name
+   * is not taken for theirs without proof from the server's doc (see
+   * {@link checkLineage}).
+   */
+  private newHere = new Set<string>();
 
   /**
    * Whether {@link fileIndex} has been built: from `state.json` when the
@@ -691,6 +701,8 @@ export class SyncEngine {
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
       this.throwIfStopped();
+      // Before any catch-up doc is applied: see `checkLineage`.
+      this.replacedHistories = historiesReplaced(result.ok ? result.operations : []);
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -872,9 +884,12 @@ export class SyncEngine {
     // Deleted while the store loaded. (Renamed, it took the doc along, and
     // `meta` names the new path.)
     if (this.fileIndex.byId.get(snap.fileId) !== meta) return;
-    await this.withPathLock(meta.relativePath, () => this.noteDiskAgreement(meta));
-    this.rememberBaseBeforeRemote(meta);
     const update = Uint8Array.from(snap.sync1);
+    await this.withPathLock(meta.relativePath, async () => {
+      await this.checkLineage(meta, this.docPathOf(meta), update);
+      await this.noteDiskAgreement(meta);
+    });
+    this.rememberBaseBeforeRemote(meta);
     this.docManager.applyRemoteUpdate(this.binding.id, meta.relativePath, update);
     this.skippedDocs.delete(meta.fileId);
     await this.snapshotDocToDisk(meta.relativePath);
@@ -943,22 +958,110 @@ export class SyncEngine {
   }
 
   /**
-   * Notes indexed under a name this device has no record of them at (see
-   * `indexListedFile`): whatever history is stored under that name is not
-   * theirs — unless stamped for them. A build before 0.3.8 left the history
-   * of a note renamed or deleted away under its old name, without a stamp,
-   * and the next note there took it for its own. Checked once per connect,
-   * before anything folds into, writes out or pushes back these docs; only
-   * names with a store are opened (see `DocManager.claimStored`).
+   * Before the server's doc of a note (`server`, its full state) is merged
+   * into the note's doc at `docPath`: check that the history there descends
+   * from the server's (see `DocManager.verifyLineage`). One that does not is
+   * deleted, and the note starts from the server's doc. Merged, the note's
+   * text went to disk and back to the server twice, for the whole team.
+   *
+   * The id does not tell. A server before the fix that continues histories
+   * revives a deleted note under its old id with a new history — a note
+   * deleted and created again under its name ("Untitled", a template, a note
+   * restored from the trash, `write_note` through MCP) while this device was
+   * away. A project seeded again, and a doc the server seeds anew from the
+   * note's file, hold a new history under the id as well. And a build before
+   * 0.3.8 left the history of a note renamed or deleted away under its name,
+   * without a stamp: the next note under the name took it for its own. Only
+   * the histories themselves tell whether they are one.
+   *
+   * The copy on disk is then the old history's (see {@link setAsideOldCopy}).
+   * Callers hold the note's path lock.
    */
-  private async claimNewDocs(metas: readonly IndexedMeta[]): Promise<void> {
-    for (const meta of metas) {
-      const path = meta.relativePath;
-      if (this.fileIndex.byPath.get(path) !== meta) continue;
-      const opened = await this.docManager.claimStored(this.binding.id, path, meta.fileId);
-      this.throwIfStopped();
-      if (opened !== null) this.afterDocOpen(meta, path, opened);
+  private async checkLineage(
+    meta: IndexedMeta,
+    docPath: string,
+    server: Uint8Array,
+  ): Promise<void> {
+    const found = await this.docManager.verifyLineage(
+      this.binding.id,
+      docPath,
+      meta.fileId,
+      server,
+      {
+        replaced: this.replacedHistories.has(meta.fileId),
+        recorded: !this.newHere.has(meta.fileId),
+      },
+    );
+    this.throwIfStopped();
+    if (found === null) return;
+    // Checked: whatever lands in the doc from now on is the new history's.
+    this.replacedHistories.delete(meta.fileId);
+    if (!found.discarded) return;
+    this.log.warn('a note’s offline history is not the server’s; starting it from the server', {
+      path: meta.relativePath,
+      fileId: meta.fileId,
+      owner: found.owner,
+    });
+    this.foldBases.delete(meta.fileId);
+    const serverText = textOf(server);
+    // The size recorded is the old history's. It tells whether the server has
+    // content for the note, and a note emptied that way waited for content
+    // forever: its snapshot never wrote the empty text over the old one.
+    const size = new TextEncoder().encode(serverText).byteLength;
+    if (meta.size !== size) {
+      meta.size = size;
+      if (this.fileIndex.byId.get(meta.fileId) === meta) this.operationLog.setFileMeta(meta);
     }
+    await this.setAsideOldCopy(meta, serverText);
+  }
+
+  /**
+   * The copy on disk of a note whose local history was not the server's (see
+   * {@link checkLineage}). It belongs to that history: the note deleted and
+   * created again, the project seeded again.
+   *
+   * When the server had it — its text now, the last content synced here, or a
+   * version in its history — nothing of it is lost: it is marked as folded,
+   * and the snapshot that follows writes the server's text over it.
+   *
+   * Otherwise it holds edits that never reached the server. Made to the very
+   * text the server's doc holds — the note's fold marker names it, as after a
+   * project seeded again with the same texts — they are folded in three-way,
+   * as any save is. Made to another text, folded into the new note they would
+   * replace its text for everyone, or scatter pieces of the old note over it:
+   * the copy is kept next to the note instead, under a conflict name, the way
+   * `keep-both` keeps a file (the next connect's first upload sends it).
+   */
+  private async setAsideOldCopy(meta: IndexedMeta, serverText: string): Promise<void> {
+    const path = meta.relativePath;
+    const disk = await this.readDiskText(path);
+    if (typeof disk !== 'string') return;
+    const hash = await sha256Hex(disk);
+    const serverHad =
+      disk === serverText ||
+      hash === meta.contentHash ||
+      (await this.serverHadVersion(meta.fileId, hash));
+    this.throwIfStopped();
+    if (serverHad) {
+      await this.markFolded(meta, disk, hash);
+      return;
+    }
+    if (meta.foldedHash !== undefined && meta.foldedHash === (await sha256Hex(serverText))) return;
+    this.forgetFoldedEdits(this.operationLog, meta.fileId);
+    await this.commitLocal(async (io) => {
+      // Renamed or deleted meanwhile: its own events own the file.
+      if (this.fileIndex.byId.get(meta.fileId) !== meta || meta.relativePath !== path) return;
+      if (!(await io.vault.exists(path))) return;
+      const aside = buildConflictPath(path, this.now());
+      this.log.warn('a note’s copy held edits of a history the server no longer has; kept aside', {
+        path,
+        aside,
+      });
+      io.echo.mark(path, ECHO_COUNT_RENAME);
+      io.echo.mark(aside, ECHO_COUNT_RENAME);
+      await io.vault.ensureParentFolder(aside);
+      await this.renameOnDisk(io, path, aside);
+    });
   }
 
   /**
@@ -1221,7 +1324,7 @@ export class SyncEngine {
     this.renamesLeft.clear();
     const occupied = await this.clearStaleCopies(files, away, here);
     this.outOfScope.clear();
-    this.newDocs = [];
+    this.newHere.clear();
     // Names our files took here: a file the listing has there is not indexed
     // over ours (see `queuedRenames`).
     const takenHere = new Set(here.values());
@@ -1296,9 +1399,6 @@ export class SyncEngine {
       }
       this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId);
     }
-    const fresh = this.newDocs;
-    this.newDocs = [];
-    await this.claimNewDocs(fresh);
   }
 
   /**
@@ -1347,9 +1447,7 @@ export class SyncEngine {
     byId.set(f.id, meta);
     // Mirror into SQLite so the next reconnect has it.
     this.operationLog.setFileMeta(meta);
-    // New to this device under this name: a history stored there is not this
-    // note's (see `claimNewDocs`).
-    if (existing === null && f.fileType === 'TEXT') this.newDocs.push(meta);
+    if (existing === null) this.newHere.add(f.id);
   }
 
   /**
@@ -3960,8 +4058,18 @@ export class SyncEngine {
     if (!current) return;
     const docPath = this.docPathOf(current);
     if (!this.docManager.has(this.binding.id, docPath)) return;
+    const update = Uint8Array.from(result.sync1);
+    await this.checkLineage(current, docPath, update);
+    // Moved, deleted or closed while that was checked: the next need fetches again.
+    if (
+      this.fileIndex.byId.get(meta.fileId) !== current ||
+      this.docPathOf(current) !== docPath ||
+      !this.docManager.has(this.binding.id, docPath)
+    ) {
+      return;
+    }
     this.rememberBaseBeforeRemote(current, docPath);
-    this.docManager.applyRemoteUpdate(this.binding.id, docPath, Uint8Array.from(result.sync1));
+    this.docManager.applyRemoteUpdate(this.binding.id, docPath, update);
     this.skippedDocs.delete(current.fileId);
     this.pushMissingOps(current, result.stateVector, docPath);
     // The fetched state may carry edits the disk hasn't seen; a snapshot that
@@ -4768,6 +4876,40 @@ export class SyncEngine {
 }
 
 // -- Local helpers ------------------------------------------------------------
+
+/** The text of a note's doc given as its full state. */
+function textOf(state: Uint8Array): string {
+  const doc = new Y.Doc();
+  try {
+    Y.applyUpdate(doc, state);
+    return doc.getText('content').toJSON();
+  } finally {
+    doc.destroy();
+  }
+}
+
+/**
+ * Notes the catch-up shows deleted and then created again under their id by
+ * a server that replaced their history doing so. A server that continues the
+ * history marks such a CREATE `revived: true` (see `sync-protocol.md`,
+ * "CREATE на существующий tombstone"); one before that marked nothing.
+ */
+function historiesReplaced(ops: readonly ServerOperation[]): Set<string> {
+  const deleted = new Set<string>();
+  const replaced = new Set<string>();
+  for (const op of ops) {
+    const payload = (op.payload ?? {}) as { fileId?: unknown; revived?: unknown };
+    const fileId = typeof payload.fileId === 'string' ? payload.fileId : '';
+    if (fileId === '') continue;
+    if (op.opType === 'DELETE') {
+      deleted.add(fileId);
+    } else if (op.opType === 'CREATE' && deleted.delete(fileId)) {
+      if (payload.revived === true) replaced.delete(fileId);
+      else replaced.add(fileId);
+    }
+  }
+  return replaced;
+}
 
 /**
  * The `fileId` a queued operation carries. The queue is parsed back from
