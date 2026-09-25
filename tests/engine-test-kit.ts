@@ -807,7 +807,13 @@ export interface ServerFileRecord {
 export type BroadcastFormat = 'current' | 'legacy';
 
 /** The operations a client sends that the {@link FakeServer} answers. */
-const SERVED = new Set(['file:rename', 'file:move', 'file:create', 'file:delete']);
+const SERVED = new Set([
+  'file:rename',
+  'file:move',
+  'file:create',
+  'file:delete',
+  'file:update-binary',
+]);
 
 /**
  * The server's side of file operations, enough to see what a client makes of
@@ -815,15 +821,18 @@ const SERVED = new Set(['file:rename', 'file:move', 'file:create', 'file:delete'
  * `applyMove`): a RENAME or MOVE is applied by file id without a precondition
  * on the source path, a collision stores the file under
  * `<name>.conflict-<clientId>`, and the operation is broadcast to the whole
- * room — the sender included — right before the ack. CREATE and DELETE are
- * applied the same way, without file contents.
+ * room — the sender included — right before the ack. CREATE, DELETE and a
+ * binary UPDATE are applied the same way, without file contents.
  *
  * Nothing is answered until {@link FakeServer.pump}: the test decides when
  * the server gets to work. The listing (`h.serverFiles`) follows every change.
  */
 export class FakeServer {
   readonly files = new Map<string, ServerFileRecord>();
-  /** What the server applied, in order: `f1 a.md -> b.md`, `create x.md`, `delete f1`. */
+  /**
+   * What the server applied, in order: `f1 a.md -> b.md`, `create x.md`,
+   * `delete f1`, `update f1`.
+   */
   readonly applied: string[] = [];
   private readonly served = new WeakSet<Emit>();
   private seq = 0;
@@ -915,6 +924,24 @@ export class FakeServer {
       case 'file:create':
         e.ack({ ok: true, outcome: this.create(p.filePath, p) });
         return;
+      case 'file:update-binary': {
+        const file = this.files.get(p.fileId ?? '');
+        if (!file || file.deleted) {
+          e.ack({ ok: false, error: 'file_not_found' });
+          return;
+        }
+        file.contentHash = p.contentHash ?? '';
+        file.size = p.size ?? 0;
+        this.applied.push(`update ${file.id}`);
+        this.publish();
+        this.broadcast(
+          'file:updated-binary',
+          { fileId: file.id, contentHash: file.contentHash, log: this.log(p.clientId) },
+          p.clientId,
+        );
+        e.ack({ ok: true, outcome: { kind: 'updated', fileId: file.id } });
+        return;
+      }
       case 'file:delete': {
         const file = this.files.get(p.fileId ?? '');
         if (!file || file.deleted) {
