@@ -360,6 +360,15 @@ fix or remove the entries, first turn the plugin off in Settings → Community
 plugins (or quit Obsidian) — a running plugin saves its settings over your
 edit — then edit `data.json` and turn the plugin back on.
 
+**`sync.log` says "another device uses the same id"** — two computers send
+changes under one client id, usually because the vault was copied to the
+second one (a USB stick, a cloud drive, git) together with
+`.obsidian/plugins/team-vault/data.json`. Team Vault applies the other
+computer's changes as a teammate's, but the id is also what keeps each
+device's changes apart on the server, so give the copy an id of its own: on
+the copied computer, quit Obsidian, set `"clientId"` in `data.json` to `""`,
+and start Obsidian again. The plugin makes a new id on start.
+
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the
 server's copy, "Keep local" to push yours, or "Keep both" to keep your
@@ -386,7 +395,9 @@ edits in `…conflict-<ts>.<ext>`.
 - The history view is read-only — restoring a version requires the web UI.
 - One client id per device, generated on first run; not synced across
   devices (that's by design — vector clock keys must be unique per
-  device).
+  device). A vault copied to another computer together with the plugin's
+  `data.json` takes the id along: see "`sync.log` says another device uses
+  the same id" under Troubleshooting.
 
 ## Development
 
