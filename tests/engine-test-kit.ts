@@ -26,6 +26,7 @@
  *     cannot connect until {@link goOnline}.
  */
 import * as Y from 'yjs';
+import { sha256Hex } from '@/sync/hash';
 import { SyncEngine, type EngineStatus } from '@/sync/engine';
 import { OperationLog } from '@/sync/operation-log';
 import {
@@ -1002,12 +1003,49 @@ export class FakeServer {
     return { outcome };
   }
 
+  /**
+   * Called for each file a CREATE adds or revives, right after `file:created`
+   * is broadcast: `data` is what the client sent, `revived` whether the id is
+   * a deleted file's brought back. See {@link ServerDocs}.
+   */
+  onCreate?: (id: string, data: unknown, revived: boolean) => void;
+
+  /** A teammate (`device-2`) creates `path` with `text`; the broadcast reaches the engine. */
+  async teammateCreate(path: string, text: string): Promise<string> {
+    const bytes = encode(text);
+    const outcome = this.create(path, {
+      clientId: 'device-2',
+      fileType: 'TEXT',
+      contentHash: await sha256Hex(text),
+      size: bytes.byteLength,
+      data: bytes,
+    }) as { fileId: string };
+    return outcome.fileId;
+  }
+
+  /** A teammate (`device-2`) deletes file `id`; the broadcast reaches the engine. */
+  teammateDelete(id: string): void {
+    const file = this.files.get(id);
+    if (!file || file.deleted) throw new Error(`no file ${id}`);
+    file.deleted = true;
+    this.applied.push(`delete ${id}`);
+    this.publish();
+    this.broadcast('file:deleted', { fileId: id, log: this.log('device-2') }, 'device-2');
+  }
+
   private create(
     path: string,
-    p: { clientId: string; fileType?: 'TEXT' | 'BINARY'; contentHash?: string; size?: number },
+    p: {
+      clientId: string;
+      fileType?: 'TEXT' | 'BINARY';
+      contentHash?: string;
+      size?: number;
+      data?: unknown;
+    },
   ): unknown {
     const live = [...this.files.values()].find((f) => !f.deleted && f.path === path);
     let outcome: unknown;
+    let added: { id: string; revived: boolean } | null = null;
     if (live && live.contentHash === p.contentHash) {
       outcome = { kind: 'created', fileId: live.id, path };
     } else {
@@ -1024,12 +1062,14 @@ export class FakeServer {
       });
       this.applied.push(`create ${at}`);
       this.publish();
+      added = { id, revived: tomb !== undefined };
       outcome = live
         ? { kind: 'conflict_create_renamed', fileId: id, originalPath: path, finalPath: at }
         : { kind: 'created', fileId: id, path: at };
     }
     const log = this.log(p.clientId);
     this.broadcast('file:created', { result: { outcome, log }, log }, p.clientId);
+    if (added !== null) this.onCreate?.(added.id, p.data, added.revived);
     return outcome;
   }
 
@@ -1052,6 +1092,145 @@ export class FakeServer {
     this.harness.serverFiles = [...this.files.values()]
       .filter((f) => !f.deleted)
       .map((f) => serverFile(f.id, f.path, f.fileType, f.contentHash, f.size));
+  }
+}
+
+/**
+ * The notes' Yjs docs on a {@link FakeServer}, kept the way `Project/server`
+ * keeps them. A text CREATE seeds a doc from the bytes sent. On a tombstone,
+ * the new text goes on top of the stored history, as the server that
+ * continues histories does — or, with `replaceOnRevive`, a new history
+ * replaces it, as the server before it did (production when 0.3.8 came out).
+ * Either way the doc's full state follows `file:created` to the whole room as
+ * a `yjs:update`. What the client sends is applied by {@link absorb};
+ * `yjs:fetch` is answered by {@link answerFetches}.
+ */
+export class ServerDocs {
+  readonly docs = new Map<string, Y.Doc>();
+  private absorbed = new WeakSet<object>();
+
+  constructor(
+    readonly server: FakeServer,
+    private harness: Harness,
+    private readonly opts: { replaceOnRevive?: boolean } = {},
+  ) {
+    server.onCreate = (id, data, revived) => this.created(id, data, revived);
+  }
+
+  /** Serve the engine built after a pause instead (with {@link FakeServer.attach}). */
+  attach(h: Harness): void {
+    this.harness = h;
+    this.absorbed = new WeakSet();
+  }
+
+  /** A note the server has: its file, and its doc — by default one holding `text`. */
+  async add(
+    id: string,
+    path: string,
+    text: string,
+    doc: Y.Doc = serverDocWith(text),
+  ): Promise<void> {
+    this.docs.set(id, doc);
+    this.server.add({
+      id,
+      path,
+      fileType: 'TEXT',
+      contentHash: await sha256Hex(text),
+      size: encode(text).byteLength,
+    });
+  }
+
+  /** The text of note `id` on the server; `null` when it is deleted or has no doc. */
+  text(id: string): string | null {
+    if (this.server.pathOf(id) === null) return null;
+    return this.docs.get(id)?.getText('content').toJSON() ?? null;
+  }
+
+  /** Every live note as `path=text`, sorted. */
+  live(): string[] {
+    return [...this.server.files.values()]
+      .filter((f) => !f.deleted)
+      .map((f) => `${f.path}=${this.text(f.id) ?? '?'}`)
+      .sort();
+  }
+
+  /** The catch-up snapshots of every live note. */
+  snapshots(): YjsDocSnapshot[] {
+    return [...this.docs]
+      .filter(([id]) => this.server.pathOf(id) !== null)
+      .map(([id, doc]) => snapshotOf(doc, id));
+  }
+
+  /** Apply every `yjs:update` the engine has sent since the last call. */
+  absorb(): void {
+    for (const e of this.harness.socketIfBuilt()?.emits ?? []) {
+      if (e.event !== 'yjs:update' || this.absorbed.has(e)) continue;
+      this.absorbed.add(e);
+      const p = e.payload as { fileId: string; update: Uint8Array | number[] };
+      const doc = this.docs.get(p.fileId);
+      if (doc && this.server.pathOf(p.fileId) !== null) {
+        Y.applyUpdate(doc, Uint8Array.from(p.update));
+      }
+    }
+  }
+
+  /** Answer every `yjs:fetch` asked so far. */
+  answerFetches(): void {
+    for (const f of this.harness.socketIfBuilt()?.fetches.splice(0) ?? []) {
+      const doc = this.docs.get(f.fileId);
+      if (!doc || this.server.pathOf(f.fileId) === null) {
+        f.answer({ ok: false, error: 'file_not_found' });
+        continue;
+      }
+      f.answer({
+        ok: true,
+        sync1: Array.from(Y.encodeStateAsUpdate(doc)),
+        stateVector: Array.from(Y.encodeStateVector(doc)),
+      });
+    }
+  }
+
+  /**
+   * Let the server work until nothing moves: answer file operations and
+   * `yjs:fetch`, and apply what the engine sends.
+   */
+  async drive(rounds = 12): Promise<void> {
+    for (let round = 0; round < rounds; round++) {
+      await this.server.pump();
+      await this.harness.settle();
+      this.absorb();
+      const asked = this.harness.socketIfBuilt()?.fetches.length ?? 0;
+      this.answerFetches();
+      await flushAsync(20);
+      this.absorb();
+      if (asked === 0 && round > 1) return;
+    }
+  }
+
+  private created(id: string, data: unknown, revived: boolean): void {
+    const file = this.server.files.get(id);
+    if (!file || file.fileType !== 'TEXT') return;
+    const text =
+      data instanceof ArrayBuffer
+        ? new TextDecoder().decode(data)
+        : ArrayBuffer.isView(data)
+          ? new TextDecoder().decode(data)
+          : '';
+    const stored = this.docs.get(id);
+    if (revived && stored && !this.opts.replaceOnRevive) {
+      const t = stored.getText('content');
+      stored.transact(() => {
+        t.delete(0, t.length);
+        t.insert(0, text);
+      });
+    } else {
+      this.docs.set(id, serverDocWith(text));
+    }
+    const socket = this.harness.socketIfBuilt();
+    const doc = this.docs.get(id);
+    if (socket?.connected && doc) {
+      socket.fire('yjs:update', { fileId: id, update: Array.from(Y.encodeStateAsUpdate(doc)) });
+    }
   }
 }
 

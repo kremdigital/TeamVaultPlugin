@@ -187,6 +187,15 @@ interface FileMetaIndex {
   byId: Map<string, IndexedMeta>;
 }
 
+/**
+ * A file the server has under a name another file still holds here — see
+ * `SyncEngine.waitForName`: renamed there (`rename`), or new to this device
+ * (`create`).
+ */
+type WaitingForName =
+  | { kind: 'rename'; fileId: string; path: string }
+  | { kind: 'create'; fileId: string; path: string; fileType: FileType };
+
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
 interface RenamedWhileAway {
   /** The file as this device last synced it, at the old path. */
@@ -463,6 +472,12 @@ export class SyncEngine {
 
   /** Whether a broadcast under this device's client id it did not send was logged. */
   private twinReported = false;
+
+  /**
+   * Files the server has under a name another file still holds here, by the
+   * name — see {@link waitForName}. Rebuilt on each connect.
+   */
+  private readonly waitingForName = new Map<string, WaitingForName>();
 
   /**
    * Notes renamed on this device whose history has not moved to the new
@@ -1227,6 +1242,12 @@ export class SyncEngine {
         this.log.debug('initialPush: skipping server-tombstoned path', path);
         continue;
       }
+      // A rename from the server may be moving a file into this name right
+      // now: its disk step comes before its records, and the file found
+      // there in between was uploaded as a new one.
+      await this.withPathLock(path, () => Promise.resolve());
+      this.throwIfStopped();
+      if (this.fileIndex.byPath.has(path)) continue;
       try {
         await this.handleLocalCreate(path);
       } catch {
@@ -1394,6 +1415,7 @@ export class SyncEngine {
     const away = this.renamedWhileAway(files, here);
     this.renamesLeft.clear();
     this.retiredAway.clear();
+    this.waitingForName.clear();
     const occupied = await this.clearStaleCopies(files, away, here);
     this.outOfScope.clear();
     this.newHere.clear();
@@ -1449,11 +1471,24 @@ export class SyncEngine {
         deferred.push(f);
         continue;
       }
-      if (occupied.has(f.path) || (takenHere.has(f.path) && local !== f.path)) {
-        // Another file's copy we could not read is still there, or our own
-        // file took the name here and has not told the server yet. Left for
-        // the next connect, known by id meanwhile.
+      if (occupied.has(f.path)) {
+        // Another file's copy we could not read is still there. Left for the
+        // next connect, known by id meanwhile.
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
+        continue;
+      }
+      if (takenHere.has(f.path) && local !== f.path) {
+        // Our own file took the name here and has not told the server yet,
+        // which stores it under a conflict name when it does: this file
+        // comes in once ours has moved there (see `waitForName`). Known by id
+        // meanwhile.
+        this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
+        this.waitingForName.set(f.path, {
+          kind: 'create',
+          fileId: f.id,
+          path: f.path,
+          fileType: f.fileType,
+        });
         continue;
       }
       this.indexListedFile(f, byPath, byId);
@@ -2360,6 +2395,8 @@ export class SyncEngine {
         // same teardown applyServerDelete does.
         await this.dropDoc(this.docManager, fileId, path);
         this.persistVectorClock();
+        this.forgetWaiting(fileId);
+        await this.releaseName(path);
         return;
       }
     }
@@ -2372,6 +2409,8 @@ export class SyncEngine {
     }
     this.queue('DELETE', path, null, { fileId });
     await this.forgetDeletedHere(fileId, path);
+    this.forgetWaiting(fileId);
+    await this.releaseName(path);
   }
 
   /**
@@ -2447,6 +2486,9 @@ export class SyncEngine {
     }
     const target = meta;
     const { fileId } = target;
+    // Renamed here after the server's rename it waited to apply: this one
+    // reaches the server after it, and wins there.
+    this.forgetWaiting(fileId);
     // A disconnected socket never answers the ack: without holding it, a
     // rename sent just before `stop()` would be lost, and the next engine
     // would upload the new path as a second file.
@@ -2494,6 +2536,8 @@ export class SyncEngine {
       await docMoved;
     }
     if (acked !== null) await this.followStoredRename(fileId, acked.outcome);
+    // The name the note left may be what another file waits for.
+    await this.releaseName(oldPath);
   }
 
   /** A local rename of `fileId` is acknowledged or queued: see {@link localRenames}. */
@@ -3218,6 +3262,18 @@ export class SyncEngine {
     // Mirror of the refreshFileIndex filter for live events: never
     // materialise a throw-away artifact another client uploaded.
     if (!this.allowServerPath(path, 'create')) return;
+    const holder = known ? undefined : this.nameHolder(path);
+    if (holder !== undefined) {
+      // Another file's copy is under the name here (see `waitForName`): taken
+      // for this file's, a note's first snapshot folded it in without a base,
+      // and its text went to the server as this one's. Known by id meanwhile.
+      this.outOfScope.set(payload.id, { path, fileType: payload.fileType });
+      this.waitForName(
+        { kind: 'create', fileId: payload.id, path, fileType: payload.fileType },
+        holder,
+      );
+      return;
+    }
     const meta: IndexedMeta = known ?? {
       bindingId: this.binding.id,
       relativePath: path,
@@ -3436,6 +3492,7 @@ export class SyncEngine {
   }
 
   private async applyServerDelete(fileId: string): Promise<void> {
+    this.forgetWaiting(fileId);
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) return;
     const holder = this.fileIndex.byPath.get(meta.relativePath);
@@ -3455,7 +3512,10 @@ export class SyncEngine {
     // Deleting is a write too: a stale index entry naming the config folder
     // must not let the server erase files there.
     if (!this.allowServerPath(meta.relativePath, 'delete')) return;
+    const path = meta.relativePath;
     await this.dropLocalCopy(meta, null);
+    // The name the file left may be what another file waits for.
+    if (this.fileIndex.byPath.get(path) !== meta) await this.releaseName(path);
   }
 
   /**
@@ -3664,6 +3724,8 @@ export class SyncEngine {
     // `retiredAway`): the move below takes that copy along.
     this.movedAway.delete(fileId);
     this.reindexRetired(fileId);
+    // Where the server has the file now: a move it waited to make is history.
+    this.forgetWaiting(fileId);
     const meta = this.fileIndex.byId.get(fileId);
     if (!meta) {
       await this.adoptRenamedFile(fileId, newPath);
@@ -3686,6 +3748,7 @@ export class SyncEngine {
     // lock: a save or snapshot there waits for the history to arrive.
     const renamedHere = this.renameCount.get(fileId) ?? 0;
     let movedMeanwhile = false;
+    let holder: IndexedMeta | undefined;
     await this.withPathLocks([oldPath, newPath], () => {
       // Renamed on this device while this waited: that rename reaches the
       // server after this one, and wins there.
@@ -3701,10 +3764,91 @@ export class SyncEngine {
         return Promise.resolve();
       }
       if (oldPath === newPath) return Promise.resolve();
+      holder = this.nameHolder(newPath, meta);
+      if (holder !== undefined) return Promise.resolve();
       return this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
     });
+    if (holder !== undefined) {
+      this.waitForName({ kind: 'rename', fileId, path: newPath }, holder);
+      return;
+    }
     // Looked up again, under the names the note has now.
-    if (movedMeanwhile) await this.applyServerRename(fileId, newPath);
+    if (movedMeanwhile) {
+      await this.applyServerRename(fileId, newPath);
+      return;
+    }
+    // The name the file left may be what another file waits for.
+    if (this.fileIndex.byId.get(fileId) !== meta || meta.relativePath !== oldPath) {
+      await this.releaseName(oldPath);
+    }
+  }
+
+  /**
+   * The file indexed here under `path`, other than `self`. As spelled: the
+   * server tells names apart by case, and on a disk that does too, `Y.bin`
+   * and `y.bin` are two files.
+   */
+  private nameHolder(path: string, self?: IndexedMeta): IndexedMeta | undefined {
+    const holder = this.fileIndex.byPath.get(path);
+    return holder === self ? undefined : holder;
+  }
+
+  /**
+   * The server has a file under a name another file still holds here: `move`
+   * — renamed there, or new to this device. The file this device has under
+   * the name has a rename of its own on its way to the server, which stores it
+   * under a conflict name: an offline rename to a name a teammate gave
+   * another note meanwhile, or two renames to one name crossing on the way.
+   * The move waits for the name to be free here (see {@link releaseName}).
+   *
+   * It used to go ahead. The copy under the name was parked aside as an
+   * anonymous conflict copy while its record went to the file moving in; the
+   * rename's ack then moved the copy of the file that had moved in to the
+   * conflict name, under the other file's id, and the fold pushed that text
+   * into it — every teammate's copy of the note held the other note's text,
+   * and the parked copy was uploaded as a duplicate.
+   */
+  private waitForName(move: WaitingForName, holder: IndexedMeta): void {
+    this.log.info('a file’s name here is still another file’s; its move waits for it', {
+      fileId: move.fileId,
+      path: move.path,
+      holder: holder.relativePath,
+      renamedHere: this.renamePendingHere(holder.fileId),
+    });
+    this.waitingForName.set(move.path, move);
+  }
+
+  /** A file of {@link waitingForName} deleted or renamed on the server meanwhile. */
+  private forgetWaiting(fileId: string): void {
+    for (const [path, move] of this.waitingForName) {
+      if (move.fileId === fileId) this.waitingForName.delete(path);
+    }
+  }
+
+  /**
+   * `path` is free here now: the file that held it moved on or was deleted. A
+   * file that waited for the name moves in (see {@link waitForName}).
+   */
+  private async releaseName(path: string): Promise<void> {
+    const move = this.waitingForName.get(path);
+    if (move === undefined || this.nameHolder(path) !== undefined) return;
+    this.waitingForName.delete(path);
+    if (move.kind === 'rename') {
+      if (!this.fileIndex.byId.has(move.fileId)) return;
+      this.log.info('a file moves into the name it waited for', move);
+      await this.applyServerRename(move.fileId, move.path);
+      return;
+    }
+    if (this.fileIndex.byId.has(move.fileId) || !this.outOfScope.has(move.fileId)) return;
+    this.log.info('a file moves into the name it waited for', move);
+    this.outOfScope.delete(move.fileId);
+    await this.applyServerCreate({ id: move.fileId, path: move.path, fileType: move.fileType });
+    if (move.fileType !== 'TEXT' || this.fileIndex.byId.get(move.fileId) === undefined) return;
+    // Its content never reached this device — the catch-up, or the update
+    // that follows a new note's broadcast, found it out of the index: pulled
+    // from the server by the snapshot.
+    this.skippedDocs.add(move.fileId);
+    this.scheduleSnapshotToDisk(move.path);
   }
 
   /**
