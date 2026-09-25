@@ -1495,6 +1495,15 @@ export class SyncEngine {
     // Names our files took here: a file the listing has there is not indexed
     // over ours (see `queuedRenames`).
     const takenHere = new Set(here.values());
+    // Names of files created here while offline, not sent yet: a file the
+    // listing has there that this device has no record of is a teammate's,
+    // made meanwhile, and the copy here is not its (see `recordCreateAck`).
+    const createdHere = new Set(
+      this.operationLog
+        .dequeueOperations(this.binding.id)
+        .filter((op) => op.opType === 'CREATE')
+        .map((op) => op.filePath),
+    );
     const renamed: ApiFile[] = [];
     // Old paths of the files renamed while away: whatever the listing shows
     // there now is indexed once our copy has moved out (see `deferred`).
@@ -1550,11 +1559,15 @@ export class SyncEngine {
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         continue;
       }
-      if (takenHere.has(f.path) && local !== f.path) {
-        // Our own file took the name here and has not told the server yet,
-        // which stores it under a conflict name when it does: this file
-        // comes in once ours has moved there (see `waitForName`). Known by id
-        // meanwhile.
+      const createdHereFirst =
+        createdHere.has(f.path) &&
+        this.operationLog.getFileMeta(this.binding.id, f.path)?.serverFileId !== f.id;
+      if ((takenHere.has(f.path) && local !== f.path) || createdHereFirst) {
+        // Our own file took the name here — renamed or created — and has not
+        // told the server yet, which stores it under a conflict name when it
+        // does: this file comes in once ours has moved there (see
+        // `waitForName`). Known by id meanwhile. Indexed now, it took our copy
+        // for its own, and the fold sent our text into it for everyone.
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         this.waitingForName.set(f.path, {
           kind: 'create',
@@ -1939,9 +1952,12 @@ export class SyncEngine {
     }
     if (await this.vault.exists(path)) {
       // A file of this device's own is there now, created after the one it
-      // deleted: the next connect sorts the two out.
+      // deleted. The connect's first upload sends it, the server stores it
+      // under a conflict name, and it moves there (see `recordCreateAck`):
+      // this file comes in then.
       this.log.info('a file taken back from the server finds its name taken here', { path });
       this.outOfScope.set(fileId, shadow);
+      this.waitingForName.set(path, { kind: 'create', fileId, path, fileType: listed.fileType });
       return;
     }
     this.throwIfStopped();
@@ -2239,16 +2255,13 @@ export class SyncEngine {
           // that follows would treat the file as new and try to BINARY-
           // download it (404), and the next CREATE pass on this path would
           // re-upload (creating server-side conflict-renamed copies).
-          const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
-          if (outcome?.fileId && outcome?.path) {
-            await this.recordCreatedFile(
-              outcome.fileId,
-              outcome.path,
-              fileType,
-              hash,
-              buffer.byteLength,
-            );
-          }
+          await this.recordCreateAck(
+            path,
+            (ack as { outcome?: unknown }).outcome,
+            fileType,
+            hash,
+            buffer.byteLength,
+          );
           this.persistVectorClock();
           return;
         }
@@ -2261,6 +2274,53 @@ export class SyncEngine {
     }
     // Offline (or NACK) — queue and bail; the engine will replay on reconnect.
     this.queue('CREATE', path, null, payload);
+  }
+
+  /**
+   * Record what the server made of a create sent from here (`path`): the file
+   * under the name asked for, or — the name taken there by another file — under
+   * the conflict name the server stored it at. There the local copy follows
+   * it, as a rename does (see `followStoredRename`), and the file the server
+   * has under the name may come in (see `waitForName`).
+   *
+   * Left unrecorded under the name asked for, as it used to be, the copy went
+   * out again with the next save and the next connect's first upload, one more
+   * conflict copy on the server each time, and the file the server has under
+   * the name never came in.
+   */
+  private async recordCreateAck(
+    path: string,
+    outcome: unknown,
+    fileType: FileType,
+    contentHash: string,
+    size: number,
+  ): Promise<void> {
+    const o = outcome as { fileId?: unknown; path?: unknown } | null | undefined;
+    const fileId = typeof o?.fileId === 'string' ? o.fileId : '';
+    if (fileId === '') return;
+    if (typeof o?.path === 'string' && o.path !== '') {
+      await this.recordCreatedFile(fileId, o.path, fileType, contentHash, size);
+      return;
+    }
+    const conflict = conflictPlacement(outcome);
+    if (conflict === null || conflict.asked !== path || conflict.stored === path) return;
+    const stored = conflict.stored;
+    if (!this.allowServerPath(stored, 'create ack')) return;
+    const moved = await this.withPathLocks([path, stored], () =>
+      this.commitLocal(async (io) => {
+        if (this.fileIndex.byPath.has(path) || this.fileIndex.byPath.has(stored)) return false;
+        if (!(await io.vault.exists(path)) || (await io.vault.exists(stored))) return false;
+        this.log.info('own create stored under a conflict name', { path, stored });
+        io.echo.mark(path, ECHO_COUNT_RENAME);
+        io.echo.mark(stored, ECHO_COUNT_RENAME);
+        await io.vault.ensureParentFolder(stored);
+        await this.renameOnDisk(io, path, stored);
+        return true;
+      }),
+    );
+    if (!moved) return;
+    await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
+    await this.releaseName(path);
   }
 
   /**
@@ -5366,16 +5426,13 @@ export class SyncEngine {
             // Keep `fileIndex` authoritative so the initial-push pass that
             // runs right after the drain skips this file instead of
             // re-uploading it.
-            const outcome = (ack as { outcome?: { fileId?: string; path?: string } }).outcome;
-            if (outcome?.fileId && outcome?.path) {
-              await this.recordCreatedFile(
-                outcome.fileId,
-                outcome.path,
-                fileType,
-                contentHash,
-                data.byteLength,
-              );
-            }
+            await this.recordCreateAck(
+              op.filePath,
+              (ack as { outcome?: unknown }).outcome,
+              fileType,
+              contentHash,
+              data.byteLength,
+            );
           }
           return ackToOutcome(ack);
         }

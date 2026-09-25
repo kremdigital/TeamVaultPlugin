@@ -212,3 +212,54 @@ describe.each(['current', 'legacy'] as const)(
     });
   },
 );
+
+describe.each(['current', 'legacy'] as const)(
+  'SyncEngine — a note created here offline under a name a teammate gave a new note, %s broadcasts',
+  (format) => {
+    // The server stores the create under a conflict name. The copy here used
+    // to stay unrecorded under the name asked for: the teammate's note,
+    // indexed there, took it for its own and the fold sent its text into the
+    // teammate's note, for everyone. Uploaded again on each save, it left one
+    // more conflict copy on the server each time.
+    it('keeps both: this one moves to the conflict name, the teammate’s comes in', async () => {
+      const h = buildHarness({ offline: true });
+      const { server, docs } = await notes(h, format, []);
+      // Created by a teammate while this device was offline.
+      await docs.add('s9', 'c.md', 'theirs\n');
+
+      await h.engine.start();
+      await flushAsync();
+      h.vault.files.set('c.md', encode('mine\n'));
+      await h.engine.handleVaultEvent({
+        bindingId: 'b1',
+        type: 'create',
+        path: 'c.md',
+        source: 'obsidian',
+      });
+      expect(h.log.dequeueOperations('b1').map((o) => o.opType)).toEqual(['CREATE']);
+      await goOnline(h, { yjsDocs: docs.snapshots() });
+      await docs.drive();
+
+      expect(disk(h)).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
+      expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
+      expect(server.applied).toEqual(['create c.conflict-device-1.md']);
+      expect(h.engine.getFileIdForPath('c.md')).toBe('s9');
+      expect(h.engine.getFileIdForPath('c.conflict-device-1.md')).not.toBeNull();
+
+      // A save goes to the note it belongs to, and nothing is uploaded again.
+      h.vault.files.set('c.conflict-device-1.md', encode('mine\nmore\n'));
+      const saved = h.engine.handleVaultEvent({
+        bindingId: 'b1',
+        type: 'modify',
+        path: 'c.conflict-device-1.md',
+        source: 'obsidian',
+      });
+      await docs.drive();
+      await saved;
+      await docs.drive();
+      expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\nmore\n', 'c.md=theirs\n']);
+      expect(h.socket().created()).toEqual(['c.md']);
+      await h.engine.stop();
+    });
+  },
+);

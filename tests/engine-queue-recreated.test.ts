@@ -266,3 +266,40 @@ describe.each(['current', 'legacy'] as const)(
     });
   },
 );
+
+describe.each(['current', 'legacy'] as const)(
+  'SyncEngine — a note deleted here offline and saved anew under its name, %s server',
+  (format) => {
+    it('keeps a teammate’s edit made meanwhile: both notes stay', async () => {
+      const { h, server, docs } = await offlineWithNote(format, 'a.md', 'A\n');
+      await userDelete(h, 'a.md');
+      h.vault.files.set('a.md', encode('fresh\n'));
+      await h.engine.handleVaultEvent({
+        bindingId: 'b1',
+        type: 'create',
+        path: 'a.md',
+        source: 'obsidian',
+      });
+      // A teammate edited the note meanwhile.
+      const theirs = docs.docs.get('f1');
+      if (!theirs) throw new Error('no doc');
+      theirs.getText('content').insert(0, 'teammate\n');
+      server.add({
+        id: 'f1',
+        path: 'a.md',
+        fileType: 'TEXT',
+        contentHash: await sha256Hex('teammate\nA\n'),
+        size: 11,
+      });
+
+      await goOnline(h, { yjsDocs: docs.snapshots() });
+      await docs.drive();
+
+      expect(disk(h)).toEqual(['a.conflict-device-1.md=fresh\n', 'a.md=teammate\nA\n']);
+      expect(docs.live()).toEqual(['a.conflict-device-1.md=fresh\n', 'a.md=teammate\nA\n']);
+      expect(server.applied).toEqual(['create a.conflict-device-1.md']);
+      expect(h.engine.getFileIdForPath('a.md')).toBe('f1');
+      await h.engine.stop();
+    });
+  },
+);
