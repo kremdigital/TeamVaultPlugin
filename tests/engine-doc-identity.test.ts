@@ -357,17 +357,11 @@ describe('SyncEngine — a new note under the name another one left', () => {
     const d1 = new Y.Doc();
     applySent(h, d1, 'f1');
 
+    // Renamed in Obsidian: the vault event reaches the engine through the watcher.
     await h.vault.rename('Untitled.md', 'Meeting.md');
-    const renaming = h.engine.handleVaultEvent({
-      bindingId: 'b1',
-      type: 'rename',
-      oldPath: 'Untitled.md',
-      newPath: 'Meeting.md',
-      source: 'obsidian',
-    });
     await flushAsync();
     h.socket().pending('file:rename').ack({ ok: true });
-    await renaming;
+    await h.settle();
     const mark = h.socket().emits.length;
 
     await createNote(h, 'Untitled.md', 'f3');

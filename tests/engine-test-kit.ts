@@ -6,6 +6,24 @@
  * The same bench as in `engine-stop.test.ts`, shared by the suites written
  * after it. `buildHarness(predecessor)` builds the engine the `EngineManager`
  * spawns after a pause: a fresh one on the same vault, log, docs and echo set.
+ *
+ * Three things real Obsidian and the real server do are part of the bench,
+ * because tests that left them out passed on code that looped in production:
+ *
+ *   - Obsidian's echo. Every `adapter.rename` — the plugin's own included —
+ *     comes back as a vault `rename` event, fired inside the call before its
+ *     promise resolves (app.js 1.13.7: `FileSystemAdapter.rename` triggers
+ *     `renamed`, `Vault.onChange` turns it into `rename`). `MemoryVault.rename`
+ *     does the same, and the event goes through a real `ObsidianWatcher` to
+ *     the engine, the way `main.ts` wires them. A user's rename in Obsidian is
+ *     that same call ({@link userRename}); a file moved while Obsidian was
+ *     closed is {@link MemoryVault.move}.
+ *   - The server's broadcasts. The server sends every file operation to the
+ *     whole project room, the sender included, right before its ack. The
+ *     {@link FakeServer} does that, in the current format (the sender's
+ *     `clientId`, the path the file was stored at) or the old one.
+ *   - A start without network. `offline: true` builds an engine whose socket
+ *     cannot connect until {@link goOnline}.
  */
 import * as Y from 'yjs';
 import { SyncEngine, type EngineStatus } from '@/sync/engine';
@@ -17,6 +35,12 @@ import {
   type PersistenceFactory,
 } from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
+import {
+  ObsidianWatcher,
+  type VaultEvent,
+  type WatchableFile,
+  type WatchableVault,
+} from '@/watcher/obsidian-events';
 import { ApiClient, type RequestUrlResponse } from '@/client/api';
 import type { ApiFile } from '@/client/types';
 import {
@@ -74,8 +98,26 @@ export interface Gate {
   release(): void;
 }
 
+type RenameListener = (file: WatchableFile, oldPath: string) => void;
+
 export class MemoryVault implements VaultAdapter {
   files = new Map<string, ArrayBuffer>();
+  private readonly renameListeners = new Set<RenameListener>();
+  /**
+   * The slice of `app.vault` an `ObsidianWatcher` listens on. Only `rename`
+   * fires: the echo the engine has to tell from a user's rename. The engine's
+   * writes and deletes are not echoed here — tests dispatch the events they
+   * need.
+   */
+  readonly watchable = {
+    on: (name: string, cb: RenameListener): unknown => {
+      if (name === 'rename') this.renameListeners.add(cb);
+      return cb;
+    },
+    offref: (ref: unknown): void => {
+      this.renameListeners.delete(ref as RenameListener);
+    },
+  } as unknown as WatchableVault;
   private gates: Array<{
     method: string;
     skip: number;
@@ -146,8 +188,17 @@ export class MemoryVault implements VaultAdapter {
     await this.pass('delete');
     this.files.delete(path);
   }
+  /**
+   * `adapter.rename`, as Obsidian runs it: the file moves, then the vault
+   * `rename` event fires — inside the call, before the promise resolves.
+   */
   async rename(oldPath: string, newPath: string): Promise<void> {
     await this.pass('rename');
+    this.move(oldPath, newPath);
+    for (const cb of [...this.renameListeners]) cb({ path: newPath, kind: 'file' }, oldPath);
+  }
+  /** Move a file on disk without Obsidian seeing it: done while it was closed. */
+  move(oldPath: string, newPath: string): void {
     const buf = this.expect(oldPath);
     this.files.delete(oldPath);
     this.files.set(newPath, buf);
@@ -280,6 +331,10 @@ export interface Emit {
 /** Socket.IO stand-in: emits wait for the test to answer them. */
 export class FakeSocket implements SocketLike {
   connected = false;
+  /** `false` while there is no network: `connect()` fails until {@link goOnline}. */
+  reachable = true;
+  /** A connect was asked for while unreachable; {@link goOnline} completes it. */
+  private wantsConnect = false;
   emits: Emit[] = [];
   /** `yjs:fetch` requests, answered by the test through `answer`. */
   fetches: Array<{ fileId: string; answer: (response: unknown) => void }> = [];
@@ -305,9 +360,22 @@ export class FakeSocket implements SocketLike {
     return this;
   }
   connect(): SocketLike {
+    if (!this.reachable) {
+      // What socket.io reports without network; it keeps retrying.
+      this.wantsConnect = true;
+      this.fire('connect_error', new Error('websocket error'));
+      return this;
+    }
     this.connected = true;
     this.fire('connect');
     return this;
+  }
+  /** The network is back: a connect asked for meanwhile goes through. */
+  goOnline(): void {
+    this.reachable = true;
+    if (!this.wantsConnect) return;
+    this.wantsConnect = false;
+    this.connect();
   }
   disconnect(): SocketLike {
     this.connected = false;
@@ -365,8 +433,30 @@ export interface Request {
   path: string;
 }
 
+/**
+ * The one `ObsidianWatcher` on a vault, as the plugin has one for all its
+ * engines: shared by an engine and the ones built after it, it hands every
+ * event to the newest.
+ */
+export interface EchoRoute {
+  engine: SyncEngine | null;
+  binding: VaultBinding;
+  /** Handlers still running for events the watcher dispatched. */
+  inflight: Set<Promise<void>>;
+  /** What those handlers threw: in the plugin, an unhandled rejection. */
+  errors: unknown[];
+  /** The {@link FakeServer} answering this vault's engines, if any. */
+  server: { serveNext(): boolean } | null;
+}
+
 export interface Harness {
   engine: SyncEngine;
+  /** See {@link EchoRoute}. */
+  route: EchoRoute;
+  /** Errors thrown by handlers of events the watcher dispatched. */
+  eventErrors: unknown[];
+  /** Wait until every event the watcher dispatched has been handled. */
+  settle: () => Promise<void>;
   vault: MemoryVault;
   log: OperationLog;
   doc: DocManager;
@@ -402,6 +492,8 @@ export interface HarnessOptions {
   docs?: DocManager;
   /** Debounce of the disk snapshot after a remote edit; 0 (the next tick) by default. */
   diskSnapshotDebounceMs?: number;
+  /** Start without network: the socket connects only after {@link goOnline}. */
+  offline?: boolean;
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -481,6 +573,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   let own: FakeSocket | null = null;
   const factory: SocketFactory = () => {
     own = new FakeSocket();
+    if (opts.offline) own.reachable = false;
     return own;
   };
   const socket = new SocketClient({ server, clientId: 'device-1', factory });
@@ -489,9 +582,10 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     resolveDeleteConflict: () => h.modal.del.promise,
   };
 
+  const engineBinding =
+    opts.localFolder === undefined ? binding : { ...binding, localFolder: opts.localFolder };
   const engine = new SyncEngine({
-    binding:
-      opts.localFolder === undefined ? binding : { ...binding, localFolder: opts.localFolder },
+    binding: engineBinding,
     server,
     clientId: 'device-1',
     vault: track(vault, 'vault', calls),
@@ -506,8 +600,14 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   });
   engine.onStatus((status) => h.statuses.push(status));
 
+  const echoRoute = predecessor?.route ?? watchVault(vault, ra, engineBinding);
+  echoRoute.engine = engine;
+
   return Object.assign(h, {
     engine,
+    route: echoRoute,
+    eventErrors: echoRoute.errors,
+    settle: () => settleEvents(echoRoute),
     vault,
     log,
     doc,
@@ -521,6 +621,77 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     },
     socketIfBuilt: (): FakeSocket | null => own,
   });
+}
+
+/** Start the vault's `ObsidianWatcher`, wired to the engine as `main.ts` does. */
+function watchVault(vault: MemoryVault, ra: RecentlyApplied, binding: VaultBinding): EchoRoute {
+  const route: EchoRoute = {
+    engine: null,
+    binding,
+    inflight: new Set(),
+    errors: [],
+    server: null,
+  };
+  const watcher = new ObsidianWatcher({
+    bindings: () => [route.binding],
+    recentlyApplied: ra,
+    modifyDebounceMs: 0,
+  });
+  watcher.onEvent((event: VaultEvent) => {
+    const engine = route.engine;
+    if (!engine) return;
+    const run = engine.handleVaultEvent(event).catch((err: unknown) => {
+      route.errors.push(err);
+    });
+    route.inflight.add(run);
+    void run.finally(() => route.inflight.delete(run));
+  });
+  watcher.start(vault.watchable);
+  return route;
+}
+
+/**
+ * Wait for the handlers of dispatched events, answering file operations on
+ * the way when a {@link FakeServer} serves the engine: a handler may be
+ * waiting for its ack.
+ */
+async function settleEvents(route: EchoRoute): Promise<void> {
+  for (let idle = 0; idle < 200; ) {
+    await flushAsync();
+    if (route.server?.serveNext()) {
+      idle = 0;
+      continue;
+    }
+    if (route.inflight.size === 0) return;
+    await Promise.race([Promise.allSettled([...route.inflight]), flushAsync(5)]);
+    idle += 1;
+  }
+  throw new Error(`${route.inflight.size} vault event(s) still being handled`);
+}
+
+/**
+ * The user renames a file in Obsidian: the file moves and the vault `rename`
+ * event goes through the watcher to the engine. Resolves once handled.
+ */
+export async function userRename(h: Harness, from: string, to: string): Promise<void> {
+  await h.vault.rename(from, to);
+  await h.settle();
+}
+
+/**
+ * The network is back for an engine started with `offline: true`: its socket
+ * connects, and the join is answered with `join`.
+ */
+export async function goOnline(
+  h: Harness,
+  join: { operations?: ServerOperation[]; yjsDocs?: YjsDocSnapshot[] } = {},
+): Promise<void> {
+  h.socket().goOnline();
+  await flushAsync();
+  h.socket()
+    .pending('project:join')
+    .ack({ ok: true, operations: join.operations ?? [], yjsDocs: join.yjsDocs ?? [] });
+  await flushAsync();
 }
 
 export async function flushAsync(times = 20): Promise<void> {
@@ -613,4 +784,255 @@ export function op(
     payload,
     createdAt: '2026-01-01',
   };
+}
+
+// -- Fake server ----------------------------------------------------------------
+
+/** A file as the {@link FakeServer} holds it. */
+export interface ServerFileRecord {
+  id: string;
+  path: string;
+  fileType: 'TEXT' | 'BINARY';
+  contentHash: string;
+  size: number;
+  deleted: boolean;
+}
+
+/**
+ * Which broadcast format the {@link FakeServer} speaks: `current` carries the
+ * sender's `clientId` and the path the file was stored at; `legacy` is what
+ * servers sent before, without `clientId` and with the path the client asked
+ * for, even when the file was stored under a conflict name.
+ */
+export type BroadcastFormat = 'current' | 'legacy';
+
+/** The operations a client sends that the {@link FakeServer} answers. */
+const SERVED = new Set(['file:rename', 'file:move', 'file:create', 'file:delete']);
+
+/**
+ * The server's side of file operations, enough to see what a client makes of
+ * its own and its teammates' changes. Like `Project/server` (`handleMove`,
+ * `applyMove`): a RENAME or MOVE is applied by file id without a precondition
+ * on the source path, a collision stores the file under
+ * `<name>.conflict-<clientId>`, and the operation is broadcast to the whole
+ * room — the sender included — right before the ack. CREATE and DELETE are
+ * applied the same way, without file contents.
+ *
+ * Nothing is answered until {@link FakeServer.pump}: the test decides when
+ * the server gets to work. The listing (`h.serverFiles`) follows every change.
+ */
+export class FakeServer {
+  readonly files = new Map<string, ServerFileRecord>();
+  /** What the server applied, in order: `f1 a.md -> b.md`, `create x.md`, `delete f1`. */
+  readonly applied: string[] = [];
+  private readonly served = new WeakSet<Emit>();
+  private seq = 0;
+
+  constructor(
+    private harness: Harness,
+    private readonly format: BroadcastFormat = 'current',
+  ) {
+    harness.route.server = this;
+  }
+
+  /** Serve the engine built after a pause instead (see `buildHarness`). */
+  attach(h: Harness): void {
+    this.harness = h;
+    h.route.server = this;
+    this.publish();
+  }
+
+  /** A file the server has — also in the listing the engine reads. */
+  add(file: Omit<ServerFileRecord, 'deleted'>): void {
+    this.files.set(file.id, { ...file, deleted: false });
+    this.publish();
+  }
+
+  /** Where the server has file `id`, or `null` when it is deleted or unknown. */
+  pathOf(id: string): string | null {
+    const file = this.files.get(id);
+    return file && !file.deleted ? file.path : null;
+  }
+
+  /**
+   * Answer the client's file operations, one at a time, until it sends no
+   * more. Throws when it is still sending after `maxOps` — a loop.
+   */
+  async pump(maxOps = 30): Promise<void> {
+    let ops = 0;
+    for (let idle = 0; idle < 3; ) {
+      await flushAsync(15);
+      if (!this.serveNext()) {
+        idle += 1;
+        continue;
+      }
+      idle = 0;
+      if (++ops > maxOps) {
+        throw new Error(`the client kept sending operations: ${this.applied.join(', ')}`);
+      }
+    }
+  }
+
+  /** Answer the client's oldest operation not answered yet; `false` when there is none. */
+  serveNext(): boolean {
+    const next = this.harness
+      .socketIfBuilt()
+      ?.emits.find((e) => SERVED.has(e.event) && !this.served.has(e));
+    if (!next) return false;
+    this.served.add(next);
+    this.answer(next);
+    return true;
+  }
+
+  /** A teammate (`device-2`) renames file `id`; the broadcast reaches the engine. */
+  teammateRename(id: string, newPath: string): void {
+    const result = this.move(id, newPath, 'device-2', 'RENAME');
+    if ('error' in result) throw new Error(result.error);
+  }
+
+  private answer(e: Emit): void {
+    const p = e.payload as {
+      clientId: string;
+      fileId?: string;
+      filePath: string;
+      newPath?: string;
+      fileType?: 'TEXT' | 'BINARY';
+      contentHash?: string;
+      size?: number;
+    };
+    switch (e.event) {
+      case 'file:rename':
+      case 'file:move': {
+        const result = this.move(
+          p.fileId ?? '',
+          p.newPath ?? '',
+          p.clientId,
+          e.event === 'file:rename' ? 'RENAME' : 'MOVE',
+        );
+        e.ack('error' in result ? { ok: false, error: result.error } : { ok: true, ...result });
+        return;
+      }
+      case 'file:create':
+        e.ack({ ok: true, outcome: this.create(p.filePath, p) });
+        return;
+      case 'file:delete': {
+        const file = this.files.get(p.fileId ?? '');
+        if (!file || file.deleted) {
+          e.ack({ ok: false, error: 'file_not_found' });
+          return;
+        }
+        file.deleted = true;
+        this.applied.push(`delete ${file.id}`);
+        this.publish();
+        this.broadcast('file:deleted', { fileId: file.id, log: this.log(p.clientId) }, p.clientId);
+        e.ack({ ok: true, outcome: { kind: 'deleted', fileId: file.id } });
+        return;
+      }
+    }
+  }
+
+  private move(
+    id: string,
+    requested: string,
+    clientId: string,
+    opType: 'RENAME' | 'MOVE',
+  ): { outcome: unknown } | { error: string } {
+    const file = this.files.get(id);
+    if (!file || file.deleted) return { error: 'file_not_found' };
+    let outcome: unknown;
+    let stored = requested;
+    if (file.path === requested) {
+      outcome = { kind: 'no_op', reason: 'same_path' };
+    } else {
+      const taken = [...this.files.values()].some(
+        (f) => f !== file && !f.deleted && f.path === requested,
+      );
+      if (taken) {
+        stored = conflictName(requested, clientId);
+        outcome = {
+          kind: 'conflict_create_renamed',
+          fileId: id,
+          originalPath: requested,
+          finalPath: stored,
+        };
+      } else {
+        outcome = { kind: 'renamed', fileId: id, from: file.path, to: requested };
+      }
+      this.applied.push(`${id} ${file.path} -> ${stored}`);
+      file.path = stored;
+      this.publish();
+    }
+    this.broadcast(
+      opType === 'RENAME' ? 'file:renamed' : 'file:moved',
+      {
+        fileId: id,
+        newPath: this.format === 'current' ? stored : requested,
+        outcome,
+        log: this.log(clientId),
+      },
+      clientId,
+    );
+    return { outcome };
+  }
+
+  private create(
+    path: string,
+    p: { clientId: string; fileType?: 'TEXT' | 'BINARY'; contentHash?: string; size?: number },
+  ): unknown {
+    const live = [...this.files.values()].find((f) => !f.deleted && f.path === path);
+    let outcome: unknown;
+    if (live && live.contentHash === p.contentHash) {
+      outcome = { kind: 'created', fileId: live.id, path };
+    } else {
+      const at = live ? conflictName(path, p.clientId) : path;
+      const tomb = [...this.files.values()].find((f) => f.deleted && f.path === at);
+      const id = tomb?.id ?? `s${++this.seq}`;
+      this.files.set(id, {
+        id,
+        path: at,
+        fileType: p.fileType ?? 'TEXT',
+        contentHash: p.contentHash ?? '',
+        size: p.size ?? 0,
+        deleted: false,
+      });
+      this.applied.push(`create ${at}`);
+      this.publish();
+      outcome = live
+        ? { kind: 'conflict_create_renamed', fileId: id, originalPath: path, finalPath: at }
+        : { kind: 'created', fileId: id, path: at };
+    }
+    const log = this.log(p.clientId);
+    this.broadcast('file:created', { result: { outcome, log }, log }, p.clientId);
+    return outcome;
+  }
+
+  private broadcast(event: string, payload: Record<string, unknown>, clientId: string): void {
+    const socket = this.harness.socketIfBuilt();
+    if (!socket?.connected) return;
+    socket.fire(event, this.format === 'current' ? { ...payload, clientId } : payload);
+  }
+
+  private log(clientId: string): {
+    id: string;
+    vectorClock: Record<string, number>;
+    createdAt: string;
+  } {
+    this.seq += 1;
+    return { id: `l${this.seq}`, vectorClock: { [clientId]: this.seq }, createdAt: '2026-01-01' };
+  }
+
+  private publish(): void {
+    this.harness.serverFiles = [...this.files.values()]
+      .filter((f) => !f.deleted)
+      .map((f) => serverFile(f.id, f.path, f.fileType, f.contentHash, f.size));
+  }
+}
+
+/** The server's `appendConflictSuffix`. */
+function conflictName(path: string, clientId: string): string {
+  const tag = clientId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'unknown';
+  const dot = path.lastIndexOf('.');
+  const slash = path.lastIndexOf('/');
+  if (dot > slash) return `${path.slice(0, dot)}.conflict-${tag}${path.slice(dot)}`;
+  return `${path}.conflict-${tag}`;
 }

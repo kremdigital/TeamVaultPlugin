@@ -24,6 +24,7 @@ import {
   serverDocWith,
   serverFile,
   snapshotOf,
+  userRename,
   type Harness,
 } from './engine-test-kit';
 
@@ -75,17 +76,7 @@ async function rejoin(
 const events = (h: Harness): string[] => h.socket().emits.map((e) => e.event);
 
 /** Rename `from` → `to` in Obsidian while the socket is down. */
-async function renameOffline(h: Harness, from: string, to: string): Promise<void> {
-  await h.vault.rename(from, to);
-  await h.engine.handleVaultEvent({
-    bindingId: 'b1',
-    type: 'rename',
-    oldPath: from,
-    newPath: to,
-    source: 'obsidian',
-  });
-  await flushAsync();
-}
+const renameOffline = userRename;
 
 describe('SyncEngine — the queue drained after renames made while away', () => {
   it.each([
@@ -272,7 +263,7 @@ describe('SyncEngine — a rename made here while offline', () => {
     const h = buildHarness();
     const hash = await remember(h, 'a.md', 'f1', encode('A\n'));
     // What 0.3.7 left: the rename queued, the record still at `a.md`.
-    await h.vault.rename('a.md', 'b.md');
+    h.vault.move('a.md', 'b.md');
     h.log.enqueueOperation('b1', {
       opType: 'RENAME',
       filePath: 'a.md',
