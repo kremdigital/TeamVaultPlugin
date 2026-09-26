@@ -1,4 +1,9 @@
-import { APPLIED_LIVE_MAX, OperationLog, type FileMeta } from '@/sync/operation-log';
+import {
+  APPLIED_LIVE_MAX,
+  DELETE_ASKED_MAX,
+  OperationLog,
+  type FileMeta,
+} from '@/sync/operation-log';
 import type { LogStorage } from '@/utils/file-log-sink';
 import { stubWindow } from './window-stub';
 
@@ -725,5 +730,43 @@ describe('OperationLog — operations applied live', () => {
     reopened.noteAppliedLive('b1', 'l8');
     reopened.purgeBinding('b1');
     expect([...reopened.appliedLiveIds('b1')]).toEqual([]);
+  });
+});
+
+describe('OperationLog — copies asked about after a server delete', () => {
+  it('remembers each file once, per binding, and forgets the ones it is told to', () => {
+    const log = makeLog();
+    log.noteDeleteAsked('b1', 'f1');
+    log.noteDeleteAsked('b1', 'f1');
+    log.noteDeleteAsked('b1', 'f2');
+    log.noteDeleteAsked('b2', 'f3');
+    expect([...log.deleteAskedIds('b1')]).toEqual(['f1', 'f2']);
+    expect([...log.deleteAskedIds('b2')]).toEqual(['f3']);
+    log.forgetDeleteAsked('b1', ['f1', 'f9']);
+    expect([...log.deleteAskedIds('b1')]).toEqual(['f2']);
+    expect([...log.deleteAskedIds('b3')]).toEqual([]);
+  });
+
+  it(`keeps the newest ${DELETE_ASKED_MAX}`, () => {
+    const log = makeLog();
+    for (let i = 1; i <= DELETE_ASKED_MAX + 2; i++) log.noteDeleteAsked('b1', `f${i}`);
+    const ids = log.deleteAskedIds('b1');
+    expect(ids.size).toBe(DELETE_ASKED_MAX);
+    expect(ids.has('f2')).toBe(false);
+    expect(ids.has('f3')).toBe(true);
+  });
+
+  it('survives a reload, and goes with the binding', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.setFileMeta(makeMeta());
+    log.noteDeleteAsked('b1', 'f7');
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect([...reopened.deleteAskedIds('b1')]).toEqual(['f7']);
+    reopened.purgeBinding('b1');
+    expect([...reopened.deleteAskedIds('b1')]).toEqual([]);
   });
 });

@@ -970,6 +970,8 @@ export class SyncEngine {
         truncated: result.ok && result.operationsTruncated === true,
         landed: this.landedHere,
       });
+      const askedBack = this.deleteAskedBack();
+      for (const id of askedBack) this.recreated.add(id);
       // Before any catch-up doc or operation lands: the files the queue's
       // operations were made to may be gone from under their ids.
       await this.settleOvertakenQueue();
@@ -1061,6 +1063,8 @@ export class SyncEngine {
         for (const id of liveBeforeJoin) seen.add(id);
       }
       this.operationLog.forgetAppliedLive(this.binding.id, seen);
+      // Taken for new files by this connect: under the id is the new one now.
+      this.operationLog.forgetDeleteAsked(this.binding.id, askedBack);
       this.setStatus('connected');
 
       // Reconnect catch-up tail, kicked off in the background so the
@@ -4680,6 +4684,7 @@ export class SyncEngine {
     // Brought back under its id while the user is asked about its copy: the
     // file under the id is this new one (see `leaveIndexWhileAsked`).
     this.askingDeleted.delete(payload.id);
+    if (!known) this.deleteAskedSettled(payload.id);
 
     // The copy of a file deleted while away, or by a teammate, which the user
     // is being asked about, is on disk under this name: kept aside first.
@@ -5030,9 +5035,14 @@ export class SyncEngine {
 
     if (movedTo !== null) {
       this.movedAway.set(meta.fileId, movedTo);
-    } else if (opts.away !== true) {
-      asked = true;
-      this.leaveIndexWhileAsked(meta);
+    } else {
+      // Kept until the question is settled, across restarts (see
+      // `deleteAskedBack`).
+      this.operationLog.noteDeleteAsked(this.binding.id, meta.fileId);
+      if (opts.away !== true) {
+        asked = true;
+        this.leaveIndexWhileAsked(meta);
+      }
     }
     try {
       return await this.settleAskedCopy(meta, movedTo, conflict, taken);
@@ -5060,7 +5070,10 @@ export class SyncEngine {
     this.throwIfStopped();
     // Another file holds the name now; the copy, if still there, is its own
     // business (see `applyServerCreate`).
-    if (taken()) return 'done';
+    if (taken()) {
+      this.deleteAskedSettled(meta.fileId);
+      return 'done';
+    }
     if (movedTo !== null) {
       // Where the server has the file now: a later rename to another name we
       // never write moves it on, one to a name we sync ends the question.
@@ -5114,6 +5127,7 @@ export class SyncEngine {
               localBuf.byteLength,
             );
             this.persistVectorClock();
+            this.deleteAskedSettled(meta.fileId);
           }
         } catch {
           this.throwIfStopped();
@@ -5127,7 +5141,19 @@ export class SyncEngine {
     await this.commitLocal(async (io) => {
       if (!taken()) await this.removeLocalCopy(io, meta);
     });
+    this.deleteAskedSettled(meta.fileId);
     return 'done';
+  }
+
+  /**
+   * The question about the copy of deleted file `fileId` is settled: the copy
+   * is gone, restored on the server, or another file's (see
+   * `OperationLog.noteDeleteAsked`). Not when **Restore on server** could not
+   * reach the server: the copy stays the deleted note's, and the next connect
+   * asks again.
+   */
+  private deleteAskedSettled(fileId: string): void {
+    this.operationLog.forgetDeleteAsked(this.binding.id, [fileId]);
   }
 
   /**
@@ -5152,6 +5178,33 @@ export class SyncEngine {
     this.unwire(path);
     this.askingDeleted.set(meta.fileId, path);
     this.awayCopies.set(path, meta.fileId);
+  }
+
+  /**
+   * Files whose copy an earlier session asked about after a server delete,
+   * the question never settled (see `OperationLog.noteDeleteAsked`), that the
+   * server lists again: a tombstone brought back — a teammate's new note
+   * under the name. The copy here, and the history under its name, are the
+   * deleted note's, with the edits the question was about: the file under
+   * the id is a new one (see {@link notesRecreated}).
+   *
+   * The catch-up can leave the DELETE out — the clock took it in when it was
+   * applied — and then only a CREATE marked `revived` tells, which counts
+   * only in a catch-up cut short. Without this, a question left open when
+   * Obsidian closed, or **Restore on server** chosen without a connection,
+   * had the note's offline edits merged into the teammate's new note on the
+   * server that continues its history, for the whole team.
+   *
+   * Not one asked about in this session and still open (see
+   * {@link askingDeleted}): out of the index, it comes in as the new file it
+   * is (see {@link applyServerCreate}).
+   */
+  private deleteAskedBack(): Set<string> {
+    const back = new Set<string>();
+    for (const id of this.operationLog.deleteAskedIds(this.binding.id)) {
+      if (this.lastListing.has(id) && !this.askingDeleted.has(id)) back.add(id);
+    }
+    return back;
   }
 
   /** The question of {@link leaveIndexWhileAsked} is settled. */

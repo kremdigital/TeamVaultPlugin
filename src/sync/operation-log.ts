@@ -95,6 +95,12 @@ export interface BindingState {
  */
 export const APPLIED_LIVE_MAX = 1000;
 
+/**
+ * How many files a binding remembers as asked about after a server delete
+ * (see {@link OperationLog.noteDeleteAsked}). The oldest go first.
+ */
+export const DELETE_ASKED_MAX = 1000;
+
 /** Per-collection row counts removed by {@link OperationLog.purgeBinding}. */
 export interface PurgeResult {
   pendingOperations: number;
@@ -144,6 +150,8 @@ interface BindingBucket {
   state: BindingState | null;
   /** Ids of operations applied live (see {@link OperationLog.noteAppliedLive}); oldest first. */
   appliedLive: string[];
+  /** Ids of files asked about after a server delete (see {@link OperationLog.noteDeleteAsked}). */
+  deleteAsked: string[];
 }
 
 export class OperationLog {
@@ -437,6 +445,45 @@ export class OperationLog {
     this.touch();
   }
 
+  // -- copies asked about after a server delete -------------------------------
+
+  /**
+   * Remember that the user is asked about this device's copy of file
+   * `fileId`, which the server deleted: the copy may hold edits the server
+   * never had, and `state.json` keeps its record until the question is
+   * settled. The question can outlive the plugin — Obsidian closed before an
+   * answer, or **Restore on server** chosen without a connection — and by
+   * then the vector clock may have taken the DELETE in, so no catch-up
+   * returns it again. A file the server lists under the id later is a new one
+   * (a tombstone brought back), not the one this device holds a copy of; the
+   * engine uses this to tell.
+   */
+  noteDeleteAsked(bindingId: string, fileId: string): void {
+    const bucket = this.bucket(bindingId);
+    if (bucket.deleteAsked.includes(fileId)) return;
+    bucket.deleteAsked.push(fileId);
+    if (bucket.deleteAsked.length > DELETE_ASKED_MAX) {
+      bucket.deleteAsked.splice(0, bucket.deleteAsked.length - DELETE_ASKED_MAX);
+    }
+    this.touch();
+  }
+
+  /** The files {@link noteDeleteAsked} remembers for a binding. */
+  deleteAskedIds(bindingId: string): Set<string> {
+    return new Set(this.bindings.get(bindingId)?.deleteAsked ?? []);
+  }
+
+  /** Forget files of {@link noteDeleteAsked}: their question is settled. */
+  forgetDeleteAsked(bindingId: string, ids: Iterable<string>): void {
+    const bucket = this.bindings.get(bindingId);
+    if (!bucket || bucket.deleteAsked.length === 0) return;
+    const gone = new Set(ids);
+    const kept = bucket.deleteAsked.filter((id) => !gone.has(id));
+    if (kept.length === bucket.deleteAsked.length) return;
+    bucket.deleteAsked = kept;
+    this.touch();
+  }
+
   // -- cross-collection maintenance -------------------------------------------
 
   /**
@@ -561,7 +608,7 @@ export class OperationLog {
   private bucket(bindingId: string): BindingBucket {
     let bucket = this.bindings.get(bindingId);
     if (!bucket) {
-      bucket = { pending: [], files: new Map(), state: null, appliedLive: [] };
+      bucket = { pending: [], files: new Map(), state: null, appliedLive: [], deleteAsked: [] };
       this.bindings.set(bindingId, bucket);
     }
     return bucket;
@@ -588,6 +635,7 @@ export class OperationLog {
             }
           : null,
         ...(bucket.appliedLive.length > 0 ? { appliedLive: bucket.appliedLive } : {}),
+        ...(bucket.deleteAsked.length > 0 ? { deleteAsked: bucket.deleteAsked } : {}),
       };
     }
     return { version: FORMAT_VERSION, nextOpId: this.nextOpId, bindings };
@@ -635,6 +683,15 @@ export class OperationLog {
           if (typeof id === 'string' && id !== '') bucket.appliedLive.push(id);
         }
         bucket.appliedLive.splice(0, Math.max(0, bucket.appliedLive.length - APPLIED_LIVE_MAX));
+      }
+
+      if (Array.isArray(rawBucket.deleteAsked)) {
+        for (const id of rawBucket.deleteAsked) {
+          if (typeof id === 'string' && id !== '' && !bucket.deleteAsked.includes(id)) {
+            bucket.deleteAsked.push(id);
+          }
+        }
+        bucket.deleteAsked.splice(0, Math.max(0, bucket.deleteAsked.length - DELETE_ASKED_MAX));
       }
 
       // A bucket that turned out to hold nothing readable shouldn't make the
