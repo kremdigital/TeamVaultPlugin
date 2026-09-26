@@ -31,6 +31,14 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
+- **This version needs the Team Vault server updated at the same time**
+  (September 2026). Team Vault now asks the server for every change it missed
+  (`operationsCatchup` in `project:join`), recognises its own operations in the
+  server's broadcasts (`clientId`), follows the name the server actually stored
+  for a rename, and relies on the server continuing a note's editing history
+  when the note is created again under a deleted note's name. Several fixes
+  below work only with such a server.
+
 - **More names that Windows can't keep as spelled no longer sync, on any
   system.** This extends the entry above about `:` and short names. A name
   that ends in a dot or a space (`Notes.`, `Notes `) is now refused, and so is
@@ -178,7 +186,9 @@ uses [Semantic Versioning](https://semver.org/).
   your delete is not sent. Their note comes back to your vault. If you saved a
   new note under the same name in the meantime, yours is kept as
   `Name.conflict-<device>.md`. Before, the delete removed the teammate's note
-  for the whole team.
+  for the whole team. Your own edits don't count as a teammate's: a note you
+  edited online, then edited again offline and deleted, is now deleted.
+  Before, it came back.
 - **A note you renamed while offline no longer comes back under its old name.**
   This now also works when you open Obsidian without a network connection, and
   when you rename a note more than once before you reconnect. Several renames of
@@ -193,7 +203,11 @@ uses [Semantic Versioning](https://semver.org/).
     note moves there. The teammate's note keeps the name and comes to your
     vault. Before, the two notes' texts could end up swapped or duplicated for
     the whole team.
-  - A rename made while sync is connecting is no longer undone on your disk.
+  - A rename made while sync is connecting is no longer undone, also when you
+    had renamed the note offline before: the new rename goes out in place of the
+    queued one. Before, the queued rename was sent after it, moved the note back
+    to the name in between for the whole team, and the next connect wrote that
+    name back to your disk.
 - **A file a teammate deleted while you were offline no longer comes back, and
   no longer stays behind on your disk.** A file renamed and then deleted came
   back under its old name for the whole team: the next start uploaded your
@@ -237,11 +251,26 @@ uses [Semantic Versioning](https://semver.org/).
 - **A new note renamed right after you create it is no longer uploaded twice.**
   This happens with Templater's `tp.file.rename`, or when you type a title on a
   slow connection. The rename now waits for the server to confirm the note and
-  goes out as a rename, so the team no longer gets the note under both names and
-  the old name no longer comes back after a restart.
+  goes out as a rename of the note the server confirmed, so the team no longer
+  gets the note under both names and the old name no longer comes back after a
+  restart. This also holds when the connection drops before the server answers
+  (the rename goes out once it is back), also when you rename the note only
+  after the connection dropped, or after Pause sync, even if you typed into it
+  before renaming it; when a note under the first name was deleted a moment
+  before, by you or a teammate (Obsidian reuses "Untitled"); and when a teammate
+  created a note with other text under the first name a moment earlier: theirs
+  keeps the name, and yours moves to the new one from its conflict name. Two
+  notes that are both still empty are one note to the server: when a teammate
+  creates an empty note under the same name at the same moment, the server can
+  take it for yours, and your rename then renames it.
 - **A note you create while offline under a name a teammate used meanwhile no
   longer overwrites theirs.** Yours is kept as `Name.conflict-<device>.md` and
-  theirs keeps the name. Before, your text replaced theirs for the whole team,
+  theirs keeps the name. If an earlier copy of yours already has that name (the
+  same name collided before), yours becomes `Name.conflict-<device>-2.md`, and so
+  on; the earlier copy stays as it is. When your note reaches the server under a
+  conflict name just as the connection drops, it is no longer uploaded again; if
+  you edited it in the meantime, the edited version is kept as a copy of its own
+  next to the first one. Before, your text replaced theirs for the whole team,
   and every save of yours added another conflict copy on the server.
 - **A rename, attachment edit or delete made offline no longer hits the new file
   a teammate created under the same name.** The server gives a file created
@@ -269,6 +298,97 @@ uses [Semantic Versioning](https://semver.org/).
   connect. They now apply right away, and `sync.log` says that another device
   uses the same id. The README's Troubleshooting section explains how to give
   the copy an id of its own.
+- **What a teammate did while you were online is no longer done again when you
+  reconnect.** When sync connects, the server replays every change the device
+  has not confirmed yet, and a change that arrived live counted as not
+  confirmed. Team Vault now remembers the creates, renames and moves it applied
+  live (in `state.json`), also those that arrive while sync is connecting, and
+  doesn't apply them again; an attachment update that brings the version you
+  already have is never written over your copy. Before, replayed over what you
+  did since:
+  - an attachment you replaced offline right after a teammate's new version
+    arrived got the teammate's version written over it when you reconnected,
+    without a question, and your version was never uploaded;
+  - a note a teammate had renamed, and you renamed again (or back), moved back
+    to the teammate's name on your disk until the next connect;
+  - a note a teammate deleted and created again under its name while you were
+    online was taken for one recreated while you were away: an edit you made to
+    it offline went into a `Name.conflict-<time>.md` copy, and an offline rename
+    or delete of it was not sent.
+- **Changes made while you were away now reach you on projects with a long
+  history.** The server looked only at the first 500 entries of a project's
+  operation journal, so on a longer project a device that had been offline got
+  none of the changes made since. Team Vault now asks for all of them. When the
+  server cuts a very long catch-up short to its newest changes, a note deleted
+  and created again is still recognised as a new note, and attachments are
+  checked against the server's file list: one missing from your vault is
+  downloaded, a changed one goes through the usual conflict prompt. An
+  attachment you delete while sync connects, or a whole folder of them, is not
+  downloaded again.
+- **A note written through MCP or the web editor while you edited it offline no
+  longer brings up a "Content conflict" prompt when you reconnect.** The write
+  was replayed as an attachment change, and every answer did worse than a merge:
+  "Keep server" mangled your edit for the whole team, "Keep local" sent the
+  note's bytes on as an attachment, and "Keep both" made a copy of the note. A
+  note's text now only ever comes and goes through its merged editing history,
+  and Team Vault never sends a note as an attachment change. Your edit and the
+  MCP write both stay, each where it was made.
+- **Reconnecting no longer loads every note created since your last sync.** Each
+  note the replay mentioned was opened with its offline store, even when the
+  note on disk already matched the server, which is the load that made sync
+  reconnect in a loop on a large vault. An attachment a teammate saved many
+  times is downloaded once when you reconnect, and not at all when you already
+  have its last version; before, it was downloaded again for each save.
+- **A note created offline whose upload reached the server just as the
+  connection dropped (or sync was paused) is no longer uploaded again as a
+  conflict copy.** Team Vault recognises its own note on the server, and an edit
+  made in the meantime is merged. When the server stored such a note under a
+  conflict name because a teammate had taken its name, the copy under the name
+  asked for is no longer left behind to overwrite the teammate's note after a
+  restart.
+- **A save or rename of a note created offline, made while its upload is on its
+  way at reconnect, no longer uploads the note a second time.**
+- **A note a teammate creates under a name you are creating at the same moment
+  keeps its text.** Their note was taken for yours, and your text replaced
+  theirs for everyone; now yours is kept as `Name.conflict-<device>.md`.
+- **On Windows and macOS, a note whose name differs from another's only in
+  letter case no longer takes that note's text.** A teammate on Linux, the web
+  editor or MCP can make `A.md` next to `a.md`; on these disks the two names are
+  one file. The second note's text replaced the first's for the whole team (or
+  the first's replaced the second's), and a copy was parked aside and uploaded
+  as a duplicate. The second name now waits until the first one is free on your
+  disk; neither note's text changes.
+- **On Windows and macOS, a folder a teammate renamed only in letter case no
+  longer duplicates its notes after a restart.** The disk keeps the folder's old
+  case, Obsidian lists the notes that way when it starts, and each was uploaded
+  as a new note. They are now recognised as the notes they are; edits and
+  deletes under the old case reach them.
+- **A lost `state.json` no longer lets an old note's copy overwrite a new note
+  of the same name.** With `state.json` deleted or unreadable, a note a teammate
+  created under the name of a note renamed away could get that old note's text
+  for the whole team, from the copy left on your disk. The copy is now removed
+  when the server still has its text, and kept as `Name.conflict-<time>.md`
+  otherwise.
+- **A rename or delete whose connection drops before the server answers is
+  queued and sent on reconnect.** It used to wait for the answer forever: the
+  offline queue stopped for the rest of the session.
+- **A note a teammate deletes and creates again while you are asked about your
+  copy no longer takes in your offline edits of the old one.** When a teammate
+  deletes a note whose copy here has changes the server may not have, you are
+  asked what to do with it. Until you answered, a new note the teammate created
+  under the same name was taken for the deleted one. The two texts were merged
+  for the whole team, or the new note's text was replaced by the old one,
+  whatever you answered. This also happened if you closed Obsidian without
+  answering, or chose **Restore on server** without a connection, and the
+  teammate created the note again before you started Obsidian. Now the new note
+  comes in as it is. Your copy is kept next to it as `Name.conflict-<time>.md`
+  and uploaded as a note of its own. You are asked only once. A save of the note
+  that arrives while you are asked is left to your answer: **Delete locally**
+  deletes it with the note, and **Restore on server** uploads the note as it is
+  when you answer. Both now also do what they say when the delete arrived while
+  sync was connecting.
+- An attachment you delete while a teammate's update of it arrives no longer
+  comes back to your disk when the server has the version you already had.
 
 ## [0.3.7] — 2026-09-23
 
