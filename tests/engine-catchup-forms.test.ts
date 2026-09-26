@@ -160,6 +160,52 @@ describe.each([
   },
 );
 
+// The DELETE of a note the teammate made again was seen on an earlier
+// connect; the CREATE was applied live and not remembered as such — a
+// `state.json` written by 0.3.7, which remembered nothing of the kind. A
+// whole catch-up leaves a DELETE out only when the clock has it: the note
+// here is the new one, and what was done to it offline goes out.
+describe('SyncEngine — a whole catch-up with a revived CREATE whose DELETE the clock has seen', () => {
+  it('sends the offline rename and edit of the note, and makes no conflict copy', async () => {
+    const { h, server, docs } = await withNotes('current', [['f1', 'Untitled.md', 'old\n']]);
+    server.teammateDelete('f1');
+    await docs.drive();
+    await drop(h);
+    await join(h, server, docs, 'whole journal');
+    expect(h.vault.text('Untitled.md')).toBeNull();
+
+    await server.teammateCreate('Untitled.md', 'S2 text\n');
+    await docs.drive();
+    expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
+    // Not remembered as applied live.
+    h.log.forgetAppliedLive('b1', new Set(h.log.appliedLiveIds('b1')));
+
+    await drop(h);
+    await h.vault.rename('Untitled.md', 'Meeting.md');
+    await flushAsync(5);
+    h.vault.files.set('Meeting.md', encode('S2 text\nmine\n'));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Meeting.md',
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+    expect(
+      (server.joinAnswer('whole journal').operations as ServerOperation[]).map(kindOf),
+    ).toEqual(['CREATE revived']);
+
+    await join(h, server, docs, 'whole journal');
+    await server.pump();
+    await docs.drive();
+
+    expect(docs.live()).toEqual(['Meeting.md=S2 text\nmine\n']);
+    expect([...h.vault.files.keys()]).toEqual(['Meeting.md']);
+    expect(h.vault.text('Meeting.md')).toBe('S2 text\nmine\n');
+    await h.engine.stop();
+  });
+});
+
 describe.each([
   ['whole journal', undefined],
   ['cut short', 1],

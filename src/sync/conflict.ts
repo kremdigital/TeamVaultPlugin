@@ -83,6 +83,22 @@ export function buildConflictPath(filePath: string, timestamp: number): string {
 }
 
 /**
+ * The name the server stores a file under when the one asked for is taken
+ * (its `appendConflictSuffix`): `<name>.conflict-<clientId>` before the
+ * extension, with `-<attempt>` after the id from the second name on —
+ * `notes/foo.md` + `device-1` + 2 → `notes/foo.conflict-device-1-2.md`. The
+ * id is cut to 32 characters, anything but `A-Z a-z 0-9 _ -` in it made `_`.
+ */
+export function serverConflictPath(filePath: string, clientId: string, attempt = 1): string {
+  const sanitized = clientId.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 32) || 'unknown';
+  const tag = attempt > 1 ? `${sanitized}-${attempt}` : sanitized;
+  const dot = filePath.lastIndexOf('.');
+  const slash = filePath.lastIndexOf('/');
+  if (dot > slash) return `${filePath.slice(0, dot)}.conflict-${tag}${filePath.slice(dot)}`;
+  return `${filePath}.conflict-${tag}`;
+}
+
+/**
  * Resolver contract — the engine asks the resolver to make a choice and
  * the resolver answers (typically by surfacing a modal). The default
  * implementation in `defaultConflictResolver` is "always keep server" so

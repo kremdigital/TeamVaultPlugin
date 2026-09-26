@@ -40,6 +40,7 @@ import {
   defaultConflictResolver,
   detectBinaryConflict,
   detectDeleteConflict,
+  serverConflictPath,
   type ConflictResolver,
 } from './conflict';
 import type { VaultEvent } from '@/watcher/obsidian-events';
@@ -311,6 +312,13 @@ const SENT_AT = 'sentAt';
  */
 const SNAPSHOT_FOLD_ATTEMPTS = 3;
 
+/**
+ * How many of a name's conflict names (`<name>.conflict-<clientId>[-n]`) the
+ * engine looks through: for its own create landed under one, or for a free
+ * one (see `SyncEngine.createTarget`).
+ */
+const CONFLICT_NAMES_TRIED = 50;
+
 /** A note deleted between `exists()` and its read — see `readDiskText`. */
 const VANISHED = Symbol('vanished');
 
@@ -384,11 +392,21 @@ export class SyncEngine {
 
   /**
    * Copies of files deleted while this device was away that `initialPush`
-   * has not settled yet — checked, removed, or asked about: path → the
-   * deleted file's id. A file created again under such a name keeps the copy
-   * aside first (see {@link applyServerCreate}).
+   * has not settled yet — checked, removed, or asked about — and of files a
+   * teammate deleted whose question is open (see {@link askingDeleted}): path
+   * → the deleted file's id. A file created again under such a name keeps the
+   * copy aside first (see {@link applyServerCreate}).
    */
   private readonly awayCopies = new Map<string, string>();
+
+  /**
+   * Files a teammate deleted while this device holds edits of them the server
+   * may never have had, whose question is open (see {@link dropLocalCopy}):
+   * id → the path of the copy. Out of the index meanwhile, and out of it after
+   * a listing that still has them; a file created again under the id or the
+   * name while the user decides keeps the copy aside (see `awayCopies`).
+   */
+  private readonly askingDeleted = new Map<string, string>();
 
   /**
    * Files renamed while this device was away whose rename the last file index
@@ -474,8 +492,25 @@ export class SyncEngine {
    */
   private recreated = new Set<string>();
 
+  /**
+   * Files this connect's index refresh found to be creates of this device's
+   * that reached the server without their ack (see `adoptLandedCreates`), by
+   * id. Never taken for notes recreated while this device was away (see
+   * {@link notesRecreated}).
+   */
+  private readonly landedHere = new Set<string>();
+
   /** The listing of this connect's index refresh, by id. */
   private lastListing = new Map<string, ApiFile>();
+
+  /**
+   * Whether the server stores a create or rename of a taken name under the
+   * first FREE `<name>.conflict-<clientId>[-n]`. It says so by echoing the
+   * catch-up flag (`operationsCatchup`) of this connect's join; every server
+   * before it takes the first conflict name whatever is there, and
+   * overwrites a live file under it (see {@link createTarget}).
+   */
+  private serverPicksFreeConflictName = false;
 
   /**
    * Files of {@link lastListing} deleted since it was taken, by id: here (the
@@ -926,10 +961,15 @@ export class SyncEngine {
       const filesPromise = this.refreshFileIndex();
       const [result] = await Promise.all([joinPromise, filesPromise]);
       this.throwIfStopped();
+      this.serverPicksFreeConflictName =
+        result.ok && result.operationsCatchup === OPERATIONS_CATCHUP;
       // Operations this device applied live: the catch-up returns them again.
       const appliedLive = this.operationLog.appliedLiveIds(this.binding.id);
       // Before any catch-up doc is applied: see `checkLineage`.
-      this.recreated = notesRecreated(result.ok ? result.operations : [], appliedLive);
+      this.recreated = notesRecreated(result.ok ? result.operations : [], appliedLive, {
+        truncated: result.ok && result.operationsTruncated === true,
+        landed: this.landedHere,
+      });
       // Before any catch-up doc or operation lands: the files the queue's
       // operations were made to may be gone from under their ids.
       await this.settleOvertakenQueue();
@@ -1563,6 +1603,8 @@ export class SyncEngine {
       const id = record.serverFileId;
       const serverHash = id === '' ? undefined : deleted.get(id);
       if (serverHash === undefined || this.fileIndex.byId.has(id)) continue;
+      // Asked about already, since a teammate deleted it live.
+      if (this.askingDeleted.has(id)) continue;
       const path = record.relativePath;
       if (this.fileIndex.byPath.has(path) || pending.has(path) || !this.isLocalName(path)) {
         continue;
@@ -1703,7 +1745,9 @@ export class SyncEngine {
     // disk by the catch-up, and stayed there, never synced again.
     for (const fileId of this.deletedIds) if (!deletesBefore.has(fileId)) deletedHere.add(fileId);
     for (const fileId of deletedHere) this.deletedSinceListing.add(fileId);
-    const files = listed.filter((f) => !deletedHere.has(f.id));
+    // Deleted by a teammate while the user is asked about the copy here (see
+    // `askingDeleted`): a listing taken before the delete still has the file.
+    const files = listed.filter((f) => !deletedHere.has(f.id) && !this.askingDeleted.has(f.id));
     // Renamed here while offline: the queue is what says where these are.
     const here = this.queuedRenames(deletedHere);
     // Renamed here while the listing was on its way: the socket is up, so the
@@ -1913,6 +1957,7 @@ export class SyncEngine {
    * as a second note under the new name.
    */
   private adoptLandedCreates(listed: readonly ApiFile[]): void {
+    this.landedHere.clear();
     const recorded = new Set(
       this.operationLog.listFileMeta(this.binding.id).map((meta) => meta.serverFileId),
     );
@@ -1933,6 +1978,7 @@ export class SyncEngine {
         fileId: f.id,
       });
       recorded.add(f.id);
+      this.landedHere.add(f.id);
       // What it went out with is what the server seeded the file from: the
       // base for the edits made since.
       this.operationLog.setFileMeta({
@@ -2669,6 +2715,13 @@ export class SyncEngine {
     // two seconds). Queue instead — the post-connect drain consults the
     // refreshed index and routes server-known paths through modify.
     if (this.socket.isConnected() && this.indexReady) {
+      // A name the server holds, on a server that would overwrite the file
+      // under the conflict name it takes (see `createTarget`).
+      const at = await this.createTarget(path);
+      if (at !== path) {
+        if (at !== null) await this.createUnderOwnName(path, at, 'watcher');
+        return null;
+      }
       try {
         // Binary bytes are staged over REST; text rides inline (small).
         const data = await this.stageBinaryBlob(fileType, hash, buffer);
@@ -2795,6 +2848,120 @@ export class SyncEngine {
     await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
     await this.releaseName(path);
     return { fileId, merged: false };
+  }
+
+  /**
+   * Where a create of the file at `path` goes: `path` itself, but not on a
+   * server that stores a create of a taken name under the first
+   * `<name>.conflict-<clientId>` whatever is there (every server before the
+   * catch-up flag, see {@link serverPicksFreeConflictName}) when the name is
+   * taken there and so is that conflict name. The file then moves here to the
+   * first free `<name>.conflict-<clientId>-<n>` — the name a server that picks
+   * a free one gives it — and is created under it. `null` when it could not
+   * move: gone, or no free name.
+   *
+   * Such a server overwrote the file under the conflict name in place — this
+   * device's copy of an earlier collision of the name ("Untitled" made offline
+   * twice while a teammate made one too), or of this very create, its ack lost
+   * — and started that note's history anew. Every device holding its history
+   * merged the two, and the copy's text was doubled for the whole team. The
+   * ack named that file, recorded here under the conflict name already: the
+   * copy under the name asked for stayed unrecorded, went out again with the
+   * next save and the next connect, and took the teammate's note under the
+   * name for its own after a restart.
+   */
+  private async createTarget(path: string): Promise<string | null> {
+    if (this.serverPicksFreeConflictName || !this.serverHasFileAt(path)) return path;
+    if (!this.serverHasFileAt(serverConflictPath(path, this.clientId))) return path;
+    for (let attempt = 2; attempt <= CONFLICT_NAMES_TRIED; attempt++) {
+      const name = serverConflictPath(path, this.clientId, attempt);
+      if (this.serverHasFileAt(name) || !this.isLocalName(name)) continue;
+      let moved: 'moved' | 'gone' | 'taken';
+      try {
+        moved = await this.withPathLocks([path, name], () =>
+          this.commitLocal(async (io): Promise<'moved' | 'gone' | 'taken'> => {
+            if (this.fileIndex.byPath.has(path) || !(await io.vault.exists(path))) return 'gone';
+            if (this.fileIndex.byPath.has(name) || (await io.vault.exists(name))) return 'taken';
+            this.log.info(
+              'a name and its conflict name are taken on a server that overwrites the conflict name; creating under another',
+              { path, name },
+            );
+            io.echo.mark(path, ECHO_COUNT_RENAME);
+            io.echo.mark(name, ECHO_COUNT_RENAME);
+            await io.vault.ensureParentFolder(name);
+            await this.renameOnDisk(io, path, name);
+            return 'moved';
+          }),
+        );
+      } catch (err) {
+        this.throwIfStopped();
+        this.log.warn('could not move a file to a conflict name of its own', {
+          path,
+          name,
+          error: describeError(err, 'rename_failed'),
+        });
+        return null;
+      }
+      if (moved === 'moved') return name;
+      if (moved === 'gone') return null;
+    }
+    this.log.warn('no free conflict name for a file whose name is taken on the server', { path });
+    return null;
+  }
+
+  /**
+   * The file at `path` moved to `name` (see {@link createTarget}): the name is
+   * free here for the file the server has under it, and the file is created
+   * under its new one.
+   */
+  private async createUnderOwnName(path: string, name: string, from: LocalSource): Promise<void> {
+    await this.releaseName(path);
+    await this.createLocal(name, from);
+  }
+
+  /**
+   * Whether the server has a file under `path`, as far as this device knows:
+   * one indexed there, or one this device knows by id only there — waiting for
+   * the name (see {@link waitForName}), or out of what it syncs.
+   */
+  private serverHasFileAt(path: string): boolean {
+    if (this.fileIndex.byPath.has(path) || this.waitingForName.has(path)) return true;
+    for (const shadow of this.outOfScope.values()) if (shadow.path === path) return true;
+    return false;
+  }
+
+  /**
+   * A queued create of the file at `path` (`payload`) that went out (see
+   * {@link SENT_HASHES}) and was stored under a conflict name before its ack
+   * was lost — the name was taken on the server: the conflict name the listing
+   * shows a file under that this device had no record of, with the content
+   * the create went out with, which the file here still holds. `null` when
+   * there is none, or the file was renamed or edited since.
+   *
+   * Sent again, the create went, on a server that does not pick a free
+   * conflict name, over that very file: its history was replaced, and the
+   * note's text doubled here and for everyone holding it.
+   */
+  private landedConflictCopy(
+    path: string,
+    payload: Record<string, unknown>,
+    hash: string,
+  ): string | null {
+    const sentAt = typeof payload[SENT_AT] === 'string' ? payload[SENT_AT] : path;
+    if (sentAt !== path || !sentHashes(payload).includes(hash)) return null;
+    for (let attempt = 1; attempt <= CONFLICT_NAMES_TRIED; attempt++) {
+      const name = serverConflictPath(path, this.clientId, attempt);
+      const meta = this.fileIndex.byPath.get(name);
+      if (
+        meta !== undefined &&
+        this.newHere.has(meta.fileId) &&
+        this.lastListing.get(meta.fileId)?.contentHash === hash
+      ) {
+        return name;
+      }
+      if (!this.serverHasFileAt(name)) return null;
+    }
+    return null;
   }
 
   /**
@@ -3344,6 +3511,12 @@ export class SyncEngine {
       }
       // Known under the new name already: this rename has been applied.
       if (this.fileIndex.byPath.has(newPath)) return;
+      // Its create went out and is queued, the ack lost with the connection or
+      // a Pause: the entry follows the note, and the next connect finds it on
+      // the server under the name it went out under (see `adoptLandedCreates`).
+      // Queued again as a create under the new name, the note went to the
+      // whole team twice, under both names.
+      if (this.followQueuedCreate(oldPath, newPath)) return;
       // A file this device never synced: under its new name it is a new file.
       // Queued as a rename without an id, it was dropped by the drain and left
       // for the next connect's first upload.
@@ -4424,9 +4597,11 @@ export class SyncEngine {
 
   /**
    * `released`: the name was free when {@link releaseName} let the file in.
-   * `foreign`: see {@link WaitingForName}. `restore`: an attachment this device
-   * has, missing from its disk (see {@link reconcileAttachments}) — not
-   * written when the user has deleted it by the time its download is in.
+   * `adopted`: a file renamed into what this binding syncs from a folder it
+   * does not (see {@link adoptRenamedFile}). `foreign`: see
+   * {@link WaitingForName}. `restore`: an attachment this device has, missing
+   * from its disk (see {@link reconcileAttachments}) — not written when the
+   * user has deleted it by the time its download is in.
    */
   private async applyServerCreate(
     payload: {
@@ -4434,7 +4609,7 @@ export class SyncEngine {
       path: string;
       fileType: FileType;
     },
-    opts: { released?: boolean; foreign?: boolean; restore?: boolean } = {},
+    opts: { released?: boolean; adopted?: boolean; foreign?: boolean; restore?: boolean } = {},
   ): Promise<void> {
     // Catch-up CREATE replays hit files `refreshFileIndex` already indexed
     // (the stale-CREATE guard requires it). Reuse that entry — resetting
@@ -4502,11 +4677,15 @@ export class SyncEngine {
     };
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(payload.id, meta);
+    // Brought back under its id while the user is asked about its copy: the
+    // file under the id is this new one (see `leaveIndexWhileAsked`).
+    this.askingDeleted.delete(payload.id);
 
-    // The copy of a file deleted while away, which the user is being asked
-    // about, is on disk under this name: kept aside first. Taken for this
-    // file's, a note's first snapshot folded it in without a base — its text
-    // over the new note's, for everyone — and a binary counted it as synced.
+    // The copy of a file deleted while away, or by a teammate, which the user
+    // is being asked about, is on disk under this name: kept aside first.
+    // Taken for this file's, a note's first snapshot folded it in without a
+    // base — its text over the new note's, for everyone — and a binary
+    // counted it as synced.
     // Under the path's lock, taken now: the snapshot of the note's first
     // update waits for it.
     const setAside =
@@ -4526,9 +4705,12 @@ export class SyncEngine {
       // database at once, and the catch-up could no longer skip a note whose
       // disk matched the server (see `catchupDocIsRedundant`).
       if (!known) {
-        // Its content comes with the update that follows the broadcast; one
-        // let into its name comes from the server's doc (see `releaseName`).
-        if (opts.released !== true) this.startedSinceJoin.add(payload.id);
+        // Its content comes with the update that follows the broadcast of a
+        // create. One let into its name, or renamed in from a folder this
+        // binding does not sync, has no such update: its content comes from
+        // the server's doc (see `releaseName`, `adoptRenamedFile`), and the
+        // catch-up's doc of it is as good.
+        if (opts.released !== true && opts.adopted !== true) this.startedSinceJoin.add(payload.id);
         await this.startDoc(payload.id, path);
       }
       await setAside;
@@ -4797,6 +4979,15 @@ export class SyncEngine {
    * or its id since — the note revived, or created anew under the name — owns
    * the copy now, and it is left to that file: checked in each local phase,
    * after every wait.
+   *
+   * A copy asked about after a teammate's delete leaves the index while the
+   * question is open (see {@link leaveIndexWhileAsked}), and is then left to
+   * a file indexed under its name or id the same way. Kept there, the file
+   * the teammate created again under the name meanwhile — the server brings
+   * the tombstone back under its id — was taken for the one deleted: its
+   * broadcast was dropped as known, and its history met the deleted note's
+   * here, offline edits included. The two were merged for the whole team, or
+   * the new note's text was lost to the old one's.
    */
   private async dropLocalCopy(
     meta: IndexedMeta,
@@ -4805,8 +4996,10 @@ export class SyncEngine {
       pushedBack: true,
     },
   ): Promise<'done' | 'ask'> {
+    /** Out of the index while the user is asked (see `leaveIndexWhileAsked`). */
+    let asked = false;
     const taken = (): boolean =>
-      opts.away === true &&
+      (opts.away === true || asked) &&
       (this.fileIndex.byId.has(meta.fileId) || this.fileIndex.byPath.has(meta.relativePath));
     // One local phase, from the check to the delete. A delete stopped before
     // it reaches the disk is not replayed: the next catch-up no longer finds
@@ -4835,8 +5028,31 @@ export class SyncEngine {
     if (!conflict) return 'done';
     if (opts.ask === false) return 'ask';
 
-    const { localBuf, localHash } = conflict;
-    if (movedTo !== null) this.movedAway.set(meta.fileId, movedTo);
+    if (movedTo !== null) {
+      this.movedAway.set(meta.fileId, movedTo);
+    } else if (opts.away !== true) {
+      asked = true;
+      this.leaveIndexWhileAsked(meta);
+    }
+    try {
+      return await this.settleAskedCopy(meta, movedTo, conflict, taken);
+    } finally {
+      if (asked) this.doneAsking(meta);
+    }
+  }
+
+  /**
+   * The question of {@link dropLocalCopy} about the copy of `meta` (`asked`:
+   * its content), and what its answer does. `taken`: whether a file indexed
+   * under the copy's name or id since owns it now.
+   */
+  private async settleAskedCopy(
+    meta: IndexedMeta,
+    movedTo: string | null,
+    asked: { localBuf: ArrayBuffer; localHash: string },
+    taken: () => boolean,
+  ): Promise<'done'> {
+    const { localBuf, localHash } = asked;
     const resolution = await this.conflictResolver.resolveDeleteConflict({
       filePath: meta.relativePath,
       localSize: localBuf.byteLength,
@@ -4908,8 +5124,44 @@ export class SyncEngine {
       return 'done';
     }
     // 'delete-local'.
-    await this.commitLocal((io) => this.removeLocalCopy(io, meta));
+    await this.commitLocal(async (io) => {
+      if (!taken()) await this.removeLocalCopy(io, meta);
+    });
     return 'done';
+  }
+
+  /**
+   * The copy of `meta`, a note or attachment a teammate deleted, is asked
+   * about (see {@link dropLocalCopy}): the file leaves the index until the
+   * question is settled, and `state.json` keeps its record — a restart asks
+   * again (see {@link deletedWhileAway}). Its history stays in the store under
+   * the name, unwired: nothing reaches it from the server meanwhile, and a
+   * snapshot due for the note is dropped with it.
+   *
+   * A file created under the name or the id meanwhile — the teammate's new
+   * note, which the server gives the deleted one's id — comes in as the new
+   * file it is (see {@link applyServerCreate}): the copy goes aside under a
+   * conflict name first, and the new note's history starts anew.
+   */
+  private leaveIndexWhileAsked(meta: IndexedMeta): void {
+    const path = meta.relativePath;
+    if (this.fileIndex.byId.get(meta.fileId) === meta) this.fileIndex.byId.delete(meta.fileId);
+    if (this.fileIndex.byPath.get(path) === meta) this.fileIndex.byPath.delete(path);
+    this.snapshotDebouncers.get(path)?.cancel();
+    this.snapshotDebouncers.delete(path);
+    this.unwire(path);
+    this.askingDeleted.set(meta.fileId, path);
+    this.awayCopies.set(path, meta.fileId);
+  }
+
+  /** The question of {@link leaveIndexWhileAsked} is settled. */
+  private doneAsking(meta: IndexedMeta): void {
+    if (this.askingDeleted.get(meta.fileId) === meta.relativePath) {
+      this.askingDeleted.delete(meta.fileId);
+    }
+    if (this.awayCopies.get(meta.relativePath) === meta.fileId) {
+      this.awayCopies.delete(meta.relativePath);
+    }
   }
 
   /**
@@ -5574,7 +5826,22 @@ export class SyncEngine {
     }
     this.outOfScope.delete(fileId);
     this.log.info('file moved into the binding folder', { fileId, newPath });
-    await this.applyServerCreate({ id: fileId, path: newPath, fileType: known.fileType });
+    await this.applyServerCreate(
+      { id: fileId, path: newPath, fileType: known.fileType },
+      { adopted: true },
+    );
+    const meta = this.fileIndex.byId.get(fileId);
+    if (known.fileType !== 'TEXT' || meta?.relativePath !== newPath) return;
+    // What the listing says of it: a note with text is not written out empty
+    // when its doc cannot be had.
+    const listed = this.lastListing.get(fileId);
+    if (listed !== undefined && meta.size === 0) meta.size = listed.size;
+    // No update follows a rename: the note's text is pulled from the server
+    // by the snapshot. Left to the next teammate's edit or the next connect,
+    // the note was missing from this device's disk until then.
+    if (!this.canFetch()) return;
+    this.skippedDocs.add(fileId);
+    this.scheduleSnapshotToDisk(newPath);
   }
 
   // -- Yjs disk snapshotting ------------------------------------------------
@@ -6310,6 +6577,19 @@ export class SyncEngine {
           // idempotent-replay path collapses the duplicates instead.
           const fileType = (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath);
           const contentHash = await sha256Hex(data);
+          // Stored under a conflict name before its ack was lost: that copy is
+          // this note, and the one here goes (see `landedConflictCopy`).
+          const landed = this.landedConflictCopy(op.filePath, op.payload, contentHash);
+          if (landed !== null) {
+            await this.dropSecondCopy(op.filePath, landed);
+            return { ok: true };
+          }
+          const at = await this.createTarget(op.filePath);
+          if (at !== op.filePath) {
+            if (at === null) return { ok: false, retryable: false, error: 'no_free_conflict_name' };
+            await this.createUnderOwnName(op.filePath, at, 'queue');
+            return { ok: true };
+          }
           let inlineData: ArrayBuffer | undefined;
           try {
             // Binary bytes go to the REST staging area; text rides inline.
@@ -6724,24 +7004,33 @@ function textOf(state: Uint8Array): string {
  * replaced the history and marked nothing. Either way the file under the id
  * is a new one.
  *
- * A marked CREATE is enough without its DELETE. A catch-up cut short to its
- * newest operations (`operationsTruncated`) can leave the DELETE out, and
- * that server continues the history: without the mark, what this device had
- * done to the deleted note and never sent was merged into the new one.
- * Without the mark, and without the DELETE, nothing is concluded: a server
- * that gives the window of the journal's first rows leaves both out, and the
- * histories themselves tell then (see `DocManager.lineageOf`) — that server
- * starts a revived note's history anew.
+ * A marked CREATE without its DELETE counts only in a catch-up cut short to
+ * its newest operations (`truncated`): that one can leave the DELETE out, and
+ * that server continues the history — without the mark, what this device had
+ * done to the deleted note and never sent was merged into the new one. In any
+ * other catch-up a DELETE left out is one the clock has seen: applied here on
+ * an earlier connect, the deleted note is gone from this device already, and
+ * the file under the id is the one it has now. Counted, a note this device
+ * created under the name of a deleted one ("Untitled"), whose ack and
+ * broadcast were lost with the connection, was taken for a teammate's: the
+ * rename queued for it was dropped and the old name came back — with an edit
+ * made since, as a second note for the whole team. Without the mark, and
+ * without the DELETE, nothing is concluded: a server that gives the window of
+ * the journal's first rows leaves both out, and the histories themselves tell
+ * then (see `DocManager.lineageOf`) — that server starts a revived note's
+ * history anew.
  *
- * Not when this device applied the CREATE live (`appliedLive`): the note it
- * has is that new one already, and what it did to it since — an edit, a
- * rename, a delete, made offline — is about the new note. Taken for a note
- * recreated while it was away, the edit went into a conflict copy and the
- * rename and the delete were dropped.
+ * Not when this device applied the CREATE live (`appliedLive`), nor for a
+ * create of its own it found landed without its ack (`landed`, see
+ * `adoptLandedCreates`): the note it has is that new one already, and what it
+ * did to it since — an edit, a rename, a delete, made offline — is about the
+ * new note. Taken for a note recreated while it was away, the edit went into a
+ * conflict copy and the rename and the delete were dropped.
  */
 function notesRecreated(
   ops: readonly ServerOperation[],
   appliedLive: ReadonlySet<string>,
+  opts: { truncated: boolean; landed: ReadonlySet<string> },
 ): Set<string> {
   const deleted = new Set<string>();
   const recreated = new Set<string>();
@@ -6752,8 +7041,8 @@ function notesRecreated(
     if (op.opType === 'DELETE') {
       deleted.add(fileId);
     } else if (op.opType === 'CREATE') {
-      const revived = deleted.delete(fileId) || payload.revived === true;
-      if (revived && !appliedLive.has(op.id)) recreated.add(fileId);
+      const revived = deleted.delete(fileId) || (opts.truncated && payload.revived === true);
+      if (revived && !appliedLive.has(op.id) && !opts.landed.has(fileId)) recreated.add(fileId);
     }
   }
   return recreated;

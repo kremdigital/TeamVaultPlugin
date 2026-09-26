@@ -72,15 +72,15 @@ function lines(text: string | null): string[] {
  * for a note written through REST, and its version history holds the text
  * this device synced: the base the fold of an offline edit merges from.
  */
-async function withNote(format: BroadcastFormat) {
+async function withNote(format: BroadcastFormat, text = 'old\n') {
   const idb = new FakeIndexedDb();
   const h = buildHarness({ docs: idb.manager() });
   const server = new FakeServer(h, format);
   const docs = new ServerDocs(server, h);
-  await remember(h, 'a.md', 'f1', 'old\n');
-  await docs.add('f1', 'a.md', 'old\n');
+  await remember(h, 'a.md', 'f1', text);
+  await docs.add('f1', 'a.md', text);
   h.routes.set('GET /api/projects/p1/files/f1', () => bytes(encode(docs.text('f1') ?? '')));
-  const synced = await sha256Hex('old\n');
+  const synced = await sha256Hex(text);
   h.routes.set('GET /api/projects/p1/files/f1/versions', () =>
     json({
       versions: [
@@ -88,7 +88,7 @@ async function withNote(format: BroadcastFormat) {
       ],
     }),
   );
-  h.routes.set('GET /api/projects/p1/files/f1/versions/v1', () => bytes(encode('old\n')));
+  h.routes.set('GET /api/projects/p1/files/f1/versions/v1', () => bytes(encode(text)));
   await connect(h, { yjsDocs: docs.snapshots() });
   await docs.drive();
   return { idb, h, server, docs };
@@ -182,6 +182,48 @@ describe.each(SERVERS)(
     );
   },
 );
+
+// U-Z: where the edits land. The note's history is on this device — a write
+// through MCP came live — when it is edited offline, and MCP writes it again
+// meanwhile, changing another line. A server that writes the text as the
+// smallest edit keeps what it left unchanged: each edit stays where it was
+// made. One that deleted the whole text and inserted the new one (production
+// when 0.3.8 came out) moved a word typed inside a line to the start of the
+// note, brought a deleted line back and doubled a replaced word — for the
+// whole team.
+describe('SyncEngine — a note with its history here, edited offline and written through MCP', () => {
+  const base = 'alpha beta\ngamma\ndelta\n';
+  const written = 'alpha beta\nGAMMA\ndelta\n';
+  it.each([
+    [
+      'a word typed inside a line',
+      'alpha new beta\ngamma\ndelta\n',
+      'alpha new beta\nGAMMA\ndelta\n',
+    ],
+    ['a line deleted', 'alpha beta\ngamma\n', 'alpha beta\nGAMMA\n'],
+    ['a word replaced', 'ALPHA beta\ngamma\ndelta\n', 'ALPHA beta\nGAMMA\ndelta\n'],
+    ['a line added at the end', `${base}offline\n`, `${written}offline\n`],
+  ])('keeps %s where it was', async (_what, offline, merged) => {
+    const { idb, h, server, docs } = await withNote('current', 'alpha beta\ngamma\n');
+    await docs.restWrite('f1', base);
+    await docs.drive();
+    expect(h.vault.text('a.md')).toBe(base);
+    expect(idb.textOf(dbNameOf('a.md'))).toBe(base);
+
+    await drop(h);
+    await editOffline(h, base, offline);
+    expect(idb.textOf(dbNameOf('a.md'))).toBe(offline);
+    await docs.restWrite('f1', written);
+    await reconnect(h, server, docs, 'whole journal');
+
+    expect(docs.text('f1')).toBe(merged);
+    expect(h.vault.text('a.md')).toBe(merged);
+    expect(idb.textOf(dbNameOf('a.md'))).toBe(merged);
+    expect(modals(h)).toEqual([]);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+});
 
 describe('SyncEngine — an attachment update of a note, live', () => {
   it.each(['legacy', 'current'] as const)(

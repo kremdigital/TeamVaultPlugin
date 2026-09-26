@@ -3,6 +3,7 @@ import {
   defaultConflictResolver,
   detectBinaryConflict,
   detectDeleteConflict,
+  serverConflictPath,
 } from '@/sync/conflict';
 
 describe('detectBinaryConflict', () => {
@@ -59,6 +60,22 @@ describe('buildConflictPath', () => {
 
   it('handles bare filenames', () => {
     expect(buildConflictPath('image.jpg', 99)).toBe('image.conflict-99.jpg');
+  });
+});
+
+describe('serverConflictPath', () => {
+  it('names the conflict copy the way the server does', () => {
+    expect(serverConflictPath('notes/U.md', 'device-1')).toBe('notes/U.conflict-device-1.md');
+    expect(serverConflictPath('notes/U.md', 'device-1', 2)).toBe('notes/U.conflict-device-1-2.md');
+    expect(serverConflictPath('a.b/Makefile', 'device-1', 3)).toBe(
+      'a.b/Makefile.conflict-device-1-3',
+    );
+  });
+
+  it('keeps the counter after an id cut to 32 characters, anything odd in it made `_`', () => {
+    const id = 'dev ice/'.padEnd(40, 'x');
+    expect(serverConflictPath('U.md', id, 2)).toBe(`U.conflict-dev_ice_${'x'.repeat(24)}-2.md`);
+    expect(serverConflictPath('U.md', '')).toBe('U.conflict-unknown.md');
   });
 });
 
