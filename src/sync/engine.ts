@@ -409,6 +409,14 @@ export class SyncEngine {
   private readonly askingDeleted = new Map<string, string>();
 
   /**
+   * Copies of deleted files the user is being asked about (see
+   * {@link dropLocalCopy}), deleted live or while this device was away: path →
+   * the deleted file's id. A save or a create of such a copy meanwhile is left
+   * to the answer (see {@link handleLocalCreate}).
+   */
+  private readonly askedCopies = new Map<string, string>();
+
+  /**
    * Files renamed while this device was away whose rename the last file index
    * refresh could not apply — see `applyRenamesWhileAway`. By id; the catch-up
    * leaves their RENAME alone until the next connect.
@@ -1331,8 +1339,9 @@ export class SyncEngine {
       this.foreignHistory.delete(meta.fileId);
       if (this.newHere.has(meta.fileId)) await this.setAsideOldCopy(meta, textOf(server), owner);
     }
+    const replaced = this.recreated.has(meta.fileId);
     const found = await this.docManager.lineageOf(this.binding.id, docPath, meta.fileId, server, {
-      replaced: this.recreated.has(meta.fileId),
+      replaced,
       recorded: !this.newHere.has(meta.fileId),
       // Whether the server had text for the note when this device last synced it.
       hadText: meta.size > 0,
@@ -1340,16 +1349,32 @@ export class SyncEngine {
     this.throwIfStopped();
     if (found === null) return;
     this.lineageChecked.add(meta.fileId);
-    if (found.related) return;
-    this.log.warn('a note’s offline history is not the server’s; starting it from the server', {
-      path: meta.relativePath,
-      fileId: meta.fileId,
-      owner: found.owner,
-    });
+    if (found.related && !replaced) return;
     this.foldBases.delete(meta.fileId);
     const serverText = textOf(server);
-    await this.setAsideOldCopy(meta, serverText);
-    await this.docManager.startOver(this.binding.id, docPath, meta.fileId);
+    if (found.related) {
+      // A note deleted and created again whose history this device never had:
+      // the catch-up skipped its doc while the disk matched the server's (see
+      // `catchupDocIsRedundant`), and a save made offline since stayed on disk
+      // only (see `handleLocalModify`). There is no history to start anew, but
+      // the copy on disk is the deleted note's all the same. Taken for the new
+      // note's, the next fold put its text over the new note's for the whole
+      // team — without a base, or merged three-way with one from the version
+      // history — and kept no copy of it.
+      this.log.info('a note deleted and created again has no history here; settling its copy', {
+        path: meta.relativePath,
+        fileId: meta.fileId,
+      });
+      await this.setAsideOldCopy(meta, serverText);
+    } else {
+      this.log.warn('a note’s offline history is not the server’s; starting it from the server', {
+        path: meta.relativePath,
+        fileId: meta.fileId,
+        owner: found.owner,
+      });
+      await this.setAsideOldCopy(meta, serverText);
+      await this.docManager.startOver(this.binding.id, docPath, meta.fileId);
+    }
     // The size recorded is the old history's. It tells whether the server has
     // content for the note, and a note emptied that way waited for content
     // forever: its snapshot never wrote the empty text over the old one. Moved
@@ -2649,6 +2674,14 @@ export class SyncEngine {
     // The copy of a file renamed away while this device was away, waiting for
     // its question (see `retiredAway`): uploaded, it came back as a new file.
     if (this.isRetiredCopy(path)) return;
+    // The copy of a deleted file the user is being asked about (see
+    // `askedCopies`), out of the index meanwhile: a save of it that was still
+    // on its way — Obsidian's, held in the watcher's debounce when the
+    // question came — is left to the answer, which reads the copy as it is
+    // then. Sent as a create, it brought the note back for the whole team
+    // before the user answered, and **Delete locally** was then ignored: the
+    // file under the name was another's.
+    if (this.askedCopies.has(path) && !this.fileIndex.byPath.has(path)) return;
     // A create of this name under way here, or a rename into it waiting for
     // one (see `renameAfterCreate`): the file is recorded once it is done.
     const underway = this.creating.get(path);
@@ -3582,18 +3615,34 @@ export class SyncEngine {
    * A note renamed from `oldPath` to `newPath` whose create is queued after
    * it went out (see {@link SENT_HASHES}): the entry moves to the new name
    * and keeps the name it went out under. `false` when there is no such entry.
+   *
+   * Every create queued under the old name moves along. A save made offline
+   * since queues one more, which never went out: taken for the note's only
+   * entry, it left the one that went out under the old name, and the next
+   * connect recorded the note the server has there under that name — gone
+   * from the disk here, written back by the catch-up — while the rename went
+   * out as a second create under the new one: the note twice, for the whole
+   * team.
    */
   private followQueuedCreate(oldPath: string, newPath: string): boolean {
-    const entry = this.operationLog
+    const entries = this.operationLog
       .dequeueOperations(this.binding.id)
-      .filter((op) => op.opType === 'CREATE' && op.filePath === oldPath)
-      .pop();
-    if (entry === undefined || sentHashes(entry.payload).length === 0) return false;
-    const sentAt = typeof entry.payload[SENT_AT] === 'string' ? entry.payload[SENT_AT] : oldPath;
-    return this.operationLog.amendOperation(entry.id, {
-      filePath: newPath,
-      payload: { ...entry.payload, [SENT_AT]: sentAt },
-    });
+      .filter((op) => op.opType === 'CREATE' && op.filePath === oldPath);
+    if (!entries.some((op) => sentHashes(op.payload).length > 0)) return false;
+    let followed = false;
+    for (const entry of entries) {
+      if (sentHashes(entry.payload).length === 0) {
+        this.operationLog.amendOperation(entry.id, { filePath: newPath });
+        continue;
+      }
+      const sentAt = typeof entry.payload[SENT_AT] === 'string' ? entry.payload[SENT_AT] : oldPath;
+      const moved = this.operationLog.amendOperation(entry.id, {
+        filePath: newPath,
+        payload: { ...entry.payload, [SENT_AT]: sentAt },
+      });
+      followed = followed || moved;
+    }
+    return followed;
   }
 
   /** {@link handleLocalRename} of a file this device has a record of: `target`. */
@@ -5033,6 +5082,7 @@ export class SyncEngine {
     if (!conflict) return 'done';
     if (opts.ask === false) return 'ask';
 
+    const path = meta.relativePath;
     if (movedTo !== null) {
       this.movedAway.set(meta.fileId, movedTo);
     } else {
@@ -5043,11 +5093,13 @@ export class SyncEngine {
         asked = true;
         this.leaveIndexWhileAsked(meta);
       }
+      this.askedCopies.set(path, meta.fileId);
     }
     try {
       return await this.settleAskedCopy(meta, movedTo, conflict, taken);
     } finally {
       if (asked) this.doneAsking(meta);
+      if (this.askedCopies.get(path) === meta.fileId) this.askedCopies.delete(path);
     }
   }
 
@@ -5062,10 +5114,9 @@ export class SyncEngine {
     asked: { localBuf: ArrayBuffer; localHash: string },
     taken: () => boolean,
   ): Promise<'done'> {
-    const { localBuf, localHash } = asked;
     const resolution = await this.conflictResolver.resolveDeleteConflict({
       filePath: meta.relativePath,
-      localSize: localBuf.byteLength,
+      localSize: asked.localBuf.byteLength,
     });
     this.throwIfStopped();
     // Another file holds the name now; the copy, if still there, is its own
@@ -5089,7 +5140,16 @@ export class SyncEngine {
       await this.commitLocal((io) => this.removeLocalCopy(io, meta, away));
       return 'done';
     }
-    if (resolution === 'restore-server') {
+    // The copy as it is now, not as it was when the question came: a save of
+    // it made meanwhile was left to this answer (see `askedCopies`). Gone
+    // since, there is nothing to restore.
+    const restoring =
+      resolution === 'restore-server' && (await this.vault.exists(meta.relativePath));
+    this.throwIfStopped();
+    if (restoring) {
+      const localBuf = await this.vault.readBinary(meta.relativePath);
+      const localHash = await sha256Hex(localBuf);
+      this.throwIfStopped();
       // Push the local content as a fresh CREATE so the server
       // un-deletes it. The recipient broadcast will reset our state.
       if (this.socket.isConnected()) {
@@ -5137,7 +5197,7 @@ export class SyncEngine {
       // Don't drop the local copy — we want the file to stay.
       return 'done';
     }
-    // 'delete-local'.
+    // 'delete-local', or a copy gone since.
     await this.commitLocal(async (io) => {
       if (!taken()) await this.removeLocalCopy(io, meta);
     });

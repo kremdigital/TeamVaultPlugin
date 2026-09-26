@@ -265,6 +265,55 @@ describe.each(['current', 'legacy'] as const)(
       },
     );
 
+    // Typed into before the rename: the save queued a second create, which
+    // never went out, and the rename took that one for the note's only entry.
+    // The one that went out stayed under the old name, and the next connect
+    // recorded the note there — gone from the disk, written back — while the
+    // rename went out as a second create: the note twice, for the whole team.
+    it.each(['the connection is back', 'Pause sync and Resume sync'] as const)(
+      'renames the note edited and then renamed without network after its create went out, its ack lost (%s)',
+      async (how) => {
+        let h = buildHarness();
+        const server = new FakeServer(h, format);
+        const docs = new ServerDocs(server, h);
+        await connect(h);
+        await flushAsync(20);
+
+        h.vault.files.set('Untitled.md', encode('tpl\n'));
+        const created = event(h, 'create', 'Untitled.md');
+        await flushAsync(5);
+        await createLandsAckLost(h, server);
+        await created;
+        await h.settle();
+        if (how === 'Pause sync and Resume sync') {
+          await h.engine.stop();
+          const next = buildHarness({ predecessor: h, offline: true });
+          server.attach(next);
+          docs.attach(next);
+          await next.engine.start();
+          h = next;
+        }
+        h.vault.files.set('Untitled.md', encode('tpl\nmine\n'));
+        await event(h, 'modify', 'Untitled.md');
+        await h.settle();
+        expect(queue(h)).toEqual(['CREATE Untitled.md', 'CREATE Untitled.md']);
+        await h.vault.rename('Untitled.md', 'Meeting.md');
+        await flushAsync(5);
+        await h.settle();
+        expect(queue(h)).toEqual(['CREATE Meeting.md', 'CREATE Meeting.md']);
+
+        if (how === 'the connection is back') await reconnect(h, server, docs);
+        else await online(h, server, docs);
+        await docs.drive();
+
+        expect(server.applied).toEqual(['create Untitled.md', 's1 Untitled.md -> Meeting.md']);
+        expect(docs.live()).toEqual(['Meeting.md=tpl\nmine\n']);
+        expect(disk(h)).toEqual(['Meeting.md=tpl\nmine\n']);
+        expect(queue(h)).toEqual([]);
+        await h.engine.stop();
+      },
+    );
+
     it('renames the note it created right before, once the connection is back', async () => {
       const h = buildHarness();
       const server = new FakeServer(h, format);

@@ -112,26 +112,63 @@ describe('SyncEngine — the catch-up asked for', () => {
   });
 });
 
+/**
+ * What this device has of the note's history: a teammate's edit brought it
+ * into the store here (`its history`), or nothing — the catch-up skipped the
+ * note's doc, its disk matching the server's text, as it does for most notes,
+ * and the offline edit stayed on disk (`no history`). The server's version
+ * history of the note may name the text it had (`no history, versions`): a
+ * base to merge the offline edit into the new note with.
+ */
+type Here = 'its history' | 'no history' | 'no history, versions';
+
 // A server that continues the history cuts the catch-up short; the one before
 // it gives the first rows, and starts a revived note's history anew.
-describe.each([
-  ['current', 'whole journal'],
-  ['current', 'cut short'],
-  ['legacy', 'first rows'],
-] as const)(
-  'SyncEngine — a note deleted and created again while away, %s server, %s',
-  (format, form) => {
+describe.each(
+  (
+    [
+      ['current', 'whole journal'],
+      ['current', 'cut short'],
+      ['legacy', 'first rows'],
+    ] as const
+  ).flatMap(([format, form]) =>
+    (['its history', 'no history', 'no history, versions'] as Here[]).map(
+      (here) => [format, form, here] as const,
+    ),
+  ),
+)(
+  'SyncEngine — a note deleted and created again while away, %s server, %s, %s here',
+  (format, form, here) => {
     it('keeps what this device did to the deleted note and never sent out of the new one', async () => {
       const { h, server, docs } = await withNotes(format, [['f1', 'Untitled.md', 'old text\n']]);
       h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: [] }));
-      // A teammate's edit brings the note's history into its store here.
-      remoteEdit(h, docs.docs.get('f1') as Y.Doc, 'f1', 'shared\n');
-      await docs.drive();
-      expect(h.vault.text('Untitled.md')).toBe('shared\nold text\n');
+      let synced = 'old text\n';
+      if (here === 'its history') {
+        // A teammate's edit brings the note's history into its store here.
+        remoteEdit(h, docs.docs.get('f1') as Y.Doc, 'f1', 'shared\n');
+        await docs.drive();
+        synced = 'shared\nold text\n';
+        expect(h.vault.text('Untitled.md')).toBe(synced);
+      } else if (here === 'no history, versions') {
+        const versions = [
+          { id: 'v2', text: 'S2 text\n' },
+          { id: 'v1', text: 'old text\n' },
+        ];
+        const listed: Array<Record<string, unknown>> = [];
+        for (const [n, v] of versions.entries()) {
+          const hash = await sha256Hex(v.text);
+          listed.push({ id: v.id, versionNumber: 2 - n, contentHash: hash, createdAt: '' });
+          h.routes.set(`GET /api/projects/p1/files/f1/versions/${v.id}`, () =>
+            bytes(encode(v.text)),
+          );
+        }
+        h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: listed }));
+      }
 
       // Typed offline, never sent.
       await drop(h);
-      h.vault.files.set('Untitled.md', encode('shared\nold text\nunsent line\n'));
+      const typed = `${synced}unsent line\n`;
+      h.vault.files.set('Untitled.md', encode(typed));
       await h.engine.handleVaultEvent({
         bindingId: 'b1',
         type: 'modify',
@@ -154,7 +191,8 @@ describe.each([
       expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
       const copies = [...h.vault.files.keys()].filter((p) => p.includes('.conflict-'));
       expect(copies).toHaveLength(1);
-      expect(h.vault.text(copies[0] ?? '')).toBe('shared\nold text\nunsent line\n');
+      expect(h.vault.text(copies[0] ?? '')).toBe(typed);
+      expect(docs.live()).toEqual([`${copies[0] ?? ''}=${typed}`, 'Untitled.md=S2 text\n']);
       await h.engine.stop();
     });
   },
