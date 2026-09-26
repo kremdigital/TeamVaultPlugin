@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.3.8] — 2026-09-27
+
 ### Security
 
 - **Server paths that Windows resolves to a different file are refused.**
@@ -79,6 +81,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **Pause sync no longer loses what you do while paused.** Pause stopped sync
+  altogether, and whatever you did in the vault meanwhile was lost as a change:
+  a note renamed while paused came back as two notes for the whole team (the new
+  name uploaded as a new note, the old one written back from the server), and a
+  note deleted while paused came back. Pause sync now works like being offline
+  on purpose: Team Vault disconnects from the server and stays disconnected
+  until **Resume sync**, even with the network up, and records everything you do
+  in Obsidian as it does when the connection drops — new notes and attachments,
+  edits, renames, moves and deletes. **Resume sync** sends it all: a note
+  renamed several times goes out as one rename, and a note deleted stays deleted
+  unless a teammate changed it meanwhile. A transfer under way when you pause is
+  called off and sent on resume. A binding you add or switch back on while
+  paused stays paused, and **Sync now** is not offered while paused. Pause still
+  ends when the plugin starts again (Obsidian restarted, the plugin turned off
+  and on).
 - **Disabling, reloading or pausing the plugin now stops the sync work
   already under way.** The same goes for switching a binding off. Before, a
   connect-time catch-up, an offline-queue drain, a file download or upload,
@@ -91,8 +108,10 @@ uses [Semantic Versioning](https://semver.org/).
   teammate's edit into a note, so no stray copy is left behind to be uploaded
   as a new file and a teammate's edit that arrives during that write is
   neither lost nor duplicated when sync resumes. Queued offline edits the server
-  has already acknowledged are no longer sent twice; at most the one in
-  flight at the moment of stopping goes out again.
+  has already acknowledged are no longer sent twice. What was on its way
+  without an answer at the moment of stopping or pausing may go out again, but
+  not the last rename or attachment edit sent, once the next connect finds the
+  server applied it.
 - A queued offline edit to an attachment that no longer exists at its path
   no longer halts the whole offline queue. A queued attachment edit whose
   bytes match the last synced version is no longer re-uploaded.
@@ -389,6 +408,49 @@ uses [Semantic Versioning](https://semver.org/).
   sync was connecting.
 - An attachment you delete while a teammate's update of it arrives no longer
   comes back to your disk when the server has the version you already had.
+- **A file you save under the name of a teammate's new file that hasn't reached
+  your vault yet no longer overwrites theirs.** This happens when you pause
+  sync, lose the connection or close Obsidian while it is still connecting and
+  the teammate's note or attachment has not come down yet, then create a note
+  (Obsidian's "Untitled") or save an attachment under the same name. Yours went
+  to the server as the new version of their file: their text or attachment was
+  replaced for the whole team and no copy was kept. Now yours is kept as
+  `Name.conflict-<device>.<ext>` and theirs keeps the name and comes to your
+  vault. The same holds when the file was saved while Obsidian was closed, and
+  when a download of the teammate's file is still on its way.
+- **The last rename you sent before the connection dropped, you paused sync or
+  the plugin was turned off is no longer sent again when the server had already
+  applied it.** Its answer never came, so it stayed queued and went out once
+  more when sync resumed; when a teammate had renamed the note meanwhile, it
+  moved the note back to your name for the whole team. The same holds for a note
+  you renamed several times in a row before the answers came. When renames of
+  several notes were on their way at once (several notes moved into a folder,
+  for example), only the last one is sure to be recognised: the others may go
+  out again, and then a teammate's rename of one of those notes meanwhile is
+  undone. Renames still on their way when Obsidian quits are not kept, and the
+  last of them can be lost.
+- **An attachment or canvas you uploaded no longer brings up a "Content
+  conflict" prompt against your own version.** When the upload's answer was cut
+  off (the connection dropped, you paused sync or turned the plugin off) and you
+  edited the file again, Team Vault took your upload for a teammate's, and
+  **Keep server** wrote your older version over the newer one for everyone; your
+  latest version now goes out without a question. When Obsidian quit or crashed
+  while the upload's answer was on its way, or within half a second of it, and a
+  teammate saved a newer version before you opened Obsidian again, your own
+  version was put against theirs: **Keep local** wrote it back over the
+  teammate's for everyone, and **Keep both** made a copy of it for everyone.
+  Their version now comes down without a question. Two cases still bring up the
+  prompt, and **Keep server** is the answer that keeps the teammate's file: the
+  teammate put back byte for byte the version you had before your upload (it
+  doesn't reach your vault, and their next version asks), or deleted the file
+  and added another one under the same name.
+- A teammate's new attachment whose download was cut short (the connection lost,
+  or sync paused) now comes down on the next connect. When a file of yours still
+  held its name at the time, it used to be recorded as synced without its bytes
+  and never came, and a file you saved under its name later went out as its new
+  version, over the teammate's.
+- A teammate's attachment deleted while it, or a new version of it, is being
+  downloaded no longer stays on your disk.
 
 ## [0.3.7] — 2026-09-23
 
