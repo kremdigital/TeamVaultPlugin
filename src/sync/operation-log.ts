@@ -79,6 +79,17 @@ export interface FileMeta {
    * the file's next sync; meanwhile the engine folds as it used to.
    */
   foldedHash?: string;
+  /**
+   * The file's content has not reached this disk yet: the engine indexed it
+   * from the server — its listing, or a teammate's create — while no file was
+   * under its name here, and has not written it since. A file saved under
+   * that name meanwhile is another one, this device's own: it is sent as a
+   * new file, and this one waits for the name (see `SyncEngine.createLocal`).
+   * Taken for this file's copy, it went to the server as its new version,
+   * over the teammate's. Cleared once the engine writes the content, or finds
+   * it on disk.
+   */
+  notOnDisk?: true;
 }
 
 export interface BindingState {
@@ -627,6 +638,7 @@ export class OperationLog {
           fileType: meta.fileType,
           lastSyncedAt: meta.lastSyncedAt,
           ...(meta.foldedHash !== undefined ? { foldedHash: meta.foldedHash } : {}),
+          ...(meta.notOnDisk === true ? { notOnDisk: true } : {}),
         })),
         state: bucket.state
           ? {
@@ -749,6 +761,7 @@ function toFileMeta(bindingId: string, raw: unknown): FileMeta | null {
     fileType,
     lastSyncedAt: toNumber(raw.lastSyncedAt, 0),
     ...(typeof raw.foldedHash === 'string' ? { foldedHash: raw.foldedHash } : {}),
+    ...(raw.notOnDisk === true ? { notOnDisk: true as const } : {}),
   };
 }
 

@@ -383,6 +383,24 @@ describe('OperationLog — persistence', () => {
     expect(legacy && 'foldedHash' in legacy).toBe(false);
   });
 
+  it('round-trips the mark of a file whose content never reached the disk', async () => {
+    // Lost on a reload, the file came back from `state.json` as one this
+    // device had a copy of, and a file saved under its name was sent as its
+    // new version.
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.setFileMeta(makeMeta({ relativePath: 'theirs.png', notOnDisk: true }));
+    log.setFileMeta(makeMeta({ relativePath: 'mine.png' }));
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.getFileMeta('b1', 'theirs.png')?.notOnDisk).toBe(true);
+    const mine = reopened.getFileMeta('b1', 'mine.png');
+    expect(mine).toEqual(makeMeta({ relativePath: 'mine.png' }));
+    expect(mine && 'notOnDisk' in mine).toBe(false);
+  });
+
   it('keeps operation ids climbing after a reload, like AUTOINCREMENT did', async () => {
     // Reusing an id would let a stale `markSent` ack drop a newer operation.
     const { storage } = makeStorage();

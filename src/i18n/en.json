@@ -13,8 +13,6 @@
   "settings.bindings.add": "Add binding",
   "settings.bindings.onlyOne": "The whole vault syncs with one project, so there can be only one binding. Remove the current binding to connect another project.",
   "settings.bindings.unreadable": "The plugin could not read part of the binding list in its settings file (sync.log says what). It may hold this vault's binding, and there can be only one, so fix or remove it first: turn the plugin off in Settings → Community plugins, edit data.json, then turn the plugin back on.",
-  "settings.bindings.toggle.name": "Enabled",
-  "settings.bindings.toggle.desc": "When off, sync for this binding is paused.",
   "settings.bindings.remove": "Remove binding",
   "settings.bindings.removeConfirm": "Remove binding \"{project}\"? Local files stay in place.",
   "settings.bindings.removeTitle": "Remove binding",

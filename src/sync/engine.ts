@@ -232,6 +232,8 @@ interface Catchup {
   renamedFrom: ReadonlyMap<string, ReadonlySet<string>>;
   /** Operations this device applied from their live broadcasts. */
   appliedLive: ReadonlySet<string>;
+  /** This device's own operations the catch-up returns (see `ownOperations`). */
+  own: ReadonlySet<ServerOperation>;
 }
 
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
@@ -695,11 +697,20 @@ export class SyncEngine {
    * skips a tombstoned path as a deleted file still on disk. Not these: the
    * delete was checked against the disk, so a file there now is a new one —
    * a note saved under the name while the plugin was off — and is uploaded.
+   * So are the names of files deleted on the server whose content never
+   * reached this disk (see `FileMeta.notOnDisk`).
    */
   private freedHere = new Set<string>();
 
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
+
+  /**
+   * The tear-down of the subscription that wires each doc opened (see
+   * {@link onSocketConnect}): one for the engine's lifetime, replaced on each
+   * connect.
+   */
+  private docsAcquiredOff: (() => void) | null = null;
 
   /**
    * Resolves the in-flight streamed Yjs catch-up once the server's final
@@ -785,6 +796,10 @@ export class SyncEngine {
     this.cleanups.push(
       this.socket.onYjsCatchup((batch) => this.trackConnectFlow(this.handleYjsCatchup(batch))),
     );
+    this.cleanups.push(() => {
+      this.docsAcquiredOff?.();
+      this.docsAcquiredOff = null;
+    });
 
     if (!this.paused) this.socket.connect();
   }
@@ -1103,6 +1118,10 @@ export class SyncEngine {
       // after each of them (see `forgetAppliedLive` below).
       const liveBeforeJoin = this.operationLog.appliedLiveIds(this.binding.id);
       this.startedSinceJoin.clear();
+      // This device's counter in the clock the join carries: an operation of
+      // the catch-up that takes it past it is this device's own (see
+      // `ownOperations`).
+      const ownSince = this.vectorClock[this.clientId] ?? 0;
       const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
       const filesPromise = this.refreshFileIndex(online);
       // Known to `resume()` on its own: a join failed by a pause ends this
@@ -1142,11 +1161,19 @@ export class SyncEngine {
         return;
       }
 
+      // Operations of this device's the server applied while their answer
+      // was lost: the connection dropped, or Pause sync closed it.
+      const own =
+        result.operationsCatchup === OPERATIONS_CATCHUP && result.operationsTruncated !== true
+          ? ownOperations(result.operations, this.clientId, ownSince)
+          : new Set<ServerOperation>();
+      this.dropLandedMoves(own);
       // Apply server-side operations the client missed.
       const catchup: Catchup = {
         superseded: supersededOps(result.operations),
         renamedFrom: renameSources(result.operations),
         appliedLive,
+        own,
       };
       for (const op of result.operations) {
         await this.applyServerOperation(op, catchup);
@@ -1192,12 +1219,14 @@ export class SyncEngine {
           this.wire(meta.fileId, meta.relativePath);
         }
       }
-      this.cleanups.push(
-        this.docManager.onDocAcquired(this.binding.id, (filePath) => {
-          const meta = this.fileIndex.byPath.get(filePath);
-          if (meta?.fileType === 'TEXT') this.wire(meta.fileId, filePath);
-        }),
-      );
+      // One subscription at a time. Added on each connect, they piled up for
+      // the engine's lifetime — a reconnect or Pause sync and Resume sync
+      // each added one — and every doc opened was wired once for each.
+      this.docsAcquiredOff?.();
+      this.docsAcquiredOff = this.docManager.onDocAcquired(this.binding.id, (filePath) => {
+        const meta = this.fileIndex.byPath.get(filePath);
+        if (meta?.fileType === 'TEXT') this.wire(meta.fileId, filePath);
+      });
 
       this.persistVectorClock();
       // What the clock took in, no catch-up returns again: the operations this
@@ -1310,6 +1339,12 @@ export class SyncEngine {
         // вальте это копия всего текста в памяти. Локальный `Y.Doc` при
         // этом не поднимался и мог отстать от сервера — при первой
         // надобности его подтянет `ensureHydrated`.
+        //
+        // Текст заметки на диске, значит, она здесь есть (см. `notOnDisk`).
+        if (meta.notOnDisk === true) {
+          delete meta.notOnDisk;
+          if (this.fileIndex.byId.get(meta.fileId) === meta) this.operationLog.setFileMeta(meta);
+        }
         this.recordFoldedHash(meta, await sha256Hex(disk));
         this.skippedDocs.add(meta.fileId);
       }
@@ -1731,7 +1766,7 @@ export class SyncEngine {
       // artifacts (e.g. Obsidian's orphaned `*.tmp.<pid>.<hex>` files).
       if (this.isIgnoredLocalPath(path)) continue;
       // Or a recorded file under another case (see `spelledHere`).
-      if (this.fileIndex.byPath.has(this.spelledHere(path))) continue;
+      if (this.knownHere(path)) continue;
       if (pending.has(path)) continue;
       // Deleted on the server while this device was away: removed, or asked
       // about, not uploaded again.
@@ -1745,7 +1780,7 @@ export class SyncEngine {
       // there in between was uploaded as a new one.
       await this.withPathLock(path, () => Promise.resolve());
       online.throwIfAborted();
-      if (this.fileIndex.byPath.has(this.spelledHere(path))) continue;
+      if (this.knownHere(path)) continue;
       try {
         await this.handleLocalCreate(path);
       } catch {
@@ -1754,6 +1789,17 @@ export class SyncEngine {
         // will surface them again.
       }
     }
+  }
+
+  /**
+   * Whether the file on disk at `path` is the copy of an indexed file, in
+   * this case or another (see `spelledHere`). Not under the name of a file
+   * whose content never reached this disk: the file there is another one, one
+   * whose create event was missed (see `yieldNameNotWritten`).
+   */
+  private knownHere(path: string): boolean {
+    const meta = this.fileIndex.byPath.get(this.spelledHere(path));
+    return meta !== undefined && !(meta.notOnDisk === true && meta.relativePath === path);
   }
 
   /** Whether `path` holds the copy of a file waiting for its question (see {@link retiredAway}). */
@@ -1912,6 +1958,21 @@ export class SyncEngine {
     online.throwIfAborted();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
     this.deletedSinceListing.clear();
+    // Records of files never written here (see `FileMeta.notOnDisk`) hold no
+    // copy to settle: a file under such a name is another one. Taken for a
+    // copy, it was moved along with the teammate's rename of the file, or the
+    // user was asked whether to delete it with the file. Only one the listing
+    // has under that very name is kept, for the index below to tell whether a
+    // file was saved there since.
+    for (const record of this.operationLog.listFileMeta(this.binding.id)) {
+      if (record.notOnDisk !== true) continue;
+      const listedAt = this.lastListing.get(record.serverFileId)?.path;
+      if (listedAt === record.relativePath) continue;
+      this.operationLog.deleteFileMeta(this.binding.id, record.relativePath);
+      // Deleted on the server: a file under the name is a new one whatever
+      // tombstone is there, and the first upload sends it (see `freedHere`).
+      if (listedAt === undefined) this.freedHere.add(record.relativePath);
+    }
     // Before anything reads the queue: a create that reached the server
     // without its ack is this device's file.
     this.adoptLandedCreates(listed);
@@ -1946,6 +2007,7 @@ export class SyncEngine {
     this.retiredAway.clear();
     this.waitingForName.clear();
     const occupied = await this.clearStaleCopies(files, away, here);
+    const absent = await this.absentHere(files);
     this.outOfScope.clear();
     this.newHere.clear();
     // Names our files took here: a file the listing has there is not indexed
@@ -2024,7 +2086,12 @@ export class SyncEngine {
       const createdHereFirst =
         createdHere.has(f.path) &&
         this.operationLog.getFileMeta(this.binding.id, f.path)?.serverFileId !== f.id;
-      if ((takenHere.has(f.path) && local !== f.path) || createdHereFirst) {
+      // Recorded as never written here, and a file is under the name now:
+      // saved while Obsidian was closed or the plugin off — another one,
+      // which the first upload sends as such (see `yieldNameNotWritten`).
+      const savedOver = !absent.has(f.id) && this.recordedNotOnDisk(f.id, f.path);
+      if (savedOver) this.forgetRecord(this.operationLog, f.id, f.path);
+      if ((takenHere.has(f.path) && local !== f.path) || createdHereFirst || savedOver) {
         // Our own file took the name here — renamed or created — and has not
         // told the server yet, which stores it under a conflict name when it
         // does: this file comes in once ours has moved there (see
@@ -2062,7 +2129,7 @@ export class SyncEngine {
         this.waitingForName.set(waiting.path, { kind: 'create', ...waiting });
         if (!yields) continue;
       }
-      this.indexListedFile(f, byPath, byId);
+      this.indexListedFile(f, byPath, byId, undefined, absent.has(f.id));
     }
     this.fileIndex = { byPath, byId };
     this.indexLoaded = true;
@@ -2076,8 +2143,35 @@ export class SyncEngine {
         this.outOfScope.set(f.id, { path: f.path, fileType: f.fileType });
         continue;
       }
-      this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId);
+      // The copy that was there has moved out just now.
+      const gone = !(await this.vault.exists(f.path));
+      this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId, undefined, gone);
     }
+  }
+
+  /**
+   * The files of `files` this device has no record of and no file under the
+   * name of: new to this device, their content not on its disk yet (see
+   * `FileMeta.notOnDisk`). By id.
+   */
+  private async absentHere(files: readonly ApiFile[]): Promise<Set<string>> {
+    const absent = new Set<string>();
+    const onDisk = new Set(await this.vault.list(this.binding.localFolder));
+    for (const f of files) {
+      if (onDisk.has(f.path) || !this.isLocalName(f.path)) continue;
+      const recorded = this.operationLog.getFileMeta(this.binding.id, f.path);
+      if (
+        recorded !== null &&
+        recorded.notOnDisk !== true &&
+        (recorded.serverFileId === f.id || recorded.serverFileId === '')
+      ) {
+        continue;
+      }
+      // Obsidian lists the vault from its own index, which can be a step
+      // behind the disk.
+      if (!(await this.vault.exists(f.path))) absent.add(f.id);
+    }
+    return absent;
   }
 
   /**
@@ -2121,7 +2215,14 @@ export class SyncEngine {
 
   /** Whether `state.json` has file `fileId` under `path`: the copy there is its. */
   private recordedAt(fileId: string, path: string): boolean {
-    return this.operationLog.getFileMeta(this.binding.id, path)?.serverFileId === fileId;
+    const recorded = this.operationLog.getFileMeta(this.binding.id, path);
+    return recorded?.serverFileId === fileId && recorded.notOnDisk !== true;
+  }
+
+  /** Whether `state.json` has file `fileId` under `path` as never written here. */
+  private recordedNotOnDisk(fileId: string, path: string): boolean {
+    const recorded = this.operationLog.getFileMeta(this.binding.id, path);
+    return recorded?.serverFileId === fileId && recorded.notOnDisk === true;
   }
 
   /**
@@ -2187,13 +2288,15 @@ export class SyncEngine {
   /**
    * Index one file of the listing at its listed path, and mirror it to
    * `state.json`. `recorded`: this device's record of the file, when it is
-   * not the one at `f.path`.
+   * not the one at `f.path`. `absent`: no file is under its name here (see
+   * `FileMeta.notOnDisk`).
    */
   private indexListedFile(
     f: ApiFile,
     byPath: Map<string, IndexedMeta>,
     byId: Map<string, IndexedMeta>,
     recorded: FileMeta | null = this.operationLog.getFileMeta(this.binding.id, f.path),
+    absent = false,
   ): void {
     // Preserve the client's last-known `contentHash` (the "common
     // ancestor" from the engine's perspective) for files we've synced
@@ -2208,9 +2311,12 @@ export class SyncEngine {
     // would hand its hashes to this one: a binary would be taken for synced
     // while the disk holds the other file's bytes, and a note would fold the
     // other file's text into this one (see `clearStaleCopies`). A record with
-    // no id comes from an old log and keeps the benefit of the doubt.
+    // no id comes from an old log and keeps the benefit of the doubt. One of
+    // a file never written here is no record of a copy (see `notOnDisk`).
     const existing =
-      recorded !== null && (recorded.serverFileId === f.id || recorded.serverFileId === '')
+      recorded !== null &&
+      recorded.notOnDisk !== true &&
+      (recorded.serverFileId === f.id || recorded.serverFileId === '')
         ? recorded
         : null;
     const meta: IndexedMeta = {
@@ -2225,6 +2331,7 @@ export class SyncEngine {
       // The fold marker is local knowledge the server listing can't restore;
       // dropping it on reconnect would bring back the reverted-edit bug.
       ...(existing?.foldedHash !== undefined ? { foldedHash: existing.foldedHash } : {}),
+      ...(existing === null && absent ? { notOnDisk: true as const } : {}),
     };
     byPath.set(f.path, meta);
     byId.set(f.id, meta);
@@ -2519,6 +2626,37 @@ export class SyncEngine {
   }
 
   /**
+   * Queued renames and moves the server has applied already: the catch-up
+   * returns this device's own (`own`, see `ownOperations`) rename of the file
+   * to the name the queued one gives it. The one the drain had in flight when
+   * the connection dropped or Pause sync closed it, its answer lost. Taken out
+   * of the queue, and the catch-up's renames of the file after it apply.
+   *
+   * Sent again, it moved the file back from where a teammate had renamed it
+   * since, for the whole team: the server applies a rename by file id,
+   * whatever the file's name is by then.
+   */
+  private dropLandedMoves(own: ReadonlySet<ServerOperation>): void {
+    for (const op of own) {
+      if (op.opType !== 'RENAME' && op.opType !== 'MOVE') continue;
+      const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
+      if (typeof fileId !== 'string' || fileId === '' || op.newPath === null) continue;
+      const moves = this.operationLog
+        .dequeueOperations(this.binding.id)
+        .filter((queued) => isQueuedMove(queued) && queuedFileId(queued.payload) === fileId);
+      const landed = moves.find((queued) => queued.newPath === op.newPath);
+      if (landed === undefined) continue;
+      this.log.info('a rename sent from here reached the server before its answer was lost', {
+        from: landed.filePath,
+        to: landed.newPath,
+        fileId,
+      });
+      this.operationLog.markSent([landed.id]);
+      if (moves.length === 1) this.renamedHere.delete(fileId);
+    }
+  }
+
+  /**
    * Whether the server's doc of note `fileId` holds nothing that the note's
    * history here lacked when it was deleted (the queued DELETE's
    * {@link DOC_STATE}): no edit from anyone else reached the server since,
@@ -2611,7 +2749,7 @@ export class SyncEngine {
       return;
     }
     this.throwIfStopped();
-    this.indexListedFile(listed, this.fileIndex.byPath, this.fileIndex.byId, null);
+    this.indexListedFile(listed, this.fileIndex.byPath, this.fileIndex.byId, null, true);
     // A note's text comes with the catch-up; an attachment is downloaded.
     if (listed.fileType === 'BINARY') {
       await this.applyServerCreate({ id: fileId, path, fileType: listed.fileType });
@@ -2847,6 +2985,9 @@ export class SyncEngine {
 
   /** {@link handleLocalCreate} past its checks: send the create, or the save of a known file. */
   private async createLocal(path: string, from: LocalSource): Promise<void> {
+    const known = this.fileIndex.byPath.get(path);
+    // No file here after all: a stray event, nothing to send.
+    if (known?.notOnDisk === true && (await this.yieldNameNotWritten(known)) === 'none') return;
     if (this.fileIndex.byPath.has(path)) {
       // The server already knows about this — treat as a modify.
       await this.handleLocalModify(path, from);
@@ -2859,6 +3000,58 @@ export class SyncEngine {
     } finally {
       this.settle(change);
     }
+  }
+
+  /**
+   * A file saved here under the name of `meta`, a file whose content has not
+   * reached this disk (see `FileMeta.notOnDisk`): a teammate's, listed at a
+   * connect that the pause, the connection lost or a restart cut short before
+   * its catch-up wrote it, or broadcast and not downloaded yet. The file here
+   * is another one, this device's own. It goes to the server as a new file,
+   * which stores it under a conflict name, and moves there (see
+   * `recordCreateAck`); `meta` leaves the index meanwhile and waits for the
+   * name (see {@link waitForName}), as a file listed under the name of a file
+   * created here offline does (see `refreshFileIndex`).
+   *
+   * Taken for a save of that file, the file here went to the server as its
+   * new version when sync resumed — a note's text replaced the teammate's,
+   * an attachment's bytes theirs, for the whole team, and no copy kept.
+   *
+   * `'yielded'`; `'none'` when there is no file under the name after all;
+   * `'changed'` when `meta` was written, moved or dropped meanwhile.
+   */
+  private async yieldNameNotWritten(meta: IndexedMeta): Promise<'yielded' | 'none' | 'changed'> {
+    const path = meta.relativePath;
+    return this.withPathLock(path, () =>
+      this.commitLocal(async (io): Promise<'yielded' | 'none' | 'changed'> => {
+        // The engine writes a file's content after it clears the flag.
+        if (this.fileIndex.byPath.get(path) !== meta || meta.notOnDisk !== true) return 'changed';
+        if (!(await io.vault.exists(path))) return 'none';
+        if (this.fileIndex.byPath.get(path) !== meta || meta.notOnDisk !== true) return 'changed';
+        this.log.info(
+          'a file saved under the name of a file not on this disk yet; that one waits',
+          {
+            path,
+            fileId: meta.fileId,
+          },
+        );
+        this.fileIndex.byPath.delete(path);
+        if (this.fileIndex.byId.get(meta.fileId) === meta) this.fileIndex.byId.delete(meta.fileId);
+        this.newHere.delete(meta.fileId);
+        this.forgetRecord(io.log, meta.fileId, path);
+        // Its history here holds nothing but the server's, if anything.
+        if (meta.fileType === 'TEXT') await this.dropDoc(io.docs, meta.fileId, path);
+        this.outOfScope.set(meta.fileId, { path, fileType: meta.fileType });
+        this.waitingForName.set(path, {
+          kind: 'create',
+          fileId: meta.fileId,
+          path,
+          fileType: meta.fileType,
+          foreign: true,
+        });
+        return 'yielded';
+      }),
+    );
   }
 
   /**
@@ -3338,8 +3531,10 @@ export class SyncEngine {
   private async handleLocalModify(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     const meta = this.fileIndex.byPath.get(path);
-    if (!meta) {
-      // No server record yet — promote to a CREATE.
+    // No server record yet — promote to a CREATE. So for a file whose content
+    // never reached this disk: the file here is another one (see
+    // `yieldNameNotWritten`).
+    if (!meta || meta.notOnDisk === true) {
       await this.handleLocalCreate(path, from);
       return;
     }
@@ -3576,7 +3771,9 @@ export class SyncEngine {
     // a stale index). Resolve the id from the server's live file list before
     // giving up — otherwise the DELETE is queued with an empty fileId and is
     // later dropped as `no_file_id`, so the deletion never propagates.
-    if (!fileId && this.socket.isConnected()) {
+    // Not a name a file of the server's waits for (see `waitForName`): the
+    // file deleted here was another one, and the server's was never here.
+    if (!fileId && this.socket.isConnected() && this.waitingFor(path) === undefined) {
       fileId = await this.resolveServerFileId(path);
       this.throwIfStopped();
     }
@@ -4665,13 +4862,24 @@ export class SyncEngine {
         break;
       }
       case 'UPDATE': {
-        const payload = (op.payload ?? {}) as { fileId?: unknown; contentHash?: unknown };
+        const payload = (op.payload ?? {}) as {
+          fileId?: unknown;
+          contentHash?: unknown;
+          size?: unknown;
+        };
         const fileId = typeof payload.fileId === 'string' ? payload.fileId : '';
         if (!fileId) break;
         // Stale-UPDATE guard: same logic — if the file is gone from the
         // server, the binary download will 404 and crash the catch-up.
         const meta = this.fileIndex.byId.get(fileId);
         if (!meta) break;
+        // This device's own upload: the version is its own (see
+        // `takeOwnVersion`). Before the check below — a teammate's update
+        // after it then finds the version it was made to.
+        if (catchup.own.has(op)) {
+          this.takeOwnVersion(meta, payload);
+          break;
+        }
         // A note's text comes with its doc, in this same catch-up: its UPDATE,
         // which a server before 0.3.8's lists, is left alone (see
         // `applyServerUpdateBinary`).
@@ -4903,6 +5111,9 @@ export class SyncEngine {
       size: 0,
       fileType: payload.fileType,
       lastSyncedAt: Date.now(),
+      // Until its content is written: a file saved under the name meanwhile
+      // is another one (see `yieldNameNotWritten`).
+      notOnDisk: true,
     };
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(payload.id, meta);
@@ -4957,18 +5168,20 @@ export class SyncEngine {
       // Meta and file go together — a meta recorded for a file that never
       // reached the disk would look like a synced copy.
       await this.commitLocal(async (io) => {
-        // Deleted by the user while it came down: gone from the index with
-        // the delete's ack, or still on its way.
-        if (
-          opts.restore === true &&
-          (this.fileIndex.byId.get(payload.id) !== meta || this.deletingHere(payload.id, path))
-        ) {
-          return;
-        }
+        // Gone from the index while it came down: deleted, or the name given
+        // up to a file saved under it here (see `yieldNameNotWritten`).
+        // Written, the bytes went over that file.
+        if (this.fileIndex.byId.get(payload.id) !== meta) return;
+        // Deleted by the user while it came down, the delete on its way.
+        if (opts.restore === true && this.deletingHere(payload.id, path)) return;
+        // A file saved under the name meanwhile: another one, which its own
+        // event sends as such (see `yieldNameNotWritten`).
+        if (await io.vault.exists(path)) return;
         // Same ordering as `applyServerUpdateBinary` — meta first, then the
         // disk write, so the watcher echo's hash compare short-circuits.
         meta.size = buf.byteLength;
         meta.contentHash = hash;
+        delete meta.notOnDisk;
         io.log.setFileMeta(meta);
         // One createBinary fires Obsidian onCreate + chokidar 'add' — two
         // echoes that both need consuming.
@@ -5012,6 +5225,36 @@ export class SyncEngine {
   }
 
   /**
+   * An attachment update of this device's own that the catch-up returns (see
+   * `ownOperations`): the version it brought is one this device uploaded — the
+   * last synced one, whatever `meta` says. It says the version before when the
+   * answer never came: the connection dropped, or Pause sync closed it. The
+   * copy here is that version, or an edit of it made since, which the queue
+   * sends; nothing is downloaded.
+   *
+   * Taken for a teammate's, the version was downloaded and compared with an
+   * edit made since: a "Content conflict" prompt between the user's own two
+   * versions, and "Keep server" wrote the older one over the newer everywhere.
+   */
+  private takeOwnVersion(
+    meta: IndexedMeta,
+    payload: { contentHash?: unknown; size?: unknown },
+  ): void {
+    if (meta.fileType !== 'BINARY' || meta.notOnDisk === true) return;
+    const hash = typeof payload.contentHash === 'string' ? payload.contentHash : '';
+    if (hash === '' || hash === meta.contentHash) return;
+    this.log.info(
+      'an attachment version sent from here reached the server before its answer was lost',
+      {
+        path: meta.relativePath,
+      },
+    );
+    meta.contentHash = hash;
+    if (typeof payload.size === 'number') meta.size = payload.size;
+    this.operationLog.setFileMeta(meta);
+  }
+
+  /**
    * An attachment's new version on the server: downloaded and written here,
    * through the conflict modal when the copy here has changed too.
    * `versionHash`: the content the update brought, when the broadcast or the
@@ -5044,6 +5287,10 @@ export class SyncEngine {
     if (versionHash !== undefined && versionHash !== '' && versionHash === meta.contentHash) {
       return;
     }
+    // A file never written here, with a file under its name: that one is
+    // another (see `yieldNameNotWritten`). Compared with it, the user was
+    // asked to choose between two different files.
+    if (meta.notOnDisk === true && (await this.vault.exists(meta.relativePath))) return;
     const newBuf = await this.downloadFile(fileId);
     this.throwIfStopped();
     const newHash = await sha256Hex(newBuf);
@@ -5059,8 +5306,10 @@ export class SyncEngine {
 
     // Conflict detection — only triggers when the user has uncommitted edits.
     // Stopped anywhere up to the write below, nothing has changed yet: the
-    // next catch-up replays this UPDATE and starts over.
-    if (await this.vault.exists(meta.relativePath)) {
+    // next catch-up replays this UPDATE and starts over. Not for a file never
+    // written here: a file saved under its name while the version came down
+    // is another one, left alone at the write below.
+    if (meta.notOnDisk !== true && (await this.vault.exists(meta.relativePath))) {
       const localBuf = await this.vault.readBinary(meta.relativePath);
       const localHash = await sha256Hex(localBuf);
       const conflict = detectBinaryConflict({
@@ -5121,6 +5370,11 @@ export class SyncEngine {
     const parkAt = aside;
     await this.commitLocal(async (io) => {
       const path = meta.relativePath;
+      // Out of the index while it came down: its name given up to a file saved
+      // under it (see `yieldNameNotWritten`), or the file deleted. The file
+      // under the name is another one.
+      if (this.fileIndex.byId.get(fileId) !== meta) return;
+      if (meta.notOnDisk === true && (await io.vault.exists(path))) return;
       if (parkAt !== null) {
         // A rename fires Obsidian onRename + chokidar 'unlink' (old) +
         // 'add' (new) — both paths need their own echo budgets, or the
@@ -5146,6 +5400,7 @@ export class SyncEngine {
       // echo's hash compare matches and the short-circuit fires.
       meta.size = newBuf.byteLength;
       meta.contentHash = newHash;
+      delete meta.notOnDisk;
       io.log.setFileMeta(meta);
       // Overwrite writes can split into chokidar `unlink` + `add` (the
       // atomic-rename pattern some editors and OS-level write paths use),
@@ -5878,7 +6133,9 @@ export class SyncEngine {
     if (oldPath === newPath) return;
     /** Where the file stepped aside to, if it did. */
     let spare: string | null = null;
-    if (await io.vault.exists(oldPath)) {
+    // A file never written here has no copy to move: a file under its old
+    // name is another one (see `yieldNameNotWritten`).
+    if (meta.notOnDisk !== true && (await io.vault.exists(oldPath))) {
       /** Where the file is on disk until the rename proper. */
       let source = oldPath;
       if (oldPath !== newPath && pathKey(oldPath) === pathKey(newPath)) {
@@ -6546,6 +6803,18 @@ export class SyncEngine {
     let text: string;
     let hash = '';
     for (let attempt = 1; ; attempt++) {
+      // A note never written here, with a file under its name: that one is
+      // another, which its own event sends as such (see
+      // `yieldNameNotWritten`). Folded in, its text went to the server as
+      // this note's, over the teammate's.
+      if (
+        meta?.notOnDisk === true &&
+        diskText !== null &&
+        diskText !== this.docManager.getText(this.binding.id, path)
+      ) {
+        this.log.debug('snapshot left out: another file is under the name of a note', path);
+        return;
+      }
       await this.foldDiskEditsIntoDoc(path, diskText);
       text = this.docManager.getText(this.binding.id, path);
       if (meta) hash = await sha256Hex(text);
@@ -6650,6 +6919,8 @@ export class SyncEngine {
   ): void {
     meta.contentHash = hash;
     meta.size = new TextEncoder().encode(text).byteLength;
+    // On disk now: the write comes right after, or the disk has it already.
+    delete meta.notOnDisk;
     log.setFileMeta(meta);
   }
 
@@ -7436,6 +7707,33 @@ function describeError(err: unknown, fallback: string): string {
   if (err instanceof ApiError) return `${err.kind} (HTTP ${err.status})`;
   if (err instanceof Error) return err.message;
   return fallback;
+}
+
+/**
+ * The operations of a whole-journal catch-up that this device sent itself:
+ * each takes this device's counter in the clock past `since`, the counter the
+ * join carried, or past the one an earlier such operation took it to. The
+ * server stores an operation with its sender's counter one up
+ * (`increment(vectorClock, clientId)`), so an operation this device sent last
+ * comes back in the next catch-up — acknowledged or not. A teammate's
+ * operation can carry this device's counter too, one it took in from a
+ * catch-up of its own, but only one this device's operation reached first:
+ * it comes later in the journal, and takes the counter no further.
+ */
+function ownOperations(
+  ops: readonly ServerOperation[],
+  clientId: string,
+  since: number,
+): Set<ServerOperation> {
+  const own = new Set<ServerOperation>();
+  let seen = since;
+  for (const op of ops) {
+    const counter = op.vectorClock?.[clientId];
+    if (typeof counter !== 'number' || counter <= seen) continue;
+    own.add(op);
+    seen = counter;
+  }
+  return own;
 }
 
 /** File id → every path the catch-up's renames and moves of that file start from. */
