@@ -22,9 +22,9 @@ reconnect, and every file keeps its version history. Companion to the
 - **Binary files** — versioned via REST snapshots. A three-way conflict
   prompt opens when both sides have diverged from the same starting hash
   (keep-server / keep-local / keep-both).
-- **Offline-first** — edits made while disconnected queue in a local
-  operation log; the engine drains the queue on reconnect with
-  exponential-backoff reconnect to the server.
+- **Offline-first** — edits made while disconnected, or while sync is
+  paused, queue in a local operation log; the engine drains the queue on
+  reconnect with exponential-backoff reconnect to the server.
 - **External edits** — chokidar watches the filesystem, so changes from CLI
   scripts and AI agents propagate the same way as in-app edits.
 - **Version history** — right-pane view shows every server-side version of
@@ -263,11 +263,19 @@ Available from the command palette (`Ctrl/Cmd-P`), where Obsidian lists
 them under the plugin's name:
 
 - **Team Vault: Sync now** — runs a deep diff against every active
-  binding (catches files that drifted while the plugin was offline).
-- **Team Vault: Pause sync** — disconnects every engine until you resume.
-  Shown only while sync runs.
-- **Team Vault: Resume sync** — reconnect after a manual pause. Shown only
-  while paused.
+  binding (catches files that drifted while the plugin was offline). Not
+  shown while paused.
+- **Team Vault: Pause sync** — work offline on purpose. Team Vault
+  disconnects from the server and stays disconnected until you resume, even
+  when the network is up; a transfer under way is called off. Everything
+  you do in Obsidian meanwhile — new notes and attachments, edits, renames,
+  moves, deletes — is recorded as it is when the connection drops, and goes
+  to the server when you resume: a note renamed several times goes as one
+  rename, a note deleted stays deleted. Pause lasts until you resume or the
+  plugin starts again (Obsidian restarted, the plugin turned off and on),
+  which connects. Shown only while sync runs.
+- **Team Vault: Resume sync** — connect again after a pause and send what
+  you did meanwhile. Shown only while paused.
 - **Team Vault: Toggle active file history** — opens the right-pane history
   view for the file currently in focus, or closes it if it is open.
 - **Team Vault: Open settings** — focuses the plugin's settings tab.
@@ -285,7 +293,7 @@ binding:
 | `check-circle` | `connected`  | Every binding is connected and up to date.   |
 | `refresh-cw`   | `syncing`    | At least one binding is mid-sync.            |
 | `refresh-cw`   | `connecting` | Initial handshake in progress.               |
-| `pause`        | `paused`     | You pressed Pause.                           |
+| `pause`        | `paused`     | You pressed Pause; changes wait for Resume.  |
 | `wifi-off`     | `offline`    | Every binding lost the server.               |
 | `alert-circle` | `error`      | One or more bindings hit an error (see log). |
 | `circle`       | `idle`       | No active bindings yet.                      |
@@ -401,6 +409,17 @@ edits in `…conflict-<ts>.<ext>`.
   letter case keeps its old case on a Windows or Mac disk: its notes stay
   synced, and a note you create in it goes to the server under the folder's
   old case.
+- Team Vault syncs a rename or a delete only when it sees it happen: in
+  Obsidian, or on disk while Obsidian runs with the plugin on — online,
+  offline or paused. A file renamed or moved while Obsidian is closed or the
+  plugin is off reaches your teammates as a new file next to the old one,
+  and the old name comes back to your vault; a file deleted then stays on
+  the server, and a note comes back to your vault too. A rename made outside
+  Obsidian while it runs (in Explorer or Finder, by `git` or a script)
+  reaches them as the old file deleted and a new one created, and a note's
+  version history stays with the deleted one. So rename, move and delete
+  files in Obsidian, and to keep working without syncing, use **Pause sync**
+  rather than closing Obsidian or turning the plugin off.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.
