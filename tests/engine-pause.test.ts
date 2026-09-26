@@ -1062,6 +1062,221 @@ describe('Pause sync — an operation the server applied before the pause cut it
     expect(queue(next)).toEqual([]);
     await next.engine.stop();
   });
+
+  it.each(['pause', 'drop'] as const)(
+    'takes a teammate’s return to the version before its own upload whose answer was cut off (%s), asking nothing',
+    async (how) => {
+      const { h, server, docs, onServer, downloads } = await attachment();
+      await h.engine.start();
+      answerAsSent(h, server, docs);
+      await docs.drive();
+      h.vault.files.set('p.png', encode('v2'));
+      const saved = h.engine.handleVaultEvent(vaultEvent('modify', 'p.png'));
+      await emitted(h, 'file:update-binary');
+      // Away while the update's answer is on its way; the server has it.
+      await away(h, how);
+      expect(server.serveNext()).toBe(true);
+      await saved.catch(() => undefined);
+      await flushAsync(20);
+      expect(onServer()).toBe('v2');
+      expect(queue(h)).toEqual(['UPDATE p.png']);
+      // A teammate puts the picture back as it was: v1's bytes.
+      await server.teammateUpdate('f2', encode('v1'));
+
+      h.modal.binary.resolve('keep-local');
+      await back(h, how);
+      answerAsSent(h, server, docs);
+      await docs.drive();
+      // The version synced here, v1, is the one the teammate's update brings.
+      // Taken for that update applied here live, the upload was not known for
+      // this device's own, and went out again: v2 over the teammate's v1 for
+      // the whole team, nothing asked.
+      expect(h.calls).not.toContain('modal.resolveBinaryConflict');
+      expect(onServer()).toBe('v1');
+      expect(disk(h)).toEqual(['p.png=v1']);
+      expect(downloads).toEqual(['v1']);
+      expect(queue(h)).toEqual([]);
+      expect(h.engine.getStatus()).toBe('connected');
+      await h.engine.stop();
+    },
+  );
+
+  it.each(['pause', 'drop', 'restart'] as const)(
+    'asks nothing about a teammate’s attachment put under the name of one it updated last, applied here live (%s)',
+    async (how) => {
+      const { h, server, docs, onServer, route } = await attachment();
+      await h.engine.start();
+      answerAsSent(h, server, docs);
+      await docs.drive();
+      h.vault.files.set('p.png', encode('v2'));
+      const saved = h.engine.handleVaultEvent(vaultEvent('modify', 'p.png'));
+      await docs.drive();
+      await saved;
+      expect(onServer()).toBe('v2');
+      // The user's last file operation. A teammate deletes the picture and puts
+      // another one under its name: the server brings the file back under its
+      // id. Both broadcasts are applied here.
+      server.teammateDelete('f2');
+      await flushAsync(40);
+      await h.settle();
+      expect(await server.teammateUpload('p.png', encode('v3'))).toBe('f2');
+      await flushAsync(40);
+      await h.settle();
+      expect(disk(h)).toEqual(['p.png=v3']);
+
+      let cur = h;
+      if (how === 'restart') {
+        await h.engine.stop();
+        cur = restarted(h, server, docs);
+        route(cur);
+        await cur.engine.start();
+      } else {
+        await away(h, how);
+        await back(h, how);
+      }
+      answerAsSent(cur, server, docs);
+      await docs.drive();
+      // The teammate saves a new version of their picture.
+      cur.modal.binary.resolve('keep-local');
+      await server.teammateUpdate('f2', encode('v4'));
+      await flushAsync(40);
+      await cur.settle();
+      // The catch-up returns v2, the device's last operation, then the
+      // teammate's delete and create: no update of theirs. v2 was taken for
+      // the version synced here, and the teammate's picture on disk for an
+      // edit of it: their next version was put against it in a "Content
+      // conflict" prompt, and "Keep local" wrote their first picture back over
+      // it for the whole team.
+      expect(cur.calls).not.toContain('modal.resolveBinaryConflict');
+      expect(onServer()).toBe('v4');
+      expect(disk(cur)).toEqual(['p.png=v4']);
+      expect(queue(cur)).toEqual([]);
+      expect(cur.engine.getStatus()).toBe('connected');
+      await cur.engine.stop();
+    },
+  );
+
+  /** Rename note `x.md` along `names` online, each sent before the answer of the one before came. */
+  async function renameAlong(h: Harness, names: readonly string[]): Promise<Promise<void>[]> {
+    const renames: Promise<void>[] = [];
+    let from = 'x.md';
+    for (const [i, to] of names.entries()) {
+      renames.push(h.vault.rename(from, to));
+      await emitted(h, 'file:rename', i + 1);
+      from = to;
+    }
+    return renames;
+  }
+
+  it.each([
+    ['x.md → y.md → z.md → w.md → z.md', ['y.md', 'z.md', 'w.md', 'z.md'], 3],
+    ['x.md → y.md → z.md → y.md', ['y.md', 'z.md', 'y.md'], 2],
+  ] as const)(
+    'sends the last of the renames %s the plugin’s stop cut the answers of, the server missing it',
+    async (_chain, names, applied) => {
+      const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
+      await h.engine.start();
+      answerAsSent(h, server, docs);
+      await docs.drive();
+      const renames = await renameAlong(h, names);
+      // The plugin turned off with all of them on their way; the server
+      // applies all but the last.
+      await h.engine.stop();
+      await Promise.allSettled(renames);
+      for (let i = 0; i < applied; i++) expect(server.serveNext()).toBe(true);
+      await flushAsync(20);
+      expect(server.pathOf('f1')).toBe(names[applied - 1]);
+
+      const next = restarted(h, server, docs);
+      await next.engine.start();
+      answerAsSent(next, server, docs);
+      await docs.drive();
+      // The catch-up returns each rename the server applied. One in the middle
+      // gives the name the chain ends at: taken for the chain landed, the
+      // user's last rename never went out, and the note went back to the
+      // server's name here too.
+      const last = names[names.length - 1];
+      expect(server.applied).toHaveLength(applied + 1);
+      expect(server.pathOf('f1')).toBe(last);
+      expect(disk(next)).toEqual([`${last}=X\n`]);
+      expect(queue(next)).toEqual([]);
+      await next.engine.stop();
+    },
+  );
+
+  it('sends a rename made while paused back to a name in the middle of renames the server applied, after a restart', async () => {
+    const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
+    await h.engine.start();
+    answerAsSent(h, server, docs);
+    await docs.drive();
+    const renames = await renameAlong(h, ['y.md', 'z.md', 'w.md']);
+    // Paused with all three on their way; the server has them.
+    h.engine.pause();
+    await flushAsync(20);
+    await Promise.allSettled(renames);
+    for (let i = 0; i < 3; i++) expect(server.serveNext()).toBe(true);
+    await flushAsync(20);
+    expect(server.pathOf('f1')).toBe('w.md');
+    await userRename(h, 'w.md', 'z.md');
+    // Obsidian restarts: the pause ends.
+    await h.engine.stop();
+
+    const next = restarted(h, server, docs);
+    await next.engine.start();
+    answerAsSent(next, server, docs);
+    await docs.drive();
+    expect(server.applied).toEqual([
+      'f1 x.md -> y.md',
+      'f1 y.md -> z.md',
+      'f1 z.md -> w.md',
+      'f1 w.md -> z.md',
+    ]);
+    expect(server.pathOf('f1')).toBe('z.md');
+    expect(disk(next)).toEqual(['z.md=X\n']);
+    expect(queue(next)).toEqual([]);
+    await next.engine.stop();
+  });
+
+  it('does not send again the renames of a note split by another note’s rename, cut off by the stop', async () => {
+    // `x.md → b.md`, `c.md → x.md`, `b.md → c.md`: the second takes the
+    // first one's old name, and the third the second one's, so the queue
+    // keeps all three as they are.
+    const { h, server, docs } = await seeded([
+      ['x.md', 'f1', 'X\n'],
+      ['c.md', 'f2', 'C\n'],
+    ]);
+    await h.engine.start();
+    answerAsSent(h, server, docs);
+    await docs.drive();
+    const renames = [h.vault.rename('x.md', 'b.md')];
+    await emitted(h, 'file:rename', 1);
+    renames.push(h.vault.rename('c.md', 'x.md'));
+    await emitted(h, 'file:rename', 2);
+    renames.push(h.vault.rename('b.md', 'c.md'));
+    await emitted(h, 'file:rename', 3);
+    await h.engine.stop();
+    await Promise.allSettled(renames);
+    for (let i = 0; i < 3; i++) expect(server.serveNext()).toBe(true);
+    await flushAsync(20);
+    // A teammate renames the first note on meanwhile.
+    server.teammateRename('f1', 'q.md');
+
+    const next = restarted(h, server, docs);
+    await next.engine.start();
+    answerAsSent(next, server, docs);
+    await docs.drive();
+    // Each queued rename is known by the last of its own the server applied,
+    // not the note's: sent again, the first moved the note back to `b.md`.
+    expect(server.applied).toEqual([
+      'f1 x.md -> b.md',
+      'f2 c.md -> x.md',
+      'f1 b.md -> c.md',
+      'f1 c.md -> q.md',
+    ]);
+    expect(disk(next)).toEqual(['q.md=X\n', 'x.md=C\n']);
+    expect(queue(next)).toEqual([]);
+    await next.engine.stop();
+  });
 });
 
 // -- A teammate's file not on this disk yet -------------------------------------

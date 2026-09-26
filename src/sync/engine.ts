@@ -235,8 +235,11 @@ interface Catchup {
   appliedLive: ReadonlySet<string>;
   /** This device's own operations the catch-up returns (see `ownOperations`). */
   own: ReadonlySet<ServerOperation>;
-  /** File id → the catch-up's updates of that file, in order (see `syncedSince`). */
-  updates: ReadonlyMap<string, readonly ServerOperation[]>;
+  /**
+   * File id → the catch-up's creates, updates and deletes of that file, in
+   * order (see `syncedSince`, `revivedSince`).
+   */
+  changes: ReadonlyMap<string, readonly ServerOperation[]>;
 }
 
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
@@ -348,9 +351,11 @@ const SENT_COUNTER = 'sentCounter';
 /**
  * Payload of a queued RENAME or MOVE that later renames of the same file were
  * folded into (see `SyncEngine.collapseQueuedRenames`): the counters those
- * went out with (see {@link SENT_COUNTER}). The catch-up returns the one of
- * them the server applied last. Known by the entry's own counter alone, it was
- * taken for a rename whose answer came, and the chain went out again: a
+ * went out with (see {@link SENT_COUNTER}). The catch-up returns those of them
+ * the server applied past the clock the join carries: after a pause or a
+ * dropped connection the last one, after a restart each (see
+ * `SyncEngine.dropLandedMoves`). Known by the entry's own counter alone, it
+ * was taken for a rename whose answer came, and the chain went out again: a
  * teammate's rename of the file since was undone for the whole team.
  */
 const SENT_COUNTERS = 'sentCounters';
@@ -1206,7 +1211,7 @@ export class SyncEngine {
         renamedFrom: renameSources(result.operations),
         appliedLive,
         own,
-        updates: updatesByFile(result.operations),
+        changes: changesByFile(result.operations),
       };
       for (const op of result.operations) {
         await this.applyServerOperation(op, catchup);
@@ -2746,16 +2751,28 @@ export class SyncEngine {
    * A queued rename made to go on since it went out (see
    * `collapseQueuedRenames`) gives another name, and goes out again. One that
    * renames sent from here after it were folded into is each of them too (see
-   * {@link SENT_COUNTERS}): the last of them the server applied gave the name
-   * the entry ends at.
+   * {@link SENT_COUNTERS}), and the catch-up can return several of them:
+   * after a restart, every one the server applied. The last of those is where
+   * the server has the file: the entry has landed when that one gave the name
+   * the entry ends at. Checked against any of them, a rename in the middle of
+   * the chain to that name took the entry for landed while a later one had
+   * moved the file on (`x → y → z → w → z`, the last one lost on the way): the
+   * user's last rename never went out, and the note went back to `w` here too.
    */
   private dropLandedMoves(own: ReadonlySet<ServerOperation>): void {
+    /** Queued move id → it, and the last of the catch-up's renames it is. */
+    const lastApplied = new Map<number, { landed: PendingOperation; op: ServerOperation }>();
     for (const op of own) {
       if (op.opType !== 'RENAME' && op.opType !== 'MOVE') continue;
       const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
       if (typeof fileId !== 'string' || fileId === '' || op.newPath === null) continue;
       const landed = this.answerLost(op, fileId, isQueuedMove);
-      if (landed === undefined || landed.newPath !== op.newPath) continue;
+      // In the order the server applied them: a later one replaces it.
+      if (landed !== undefined) lastApplied.set(landed.id, { landed, op });
+    }
+    for (const { landed, op } of lastApplied.values()) {
+      if (landed.newPath !== op.newPath) continue;
+      const fileId = queuedFileId(landed.payload);
       const moves = this.operationLog
         .dequeueOperations(this.binding.id)
         .filter((queued) => isQueuedMove(queued) && queuedFileId(queued.payload) === fileId);
@@ -5051,12 +5068,14 @@ export class SyncEngine {
         // `takeOwnVersion`). Before the check below — a teammate's update
         // after it then finds the version it was made to. Not when the
         // version synced here is a teammate's saved over it since, applied
-        // here live (see `syncedSince`). The queued upload whose answer was
-        // lost (see `answerLost`) is its own for sure.
+        // here live (see `syncedSince`), nor when the file was deleted and
+        // brought back under its id since (see `revivedSince`). The queued
+        // upload whose answer was lost (see `answerLost`) is its own for sure.
         if (
           catchup.own.has(op) &&
           (this.answerLost(op, fileId, (queued) => queued.opType === 'UPDATE') !== undefined ||
-            !syncedSince(catchup, op, fileId, meta.contentHash))
+            (!syncedSince(catchup, op, fileId, meta.contentHash) &&
+              !revivedSince(catchup, op, fileId)))
         ) {
           this.takeOwnVersion(meta, payload);
           break;
@@ -5426,7 +5445,12 @@ export class SyncEngine {
    * Not called when the version synced here is a teammate's saved over it
    * since and applied here live (see `syncedSince`): taken back from that one,
    * the version synced here made the teammate's new again, and an edit made
-   * over it was put against it in a "Content conflict" prompt.
+   * over it was put against it in a "Content conflict" prompt. Nor when the
+   * file was deleted and brought back under its id since (see
+   * `revivedSince`): the version synced here went back to this device's
+   * older one while the disk had the teammate's file put under the name,
+   * applied here live. Their next version was put against it in that prompt,
+   * and "Keep local" wrote their first file back over it for the whole team.
    */
   private takeOwnVersion(
     meta: IndexedMeta,
@@ -7219,7 +7243,8 @@ export class SyncEngine {
       if (target === first.filePath) absorbed.add(first.id);
       else {
         // The server may have applied any of them, its answer lost: the
-        // catch-up returns the last one it applied (see `dropLandedMoves`).
+        // catch-up returns them, and the last one it applied tells where the
+        // file is (see `dropLandedMoves`).
         if (carried.length > 0) {
           this.operationLog.amendOperation(first.id, {
             payload: {
@@ -8021,16 +8046,16 @@ function supersededOps(ops: readonly ServerOperation[]): Set<ServerOperation> {
   return superseded;
 }
 
-/** File id → the updates of that file among `ops`, in their order. */
-function updatesByFile(ops: readonly ServerOperation[]): Map<string, ServerOperation[]> {
+/** File id → the creates, updates and deletes of that file among `ops`, in their order. */
+function changesByFile(ops: readonly ServerOperation[]): Map<string, ServerOperation[]> {
   const out = new Map<string, ServerOperation[]>();
   for (const op of ops) {
-    if (op.opType !== 'UPDATE') continue;
+    if (op.opType !== 'CREATE' && op.opType !== 'UPDATE' && op.opType !== 'DELETE') continue;
     const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
     if (typeof fileId !== 'string' || fileId === '') continue;
-    const updates = out.get(fileId);
-    if (updates === undefined) out.set(fileId, [op]);
-    else updates.push(op);
+    const changes = out.get(fileId);
+    if (changes === undefined) out.set(fileId, [op]);
+    else changes.push(op);
   }
   return out;
 }
@@ -8049,14 +8074,33 @@ function syncedSince(
   synced: string,
 ): boolean {
   if (synced === '') return false;
-  const updates = catchup.updates.get(fileId) ?? [];
-  const at = updates.indexOf(op);
+  const changes = catchup.changes.get(fileId) ?? [];
+  const at = changes.indexOf(op);
   return (
     at >= 0 &&
-    updates
+    changes
       .slice(at + 1)
-      .some((later) => (later.payload as { contentHash?: unknown } | null)?.contentHash === synced)
+      .some(
+        (later) =>
+          later.opType === 'UPDATE' &&
+          (later.payload as { contentHash?: unknown } | null)?.contentHash === synced,
+      )
   );
+}
+
+/**
+ * Whether file `fileId` was deleted, and brought back under its id, after
+ * `op` in the catch-up: a file created under a deleted file's name takes the
+ * deleted one's id (the server revives its tombstone). The version `op`
+ * brought is history then, whatever is synced here. A teammate who deleted an
+ * attachment and put a new one under its name comes back as a DELETE and a
+ * CREATE, never an UPDATE, so `syncedSince` does not see the new one's
+ * version, applied here live.
+ */
+function revivedSince(catchup: Catchup, op: ServerOperation, fileId: string): boolean {
+  const changes = catchup.changes.get(fileId) ?? [];
+  const at = changes.indexOf(op);
+  return at >= 0 && changes.slice(at + 1).some((later) => later.opType !== 'UPDATE');
 }
 
 /**
