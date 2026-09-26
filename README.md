@@ -271,9 +271,10 @@ them under the plugin's name:
   you do in Obsidian meanwhile — new notes and attachments, edits, renames,
   moves, deletes — is recorded as it is when the connection drops, and goes
   to the server when you resume: a note renamed several times goes as one
-  rename, a note deleted stays deleted. Pause lasts until you resume or the
-  plugin starts again (Obsidian restarted, the plugin turned off and on),
-  which connects. Shown only while sync runs.
+  rename, and a note deleted stays deleted, unless a teammate changed it
+  meanwhile — then it comes back with their changes. Pause lasts until you
+  resume or the plugin starts again (Obsidian restarted, the plugin turned
+  off and on), which connects. Shown only while sync runs.
 - **Team Vault: Resume sync** — connect again after a pause and send what
   you did meanwhile. Shown only while paused.
 - **Team Vault: Toggle active file history** — opens the right-pane history
@@ -410,16 +411,18 @@ edits in `…conflict-<ts>.<ext>`.
   synced, and a note you create in it goes to the server under the folder's
   old case.
 - Team Vault syncs a rename or a delete only when it sees it happen: in
-  Obsidian, or on disk while Obsidian runs with the plugin on — online,
-  offline or paused. A file renamed or moved while Obsidian is closed or the
-  plugin is off reaches your teammates as a new file next to the old one,
-  and the old name comes back to your vault; a file deleted then stays on
-  the server, and a note comes back to your vault too. A rename made outside
-  Obsidian while it runs (in Explorer or Finder, by `git` or a script)
-  reaches them as the old file deleted and a new one created, and a note's
-  version history stays with the deleted one. So rename, move and delete
-  files in Obsidian, and to keep working without syncing, use **Pause sync**
-  rather than closing Obsidian or turning the plugin off.
+  Obsidian, or on disk while Obsidian runs with the plugin on and the file's
+  binding switched on — online, offline or paused. A file renamed or moved
+  while Obsidian is closed, the plugin is off or the binding is switched off
+  reaches your teammates as a new file next to the old one. A note's old
+  name comes back to your vault too; an attachment's doesn't, so only your
+  teammates have both. A file deleted then stays on the server, and a note
+  comes back to your vault. A rename made outside Obsidian while it runs (in
+  Explorer or Finder, by `git` or a script) reaches them as the old file
+  deleted and a new one created, and a note's version history stays with the
+  deleted one. So rename, move and delete files in Obsidian, and to keep
+  working without syncing, use **Pause sync** rather than closing Obsidian,
+  turning the plugin off or switching the binding off.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.
