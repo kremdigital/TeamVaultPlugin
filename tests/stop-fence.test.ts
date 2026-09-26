@@ -1,9 +1,11 @@
 /**
  * Building blocks of `SyncEngine.stop()` (TASK-0030): the dependency fence,
- * the abortable offline-queue drain and the cancellable binary transfers.
- * The engine-level regression tests live in `engine-stop.test.ts`.
+ * the abortable offline-queue drain and the cancellable binary transfers;
+ * and of Pause sync, the connection's own signal within the engine's. The
+ * engine-level regression tests live in `engine-stop.test.ts` and
+ * `engine-pause.test.ts`.
  */
-import { EngineStoppedError, fence } from '@/sync/stop-fence';
+import { EngineStoppedError, SyncPausedError, childController, fence } from '@/sync/stop-fence';
 import { flushPendingQueue, type PendingEmitter, type ReplayOutcome } from '@/sync/reconnect';
 import { OperationLog } from '@/sync/operation-log';
 import {
@@ -79,6 +81,35 @@ describe('fence', () => {
     // The dependency's internals run on the real object, past the abort.
     await expect(pending).resolves.toBe(1);
     expect(() => fenced.bump()).toThrow(EngineStoppedError);
+  });
+});
+
+describe('childController — the connection within the engine lifetime', () => {
+  it('aborts with the parent, and with the reason the parent gives', () => {
+    const parent = new AbortController();
+    const child = childController(parent.signal);
+    const reason = new EngineStoppedError();
+    parent.abort(reason);
+    expect(child.signal.aborted).toBe(true);
+    expect(child.signal.reason).toBe(reason);
+  });
+
+  it('aborts on its own without touching the parent, and stops following it', () => {
+    const parent = new AbortController();
+    const remove = jest.spyOn(parent.signal, 'removeEventListener');
+    const child = childController(parent.signal);
+    child.abort(new SyncPausedError());
+    expect(parent.signal.aborted).toBe(false);
+    expect(child.signal.reason).toBeInstanceOf(SyncPausedError);
+    expect(remove).toHaveBeenCalledWith('abort', expect.any(Function));
+    parent.abort(new EngineStoppedError());
+    expect(child.signal.reason).toBeInstanceOf(SyncPausedError);
+  });
+
+  it('starts aborted under an aborted parent', () => {
+    const parent = new AbortController();
+    parent.abort(new EngineStoppedError());
+    expect(childController(parent.signal).signal.reason).toBeInstanceOf(EngineStoppedError);
   });
 });
 

@@ -88,10 +88,10 @@ export class EngineManager {
   private readonly statuses = new Map<string, EngineStatus>();
   /**
    * Per binding, the server paths its engines have already refused at `warn`
-   * (`SyncEngineDeps.reportedRefusals`). Here and not in the engine: pause,
-   * resume and switching a binding off and on replace the engine, and each
-   * new one logged the same `.DS_Store` refusals at `warn` again. Kept until
-   * the plugin unloads, or until the binding is removed.
+   * (`SyncEngineDeps.reportedRefusals`). Here and not in the engine:
+   * switching a binding off and on replaces the engine, and each new one
+   * logged the same `.DS_Store` refusals at `warn` again. Kept until the
+   * plugin unloads, or until the binding is removed.
    */
   private readonly reportedRefusals = new Map<string, Set<string>>();
   private listeners = new Set<AggregateListener>();
@@ -141,9 +141,14 @@ export class EngineManager {
    *   - new enabled bindings → create + start an engine,
    *   - bindings turned off / removed → stop + drop the engine,
    *   - everything else → leave alone.
+   *
+   * While paused too: a binding added meanwhile gets an engine that is paused
+   * from the start — it records the changes made in the vault and connects on
+   * `resume()` — and one removed or switched off is stopped (and its local
+   * state purged, when removed) as at any other time.
    */
   async refreshFromSettings(): Promise<void> {
-    if (this.paused || this.stopped) return;
+    if (this.stopped) return;
     const { servers, bindings } = this.deps.getSettings();
     const serverById = new Map(servers.map((s) => [s.id, s]));
     const desired = new Set<string>();
@@ -170,23 +175,41 @@ export class EngineManager {
     }
   }
 
-  /** Stop every engine but keep settings; resumes via `resume()`. */
-  async pause(): Promise<void> {
+  /**
+   * Pause sync: every engine closes its connection and stays disconnected
+   * until `resume()`, and goes on recording what changes in the vault — the
+   * offline queue, renames and deletes, notes folded into their docs — exactly
+   * as when the network drops (see `SyncEngine.pause`).
+   *
+   * The engines used to be stopped and dropped, and a vault event with no
+   * engine to take it was lost: a note renamed while paused came back on
+   * resume as two notes for the whole team, one deleted came back.
+   *
+   * Not kept across a restart: the next start of the plugin connects.
+   */
+  pause(): Promise<void> {
+    if (this.stopped || this.paused) return Promise.resolve();
     this.paused = true;
-    const stops: Array<Promise<void>> = [];
-    for (const engine of this.engines.values()) stops.push(engine.stop());
-    for (const off of this.subs.values()) off();
-    this.subs.clear();
-    this.engines.clear();
-    this.statuses.clear();
-    await Promise.all(stops);
+    for (const engine of this.engines.values()) engine.pause();
     this.notifyAggregate();
+    return Promise.resolve();
   }
 
+  /**
+   * Resume sync after `pause()`: every engine connects again through the
+   * normal connect flow (see `SyncEngine.resume`), a binding added meanwhile
+   * included.
+   */
   async resume(): Promise<void> {
-    if (this.stopped) return;
+    if (this.stopped || !this.paused) return;
     this.paused = false;
     await this.refreshFromSettings();
+    // Paused again, or stopped, while the roster was reconciled.
+    if (this.paused || this.stopped) return;
+    // Each engine reports `connecting` as it takes the call.
+    const resumed = Promise.all([...this.engines.values()].map((engine) => engine.resume()));
+    this.notifyAggregate();
+    await resumed;
   }
 
   isPaused(): boolean {
@@ -211,11 +234,9 @@ export class EngineManager {
   }
 
   getAggregateStatus(): AggregateStatus {
-    if (this.paused) {
-      return { state: 'paused', bindings: {} };
-    }
     const bindings: Record<string, EngineStatus> = {};
     for (const [id, status] of this.statuses) bindings[id] = status;
+    if (this.paused) return { state: 'paused', bindings };
 
     if (Object.keys(bindings).length === 0) {
       return { state: 'idle', bindings };
@@ -226,9 +247,13 @@ export class EngineManager {
     return out;
   }
 
-  /** Force a deep-sync diff fetch on every active engine (used by "Sync now"). */
+  /**
+   * Force a deep-sync diff fetch on every active engine (used by "Sync now").
+   * Nothing while paused: sync is off until `resume()`.
+   */
   async runDeepSyncOnAll(): Promise<Array<{ bindingId: string; diff: unknown }>> {
     const out: Array<{ bindingId: string; diff: unknown }> = [];
+    if (this.paused) return out;
     for (const [id, engine] of this.engines) {
       out.push({ bindingId: id, diff: await engine.runDeepSyncDiff() });
     }
@@ -245,7 +270,7 @@ export class EngineManager {
   private async spawn(binding: VaultBinding, server: ServerConfig): Promise<void> {
     // `refreshFromSettings` awaits between bindings, so `stop()` can land in
     // the middle of its loop.
-    if (this.stopped || this.paused) return;
+    if (this.stopped) return;
     const apiClient = this.deps.apiClient ? this.deps.apiClient(server) : undefined;
     const socketClient = this.deps.socketClient
       ? this.deps.socketClient(server, this.deps.clientId)
@@ -289,6 +314,8 @@ export class EngineManager {
     });
     this.subs.set(binding.id, off);
 
+    // Spawned while paused: it takes local changes and connects on `resume()`.
+    if (this.paused) engine.pause();
     await engine.start();
     // `stop()` ran while this engine was still starting: it was stopped along
     // with the rest, but `start()` may have connected after that.
@@ -299,7 +326,7 @@ export class EngineManager {
    * Stop and forget an engine. `purge` additionally erases the binding's
    * local state from the operation log — set only when the binding is gone
    * from settings for good (see {@link refreshFromSettings}), never on a
-   * plain disable, pause, or shutdown, where the queue must survive.
+   * plain disable or shutdown, where the queue must survive.
    */
   private async dropEngine(id: string, opts: { purge?: boolean } = {}): Promise<void> {
     const engine = this.engines.get(id);

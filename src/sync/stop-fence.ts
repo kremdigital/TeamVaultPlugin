@@ -4,9 +4,10 @@
  * `SyncEngine.stop()` cannot cancel work that is already under way: a catch-up,
  * an offline-queue drain, a download, a hydration all sit on `await`s — socket
  * acks, `requestUrl`, disk reads — that nothing can interrupt. Each of them
- * used to run to the end after the plugin was disabled, paused or the binding
- * removed: writing vault files, rewriting the operation log and the offline
- * Y.Docs, issuing more requests.
+ * used to run to the end after the plugin was disabled or the binding removed:
+ * writing vault files, rewriting the operation log and the offline Y.Docs,
+ * issuing more requests. (Pause sync does not stop the engine: it closes the
+ * connection, see `SyncEngine.pause` and {@link SyncPausedError}.)
  *
  * So the engine holds every dependency it talks to — the vault, the log, the
  * doc manager, the REST and socket clients, the echo set, the conflict modal —
@@ -24,6 +25,39 @@ export class EngineStoppedError extends Error {
     super('sync engine stopped');
     this.name = 'EngineStoppedError';
   }
+}
+
+/**
+ * Unwinds the work of a connection that Pause sync closed (see
+ * `SyncEngine.pause`): the connect flow — join, catch-up, offline-queue drain,
+ * first upload — and a binary transfer. Never a failure: the next connect
+ * starts that work over, and the local changes it had taken on are queued.
+ */
+export class SyncPausedError extends Error {
+  constructor() {
+    super('sync paused');
+    this.name = 'SyncPausedError';
+  }
+}
+
+/**
+ * A controller that aborts when `parent` does, with its reason, and can be
+ * aborted on its own without touching `parent`. Once it has aborted it stops
+ * listening to `parent`, so a long-lived parent does not collect one listener
+ * per child.
+ */
+export function childController(parent: AbortSignal): AbortController {
+  const child = new AbortController();
+  if (parent.aborted) {
+    child.abort(parent.reason);
+    return child;
+  }
+  const follow = (): void => child.abort(parent.reason);
+  parent.addEventListener('abort', follow, { once: true });
+  child.signal.addEventListener('abort', () => parent.removeEventListener('abort', follow), {
+    once: true,
+  });
+  return child;
 }
 
 /**

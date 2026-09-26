@@ -5,6 +5,7 @@ import { RecentlyApplied } from '@/watcher/recently-applied';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import type { EngineStatus, SyncEngine } from '@/sync/engine';
+import type { VaultEvent } from '@/watcher/obsidian-events';
 
 /**
  * Hand-rolled `SyncEngine` stand-in. Records lifecycle calls and exposes
@@ -17,7 +18,12 @@ class FakeEngine {
   }
   startCalls = 0;
   stopCalls = 0;
+  /** Lifecycle calls in order: `start`, `pause`, `resume`, `stop`. */
+  calls: string[] = [];
+  /** Vault events handed to this engine. */
+  events: VaultEvent[] = [];
   status: EngineStatus = 'stopped';
+  private paused = false;
   private listeners = new Set<(status: EngineStatus, detail?: string) => void>();
 
   constructor(public readonly bindingId: string) {
@@ -26,11 +32,26 @@ class FakeEngine {
 
   async start(): Promise<void> {
     this.startCalls++;
-    this.setStatus('connecting');
+    this.calls.push('start');
+    this.setStatus(this.paused ? 'offline' : 'connecting');
   }
   async stop(): Promise<void> {
     this.stopCalls++;
+    this.calls.push('stop');
     this.setStatus('stopped');
+  }
+  pause(): void {
+    this.calls.push('pause');
+    this.paused = true;
+    if (this.startCalls > 0) this.setStatus('offline', 'paused');
+  }
+  async resume(): Promise<void> {
+    this.calls.push('resume');
+    this.paused = false;
+    this.setStatus('connecting');
+  }
+  async handleVaultEvent(event: VaultEvent): Promise<void> {
+    this.events.push(event);
   }
   onStatus(cb: (status: EngineStatus, detail?: string) => void): () => void {
     this.listeners.add(cb);
@@ -169,7 +190,10 @@ describe('EngineManager — roster lifecycle', () => {
     await m.stop();
   });
 
-  it('pause/resume tears every engine down then re-creates', async () => {
+  // Pause stopped and dropped every engine, and a vault event with no engine
+  // to take it was lost: a note renamed while paused came back on resume as
+  // two notes for the whole team, one deleted came back.
+  it('pause keeps every engine, paused, and resume resumes the same one', async () => {
     const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
     await m.start();
     const first = FakeEngine.lastFor('a');
@@ -177,23 +201,104 @@ describe('EngineManager — roster lifecycle', () => {
 
     await m.pause();
     expect(m.isPaused()).toBe(true);
-    expect(first?.stopCalls).toBe(1);
+    expect(m.getEngine('a')).toBe(first);
+    expect(first?.calls).toEqual(['start', 'pause']);
 
     await m.resume();
     expect(m.isPaused()).toBe(false);
-    // Pause/resume cycle creates a fresh engine instance.
-    expect(FakeEngine.lastFor('a')?.startCalls).toBe(1);
+    expect(FakeEngine.lastFor('a')).toBe(first);
+    expect(first?.calls).toEqual(['start', 'pause', 'resume']);
     await m.stop();
   });
 
-  it('refreshFromSettings is a no-op while paused', async () => {
+  it('hands vault events to the engines while paused', async () => {
+    const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
+    await m.start();
+    await m.pause();
+    const rename: VaultEvent = {
+      type: 'rename',
+      bindingId: 'a',
+      oldPath: 'offlene-a.md',
+      newPath: 'chain-b.md',
+      source: 'obsidian',
+    };
+    await m.dispatchVaultEvent(rename);
+    expect(FakeEngine.lastFor('a')?.events).toEqual([rename]);
+    await m.stop();
+  });
+
+  it('gives a binding added while paused an engine paused before it starts', async () => {
     const bindings = [makeBinding({ id: 'a' })];
     const m = new EngineManager(makeDeps([server], bindings));
     await m.start();
     await m.pause();
     bindings.push(makeBinding({ id: 'b' }));
     await m.refreshFromSettings();
-    expect(FakeEngine.lastFor('b')).toBeUndefined();
+    expect(FakeEngine.lastFor('b')?.calls).toEqual(['pause', 'start']);
+    expect(m.getAggregateStatus().state).toBe('paused');
+
+    await m.resume();
+    expect(FakeEngine.lastFor('b')?.calls).toEqual(['pause', 'start', 'resume']);
+    await m.stop();
+  });
+
+  it('stops a binding switched off while paused, and one removed, purging only that one', async () => {
+    const bindings = [makeBinding({ id: 'a' }), makeBinding({ id: 'b' })];
+    const deps = makeDeps([server], bindings);
+    deps.operationLog.enqueueOperation('a', { opType: 'CREATE', filePath: 'kept.md' });
+    deps.operationLog.enqueueOperation('b', { opType: 'CREATE', filePath: 'gone.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+    await m.pause();
+
+    (bindings[0] as VaultBinding).enabled = false;
+    bindings.pop();
+    await m.refreshFromSettings();
+
+    expect(FakeEngine.lastFor('a')?.calls).toEqual(['start', 'pause', 'stop']);
+    expect(FakeEngine.lastFor('b')?.calls).toEqual(['start', 'pause', 'stop']);
+    expect(m.getEngine('a')).toBeUndefined();
+    expect(deps.operationLog.pendingCount('a')).toBe(1);
+    expect(deps.operationLog.pendingCount('b')).toBe(0);
+
+    // Switched back on while still paused: a new engine, paused.
+    (bindings[0] as VaultBinding).enabled = true;
+    await m.refreshFromSettings();
+    expect(m.getEngine('a')).toBeDefined();
+    expect(FakeEngine.lastFor('a')?.calls).toEqual(['pause', 'start']);
+    await m.stop();
+  });
+
+  it('stops every engine on stop() while paused, and resumes nothing after', async () => {
+    const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
+    await m.start();
+    await m.pause();
+    await m.stop();
+    await m.resume();
+    expect(FakeEngine.lastFor('a')?.calls).toEqual(['start', 'pause', 'stop']);
+  });
+
+  it('runs no deep sync while paused', async () => {
+    const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
+    await m.start();
+    const engine = FakeEngine.lastFor('a') as unknown as { runDeepSyncDiff: jest.Mock };
+    engine.runDeepSyncDiff = jest.fn(async () => ({}));
+    await m.pause();
+    expect(await m.runDeepSyncOnAll()).toEqual([]);
+    expect(engine.runDeepSyncDiff).not.toHaveBeenCalled();
+    await m.resume();
+    expect(await m.runDeepSyncOnAll()).toHaveLength(1);
+    await m.stop();
+  });
+
+  it('pausing twice, or resuming when not paused, changes nothing', async () => {
+    const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
+    await m.start();
+    await m.resume();
+    await m.pause();
+    await m.pause();
+    expect(FakeEngine.lastFor('a')?.calls).toEqual(['start', 'pause']);
+    await m.stop();
   });
 
   it('spawns nothing after stop(), whatever calls in later', async () => {
@@ -257,11 +362,19 @@ describe('EngineManager — aggregate status', () => {
     expect(m.getAggregateStatus()).toEqual({ state: 'idle', bindings: {} });
   });
 
-  it('reports paused after pause()', async () => {
+  it('reports paused after pause(), whatever the engines report meanwhile', async () => {
     const m = new EngineManager(makeDeps([server], [makeBinding({ id: 'a' })]));
     await m.start();
+    const seen: string[] = [];
+    m.onAggregateStatus((s) => seen.push(s.state));
     await m.pause();
+    expect(m.getAggregateStatus()).toEqual({ state: 'paused', bindings: { a: 'offline' } });
+    FakeEngine.lastFor('a')?.setStatus('error', 'boom');
     expect(m.getAggregateStatus().state).toBe('paused');
+    await m.resume();
+    expect(m.getAggregateStatus().state).toBe('connecting');
+    expect(seen[seen.length - 1]).toBe('connecting');
+    await m.stop();
   });
 
   it('error wins over everything else', async () => {

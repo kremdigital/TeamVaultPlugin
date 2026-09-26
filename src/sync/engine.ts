@@ -55,7 +55,7 @@ import {
 } from '@/watcher/path-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
-import { EngineStoppedError, fence } from './stop-fence';
+import { EngineStoppedError, SyncPausedError, childController, fence } from './stop-fence';
 
 /**
  * Silent fallback so the engine always has a logger to call, even when one
@@ -97,6 +97,10 @@ const MAX_REPORTED_REFUSALS = 1000;
  * Every dependency is held through a stop fence (see `stop-fence.ts`), so the
  * check after each `await` is built in: a flow that wakes up after `stop()`
  * refuses on its next call and unwinds.
+ *
+ * Pause sync does not stop it: {@link SyncEngine.pause} closes the connection
+ * and keeps the engine taking local changes as it does with the network down,
+ * and {@link SyncEngine.resume} connects again.
  *
  * Two things are not cut off, because cutting them loses data:
  *
@@ -145,9 +149,9 @@ export interface SyncEngineDeps {
   /**
    * Server paths this binding's engines have already refused at `warn` — see
    * `allowServerPath`. The `EngineManager` hands every engine of a binding the
-   * same set, kept while the plugin runs: pausing sync or switching the
-   * binding off and on spawns a new engine, and with a set of its own that
-   * engine reported every such path at `warn` again. Default: a new set.
+   * same set, kept while the plugin runs: switching the binding off and on
+   * spawns a new engine, and with a set of its own that engine reported every
+   * such path at `warn` again. Default: a new set.
    */
   reportedRefusals?: Set<string>;
 }
@@ -268,6 +272,17 @@ const ECHO_COUNT_RENAME = 2;
 const CATCHUP_TIMEOUT_MS = 5 * 60 * 1000;
 
 /**
+ * How long {@link SyncEngine.resume} waits for the flows of the connection
+ * Pause sync closed to end before it connects anyway. They end at their next
+ * step; one can wait longer only on a request that hangs or on a question to
+ * the user.
+ */
+const RESUME_WAIT_MS = 30_000;
+
+/** The status detail of an engine on Pause sync. */
+const PAUSED_DETAIL = 'paused';
+
+/**
  * Payload flag of a queued DELETE that `stop()` handed over before the
  * stale-delete check had run: the replay runs that check first. Local to the
  * queue — the replay never sends it to the server.
@@ -343,6 +358,25 @@ export class SyncEngine {
    * still in flight.
    */
   private readonly lifetime = new AbortController();
+  /**
+   * The connection's own lifetime: aborted by {@link pause} with a
+   * {@link SyncPausedError}, and with {@link lifetime} by `stop()`. It ends the
+   * work of the connection at its next step — the connect flow, the drain and
+   * the first upload (see {@link onSocketConnect}) — and cancels binary
+   * transfers. {@link resume} starts a new one.
+   */
+  private online: AbortController;
+  /** Set by {@link pause}, cleared by {@link resume}. */
+  private paused = false;
+  /** Set by {@link start}: only a started engine connects on {@link resume}. */
+  private started = false;
+  /**
+   * The connect flows still running (see {@link trackConnectFlow}), each as a
+   * promise that never rejects. {@link resume} waits for them.
+   */
+  private readonly connectFlows = new Set<Promise<void>>();
+  /** How many times {@link resume} has run: a later call takes over from an earlier one. */
+  private resumes = 0;
   /** The dependencies without the fence — for {@link commitLocal} blocks only. */
   private readonly local: LocalIO;
   /** Local changes taken on and not settled yet — see {@link hold}. */
@@ -684,9 +718,10 @@ export class SyncEngine {
     this.server = deps.server;
     this.clientId = deps.clientId;
     // Everything the engine can act on goes through the fence: the shared
-    // vault, log, docs and echo set (a paused engine's successor uses the same
-    // ones), the network, and the conflict modal.
+    // vault, log, docs and echo set (the engine spawned after this one uses the
+    // same ones), the network, and the conflict modal.
     const { signal } = this.lifetime;
+    this.online = childController(signal);
     this.local = {
       vault: deps.vault,
       log: deps.operationLog,
@@ -720,18 +755,21 @@ export class SyncEngine {
   /**
    * Connect to the server, run the catch-up handshake, drain any queued
    * pending operations. Idempotent — calling on a started engine is a
-   * no-op.
+   * no-op. An engine paused before it started (see {@link pause}) takes local
+   * changes from here on, and connects on {@link resume}.
    */
   async start(): Promise<void> {
     // Single use — see the class comment. A restart would hand the new socket
     // to flows of the previous run.
     if (this.hasStopped) return;
     if (this.status !== 'stopped' && this.status !== 'error') return;
+    this.started = true;
     // Before the first connect, which may never come this session.
     this.loadIndex();
-    this.setStatus('connecting');
+    if (this.paused) this.setStatus('offline', PAUSED_DETAIL);
+    else this.setStatus('connecting');
 
-    this.cleanups.push(this.socket.onConnect(() => void this.onSocketConnect()));
+    this.cleanups.push(this.socket.onConnect(() => this.trackConnectFlow(this.onSocketConnect())));
     this.cleanups.push(
       this.socket.onDisconnect((reason) => {
         this.setStatus('offline', reason);
@@ -745,15 +783,107 @@ export class SyncEngine {
     this.cleanups.push(this.socket.onFileEvent((event) => void this.handleServerFileEvent(event)));
     this.cleanups.push(this.socket.onYjsUpdate((msg) => this.handleServerYjsUpdate(msg)));
     this.cleanups.push(
-      this.socket.onYjsCatchup((batch) => this.detach(this.handleYjsCatchup(batch))),
+      this.socket.onYjsCatchup((batch) => this.trackConnectFlow(this.handleYjsCatchup(batch))),
     );
 
-    this.socket.connect();
+    if (!this.paused) this.socket.connect();
   }
 
   /**
-   * Stop for good (plugin disabled or reloaded, sync paused, binding switched
-   * off or removed).
+   * Pause sync: close the connection and keep it closed until {@link resume},
+   * while the engine goes on taking local changes exactly as it does when the
+   * network drops — the file index from `state.json`, the offline queue, a
+   * chain of renames of one file sent as one, a delete that takes the file out
+   * of the records at once, a save folded into the note's history. The engine
+   * used to be stopped instead, and every change made meanwhile was lost as an
+   * intent: a note renamed while paused was uploaded again under its new name
+   * on resume, the old name coming back from the server, and a note deleted
+   * while paused came back.
+   *
+   * The socket is closed on purpose, so socket.io does not reconnect it. Emits
+   * waiting for an ack fail, and a `yjs:fetch` is answered at once; each change
+   * they carried is queued, as when the connection drops. The work of the
+   * connection — the connect flow, the catch-up, the drain and the first
+   * upload — ends at its next step (see {@link online}); the operation the
+   * drain had in flight stays queued and goes out on resume, once. Binary
+   * transfers are cancelled, and an upload cut short is queued. A local phase
+   * already running ends as it would anyway.
+   */
+  pause(): void {
+    if (this.hasStopped || this.paused) return;
+    this.paused = true;
+    this.online.abort(new SyncPausedError());
+    this.socketLink.disconnect();
+    // Never started: `start()` finds the engine paused.
+    if (this.started) this.setStatus('offline', PAUSED_DETAIL);
+  }
+
+  /**
+   * Resume sync after {@link pause}: connect again through the normal connect
+   * flow — the join with the catch-up flag, the catch-up, the drain of what
+   * was queued meanwhile, the first upload. Only once the previous
+   * connection's flows have ended (they end at their next step; after
+   * {@link RESUME_WAIT_MS} the engine connects anyway): one still running
+   * would share the file index, the queue and the catch-up with the new one's.
+   * A pause, a stop or another resume meanwhile takes over.
+   */
+  async resume(): Promise<void> {
+    if (this.hasStopped || !this.paused) return;
+    this.paused = false;
+    const attempt = ++this.resumes;
+    if (this.started) this.setStatus('connecting');
+    await this.connectFlowsEnded();
+    if (this.hasStopped || this.paused || attempt !== this.resumes) return;
+    this.online = childController(this.lifetime.signal);
+    if (this.started) this.socket.connect();
+  }
+
+  /** Whether sync is paused (see {@link pause}). */
+  isPaused(): boolean {
+    return this.paused;
+  }
+
+  /**
+   * Keep a flow of the connection known to {@link resume} until it ends, and
+   * run it as {@link detach} does. A flow that does not reject (the connect
+   * flow catches its own errors) is only tracked.
+   */
+  private trackConnectFlow(flow: Promise<void>, opts: { detach?: boolean } = {}): void {
+    const ended = flow.then(
+      () => undefined,
+      () => undefined,
+    );
+    this.connectFlows.add(ended);
+    void ended.then(() => this.connectFlows.delete(ended));
+    if (opts.detach !== false) this.detach(flow);
+  }
+
+  /** Resolves once no connect flow is running, or after {@link RESUME_WAIT_MS}. */
+  private async connectFlowsEnded(): Promise<void> {
+    const deadline = Date.now() + RESUME_WAIT_MS;
+    while (this.connectFlows.size > 0) {
+      const left = deadline - Date.now();
+      if (left <= 0) {
+        this.log.warn('connecting again while the previous connection’s work still runs', {
+          flows: this.connectFlows.size,
+        });
+        return;
+      }
+      let timer: number | undefined;
+      const waited = new Promise<void>((resolve) => {
+        timer = window.setTimeout(resolve, left);
+      });
+      try {
+        await Promise.race([Promise.all([...this.connectFlows]), waited]);
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+  }
+
+  /**
+   * Stop for good (plugin disabled or reloaded, binding switched off or
+   * removed).
    *
    * Work already under way cannot be interrupted: it sits on socket acks,
    * `requestUrl` calls and disk reads. Aborting the lifetime signal makes sure
@@ -838,7 +968,9 @@ export class SyncEngine {
       await this.dispatchVaultEvent(event);
     } catch (err) {
       // `stop()` landed while the event was being handled — nothing to report.
-      if (this.hasStopped) return;
+      // Nor a transfer Pause sync cancelled: the change is recorded already,
+      // and what the transfer was for comes with the next connect.
+      if (this.hasStopped || err instanceof SyncPausedError) return;
       throw err;
     }
   }
@@ -932,6 +1064,11 @@ export class SyncEngine {
   // -- Connection / catch-up -----------------------------------------------
 
   private async onSocketConnect(): Promise<void> {
+    // The connection this flow works for: Pause sync ends it (see `online`),
+    // and the flow then unwinds at its next step.
+    const online = this.online.signal;
+    /** This connect's catch-up completion signal, while it is the armed one. */
+    let armed: (() => void) | null = null;
     try {
       this.setStatus('syncing');
       // Re-gate streamed catch-up for this connect: batches that arrive before
@@ -953,6 +1090,7 @@ export class SyncEngine {
       // Arm the streamed-catch-up completion signal before the join so a fast
       // server stream can't resolve before we're waiting on it.
       const catchupDone = new Promise<void>((resolve) => {
+        armed = resolve;
         this.catchupResolve = resolve;
       });
 
@@ -966,9 +1104,12 @@ export class SyncEngine {
       const liveBeforeJoin = this.operationLog.appliedLiveIds(this.binding.id);
       this.startedSinceJoin.clear();
       const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
-      const filesPromise = this.refreshFileIndex();
+      const filesPromise = this.refreshFileIndex(online);
+      // Known to `resume()` on its own: a join failed by a pause ends this
+      // flow at once, while the listing is still on its way.
+      this.trackConnectFlow(filesPromise, { detach: false });
       const [result] = await Promise.all([joinPromise, filesPromise]);
-      this.throwIfStopped();
+      online.throwIfAborted();
       this.serverPicksFreeConflictName =
         result.ok && result.operationsCatchup === OPERATIONS_CATCHUP;
       // Operations this device applied live: the catch-up returns them again.
@@ -982,8 +1123,8 @@ export class SyncEngine {
       for (const id of askedBack) this.recreated.add(id);
       // Before any catch-up doc or operation lands: the files the queue's
       // operations were made to may be gone from under their ids.
-      await this.settleOvertakenQueue();
-      this.throwIfStopped();
+      await this.settleOvertakenQueue(online);
+      online.throwIfAborted();
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -991,8 +1132,8 @@ export class SyncEngine {
       const buffered = this.pendingCatchup;
       this.pendingCatchup = [];
       for (const batch of buffered) {
-        await this.processCatchupBatch(batch);
-        this.throwIfStopped();
+        await this.processCatchupBatch(batch, online);
+        online.throwIfAborted();
       }
 
       if (!result.ok) {
@@ -1009,29 +1150,30 @@ export class SyncEngine {
       };
       for (const op of result.operations) {
         await this.applyServerOperation(op, catchup);
-        this.throwIfStopped();
+        online.throwIfAborted();
       }
       // A catch-up that may have left operations out: the server's window of
       // the journal's first rows, or one cut short. Attachments are checked
-      // against the listing instead (see `reconcileAttachments`).
-      if (result.operationsCatchup !== OPERATIONS_CATCHUP || result.operationsTruncated === true) {
-        await this.reconcileAttachments();
-        this.throwIfStopped();
-      }
+      // against the listing instead (see `reconcileAttachments`). After a
+      // whole one, the attachments new to this device only.
+      const partial =
+        result.operationsCatchup !== OPERATIONS_CATCHUP || result.operationsTruncated === true;
+      await this.reconcileAttachments(online, { onlyNew: !partial });
+      online.throwIfAborted();
 
       // Hydrate Yjs docs. New servers STREAM them via `yjs:catchup` (handled by
       // `handleYjsCatchup`); we wait for the `done` batch here. Legacy servers
       // return them inline in the ack — apply those directly.
       if (result.yjsStream) {
-        await this.waitForCatchup(catchupDone);
+        await this.waitForCatchup(catchupDone, online);
       } else {
         this.catchupResolve = null;
         for (const snap of result.yjsDocs ?? []) {
           await this.applyCatchupDoc(snap);
-          this.throwIfStopped();
+          online.throwIfAborted();
         }
       }
-      this.throwIfStopped();
+      online.throwIfAborted();
 
       // Подписка на отправку локальных правок — ЛЕНИВО.
       //
@@ -1078,11 +1220,11 @@ export class SyncEngine {
       // Reconnect catch-up tail, kicked off in the background so the
       // `connected` status doesn't wait on every queued upload. Ordering
       // inside is load-bearing — see `drainThenInitialPush`.
-      this.detach(this.drainThenInitialPush());
+      this.trackConnectFlow(this.drainThenInitialPush(online));
     } catch (err) {
-      this.catchupResolve = null;
-      // Cut short by `stop()` — not a sync failure.
-      if (this.hasStopped) return;
+      if (this.catchupResolve === armed) this.catchupResolve = null;
+      // Cut short by `stop()` or by Pause sync — not a sync failure.
+      if (online.aborted) return;
       // Cut short by the connection dropping: the status says so already, and
       // the next connect starts over.
       if (!this.socketLink.isConnected()) return;
@@ -1102,14 +1244,18 @@ export class SyncEngine {
       this.pendingCatchup.push(batch);
       return;
     }
-    await this.processCatchupBatch(batch);
+    // It came on the connection open now.
+    await this.processCatchupBatch(batch, this.online.signal);
   }
 
-  /** Applies a catch-up batch's docs; the final `done` batch ends the wait. */
-  private async processCatchupBatch(batch: YjsCatchupBatch): Promise<void> {
+  /**
+   * Applies a catch-up batch's docs; the final `done` batch ends the wait.
+   * `online`: the connection the batch came on (see `online`).
+   */
+  private async processCatchupBatch(batch: YjsCatchupBatch, online: AbortSignal): Promise<void> {
     for (const snap of batch.docs) {
       await this.applyCatchupDoc(snap);
-      this.throwIfStopped();
+      online.throwIfAborted();
     }
     if (batch.done) {
       this.catchupResolve?.();
@@ -1316,10 +1462,10 @@ export class SyncEngine {
    *
    * The copy on disk is then the old history's (see {@link setAsideOldCopy}),
    * and it is settled before the history goes. The other way round, a stop
-   * in between — Pause sync, a reload, Obsidian closed while the server's
-   * version history was looked up — left the disk with edits the server
-   * never got, a fold marker saying they were folded, and no history holding
-   * them: the next start wrote the server's text over them.
+   * in between — a reload, the plugin turned off, Obsidian closed while the
+   * server's version history was looked up — left the disk with edits the
+   * server never got, a fold marker saying they were folded, and no history
+   * holding them: the next start wrote the server's text over them.
    *
    * Callers hold the note's path lock.
    */
@@ -1450,24 +1596,26 @@ export class SyncEngine {
    * Waits for the streamed catch-up to finish, but never hangs the whole
    * connect on a stalled stream — after {@link CATCHUP_TIMEOUT_MS} we proceed
    * to `connected` regardless (the initial-push drain reconciles the rest).
+   * `online`: the connection the catch-up comes on (see `online`).
    */
-  private waitForCatchup(done: Promise<void>): Promise<void> {
-    const { signal } = this.lifetime;
+  private waitForCatchup(done: Promise<void>, online: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
       let settled = false;
       const finish = (): void => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timer);
-        signal.removeEventListener('abort', finish);
+        online.removeEventListener('abort', finish);
         this.catchupResolve = null;
         resolve();
       };
       const timer = window.setTimeout(finish, CATCHUP_TIMEOUT_MS);
-      // `stop()` ends the wait at once: the connect flow unwinds instead of
-      // holding the engine in memory until the guard fires.
-      if (signal.aborted) finish();
-      else signal.addEventListener('abort', finish, { once: true });
+      // `stop()` and Pause sync end the wait at once: the connect flow
+      // unwinds instead of waiting out the guard for batches that no longer
+      // come. Waited out, a pause during the catch-up reported the binding
+      // connected five minutes later, and its drain ran while paused.
+      if (online.aborted) finish();
+      else online.addEventListener('abort', finish, { once: true });
       void done.then(finish);
     });
   }
@@ -1485,21 +1633,22 @@ export class SyncEngine {
    * goes — so the `initialPush` that follows recognises every file the
    * queue already synced and skips it.
    */
-  private async drainThenInitialPush(): Promise<void> {
+  private async drainThenInitialPush(online: AbortSignal): Promise<void> {
     try {
-      await this.flushPendingOperations();
+      await this.flushPendingOperations(online);
     } catch {
-      // A drain stopped with the engine ends the tail here.
-      this.throwIfStopped();
+      // A drain stopped with the engine or by Pause sync ends the tail here:
+      // the first upload of a paused connection would queue every new file.
+      online.throwIfAborted();
       // A failed drain must not block the initial-push pass — pre-existing
       // files still need their first upload, and whatever stayed queued is
       // retried on the next reconnect. `initialPush` itself skips paths
       // that are still queued.
     }
     try {
-      await this.initialPush();
+      await this.initialPush(online);
     } finally {
-      await this.askAboutRetiredWhileAway();
+      await this.askAboutRetiredWhileAway(online);
     }
   }
 
@@ -1512,7 +1661,7 @@ export class SyncEngine {
    * server). Errors per-file are swallowed so one bad file doesn't block
    * the rest.
    */
-  private async initialPush(): Promise<void> {
+  private async initialPush(online: AbortSignal): Promise<void> {
     const paths = await this.vault.list(this.binding.localFolder);
     const pending = this.operationLog.pendingPaths(this.binding.id);
     // Paths the server currently holds as tombstones. Re-uploading one would
@@ -1520,7 +1669,7 @@ export class SyncEngine {
     // and a file the server deleted but that is still on disk would come back
     // as a fresh CREATE. Honour the server's tombstones instead.
     const tombstones = await this.fetchServerTombstones();
-    this.throwIfStopped();
+    online.throwIfAborted();
     if (tombstones === null) {
       // Couldn't confirm the server's tombstones. Don't risk re-uploading a
       // deleted-but-still-on-disk file — after catch-up merges the delete
@@ -1540,23 +1689,23 @@ export class SyncEngine {
     for (const [path, away] of deletedAway) this.awayCopies.set(path, away.record.serverFileId);
     try {
       for (const away of deletedAway.values()) {
-        this.throwIfStopped();
+        online.throwIfAborted();
         try {
           if ((await this.dropDeletedWhileAway(away.record, away.serverHash, false)) === 'ask') {
             asks.push(away);
           }
         } catch {
-          this.throwIfStopped();
+          online.throwIfAborted();
           // Left as it is: the next connect finds the record again.
         }
       }
-      await this.uploadNewFiles(paths, pending, tombstones.paths, deletedAway);
+      await this.uploadNewFiles(paths, pending, tombstones.paths, deletedAway, online);
       for (const away of asks) {
-        this.throwIfStopped();
+        online.throwIfAborted();
         try {
           await this.dropDeletedWhileAway(away.record, away.serverHash, true);
         } catch {
-          this.throwIfStopped();
+          online.throwIfAborted();
           // Left as it is: the next connect finds the record again.
         }
       }
@@ -1573,9 +1722,10 @@ export class SyncEngine {
     pending: ReadonlySet<string>,
     tombstoned: ReadonlySet<string>,
     deletedAway: ReadonlyMap<string, unknown>,
+    online: AbortSignal,
   ): Promise<void> {
     for (const path of paths) {
-      this.throwIfStopped();
+      online.throwIfAborted();
       // Watcher events are filtered upstream, but this pass walks the raw
       // vault listing — without the same filter it uploads throw-away
       // artifacts (e.g. Obsidian's orphaned `*.tmp.<pid>.<hex>` files).
@@ -1594,12 +1744,12 @@ export class SyncEngine {
       // now: its disk step comes before its records, and the file found
       // there in between was uploaded as a new one.
       await this.withPathLock(path, () => Promise.resolve());
-      this.throwIfStopped();
+      online.throwIfAborted();
       if (this.fileIndex.byPath.has(this.spelledHere(path))) continue;
       try {
         await this.handleLocalCreate(path);
       } catch {
-        this.throwIfStopped();
+        online.throwIfAborted();
         // Per-file failures are swallowed — the watcher / next reconnect
         // will surface them again.
       }
@@ -1751,12 +1901,15 @@ export class SyncEngine {
     this.fileIndex = { byPath, byId };
   }
 
-  private async refreshFileIndex(): Promise<void> {
+  /** `online`: the connection the refresh is for (see `online`). */
+  private async refreshFileIndex(online: AbortSignal): Promise<void> {
     const renamesBefore = new Map(this.renameCount);
     const deletesBefore = new Set(this.deletedIds);
     const listed = await this.api.getProjectFiles(this.binding.projectId);
-    // A listing that lands after `stop()` must not rewrite the log's file meta.
-    this.throwIfStopped();
+    // A listing that lands after `stop()` must not rewrite the log's file meta,
+    // nor one that lands after Pause sync the index the paused engine keeps
+    // recording local changes in.
+    online.throwIfAborted();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
     this.deletedSinceListing.clear();
     // Before anything reads the queue: a create that reached the server
@@ -2328,7 +2481,7 @@ export class SyncEngine {
    * Every queued operation of such a file is dropped, and the file the server
    * has comes back here (see {@link takeBackOvertaken}).
    */
-  private async settleOvertakenQueue(): Promise<void> {
+  private async settleOvertakenQueue(online: AbortSignal): Promise<void> {
     const ops = this.operationLog.dequeueOperations(this.binding.id);
     const overtaken = new Set<string>();
     for (const op of ops) {
@@ -2340,8 +2493,11 @@ export class SyncEngine {
         const known = lastSyncedHashes(op.payload);
         const now = this.lastListing.get(fileId)?.contentHash ?? '';
         if (known === null || known.includes(now)) continue;
-        if (!(await this.serverDocWithin(fileId, op.payload))) overtaken.add(fileId);
-        this.throwIfStopped();
+        const within = await this.serverDocWithin(fileId, op.payload);
+        // Paused while the server's doc was asked for: no answer, not a "no".
+        // Taken for one, the delete was dropped and the note came back.
+        online.throwIfAborted();
+        if (!within) overtaken.add(fileId);
       }
     }
     if (overtaken.size === 0) return;
@@ -2358,7 +2514,7 @@ export class SyncEngine {
         ops: dropped.filter((op) => queuedFileId(op.payload) === fileId).map((op) => op.opType),
       });
       await this.takeBackOvertaken(listed);
-      this.throwIfStopped();
+      online.throwIfAborted();
     }
   }
 
@@ -3159,17 +3315,23 @@ export class SyncEngine {
     }
   }
 
-  /** `PUT /blobs/:hash`, cancelled by `stop()` — see {@link lifetime}. */
+  /**
+   * `PUT /blobs/:hash`, cancelled by `stop()` and by Pause sync — see
+   * {@link online}. Cut short, the change it carries is queued.
+   */
   private uploadBlob(contentHash: string, buffer: ArrayBuffer): Promise<void> {
     return this.api.uploadBlob(this.binding.projectId, contentHash, buffer, {
-      signal: this.lifetime.signal,
+      signal: this.online.signal,
     });
   }
 
-  /** Download a file's current bytes, cancelled by `stop()`. */
+  /**
+   * Download a file's current bytes, cancelled by `stop()` and by Pause sync;
+   * the next connect's catch-up brings them.
+   */
   private downloadFile(fileId: string): Promise<ArrayBuffer> {
     return this.api.downloadFile(this.binding.projectId, fileId, {
-      signal: this.lifetime.signal,
+      signal: this.online.signal,
     });
   }
 
@@ -4143,8 +4305,9 @@ export class SyncEngine {
       await this.applyServerFileEvent(event);
       this.noteAppliedLive(event);
     } catch (err) {
-      // Cut short by `stop()` — not a failure to apply.
-      if (this.hasStopped) return;
+      // Cut short by `stop()`, or its download by Pause sync — not a failure
+      // to apply: the next connect's catch-up brings the change again.
+      if (this.hasStopped || err instanceof SyncPausedError) return;
       this.setStatus('error', describeError(err, 'apply_failed'));
     }
   }
@@ -4608,10 +4771,23 @@ export class SyncEngine {
    * their turn came, and a delete of a file still on disk is not sent (see
    * `sendLocalDelete`): the folder came back here, and its files stayed on the
    * server for the whole team.
+   *
+   * `onlyNew`, after a catch-up of the whole journal: only the attachments
+   * new to this device, missing here. Such a catch-up leaves out a CREATE the
+   * clock took in at a connect that did not apply it: the file waited for a
+   * name this device's own file held (see `waitForName`), and its download
+   * failed when the name came free — the connection lost, Pause sync. The
+   * listing indexed it at the next connect, recorded as synced, and it never
+   * came; a file saved under the name here was then sent as its new version,
+   * over the teammate's.
    */
-  private async reconcileAttachments(): Promise<void> {
+  private async reconcileAttachments(
+    online: AbortSignal,
+    opts: { onlyNew?: boolean } = {},
+  ): Promise<void> {
     for (const meta of [...this.fileIndex.byId.values()]) {
       if (meta.fileType !== 'BINARY') continue;
+      if (opts.onlyNew === true && !this.newHere.has(meta.fileId)) continue;
       const listed = this.lastListing.get(meta.fileId);
       if (listed === undefined) continue;
       // Deleted since the pass began: not brought back.
@@ -4628,9 +4804,9 @@ export class SyncEngine {
         }
       } catch {
         // The next connect checks again.
-        this.throwIfStopped();
+        online.throwIfAborted();
       }
-      this.throwIfStopped();
+      online.throwIfAborted();
     }
   }
 
@@ -5617,9 +5793,9 @@ export class SyncEngine {
    * the question a live rename asks (see {@link dropLocalCopy}). Where the
    * server has the file then is the name it moved on to.
    */
-  private async askAboutRetiredWhileAway(): Promise<void> {
+  private async askAboutRetiredWhileAway(online: AbortSignal): Promise<void> {
     for (const [fileId, { meta, serverHash }] of [...this.retiredAway]) {
-      this.throwIfStopped();
+      online.throwIfAborted();
       const movedTo = this.outOfScope.get(fileId)?.path;
       if (!this.reindexRetired(fileId) || movedTo === undefined) continue;
       try {
@@ -5629,7 +5805,7 @@ export class SyncEngine {
           ...(serverHad !== null ? { serverHad } : {}),
         });
       } catch {
-        this.throwIfStopped();
+        online.throwIfAborted();
         // Left as it is: the next connect finds the rename again.
       }
     }
@@ -6502,11 +6678,14 @@ export class SyncEngine {
    * out of the engine lets us reuse the same drain machinery from a
    * future "Sync now" command.
    */
-  private async flushPendingOperations(): Promise<void> {
+  private async flushPendingOperations(online: AbortSignal): Promise<void> {
     this.collapseQueuedRenames();
     const emit: PendingEmitter = (op) => this.replayPending(op);
+    // Pause sync ends the drain like `stop()`: the operation in flight stays
+    // queued and goes out once on resume, and the drain is not reported as
+    // halted on it.
     const result = await flushPendingQueue(this.binding.id, this.operationLog, emit, {
-      signal: this.lifetime.signal,
+      signal: online,
     });
     // A halted drain used to be invisible: the queue simply stopped moving and
     // nothing said so. Surface it — one stuck operation holds back every edit
@@ -7051,12 +7230,13 @@ export class SyncEngine {
   }
 
   /**
-   * Run a flow nobody awaits. Being cut short by `stop()` is not a failure
-   * and ends it silently; any other rejection surfaces as it did before.
+   * Run a flow nobody awaits. Being cut short by `stop()` or by Pause sync is
+   * not a failure and ends it silently; any other rejection surfaces as it
+   * did before.
    */
   private detach(flow: Promise<void>): void {
     void flow.catch((err: unknown) => {
-      if (!this.hasStopped) throw err;
+      if (!this.hasStopped && !(err instanceof SyncPausedError)) throw err;
     });
   }
 

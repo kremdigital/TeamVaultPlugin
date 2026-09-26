@@ -357,6 +357,26 @@ describe('SocketClient — emits', () => {
     }
   });
 
+  // Pause sync closes the socket while a note's state may be on its way:
+  // left to its timeout, the answer kept a save of the note waiting for 15 s
+  // and took the server for one without `yjs:fetch` until the next connect.
+  it('fetchYjsDoc answers at once when the client disconnects, and clears its timer', async () => {
+    const win = stubWindow();
+    try {
+      const { client, socket } = captureSocket();
+      client.connect();
+      const promise = client.fetchYjsDoc('p1', 'f1', 60_000);
+      client.disconnect();
+      await expect(promise).resolves.toEqual({ ok: false, error: 'disconnected' });
+      expect(win.clearTimeout).toHaveBeenCalledTimes(1);
+      // A late answer on the closed socket changes nothing.
+      socket().ackLast({ ok: true, sync1: [], stateVector: [] });
+      await expect(promise).resolves.toEqual({ ok: false, error: 'disconnected' });
+    } finally {
+      win.restore();
+    }
+  });
+
   it('fetchYjsDoc resolves (does not reject) before connect', async () => {
     const client = new SocketClient({ server, clientId, factory });
     await expect(client.fetchYjsDoc('p1', 'f1')).resolves.toEqual({

@@ -289,6 +289,8 @@ export class SocketClient {
   private yjsCatchupCbs = new Set<EventCb<YjsCatchupBatch>>();
   /** Emits waiting for their acks — see {@link emitWithAck}. */
   private readonly pendingAcks = new Set<PendingAck>();
+  /** `yjs:fetch` requests waiting for their answer — see {@link fetchYjsDoc}. */
+  private readonly pendingFetches = new Set<(result: YjsFetchResult) => void>();
 
   constructor(options: SocketClientOptions) {
     this.factory = options.factory ?? defaultFactory;
@@ -436,7 +438,11 @@ export class SocketClient {
     socket.connect();
   }
 
-  /** Tear everything down. The instance is reusable — `connect()` rebuilds. */
+  /**
+   * Tear everything down. The instance is reusable — `connect()` rebuilds.
+   * socket.io does not reconnect a socket closed this way: nothing goes out
+   * until the next `connect()` (Pause sync and Resume sync rely on it).
+   */
   disconnect(): void {
     if (this.socket) {
       this.socket.disconnect();
@@ -444,6 +450,11 @@ export class SocketClient {
     }
     // Nothing emitted on this socket is sent or answered any more.
     this.failPendingAcks(() => true);
+    // Nor a `yjs:fetch`: answered now rather than by its timeout, which kept a
+    // save of the note waiting and took the server for one without the event.
+    for (const settle of [...this.pendingFetches]) {
+      settle({ ok: false, error: 'disconnected' });
+    }
   }
 
   // -- Subscriptions --------------------------------------------------------
@@ -540,11 +551,15 @@ export class SocketClient {
         resolve({ ok: false, error: 'socket_not_connected' });
         return;
       }
-      const timer = window.setTimeout(() => resolve({ ok: false, error: 'timeout' }), timeoutMs);
-      this.socket.emit('yjs:fetch', { projectId, fileId }, (ack: YjsFetchResult) => {
+      let timer: number | undefined;
+      const settle = (result: YjsFetchResult): void => {
+        if (!this.pendingFetches.delete(settle)) return;
         window.clearTimeout(timer);
-        resolve(ack);
-      });
+        resolve(result);
+      };
+      this.pendingFetches.add(settle);
+      timer = window.setTimeout(() => settle({ ok: false, error: 'timeout' }), timeoutMs);
+      this.socket.emit('yjs:fetch', { projectId, fileId }, (ack: YjsFetchResult) => settle(ack));
     });
   }
 

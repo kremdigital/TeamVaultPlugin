@@ -5,7 +5,9 @@
  *
  * The same bench as in `engine-stop.test.ts`, shared by the suites written
  * after it. `buildHarness(predecessor)` builds the engine the `EngineManager`
- * spawns after a pause: a fresh one on the same vault, log, docs and echo set.
+ * spawns after the one before it stopped — a reload, the binding switched off
+ * and on: a fresh one on the same vault, log, docs and echo set. (Pause sync
+ * keeps the engine: `engine.pause()` and `engine.resume()`.)
  *
  * Three things real Obsidian and the real server do are part of the bench,
  * because tests that left them out passed on code that looped in production:
@@ -449,7 +451,13 @@ export class FakeSocket implements SocketLike {
     this.wantsConnect = false;
     this.connect();
   }
+  /**
+   * Closed on purpose: socket.io does not reconnect such a socket, so a
+   * connect asked for while unreachable is dropped. A test that models the
+   * connection coming back calls {@link connect} itself.
+   */
   disconnect(): SocketLike {
+    this.wantsConnect = false;
     this.connected = false;
     this.fire('disconnect', 'io client disconnect');
     return this;
@@ -646,7 +654,12 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   const api = new ApiClient(
     server,
     (p) => route(p.method ?? 'GET', p.url),
-    (p) => route(p.method, p.url),
+    // As `fetch` does: a transfer called off before it starts is never sent,
+    // and one called off on its way rejects with the signal's reason.
+    (p) =>
+      p.signal?.aborted
+        ? Promise.reject(abortReason(p.signal))
+        : abortable(route(p.method, p.url), p.signal),
   );
   // Each engine gets its own socket, so a predecessor's late emits stay
   // apart from its successor's.
@@ -701,6 +714,21 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     },
     socketIfBuilt: (): FakeSocket | null => own,
   });
+}
+
+/** The reason `signal` aborted with, as an error. */
+function abortReason(signal: AbortSignal): Error {
+  const reason: unknown = signal.reason;
+  return reason instanceof Error ? reason : new Error(String(reason));
+}
+
+/** `work`, rejected with `signal`'s reason as soon as `signal` aborts. */
+function abortable<T>(work: Promise<T>, signal: AbortSignal | undefined): Promise<T> {
+  if (signal === undefined) return work;
+  const aborted = new Promise<never>((_resolve, reject) => {
+    signal.addEventListener('abort', () => reject(abortReason(signal)), { once: true });
+  });
+  return Promise.race([work, aborted]);
 }
 
 /** Start the vault's `ObsidianWatcher`, wired to the engine as `main.ts` does. */
@@ -956,7 +984,7 @@ export class FakeServer {
     harness.route.server = this;
   }
 
-  /** Serve the engine built after a pause instead (see `buildHarness`). */
+  /** Serve the engine built after this one instead (see `buildHarness`). */
   attach(h: Harness): void {
     this.harness = h;
     h.route.server = this;
@@ -1464,7 +1492,7 @@ export class ServerDocs {
     server.onCreate = (id, data, revived) => this.created(id, data, revived);
   }
 
-  /** Serve the engine built after a pause instead (with {@link FakeServer.attach}). */
+  /** Serve the engine built after this one instead (with {@link FakeServer.attach}). */
   attach(h: Harness): void {
     this.harness = h;
     this.absorbed = new WeakSet();

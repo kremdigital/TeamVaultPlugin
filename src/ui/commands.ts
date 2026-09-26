@@ -10,8 +10,10 @@ import { HISTORY_VIEW_TYPE } from './views/history-view';
  * once during `onload`.
  *
  * Commands (English names; the palette shows them as "Team Vault: …"):
- *   - "Sync now"                   — runDeepSync on every active engine.
- *   - "Pause sync"                 — manager.pause().
+ *   - "Sync now"                   — runDeepSync on every active engine; not
+ *                                    while paused.
+ *   - "Pause sync"                 — manager.pause(): disconnected, local
+ *                                    changes recorded for the resume.
  *   - "Resume sync"                — manager.resume().
  *   - "Toggle active file history" — open / close the right-pane History view.
  *   - "Open settings"              — focus the plugin's settings tab.
@@ -39,8 +41,13 @@ export function registerCommands(plugin: Plugin, deps: CommandsDeps): void {
   plugin.addCommand({
     id: 'sync-now',
     name: t('command.syncNow'),
-    callback: () => {
-      void runSyncNow(deps);
+    // Not while paused, like the status bar menu: sync is off until resumed,
+    // and "Sync completed" would say otherwise. Obsidian runs the callback
+    // with `checking: false` without asking first (a hotkey), so it checks too.
+    checkCallback: (checking) => {
+      if (deps.manager.isPaused()) return false;
+      if (!checking) void runSyncNow(deps);
+      return true;
     },
   });
 
