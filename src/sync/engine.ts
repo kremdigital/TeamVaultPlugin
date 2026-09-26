@@ -22,6 +22,7 @@ import {
   OperationLog,
   type FileMeta,
   type OperationType,
+  type PendingOperation,
   type PendingOperationInput,
 } from './operation-log';
 import { classifyFileType, type FileType } from './file-type';
@@ -322,6 +323,25 @@ const SENT_HASHES = 'sentHashes';
  * under the note's name now.
  */
 const SENT_AT = 'sentAt';
+
+/**
+ * Payload of a queued RENAME, MOVE or attachment UPDATE: this device's counter
+ * in the vector clock the operation last went out with, to a server that may
+ * have applied it without its ack reaching this device (the connection
+ * dropped, Pause sync closed it, the engine stopped). The server stores an
+ * operation with its sender's counter one up, so the catch-up's operation of
+ * this device with the counter one past it is this very entry, applied (see
+ * `SyncEngine.answerLost`). Local to the queue, like {@link RECHECK_DELETE}.
+ *
+ * The catch-up returns this device's last operation whether its answer came
+ * or not. Known by what it did alone — the name a rename gave, the version an
+ * update brought — an answered one was taken for a queued one that did the
+ * same since: a rename back to that name was dropped, and the teammate's
+ * rename after it stayed for the whole team; an attachment's version was
+ * taken back from the teammate's saved over it, and an edit made over that
+ * one was put against it in a "Content conflict" prompt.
+ */
+const SENT_COUNTER = 'sentCounter';
 
 /**
  * How many times one snapshot folds a disk that changed under it before it
@@ -1958,6 +1978,7 @@ export class SyncEngine {
     online.throwIfAborted();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
     this.deletedSinceListing.clear();
+    await this.recordWrittenAfterAll(online);
     // Records of files never written here (see `FileMeta.notOnDisk`) hold no
     // copy to settle: a file under such a name is another one. Taken for a
     // copy, it was moved along with the teammate's rename of the file, or the
@@ -2146,6 +2167,75 @@ export class SyncEngine {
       // The copy that was there has moved out just now.
       const gone = !(await this.vault.exists(f.path));
       this.indexListedFile(f, this.fileIndex.byPath, this.fileIndex.byId, undefined, gone);
+    }
+  }
+
+  /**
+   * Records of files never written here (see `FileMeta.notOnDisk`) whose
+   * content is under their name after all: the engine wrote it, and the
+   * record of the write was lost. `state.json` takes a change of a record
+   * after a moment's delay, and Obsidian quits without unloading the plugin:
+   * a teammate's file written in the last moment before a quit or a crash
+   * stayed recorded as never come. Taken for a file saved under the name at
+   * the next connect, it went up as a new file — once the teammate had
+   * edited theirs, a conflict copy with the old content for the whole team;
+   * once they had deleted it, the file back for everyone.
+   *
+   * The file under the name is the teammate's when it has the content the
+   * record has, which the listing gave when it was recorded, or the content
+   * the server has now (the catch-up can bring a newer one than the
+   * listing). A file of the user's with that very content is the same file.
+   * Recorded then as a copy, synced at that content. `online`: see
+   * `refreshFileIndex`.
+   */
+  private async recordWrittenAfterAll(online: AbortSignal): Promise<void> {
+    for (const record of this.operationLog.listFileMeta(this.binding.id)) {
+      if (record.notOnDisk !== true) continue;
+      const path = record.relativePath;
+      let hash: string;
+      let size: number;
+      try {
+        if (!(await this.vault.exists(path))) continue;
+        if (record.fileType === 'TEXT') {
+          const text = await this.vault.readText(path);
+          hash = await sha256Hex(text);
+          size = new TextEncoder().encode(text).byteLength;
+        } else {
+          const data = await this.vault.readBinary(path);
+          hash = await sha256Hex(data);
+          size = data.byteLength;
+        }
+      } catch {
+        // Unreadable now: left as it is, for the index to go by the record.
+        online.throwIfAborted();
+        continue;
+      }
+      online.throwIfAborted();
+      const known = [record.contentHash, this.lastListing.get(record.serverFileId)?.contentHash];
+      if (!known.includes(hash)) continue;
+      // Changed while the file was read: that change stands.
+      const now = this.operationLog.getFileMeta(this.binding.id, path);
+      if (
+        now?.notOnDisk !== true ||
+        now.serverFileId !== record.serverFileId ||
+        now.contentHash !== record.contentHash
+      ) {
+        continue;
+      }
+      this.log.info('a file recorded as not written here is on disk; taken for its copy', {
+        path,
+        fileId: record.serverFileId,
+      });
+      // The text is in the note's history here, or comes with the server's.
+      const folded = record.fileType === 'TEXT' ? { foldedHash: hash } : {};
+      const copy: FileMeta = { ...now, contentHash: hash, size, ...folded };
+      delete copy.notOnDisk;
+      this.operationLog.setFileMeta(copy);
+      const indexed = this.fileIndex.byPath.get(path);
+      if (indexed?.fileId === record.serverFileId && indexed.notOnDisk === true) {
+        delete indexed.notOnDisk;
+        Object.assign(indexed, { contentHash: hash, size, ...folded });
+      }
     }
   }
 
@@ -2628,24 +2718,31 @@ export class SyncEngine {
   /**
    * Queued renames and moves the server has applied already: the catch-up
    * returns this device's own (`own`, see `ownOperations`) rename of the file
-   * to the name the queued one gives it. The one the drain had in flight when
-   * the connection dropped or Pause sync closed it, its answer lost. Taken out
-   * of the queue, and the catch-up's renames of the file after it apply.
+   * that is the queued one gone out (see {@link answerLost}), to the name the
+   * queued one gives it. The one on its way when the connection dropped or
+   * Pause sync closed it, its answer lost. Taken out of the queue, and the
+   * catch-up's renames of the file after it apply.
    *
    * Sent again, it moved the file back from where a teammate had renamed it
    * since, for the whole team: the server applies a rename by file id,
    * whatever the file's name is by then.
+   *
+   * By the name alone, a rename made since back to the name that the device's
+   * last rename gave, answered, was taken for this one: a teammate had
+   * renamed the file on meanwhile, and their name stayed for the whole team.
+   * A queued rename made to go on since it went out (see
+   * `collapseQueuedRenames`) gives another name, and goes out again.
    */
   private dropLandedMoves(own: ReadonlySet<ServerOperation>): void {
     for (const op of own) {
       if (op.opType !== 'RENAME' && op.opType !== 'MOVE') continue;
       const fileId = (op.payload as { fileId?: unknown } | null)?.fileId;
       if (typeof fileId !== 'string' || fileId === '' || op.newPath === null) continue;
+      const landed = this.answerLost(op, fileId, isQueuedMove);
+      if (landed === undefined || landed.newPath !== op.newPath) continue;
       const moves = this.operationLog
         .dequeueOperations(this.binding.id)
         .filter((queued) => isQueuedMove(queued) && queuedFileId(queued.payload) === fileId);
-      const landed = moves.find((queued) => queued.newPath === op.newPath);
-      if (landed === undefined) continue;
       this.log.info('a rename sent from here reached the server before its answer was lost', {
         from: landed.filePath,
         to: landed.newPath,
@@ -2654,6 +2751,45 @@ export class SyncEngine {
       this.operationLog.markSent([landed.id]);
       if (moves.length === 1) this.renamedHere.delete(fileId);
     }
+  }
+
+  /**
+   * The queued operation of file `fileId` that `op`, an operation of this
+   * device's in the catch-up, is — sent, its answer lost, and applied by the
+   * server: the one that went out with the counter `op` takes one past (see
+   * {@link SENT_COUNTER}). `undefined` when `op` is one whose answer came.
+   * `kind`: the queued operations `op` can be.
+   */
+  private answerLost(
+    op: ServerOperation,
+    fileId: string,
+    kind: (queued: PendingOperation) => boolean,
+  ): PendingOperation | undefined {
+    const counter = op.vectorClock?.[this.clientId];
+    if (typeof counter !== 'number') return undefined;
+    return this.operationLog
+      .dequeueOperations(this.binding.id)
+      .find(
+        (queued) =>
+          kind(queued) &&
+          queuedFileId(queued.payload) === fileId &&
+          sentCounter(queued.payload) === counter - 1,
+      );
+  }
+
+  /**
+   * Record in queued operation `opId` this device's counter in `clock`, the
+   * vector clock it goes out with now (see {@link SENT_COUNTER}).
+   */
+  private noteSent(opId: number, clock: VectorClock): void {
+    const counter = clock[this.clientId];
+    const entry = this.operationLog
+      .dequeueOperations(this.binding.id)
+      .find((queued) => queued.id === opId);
+    if (counter === undefined || entry === undefined) return;
+    this.operationLog.amendOperation(opId, {
+      payload: { ...entry.payload, [SENT_COUNTER]: counter },
+    });
   }
 
   /**
@@ -3613,22 +3749,34 @@ export class SyncEngine {
     const buffer = await this.vault.readBinary(path);
     const hash = await sha256Hex(buffer);
     if (hash === meta.contentHash) return; // nothing changed
-    const payload = { fileId: meta.fileId, contentHash: hash, size: buffer.byteLength };
+    const payload: Record<string, unknown> = {
+      fileId: meta.fileId,
+      contentHash: hash,
+      size: buffer.byteLength,
+    };
     if (change) change.payload = payload;
 
     if (this.socket.isConnected()) {
+      /** Out from here, with no answer yet (see `SENT_COUNTER`). */
+      let sent: number | undefined;
       try {
         // Binary bytes go to the REST staging area; the socket op is metadata-only.
         await this.uploadBlob(hash, buffer);
         this.throwIfStopped();
+        const vectorClock = this.bumpClock();
+        sent = vectorClock[this.clientId];
+        // Handed over by `stop()` while on its way, it says so too.
+        if (change) change.payload = { ...payload, [SENT_COUNTER]: sent };
         const ack = await this.emitBinaryUpdate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
-          vectorClock: this.bumpClock(),
+          vectorClock,
           fileId: meta.fileId,
           contentHash: hash,
           size: buffer.byteLength,
         });
+        // Answered: not applied, when refused.
+        sent = undefined;
         this.throwIfStopped();
         if (ack.ok) {
           meta.contentHash = hash;
@@ -3641,6 +3789,7 @@ export class SyncEngine {
         this.throwIfStopped();
         this.log.debug('binary update staging/emit failed; queueing', path);
       }
+      if (sent !== undefined) payload[SENT_COUNTER] = sent;
     }
     this.queue('UPDATE', path, null, payload);
   }
@@ -4023,6 +4172,8 @@ export class SyncEngine {
     let docMoved: Promise<void> = Promise.resolve();
     /** What the server made of the rename, once it has acknowledged it. */
     let acked: { outcome: unknown } | null = null;
+    /** Out from here with no answer, so maybe applied (see `SENT_COUNTER`). */
+    let unanswered: Record<string, unknown> = {};
     try {
       // The note is under its new name on disk already, so it is recorded
       // there at once — whether the server hears of the rename now or from
@@ -4038,11 +4189,15 @@ export class SyncEngine {
       // The history follows, under both names' locks.
       docMoved = this.moveRenamedDoc(target, oldPath, newPath);
       if (this.socket.isConnected() && this.supersedeQueuedMoves(fileId, newPath)) {
+        const vectorClock = this.bumpClock();
+        const counter = vectorClock[this.clientId];
+        // Handed over by `stop()` while on its way: see `SENT_COUNTER`.
+        change.payload = { fileId, [SENT_COUNTER]: counter };
         try {
           const ack = await this.socket.emitFileRename({
             projectId: this.binding.projectId,
             clientId: this.clientId,
-            vectorClock: this.bumpClock(),
+            vectorClock,
             fileId,
             filePath: oldPath,
             newPath,
@@ -4053,13 +4208,15 @@ export class SyncEngine {
             acked = { outcome: (ack as { outcome?: unknown }).outcome };
           }
         } catch {
-          // The connection dropped before the ack: queued, and the replay is a
-          // rename to where the server may have the file already — a no-op.
+          // The connection dropped before the ack: queued, and the next
+          // connect tells whether the server applied it (see
+          // `dropLandedMoves`).
           this.throwIfStopped();
           this.log.debug('rename emit failed; queueing', { oldPath, newPath });
+          unanswered = { [SENT_COUNTER]: counter };
         }
       }
-      if (acked === null) this.queue('RENAME', oldPath, newPath, { fileId });
+      if (acked === null) this.queue('RENAME', oldPath, newPath, { fileId, ...unanswered });
     } finally {
       this.settle(change);
       // Acknowledged: a teammate's rename broadcast from here on was applied
@@ -4873,10 +5030,15 @@ export class SyncEngine {
         // server, the binary download will 404 and crash the catch-up.
         const meta = this.fileIndex.byId.get(fileId);
         if (!meta) break;
-        // This device's own upload: the version is its own (see
-        // `takeOwnVersion`). Before the check below — a teammate's update
-        // after it then finds the version it was made to.
-        if (catchup.own.has(op)) {
+        // This device's own upload whose answer was lost: the version is its
+        // own (see `takeOwnVersion`). Before the check below — a teammate's
+        // update after it then finds the version it was made to. One whose
+        // answer came is any update: the version synced here may be a
+        // teammate's saved over it since, applied as it came.
+        if (
+          catchup.own.has(op) &&
+          this.answerLost(op, fileId, (queued) => queued.opType === 'UPDATE') !== undefined
+        ) {
           this.takeOwnVersion(meta, payload);
           break;
         }
@@ -5226,11 +5388,11 @@ export class SyncEngine {
 
   /**
    * An attachment update of this device's own that the catch-up returns (see
-   * `ownOperations`): the version it brought is one this device uploaded — the
-   * last synced one, whatever `meta` says. It says the version before when the
-   * answer never came: the connection dropped, or Pause sync closed it. The
-   * copy here is that version, or an edit of it made since, which the queue
-   * sends; nothing is downloaded.
+   * `ownOperations`), whose answer never came — the connection dropped, or
+   * Pause sync closed it (see {@link answerLost}): the version it brought is
+   * one this device uploaded, the last synced one, while `meta` says the
+   * version before. The copy here is that version, or an edit of it made
+   * since, which the queue sends; nothing is downloaded.
    *
    * Taken for a teammate's, the version was downloaded and compared with an
    * edit made since: a "Content conflict" prompt between the user's own two
@@ -7236,10 +7398,13 @@ export class SyncEngine {
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
           this.throwIfStopped();
+          const vectorClock = this.bumpClock();
+          // Out from here, answered or not (see `SENT_COUNTER`).
+          if (op.id !== undefined) this.noteSent(op.id, vectorClock);
           const ack = await this.emitBinaryUpdate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
-            vectorClock: this.bumpClock(),
+            vectorClock,
             fileId,
             contentHash,
             size: data.byteLength,
@@ -7321,6 +7486,8 @@ export class SyncEngine {
             filePath: op.filePath,
             newPath,
           };
+          // Out from here, answered or not (see `SENT_COUNTER`).
+          if (op.id !== undefined) this.noteSent(op.id, payload.vectorClock);
           const ack =
             op.opType === 'RENAME'
               ? await this.socket.emitFileRename(payload)
@@ -7640,6 +7807,12 @@ function sentHashes(payload: Record<string, unknown>): string[] {
   const value = payload[SENT_HASHES];
   if (!Array.isArray(value)) return [];
   return value.filter((hash): hash is string => typeof hash === 'string' && hash !== '');
+}
+
+/** The counter a queued operation last went out with (see {@link SENT_COUNTER}); `null` when it did not. */
+function sentCounter(payload: Record<string, unknown>): number | null {
+  const value = payload[SENT_COUNTER];
+  return typeof value === 'number' && Number.isSafeInteger(value) ? value : null;
 }
 
 /**
