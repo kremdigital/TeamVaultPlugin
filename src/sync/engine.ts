@@ -351,9 +351,10 @@ const SENT_COUNTER = 'sentCounter';
 /**
  * Payload of a queued RENAME or MOVE that later renames of the same file were
  * folded into (see `SyncEngine.collapseQueuedRenames`): the counters those
- * went out with (see {@link SENT_COUNTER}). The catch-up returns those of them
- * the server applied past the clock the join carries: after a pause or a
- * dropped connection the last one, after a restart each (see
+ * went out with (see {@link SENT_COUNTER}). The catch-up returns only those of
+ * them the server applied past the clock the join carries, and every answer that
+ * came moves that clock: after a pause or a dropped connection, and after the
+ * plugin is turned off and on once some answers came, just the last one (see
  * `SyncEngine.dropLandedMoves`). Known by the entry's own counter alone, it
  * was taken for a rename whose answer came, and the chain went out again: a
  * teammate's rename of the file since was undone for the whole team.
@@ -2751,8 +2752,9 @@ export class SyncEngine {
    * A queued rename made to go on since it went out (see
    * `collapseQueuedRenames`) gives another name, and goes out again. One that
    * renames sent from here after it were folded into is each of them too (see
-   * {@link SENT_COUNTERS}), and the catch-up can return several of them:
-   * after a restart, every one the server applied. The last of those is where
+   * {@link SENT_COUNTERS}), and the catch-up can return several of them: those
+   * the server applied past the clock the join carries, which every answer that
+   * came moves. The last of those is where
    * the server has the file: the entry has landed when that one gave the name
    * the entry ends at. Checked against any of them, a rename in the middle of
    * the chain to that name took the entry for landed while a later one had
