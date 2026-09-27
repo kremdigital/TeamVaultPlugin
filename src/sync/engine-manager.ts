@@ -96,8 +96,12 @@ export class EngineManager {
    * compares the settings with this, not with the entry the engine was given.
    */
   private readonly connections = new Map<string, ServerConnection>();
-  /** Bindings whose engine is being replaced by one on a new address or key. */
-  private readonly restarting = new Set<string>();
+  /**
+   * Bindings whose engine is being replaced by one on a new address or key,
+   * each with a promise that settles once the new engine has taken the old
+   * one's place — or once it is clear that none will (see `restartEngine`).
+   */
+  private readonly restarts = new Map<string, Promise<void>>();
   /**
    * Per binding, the server paths its engines have already refused at `warn`
    * (`SyncEngineDeps.reportedRefusals`). Here and not in the engine:
@@ -235,8 +239,19 @@ export class EngineManager {
 
   // -- Vault event fan-out --------------------------------------------------
 
-  /** Forward a watcher event to the engine that owns the binding. */
+  /**
+   * Forward a watcher event to the engine that owns the binding.
+   *
+   * While that engine is being replaced — its server got a new address or API
+   * key — the event waits for the new one. The old one drops what comes once
+   * it is stopping, and it may be stopping for a while: it waits for a local
+   * phase it has under way. Dropped so, a change was lost although the binding
+   * stays on: a note deleted then came back from the server, one renamed came
+   * back under its old name next to the new one.
+   */
   async dispatchVaultEvent(event: VaultEvent): Promise<void> {
+    const restart = this.restarts.get(event.bindingId);
+    if (restart) await restart;
     const engine = this.engines.get(event.bindingId);
     if (!engine) return;
     await engine.handleVaultEvent(event);
@@ -350,15 +365,35 @@ export class EngineManager {
    * queued, on the new address. A paused manager spawns it paused.
    *
    * Refreshes run side by side (every connect saves the settings, and a save
-   * refreshes), so one that comes while the engine stops leaves this binding
-   * to this call. And the settings are read again once it has stopped: a
-   * refresh meanwhile may have dropped the engine (the binding switched off
-   * or removed, and purged then), or the server may have changed once more.
+   * refreshes), so one that comes meanwhile leaves this binding to this call.
+   * And the settings are read again once the engine has stopped: a refresh
+   * meanwhile may have dropped it (the binding switched off or removed, and
+   * purged then), or the server may have changed once more.
+   *
+   * Vault events for the binding wait until this call ends (see
+   * `dispatchVaultEvent`), and then go to the new engine — to none, when the
+   * binding is off by then or the plugin unloads.
    */
   private async restartEngine(id: string): Promise<void> {
     const engine = this.engines.get(id);
-    if (!engine || this.restarting.has(id)) return;
-    this.restarting.add(id);
+    if (!engine || this.restarts.has(id)) return;
+    let settle!: () => void;
+    this.restarts.set(
+      id,
+      new Promise<void>((resolve) => {
+        settle = resolve;
+      }),
+    );
+    try {
+      await this.replaceEngine(id, engine);
+    } finally {
+      this.restarts.delete(id);
+      settle();
+    }
+  }
+
+  /** The body of {@link restartEngine}. */
+  private async replaceEngine(id: string, engine: SyncEngine): Promise<void> {
     this.deps.logger?.info('server address or API key changed; restarting the engine', {
       bindingId: id,
     });
@@ -366,11 +401,7 @@ export class EngineManager {
     // one until the new engine reports its own.
     this.subs.get(id)?.();
     this.subs.delete(id);
-    try {
-      await engine.stop();
-    } finally {
-      this.restarting.delete(id);
-    }
+    await engine.stop();
     if (this.engines.get(id) !== engine) return;
     this.forget(id);
     const { servers, bindings } = this.deps.getSettings();

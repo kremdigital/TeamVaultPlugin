@@ -686,6 +686,38 @@ describe('EngineManager — server address or key changed', () => {
     return (id) => new SlowStopEngine(id);
   }
 
+  /**
+   * Engines that drop vault events from the moment they start stopping, as
+   * `SyncEngine` does, and whose `stop()` waits for the gate — as it waits
+   * for a local phase it has under way.
+   */
+  function stoppingDropsEvents(gate: Promise<void>): (bindingId: string) => FakeEngine {
+    class StoppingEngine extends FakeEngine {
+      private stopping = false;
+      override async stop(): Promise<void> {
+        this.stopping = true;
+        this.stopCalls++;
+        this.calls.push('stop');
+        await gate;
+        this.setStatus('stopped');
+      }
+      override async handleVaultEvent(event: VaultEvent): Promise<void> {
+        if (this.stopping) return;
+        await super.handleVaultEvent(event);
+      }
+    }
+    return (id) => new StoppingEngine(id);
+  }
+
+  const renamed: VaultEvent = {
+    type: 'rename',
+    bindingId: 'a',
+    oldPath: 'a.md',
+    newPath: 'a2.md',
+    source: 'obsidian',
+  };
+  const deleted: VaultEvent = { type: 'delete', bindingId: 'a', path: 'b.md', source: 'fs' };
+
   function gate(): { promise: Promise<void>; open: () => void } {
     let open!: () => void;
     const promise = new Promise<void>((resolve) => {
@@ -941,6 +973,95 @@ describe('EngineManager — server address or key changed', () => {
     expect(runs[1]?.engine.stopCalls).toBe(1);
   });
 
+  it('hands the vault events that come while an engine restarts to the new one, in order', async () => {
+    const stopping = gate();
+    const servers = [s1(), s2()];
+    const bindings = [makeBinding({ id: 'a' }), makeBinding({ id: 'c', serverId: 's2' })];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      bindings,
+      {},
+      stoppingDropsEvents(stopping.promise),
+    );
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    // A rename and a delete from outside Obsidian while the old engine still
+    // finishes a local phase: it would drop both, although the binding is on.
+    const dispatched = [m.dispatchVaultEvent(renamed), m.dispatchVaultEvent(deleted)];
+    // Another binding's events are not held up by it.
+    const other: VaultEvent = { type: 'modify', bindingId: 'c', path: 'c.md', source: 'fs' };
+    await m.dispatchVaultEvent(other);
+    expect(spawnedFor(spawned, 'c')[0]?.engine.events).toEqual([other]);
+
+    stopping.open();
+    await Promise.all([restarting, ...dispatched]);
+
+    const [old, fresh] = spawnedFor(spawned, 'a');
+    expect(fresh?.url).toBe('https://teamvault.example.com');
+    expect(old?.engine.events).toEqual([]);
+    expect(fresh?.engine.events).toEqual([renamed, deleted]);
+    // Once it is in place, events go straight to it.
+    await m.dispatchVaultEvent(renamed);
+    expect(fresh?.engine.events).toEqual([renamed, deleted, renamed]);
+    await m.stop();
+  });
+
+  it('while paused, hands them to the new engine too: it records them for the resume', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      [makeBinding({ id: 'a' })],
+      {},
+      stoppingDropsEvents(stopping.promise),
+    );
+    const m = new EngineManager(deps);
+    await m.start();
+    await m.pause();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    const dispatched = m.dispatchVaultEvent(deleted);
+    stopping.open();
+    await Promise.all([restarting, dispatched]);
+
+    const fresh = spawnedFor(spawned, 'a')[1];
+    expect(fresh?.engine.calls).toEqual(['pause', 'start']);
+    expect(fresh?.engine.events).toEqual([deleted]);
+    await m.stop();
+  });
+
+  it('drops the waiting events when the binding is switched off before the restart ends', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const bindings = [makeBinding({ id: 'a' })];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      bindings,
+      {},
+      stoppingDropsEvents(stopping.promise),
+    );
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    const dispatched = m.dispatchVaultEvent(deleted);
+    (bindings[0] as VaultBinding).enabled = false;
+    const switchedOff = m.refreshFromSettings();
+    stopping.open();
+    await Promise.all([restarting, switchedOff, dispatched]);
+
+    // Switched off, the binding syncs nothing: no engine took the event.
+    expect(spawnedFor(spawned, 'a')).toHaveLength(1);
+    expect(spawnedFor(spawned, 'a')[0]?.engine.events).toEqual([]);
+    expect(m.getEngine('a')).toBeUndefined();
+    await m.stop();
+  });
+
   it('spawns nothing when the plugin unloads while an engine restarts', async () => {
     const stopping = gate();
     const servers = [s1()];
@@ -948,7 +1069,7 @@ describe('EngineManager — server address or key changed', () => {
       servers,
       [makeBinding({ id: 'a' })],
       {},
-      slowStop(stopping.promise),
+      stoppingDropsEvents(stopping.promise),
     );
     deps.operationLog.enqueueOperation('a', { opType: 'UPDATE', filePath: 'note.md' });
     const m = new EngineManager(deps);
@@ -956,12 +1077,15 @@ describe('EngineManager — server address or key changed', () => {
 
     servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
     const restarting = m.refreshFromSettings();
+    const dispatched = m.dispatchVaultEvent(deleted);
     const stopped = m.stop();
     stopping.open();
-    await Promise.all([restarting, stopped]);
+    await Promise.all([restarting, stopped, dispatched]);
 
     expect(spawnedFor(spawned, 'a')).toHaveLength(1);
     expect(m.getEngine('a')).toBeUndefined();
     expect(deps.operationLog.pendingCount('a')).toBe(1);
+    // An event waiting for the new engine goes nowhere: the plugin is off.
+    expect(spawnedFor(spawned, 'a')[0]?.engine.events).toEqual([]);
   });
 });
