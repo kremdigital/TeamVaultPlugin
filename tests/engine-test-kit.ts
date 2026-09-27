@@ -431,6 +431,13 @@ function voidAll(e: Emit): void {
 /** Socket.IO stand-in: emits wait for the test to answer them. */
 export class FakeSocket implements SocketLike {
   connected = false;
+  /**
+   * In the project's room: from its `project:join` on, until the connection
+   * ends. The server joins a socket to the room when it takes the join, and
+   * broadcasts `file:*` and `yjs:update` to the room only — not to a socket
+   * that connected and is still asking `ops:status` (see {@link FakeServer}).
+   */
+  inRoom = false;
   /** `false` while there is no network: `connect()` fails until {@link goOnline}. */
   reachable = true;
   /** A connect was asked for while unreachable; {@link goOnline} completes it. */
@@ -474,6 +481,8 @@ export class FakeSocket implements SocketLike {
       this.statusQueries.push(query);
       this.statusResponder(query);
     } else if (event === 'project:join') {
+      // The server takes the socket into the room before it reads the catch-up.
+      this.inRoom = true;
       const join: Emit = { event, payload: args[0], ack, seq };
       const answer = withIdempotency(ack);
       join.ack = (response): void => {
@@ -493,6 +502,7 @@ export class FakeSocket implements SocketLike {
   kill(): void {
     this.killed = true;
     this.connected = false;
+    this.inRoom = false;
     this.reachable = false;
     this.wantsConnect = false;
     this.listeners.clear();
@@ -505,6 +515,8 @@ export class FakeSocket implements SocketLike {
       return this;
     }
     this.connected = true;
+    // A new connection is in no room until it joins one.
+    this.inRoom = false;
     this.fire('connect');
     return this;
   }
@@ -523,6 +535,7 @@ export class FakeSocket implements SocketLike {
   disconnect(): SocketLike {
     this.wantsConnect = false;
     this.connected = false;
+    this.inRoom = false;
     this.fire('disconnect', 'io client disconnect');
     return this;
   }
@@ -1072,6 +1085,15 @@ function fileIdOf(op: ServerOperation): string {
   return typeof id === 'string' ? id : '';
 }
 
+/**
+ * The harness's socket when the server's broadcasts to the project room reach
+ * it: connected, and joined to the project since (see {@link FakeSocket.inRoom}).
+ */
+function roomSocket(h: Harness): FakeSocket | null {
+  const socket = h.socketIfBuilt();
+  return socket?.connected && socket.inRoom ? socket : null;
+}
+
 /** The operations a client sends that the {@link FakeServer} answers. */
 const SERVED = new Set([
   'file:rename',
@@ -1337,7 +1359,8 @@ export class FakeServer {
       e.ack({ ok: false, error: 'invalid_payload' });
       return;
     }
-    const asked = opIds;
+    // An id asked twice counts once, as the server's `parseOpsStatus` has it.
+    const asked = [...new Set(opIds)];
     const found = asked
       .map((opId) => ({ opId, applied: this.byOpId.get(opId) }))
       .filter(
@@ -1435,7 +1458,10 @@ export class FakeServer {
           return;
         }
         if (file.deleted) {
-          // DELETE wins over UPDATE: logged, nothing changes.
+          // DELETE wins over UPDATE: logged, nothing changes. The server still
+          // broadcasts an attachment's update, with the hash it was sent
+          // (`files.ts` sends `file:updated-binary` for every non-text UPDATE);
+          // a note's sends nothing.
           const log = this.log(p.clientId, p.vectorClock);
           const outcome = { kind: 'no_op', reason: 'tombstone', fileId: file.id };
           this.record(
@@ -1446,6 +1472,14 @@ export class FakeServer {
             { fileId: file.id, fileType: file.fileType, suppressed: 'tombstone' },
             { clientId: p.clientId, opId, outcome },
           );
+          if (file.fileType === 'BINARY') {
+            this.broadcast(
+              'file:updated-binary',
+              { fileId: file.id, contentHash: p.contentHash ?? '', log },
+              p.clientId,
+              opId,
+            );
+          }
           e.ack({ ok: true, outcome, log });
           return;
         }
@@ -1473,12 +1507,16 @@ export class FakeServer {
           },
           { clientId: p.clientId, opId, outcome },
         );
-        this.broadcast(
-          'file:updated-binary',
-          { fileId: file.id, contentHash: file.contentHash, log },
-          p.clientId,
-          opId,
-        );
+        // A note's new text goes to the room as its doc (`yjs:update`), never
+        // as `file:updated-binary` (`sync-protocol.md`, «UPDATE текстового файла»).
+        if (file.fileType === 'BINARY') {
+          this.broadcast(
+            'file:updated-binary',
+            { fileId: file.id, contentHash: file.contentHash, log },
+            p.clientId,
+            opId,
+          );
+        }
         e.ack({ ok: true, outcome, log });
         return;
       }
@@ -1537,7 +1575,6 @@ export class FakeServer {
       if (taken) {
         // A row there is taken over when it is a tombstone or this very file.
         stored = this.conflictPath(requested, clientId, (f) => f.deleted || f.id === id);
-        this.dropTombstoneAt(stored);
         outcome = {
           kind: 'conflict_create_renamed',
           fileId: id,
@@ -1547,6 +1584,9 @@ export class FakeServer {
       } else {
         outcome = { kind: 'renamed', fileId: id, from: file.path, to: requested };
       }
+      // A tombstone where the file goes gives way to it, conflict name or not
+      // (the server's `applyMove`): no deleted row keeps the name.
+      this.dropTombstoneAt(stored);
       this.applied.push(`${id} ${file.path} -> ${stored}`);
       file.path = stored;
       this.publish();
@@ -1778,8 +1818,16 @@ export class FakeServer {
       p.opId,
     );
     if (added !== null) this.onCreate?.(added.id, p.data, added.revived);
+    else if (outcome.merged === true) this.onMerge?.(fileId);
     return { outcome, log };
   }
+
+  /**
+   * Called for the live file a CREATE got (`merged`), right after
+   * `file:created` is broadcast: the server sends a note's stored doc to the
+   * room then, as after any CREATE of a note. See {@link ServerDocs}.
+   */
+  onMerge?: (id: string) => void;
 
   /**
    * The server's `pickConflictPath`: the first `<path>.conflict-<clientId>[-n]`
@@ -1837,15 +1885,19 @@ export class FakeServer {
     });
   }
 
-  /** Send `event` to the room, saying who sent it and the operation's `opId`. */
+  /**
+   * Send `event` to the room, saying who sent it and the operation's `opId`.
+   * A socket that has not joined the project since it connected is not in the
+   * room and hears nothing (see {@link FakeSocket.inRoom}).
+   */
   private broadcast(
     event: string,
     payload: Record<string, unknown>,
     clientId: string,
     opId: string,
   ): void {
-    const socket = this.harness.socketIfBuilt();
-    if (!socket?.connected) return;
+    const socket = roomSocket(this.harness);
+    if (!socket) return;
     socket.fire(event, { ...payload, clientId, opId });
   }
 
@@ -1884,8 +1936,10 @@ export class FakeServer {
  * the new text goes on top of the stored history, as the server does — or,
  * with `replaceOnRevive`, a new history replaces it, as every server before
  * 0.3.8's did (and as a project seeded anew has new histories). Either way the
- * doc's full state follows `file:created` to the whole room as a `yjs:update`. What the client sends is applied by
- * {@link absorb}; `yjs:fetch` is answered by {@link answerFetches}.
+ * doc's full state follows `file:created` to the whole room as a `yjs:update`,
+ * and so does the untouched doc of the note a CREATE was merged into. What the
+ * client sends is applied by {@link absorb}; `yjs:fetch` is answered by
+ * {@link answerFetches}.
  */
 export class ServerDocs {
   readonly docs = new Map<string, Y.Doc>();
@@ -1897,6 +1951,7 @@ export class ServerDocs {
     private readonly opts: { replaceOnRevive?: boolean } = {},
   ) {
     server.onCreate = (id, data, revived) => this.created(id, data, revived);
+    server.onMerge = (id) => this.sendState(id);
   }
 
   /** Serve the engine built after this one instead (with {@link FakeServer.attach}). */
@@ -1937,8 +1992,8 @@ export class ServerDocs {
     if (ytext.toJSON() !== text) {
       doc.transact(() => serverTextEdit(ytext, text));
     }
-    const socket = this.harness.socketIfBuilt();
-    if (socket?.connected) {
+    const socket = roomSocket(this.harness);
+    if (socket) {
       socket.fire('yjs:update', {
         fileId: id,
         update: Array.from(Y.encodeStateAsUpdate(doc, seen)),
@@ -2035,9 +2090,14 @@ export class ServerDocs {
     } else {
       this.docs.set(id, serverDocWith(text));
     }
-    const socket = this.harness.socketIfBuilt();
+    this.sendState(id);
+  }
+
+  /** Note `id`'s whole stored doc to the room, as a `yjs:update` (`broadcastYjsState`). */
+  private sendState(id: string): void {
+    const socket = roomSocket(this.harness);
     const doc = this.docs.get(id);
-    if (socket?.connected && doc) {
+    if (socket && doc && this.server.files.get(id)?.fileType === 'TEXT') {
       socket.fire('yjs:update', { fileId: id, update: Array.from(Y.encodeStateAsUpdate(doc)) });
     }
   }

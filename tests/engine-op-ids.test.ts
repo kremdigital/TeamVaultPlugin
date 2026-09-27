@@ -32,9 +32,11 @@ import {
   logOn,
   nextJoin,
   op,
+  protocolFixture,
   restartFromDisk,
   serverDocWith,
   serverFile,
+  shapeOf,
   snapshotOf,
   userRename,
   type Emit,
@@ -1243,6 +1245,54 @@ describe('SyncEngine — an operation the server refuses', () => {
       1,
     );
     expect(b.server.applied).toEqual([]);
+    await b.h.engine.stop();
+  });
+});
+
+// -- The requests, as the server's contract has them ------------------------------------
+
+describe('SyncEngine — its requests have the keys of the contract’s examples', () => {
+  /** The payload of the first `event` the socket sent. */
+  function payloadOf(h: Harness, event: string): unknown {
+    const found = h.socket().emits.find((e) => e.event === event);
+    if (!found) throw new Error(`no ${event} sent`);
+    return found.payload;
+  }
+
+  it('sends file:* and ops:status as tests/fixtures/protocol-0.4/request-* spell them', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']]);
+    await userRename(b.h, 'a.md', 'b.md');
+    b.h.vault.files.set('img.png', encode('v2'));
+    const modified = b.h.engine.handleVaultEvent(event('modify', 'img.png'));
+    b.h.vault.files.set('new.md', encode('new\n'));
+    const created = b.h.engine.handleVaultEvent(event('create', 'new.md'));
+    await b.server.pump();
+    await Promise.all([modified, created]);
+    b.h.vault.files.delete('new.md');
+    const deleted = b.h.engine.handleVaultEvent(event('delete', 'new.md'));
+    await b.docs.drive();
+    await deleted;
+    // Offline, a rename waits in the queue: the next connect asks about it first.
+    b.h.socket().disconnect();
+    await userRename(b.h, 'b.md', 'c.md');
+    await reconnect(b);
+
+    // What the server's contract test sends as the plugin's requests: the same keys.
+    for (const [event, example] of [
+      ['file:create', 'request-file-create'], // a note: its bytes inline
+      ['file:update-binary', 'request-file-update-binary'], // an attachment: bytes staged
+      ['file:rename', 'request-file-rename'],
+      ['file:delete', 'request-file-delete'],
+    ] as const) {
+      expect([event, shapeOf(payloadOf(b.h, event))]).toEqual([
+        event,
+        shapeOf(protocolFixture(example)),
+      ]);
+    }
+    const asked = b.h.socket().statusQueries[0]?.payload;
+    expect(shapeOf(asked)).toEqual(shapeOf(protocolFixture('ops-status-request')));
+    expect(b.server.pathOf('f1')).toBe('c.md');
+    appliedOnce(b.server);
     await b.h.engine.stop();
   });
 });

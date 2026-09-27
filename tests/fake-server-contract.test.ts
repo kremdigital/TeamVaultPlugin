@@ -11,16 +11,26 @@ import { newOpId } from '@/sync/operation-log';
 import {
   FakeServer,
   FakeSocket,
+  ServerDocs,
   protocolFixture,
   shapeOf,
   type Emit,
   type Harness,
 } from './engine-test-kit';
 
-/** A server with a room of one connected socket, no engine. */
-function room(): { server: FakeServer; socket: FakeSocket; heard: Array<[string, unknown]> } {
+/**
+ * A server with a room of one connected socket, no engine. `joined: false`:
+ * the socket connected and has not joined the project yet.
+ */
+function room(opts: { joined?: boolean } = {}): {
+  server: FakeServer;
+  socket: FakeSocket;
+  heard: Array<[string, unknown]>;
+  harness: Harness;
+} {
   const socket = new FakeSocket();
   socket.connected = true;
+  socket.inRoom = opts.joined ?? true;
   const heard: Array<[string, unknown]> = [];
   for (const event of [
     'file:created',
@@ -28,6 +38,7 @@ function room(): { server: FakeServer; socket: FakeSocket; heard: Array<[string,
     'file:deleted',
     'file:renamed',
     'file:moved',
+    'yjs:update',
   ]) {
     socket.on(event, (data: unknown) => heard.push([event, data]));
   }
@@ -40,7 +51,7 @@ function room(): { server: FakeServer; socket: FakeSocket; heard: Array<[string,
   } as unknown as Harness;
   const server = new FakeServer(stub);
   socket.statusResponder = (e): void => server.answerStatus(e);
-  return { server, socket, heard };
+  return { server, socket, heard, harness: stub };
 }
 
 /** Send `event` from device-1 and let the server answer it; resolves with the ack. */
@@ -354,5 +365,115 @@ describe('FakeServer — the shapes of the contract’s examples', () => {
       shapeOf((example.operations as unknown[])[0]),
     );
     expect(socket.emits).toEqual([]);
+  });
+});
+
+/**
+ * Where the {@link FakeServer} used to part from `Project/server` (the
+ * integration check of TASK-0035): the room, a rename onto a deleted file's
+ * name, an update of a deleted attachment, a create merged into a note, and
+ * an `ops:status` asking about an id twice.
+ */
+describe('FakeServer — as the server does', () => {
+  it('broadcasts only to a socket that joined the project since it connected', () => {
+    const { server, socket, heard } = room({ joined: false });
+    // Connected, still asking ops:status: the server has not taken it into the room.
+    send(server, socket, 'file:create', { opId: newOpId(), filePath: 'a.md', ...TEXT });
+    expect(heard).toEqual([]);
+
+    socket.emit('project:join', { projectId: 'p1' }, () => undefined);
+    expect(socket.inRoom).toBe(true);
+    send(server, socket, 'file:create', { opId: newOpId(), filePath: 'b.md', ...TEXT });
+    expect(heard.map(([event]) => event)).toEqual(['file:created']);
+
+    // A new connection is out of the room until it joins again.
+    socket.disconnect();
+    socket.connect();
+    send(server, socket, 'file:create', { opId: newOpId(), filePath: 'c.md', ...TEXT });
+    expect(heard).toHaveLength(1);
+  });
+
+  it('drops the tombstone where a rename goes, conflict name or not', () => {
+    const { server, socket, harness } = room();
+    server.add({ id: 'f1', path: 'x.md', fileType: 'TEXT', contentHash: 'h1', size: 1 });
+    server.add({ id: 'f2', path: 'y.md', fileType: 'TEXT', contentHash: 'h2', size: 1 });
+    send(server, socket, 'file:delete', { opId: newOpId(), fileId: 'f2', filePath: 'y.md' });
+    expect(harness.deletedFiles.map((f) => f.path)).toEqual(['y.md']);
+
+    send(server, socket, 'file:rename', {
+      opId: newOpId(),
+      fileId: 'f1',
+      filePath: 'x.md',
+      newPath: 'y.md',
+    });
+    expect(server.pathOf('f1')).toBe('y.md');
+    expect(server.files.has('f2')).toBe(false);
+    expect(harness.deletedFiles).toEqual([]);
+    // A create there later is a conflict copy of f1's name, not f2 revived.
+    const again = send(server, socket, 'file:create', {
+      opId: newOpId(),
+      filePath: 'y.md',
+      ...TEXT,
+    });
+    expect((again as { outcome: unknown }).outcome).toMatchObject({
+      kind: 'conflict_create_renamed',
+      finalPath: 'y.conflict-device-1.md',
+    });
+  });
+
+  it('broadcasts an update of a deleted attachment, and never a note’s as an attachment’s', () => {
+    const { server, socket, heard } = room();
+    server.add({ id: 'f3', path: 'img.png', fileType: 'BINARY', contentHash: 'h0', size: 1 });
+    server.add({ id: 'f4', path: 'n.md', fileType: 'TEXT', contentHash: 'h1', size: 1 });
+    send(server, socket, 'file:delete', { opId: newOpId(), fileId: 'f3', filePath: 'img.png' });
+    const opId = newOpId();
+    const onTombstone = send(server, socket, 'file:update-binary', {
+      opId,
+      fileId: 'f3',
+      contentHash: 'c'.repeat(64),
+      size: 3,
+    });
+    expect(onTombstone).toMatchObject({ outcome: { kind: 'no_op', reason: 'tombstone' } });
+    const [event, payload] = heard.at(-1) ?? [];
+    expect(event).toBe('file:updated-binary');
+    expect(payload).toMatchObject({ fileId: 'f3', contentHash: 'c'.repeat(64), opId });
+    expect(shapeOf(payload)).toEqual(shapeOf(protocolFixture('event-file-updated-binary')));
+
+    const before = heard.length;
+    const note = send(server, socket, 'file:update-binary', {
+      opId: newOpId(),
+      fileId: 'f4',
+      contentHash: 'd'.repeat(64),
+      size: 3,
+    });
+    expect(note).toMatchObject({ outcome: { kind: 'updated', fileId: 'f4' } });
+    expect(heard).toHaveLength(before);
+  });
+
+  it('sends the doc of the note a create was merged into to the room', async () => {
+    const { server, socket, heard, harness } = room();
+    const docs = new ServerDocs(server, harness);
+    const text = 'daily\n';
+    await docs.add('f7', 'daily.md', text);
+    const bytes = new TextEncoder().encode(text);
+    const merged = send(server, socket, 'file:create', {
+      opId: newOpId(),
+      filePath: 'daily.md',
+      fileType: 'TEXT',
+      contentHash: server.files.get('f7')?.contentHash,
+      size: bytes.byteLength,
+      data: Array.from(bytes),
+    });
+    expect(merged).toMatchObject({ outcome: { fileId: 'f7', merged: true } });
+    expect(heard.map(([event]) => event)).toEqual(['file:created', 'yjs:update']);
+    expect(heard[1]?.[1]).toMatchObject({ fileId: 'f7' });
+    // The stored doc is untouched: the merge wrote nothing into it.
+    expect(docs.text('f7')).toBe(text);
+  });
+
+  it('counts an id asked twice in ops:status once', () => {
+    const { socket } = room();
+    const lost = newOpId();
+    expect(status(socket, [lost, lost])).toEqual({ ok: true, applied: [], voided: [lost] });
   });
 });
