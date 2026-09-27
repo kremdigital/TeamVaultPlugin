@@ -1,4 +1,5 @@
 import type { LogStorage } from '@/utils/file-log-sink';
+import { uuid } from '@/utils/id';
 import type { VectorClock } from './vector-clock';
 
 /**
@@ -17,6 +18,21 @@ import type { VectorClock } from './vector-clock';
  *      we track: server file id, content hash, size, type. Lets us decide
  *      whether an incoming UPDATE actually changes anything and what to do
  *      at conflict time.
+ *
+ *   4. **operations in flight** — live operations sent (or about to be sent)
+ *      and not answered yet, each written here before it goes out (see
+ *      {@link OperationLog.recordInFlight}). A restart finds them back in the
+ *      queue, under the same `opId`, and asks the server what became of them.
+ *
+ * ## Operation ids
+ *
+ * Every operation carries an `opId` (UUID v4), given once when the operation
+ * is recorded and kept across every resend until the server declares it
+ * voided (see `sync-protocol.md`, «Идемпотентность операций»). The server
+ * applies an `opId` at most once and answers a resend with the original
+ * outcome, so an operation whose answer was lost can be sent again safely,
+ * and the next connect asks the server (`ops:status`) which of the
+ * unanswered ones it applied.
  *
  * ## Why this isn't SQLite any more
  *
@@ -49,17 +65,36 @@ export interface PendingOperationInput {
   newPath?: string | null;
   /** Arbitrary structured data for the operation (e.g. contentHash, size). */
   payload?: Record<string, unknown>;
+  /** The operation's key (UUID v4); a new one is given when absent. */
+  opId?: string;
+  /**
+   * The operation answers a question to the user (**Restore on server**, a
+   * file moved back): it is never replayed. A late answer closes it; voided,
+   * it goes, and the question comes again.
+   */
+  settleOnly?: true;
 }
 
 export interface PendingOperation {
   id: number;
   bindingId: string;
+  /**
+   * Idempotency key, UUID v4 in lower case: given once, sent with every try
+   * of the operation, changed only when the server declared it voided (see
+   * {@link OperationLog.rotateOpId}).
+   */
+  opId: string;
   opType: OperationType;
   filePath: string;
   newPath: string | null;
   payload: Record<string, unknown>;
   createdAt: number;
+  /** See {@link PendingOperationInput.settleOnly}. */
+  settleOnly?: true;
 }
+
+/** An operation as recorded in flight (see {@link OperationLog.recordInFlight}). */
+export type InFlightInput = PendingOperationInput & { opId: string };
 
 export interface FileMeta {
   bindingId: string;
@@ -112,6 +147,37 @@ export const APPLIED_LIVE_MAX = 1000;
  */
 export const DELETE_ASKED_MAX = 1000;
 
+/**
+ * Payload fields of 0.3.x queue entries that said an operation had gone out
+ * and might have been applied without its answer. Operation ids replace them;
+ * a log written before 0.4.0 has them stripped when it loads (see `hydrate`).
+ */
+const LEGACY_SENT_FIELDS = ['sentCounter', 'sentCounters', 'sentHashes', 'sentAt'] as const;
+
+/** Whether `value` is an operation id: a UUID v4, in lower case. */
+export function isOpId(value: unknown): value is string {
+  return (
+    typeof value === 'string' &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value)
+  );
+}
+
+/** A new operation id. */
+export function newOpId(): string {
+  return uuid().toLowerCase();
+}
+
+/**
+ * {@link OperationLog.persistNow} could not put the log on disk: the write
+ * failed, or a newer instance of the plugin has taken the file over.
+ */
+export class StateNotWrittenError extends Error {
+  constructor(reason: 'write_failed' | 'taken_over') {
+    super(`state_not_written: ${reason}`);
+    this.name = 'StateNotWrittenError';
+  }
+}
+
 /** Per-collection row counts removed by {@link OperationLog.purgeBinding}. */
 export interface PurgeResult {
   pendingOperations: number;
@@ -152,11 +218,19 @@ export interface OperationLogOptions {
    * overwriting the newer file with an older snapshot. Default: always.
    */
   ownsFile?: () => boolean;
+  /** Something the log noticed while loading that is worth a line in `sync.log`. */
+  onWarn?: (message: string, detail: Record<string, unknown>) => void;
 }
 
 /** Everything the log knows about one binding. */
 interface BindingBucket {
   pending: PendingOperation[];
+  /**
+   * Live operations recorded before they went out and not answered yet (see
+   * {@link OperationLog.recordInFlight}). Not in {@link pending}: the drain
+   * does not replay them, the emit waiting for their answer settles them.
+   */
+  inflight: PendingOperation[];
   files: Map<string, FileMeta>;
   state: BindingState | null;
   /** Ids of operations applied live (see {@link OperationLog.noteAppliedLive}); oldest first. */
@@ -172,6 +246,7 @@ export class OperationLog {
   private readonly flushDelayMs: number;
   private readonly onError: (err: unknown) => void;
   private readonly ownsFile: () => boolean;
+  private readonly onWarn: (message: string, detail: Record<string, unknown>) => void;
 
   private readonly bindings = new Map<string, BindingBucket>();
   /** Mirrors SQLite AUTOINCREMENT: ids keep climbing across deletes. */
@@ -179,8 +254,13 @@ export class OperationLog {
 
   private dirty = false;
   private timer: number | null = null;
-  /** Serializes writes so two flushes can't interleave on the same file. */
-  private chain: Promise<void> = Promise.resolve();
+  /**
+   * Serializes writes so two flushes can't interleave on the same file. Never
+   * rejects: resolves with whether the last write put the document on disk.
+   */
+  private chain: Promise<boolean> = Promise.resolve(true);
+  /** Writes under way — see {@link hasUnwrittenChanges}. */
+  private writing = 0;
   private closed = false;
 
   constructor(options: OperationLogOptions = {}) {
@@ -190,6 +270,7 @@ export class OperationLog {
     this.flushDelayMs = options.flushDelayMs ?? DEFAULT_FLUSH_DELAY_MS;
     this.onError = options.onError ?? ((): void => undefined);
     this.ownsFile = options.ownsFile ?? ((): boolean => true);
+    this.onWarn = options.onWarn ?? ((): void => undefined);
   }
 
   /** True when this instance has somewhere to persist to. */
@@ -257,58 +338,170 @@ export class OperationLog {
 
   // -- pending operations -----------------------------------------------------
 
+  /** Queue an operation; it gets a new `opId` unless `op` carries one. */
   enqueueOperation(bindingId: string, op: PendingOperationInput): PendingOperation {
-    const entry: PendingOperation = {
-      id: this.nextOpId++,
-      bindingId,
-      opType: op.opType,
-      filePath: op.filePath,
-      newPath: op.newPath ?? null,
-      payload: op.payload ?? {},
-      createdAt: this.now(),
-    };
+    const entry = this.entryOf(bindingId, op);
     this.bucket(bindingId).pending.push(entry);
     // The queue is the one part of the log that can't be reconstructed from
     // the server, so it doesn't wait out the debounce.
     this.touch({ immediate: true });
-    return { ...entry, payload: { ...entry.payload } };
+    return copyOf(entry);
+  }
+
+  /**
+   * Record a live operation about to go out, before it does: from here until
+   * its answer the log holds it in flight, and a restart finds it back in the
+   * queue under the same `opId`. Written at once — the caller awaits
+   * {@link persistNow} before the emit. Its `id` comes from the queue's
+   * sequence, so it keeps its place among queued operations when it goes back
+   * there (see {@link requeueInFlight}).
+   */
+  recordInFlight(bindingId: string, op: InFlightInput): PendingOperation {
+    const entry = this.entryOf(bindingId, op);
+    this.bucket(bindingId).inflight.push(entry);
+    this.touch({ immediate: true });
+    return copyOf(entry);
+  }
+
+  /**
+   * The answer of an operation in flight came, and what it settled is
+   * recorded: the entry goes. The write waits out the debounce, and takes the
+   * entry's result — recorded in the same synchronous block — along with it.
+   */
+  clearInFlight(bindingId: string, opId: string): boolean {
+    const bucket = this.bindings.get(bindingId);
+    const at = bucket?.inflight.findIndex((op) => op.opId === opId) ?? -1;
+    if (!bucket || at < 0) return false;
+    bucket.inflight.splice(at, 1);
+    this.touch();
+    return true;
+  }
+
+  /**
+   * An operation in flight goes back to the queue, where its `id` puts it:
+   * its answer will not come in this session (the connection dropped, the
+   * server asked for a retry). `rotate`: the server voided its `opId`, so it
+   * gets a new one. `null` when no such operation is in flight.
+   */
+  requeueInFlight(
+    bindingId: string,
+    opId: string,
+    opts: { rotate?: boolean } = {},
+  ): PendingOperation | null {
+    const bucket = this.bindings.get(bindingId);
+    const at = bucket?.inflight.findIndex((op) => op.opId === opId) ?? -1;
+    if (!bucket || at < 0) return null;
+    const [entry] = bucket.inflight.splice(at, 1);
+    if (!entry) return null;
+    if (opts.rotate === true) entry.opId = newOpId();
+    insertById(bucket.pending, entry);
+    this.touch({ immediate: true });
+    return copyOf(entry);
+  }
+
+  /** The operations of a binding in flight, oldest first. */
+  inFlightOperations(bindingId: string): PendingOperation[] {
+    return (this.bindings.get(bindingId)?.inflight ?? []).map(copyOf);
+  }
+
+  /** Whether operation `opId` is in flight for a binding. */
+  isInFlight(bindingId: string, opId: string): boolean {
+    return this.bindings.get(bindingId)?.inflight.some((op) => op.opId === opId) ?? false;
+  }
+
+  /** The queued or in-flight operation of a binding with this `opId`, if any. */
+  findByOpId(bindingId: string, opId: string): PendingOperation | null {
+    const bucket = this.bindings.get(bindingId);
+    const found =
+      bucket?.pending.find((op) => op.opId === opId) ??
+      bucket?.inflight.find((op) => op.opId === opId);
+    return found ? copyOf(found) : null;
+  }
+
+  /**
+   * Give queued operation `entryId` a new `opId`: the server voided the old
+   * one, which it will never apply now. Returns the new one; `''` when no such
+   * operation is queued.
+   */
+  rotateOpId(bindingId: string, entryId: number): string {
+    const entry = this.bindings.get(bindingId)?.pending.find((op) => op.id === entryId);
+    if (!entry) return '';
+    entry.opId = newOpId();
+    this.touch({ immediate: true });
+    return entry.opId;
+  }
+
+  /**
+   * Put another operation in the place of queued operation `entryId`: same
+   * `id` and place in the queue, a new `opId`. `null` when no such operation
+   * is queued.
+   */
+  replaceOperation(
+    bindingId: string,
+    entryId: number,
+    op: PendingOperationInput,
+  ): PendingOperation | null {
+    const bucket = this.bindings.get(bindingId);
+    const at = bucket?.pending.findIndex((queued) => queued.id === entryId) ?? -1;
+    const old = at < 0 ? undefined : bucket?.pending[at];
+    if (!bucket || !old) return null;
+    const entry: PendingOperation = {
+      id: old.id,
+      bindingId,
+      opId: op.opId ?? newOpId(),
+      opType: op.opType,
+      filePath: op.filePath,
+      newPath: op.newPath ?? null,
+      payload: { ...(op.payload ?? {}) },
+      createdAt: this.now(),
+      ...(op.settleOnly === true ? { settleOnly: true as const } : {}),
+    };
+    bucket.pending[at] = entry;
+    this.touch({ immediate: true });
+    return copyOf(entry);
   }
 
   /**
    * Return all pending operations for a binding in insertion order. Does not
    * delete them — call `markSent(ids)` once the server has acknowledged the
-   * batch.
+   * batch. Operations in flight are not among them.
    */
   dequeueOperations(bindingId: string): PendingOperation[] {
     const bucket = this.bindings.get(bindingId);
     if (!bucket) return [];
-    return bucket.pending.map((op) => ({ ...op, payload: { ...op.payload } }));
+    return bucket.pending.map(copyOf);
   }
 
-  /** Whether operation `opId` is still queued for a binding. */
-  isPending(bindingId: string, opId: number): boolean {
-    return this.bindings.get(bindingId)?.pending.some((op) => op.id === opId) ?? false;
+  /** Whether queue entry `entryId` is still queued for a binding. */
+  isPending(bindingId: string, entryId: number): boolean {
+    return this.bindings.get(bindingId)?.pending.some((op) => op.id === entryId) ?? false;
   }
 
-  /** Number of pending operations for one binding, or across all of them. */
+  /**
+   * Number of operations not settled yet — queued or in flight — for one
+   * binding, or across all of them.
+   */
   pendingCount(bindingId?: string): number {
     if (bindingId === undefined) {
       let total = 0;
-      for (const bucket of this.bindings.values()) total += bucket.pending.length;
+      for (const bucket of this.bindings.values()) {
+        total += bucket.pending.length + bucket.inflight.length;
+      }
       return total;
     }
-    return this.bindings.get(bindingId)?.pending.length ?? 0;
+    const bucket = this.bindings.get(bindingId);
+    return bucket ? bucket.pending.length + bucket.inflight.length : 0;
   }
 
   /**
    * Point a queued RENAME or MOVE at another destination, keeping its place in
-   * the queue: a chain of renames of one file is sent as one (see
-   * `SyncEngine.collapseQueuedRenames`). `false` when no such operation is
-   * queued.
+   * the queue and its `opId`: a chain of renames of one file is sent as one
+   * (see `SyncEngine.collapseQueuedRenames`). `false` when no such operation
+   * is queued.
    */
-  retargetOperation(opId: number, newPath: string): boolean {
+  retargetOperation(entryId: number, newPath: string): boolean {
     for (const bucket of this.bindings.values()) {
-      const op = bucket.pending.find((p) => p.id === opId);
+      const op = bucket.pending.find((p) => p.id === entryId);
       if (!op) continue;
       if (op.opType !== 'RENAME' && op.opType !== 'MOVE') return false;
       op.newPath = newPath;
@@ -319,16 +512,16 @@ export class OperationLog {
   }
 
   /**
-   * Change a queued operation in place, keeping its place in the queue: its
-   * path, or its payload (replaced whole). `false` when no such operation is
-   * queued.
+   * Change a queued operation in place, keeping its place in the queue and its
+   * `opId`: its path, or its payload (replaced whole). `false` when no such
+   * operation is queued.
    */
   amendOperation(
-    opId: number,
+    entryId: number,
     amend: { filePath?: string; payload?: Record<string, unknown> },
   ): boolean {
     for (const bucket of this.bindings.values()) {
-      const op = bucket.pending.find((p) => p.id === opId);
+      const op = bucket.pending.find((p) => p.id === entryId);
       if (!op) continue;
       if (amend.filePath !== undefined) op.filePath = amend.filePath;
       if (amend.payload !== undefined) op.payload = { ...amend.payload };
@@ -338,9 +531,10 @@ export class OperationLog {
     return false;
   }
 
-  markSent(opIds: readonly number[]): void {
-    if (opIds.length === 0) return;
-    const drop = new Set(opIds);
+  /** Take queue entries `entryIds` out of the queue: sent, or dropped. */
+  markSent(entryIds: readonly number[]): void {
+    if (entryIds.length === 0) return;
+    const drop = new Set(entryIds);
     let removed = false;
     for (const bucket of this.bindings.values()) {
       const before = bucket.pending.length;
@@ -351,17 +545,18 @@ export class OperationLog {
   }
 
   /**
-   * Distinct file paths that still have a queued operation — both the
-   * source `filePath` and any RENAME/MOVE `newPath`. The initial-push
-   * pass consults this so it never re-uploads a file whose CREATE/RENAME
-   * is still waiting in the queue (e.g. after a drain halted on a
-   * transient failure); the queued op is the source of truth there.
+   * Distinct file paths that still have a queued or in-flight operation —
+   * both the source `filePath` and any RENAME/MOVE `newPath`. The
+   * initial-push pass consults this so it never re-uploads a file whose
+   * CREATE/RENAME is still waiting in the queue (e.g. after a drain halted on
+   * a transient failure) or waiting for its answer; the operation is the
+   * source of truth there.
    */
   pendingPaths(bindingId: string): Set<string> {
     const out = new Set<string>();
     const bucket = this.bindings.get(bindingId);
     if (!bucket) return out;
-    for (const op of bucket.pending) {
+    for (const op of [...bucket.pending, ...bucket.inflight]) {
       out.add(op.filePath);
       if (op.newPath) out.add(op.newPath);
     }
@@ -509,7 +704,7 @@ export class OperationLog {
     const bucket = this.bindings.get(bindingId);
     if (!bucket) return { pendingOperations: 0, fileMeta: 0, bindingsState: 0 };
     const result: PurgeResult = {
-      pendingOperations: bucket.pending.length,
+      pendingOperations: bucket.pending.length + bucket.inflight.length,
       fileMeta: bucket.files.size,
       bindingsState: bucket.state ? 1 : 0,
     };
@@ -527,7 +722,14 @@ export class OperationLog {
   listBindingIds(): string[] {
     const out: string[] = [];
     for (const [id, bucket] of this.bindings) {
-      if (bucket.pending.length > 0 || bucket.files.size > 0 || bucket.state) out.push(id);
+      if (
+        bucket.pending.length > 0 ||
+        bucket.inflight.length > 0 ||
+        bucket.files.size > 0 ||
+        bucket.state
+      ) {
+        out.push(id);
+      }
     }
     return out;
   }
@@ -547,6 +749,34 @@ export class OperationLog {
     // while the last change is still on its way to disk.
     if (this.dirty) this.chain = this.chain.then(() => this.writeOnce());
     await this.chain;
+  }
+
+  /**
+   * Put every change made so far on disk and wait for it: the write-ahead step
+   * before an operation goes out (see {@link recordInFlight}). Rejects with
+   * {@link StateNotWrittenError} when the write failed, or when a newer
+   * instance of the plugin has taken the file over — the operation must not
+   * go out then. A log without storage resolves at once.
+   */
+  async persistNow(): Promise<void> {
+    if (!this.persistent) return;
+    if (!this.ownsFile()) throw new StateNotWrittenError('taken_over');
+    if (this.timer !== null) {
+      window.clearTimeout(this.timer);
+      this.timer = null;
+    }
+    if (this.dirty) this.chain = this.chain.then(() => this.writeOnce());
+    const written = await this.chain;
+    if (!this.ownsFile()) throw new StateNotWrittenError('taken_over');
+    if (!written) throw new StateNotWrittenError('write_failed');
+  }
+
+  /**
+   * Whether a change has not reached the disk yet: waiting out the debounce,
+   * or on its way. Obsidian's quit waits for such a change (see `main.ts`).
+   */
+  hasUnwrittenChanges(): boolean {
+    return this.persistent && (this.dirty || this.timer !== null || this.writing > 0);
   }
 
   /** Mark the document dirty and schedule (or force) a write. */
@@ -576,16 +806,32 @@ export class OperationLog {
    * won't replace an existing file, say) we fall back to writing in place,
    * which is still better than dropping the change.
    */
-  private async writeOnce(): Promise<void> {
-    if (!this.persistent || !this.dirty) return;
+  private async writeOnce(): Promise<boolean> {
+    if (!this.persistent || !this.dirty) return true;
     if (!this.ownsFile()) {
       // A newer instance of the plugin has the file now (see `ownsFile`).
       this.dirty = false;
-      return;
+      return false;
     }
+    this.writing += 1;
+    try {
+      return await this.writeDocument();
+    } finally {
+      this.writing -= 1;
+    }
+  }
+
+  /** {@link writeOnce} past its checks: `true` once the document is on disk. */
+  private async writeDocument(): Promise<boolean> {
     const storage = this.storage!;
     const path = this.filePath!;
-    const payload = JSON.stringify(this.serialize());
+    let payload: string;
+    try {
+      payload = JSON.stringify(this.serialize());
+    } catch (err) {
+      this.onError(err);
+      return false;
+    }
     // Clear BEFORE the await: mutations that land while the write is in
     // flight must set the flag again and trigger their own write, rather
     // than being swallowed by this one.
@@ -604,7 +850,7 @@ export class OperationLog {
         this.onError(fallbackErr);
         // Keep the change queued for the next attempt.
         this.dirty = true;
-        return;
+        return false;
       }
       // A temp file left behind would outlive the file it was meant to
       // replace: `load` reads it when `state.json` is gone.
@@ -614,15 +860,38 @@ export class OperationLog {
         this.onError(cleanupErr);
       }
     }
+    return true;
   }
 
   private bucket(bindingId: string): BindingBucket {
     let bucket = this.bindings.get(bindingId);
     if (!bucket) {
-      bucket = { pending: [], files: new Map(), state: null, appliedLive: [], deleteAsked: [] };
+      bucket = {
+        pending: [],
+        inflight: [],
+        files: new Map(),
+        state: null,
+        appliedLive: [],
+        deleteAsked: [],
+      };
       this.bindings.set(bindingId, bucket);
     }
     return bucket;
+  }
+
+  /** A new entry for `op`, next in the queue's sequence. */
+  private entryOf(bindingId: string, op: PendingOperationInput): PendingOperation {
+    return {
+      id: this.nextOpId++,
+      bindingId,
+      opId: op.opId ?? newOpId(),
+      opType: op.opType,
+      filePath: op.filePath,
+      newPath: op.newPath ?? null,
+      payload: { ...(op.payload ?? {}) },
+      createdAt: this.now(),
+      ...(op.settleOnly === true ? { settleOnly: true as const } : {}),
+    };
   }
 
   private serialize(): unknown {
@@ -630,6 +899,7 @@ export class OperationLog {
     for (const [id, bucket] of this.bindings) {
       bindings[id] = {
         pending: bucket.pending,
+        ...(bucket.inflight.length > 0 ? { inflight: bucket.inflight } : {}),
         files: [...bucket.files.values()].map((meta) => ({
           relativePath: meta.relativePath,
           serverFileId: meta.serverFileId,
@@ -661,19 +931,33 @@ export class OperationLog {
     if (!isRecord(bindings)) return;
 
     let maxId = 0;
+    /** Queue entries of a 0.3.x build that had gone out, answered or not. */
+    let legacySent = 0;
+    const opIds = new Set<string>();
     for (const [bindingId, rawBucket] of Object.entries(bindings)) {
       if (!isRecord(rawBucket)) continue;
       const bucket = this.bucket(bindingId);
 
-      if (Array.isArray(rawBucket.pending)) {
-        for (const rawOp of rawBucket.pending) {
-          const op = toPendingOperation(bindingId, rawOp);
-          if (!op) continue;
-          bucket.pending.push(op);
-          if (op.id > maxId) maxId = op.id;
-        }
-        bucket.pending.sort((a, b) => a.id - b.id);
+      // What was in flight when the document was written goes back to the
+      // queue, in its place: its answer never comes to this instance, and the
+      // next connect asks the server what became of it.
+      const rawOps: unknown[] = [
+        ...(Array.isArray(rawBucket.pending) ? (rawBucket.pending as unknown[]) : []),
+        ...(Array.isArray(rawBucket.inflight) ? (rawBucket.inflight as unknown[]) : []),
+      ];
+      for (const rawOp of rawOps) {
+        const op = toPendingOperation(bindingId, rawOp);
+        if (!op) continue;
+        // A queue written before operation ids, or an id seen twice: a new
+        // one. The server has never seen it, so the operation is sent again
+        // as the 0.3.x build would have sent it.
+        if (!isOpId(op.opId) || opIds.has(op.opId)) op.opId = newOpId();
+        opIds.add(op.opId);
+        if (stripLegacySentFields(op.payload)) legacySent += 1;
+        bucket.pending.push(op);
+        if (op.id > maxId) maxId = op.id;
       }
+      bucket.pending.sort((a, b) => a.id - b.id);
 
       if (Array.isArray(rawBucket.files)) {
         for (const rawMeta of rawBucket.files) {
@@ -714,6 +998,11 @@ export class OperationLog {
     }
 
     this.nextOpId = Math.max(toNumber(doc.nextOpId, 1), maxId + 1);
+    if (legacySent > 0) {
+      // Their answers were lost to a 0.3.x build: the server may have applied
+      // them, and they go out once more under new ids (the risk 0.3.x had).
+      this.onWarn(`legacy in-flight entries: ${legacySent}`, { entries: legacySent });
+    }
   }
 }
 
@@ -729,6 +1018,29 @@ function toNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+/** A copy of `op` the caller may change without touching the log. */
+function copyOf(op: PendingOperation): PendingOperation {
+  return { ...op, payload: { ...op.payload } };
+}
+
+/** Put `entry` into `queue`, kept in `id` order, after entries with a smaller `id`. */
+function insertById(queue: PendingOperation[], entry: PendingOperation): void {
+  const at = queue.findIndex((op) => op.id > entry.id);
+  if (at < 0) queue.push(entry);
+  else queue.splice(at, 0, entry);
+}
+
+/** Remove the fields of {@link LEGACY_SENT_FIELDS} from `payload`; whether there were any. */
+function stripLegacySentFields(payload: Record<string, unknown>): boolean {
+  let found = false;
+  for (const field of LEGACY_SENT_FIELDS) {
+    if (!(field in payload)) continue;
+    delete payload[field];
+    found = true;
+  }
+  return found;
+}
+
 function toPendingOperation(bindingId: string, raw: unknown): PendingOperation | null {
   if (!isRecord(raw)) return null;
   const { id, opType, filePath } = raw;
@@ -738,11 +1050,14 @@ function toPendingOperation(bindingId: string, raw: unknown): PendingOperation |
   return {
     id,
     bindingId,
+    // Checked by `hydrate`, which gives a new one to an entry without one.
+    opId: typeof raw.opId === 'string' ? raw.opId : '',
     opType: opType as OperationType,
     filePath,
     newPath: typeof raw.newPath === 'string' ? raw.newPath : null,
-    payload: isRecord(raw.payload) ? raw.payload : {},
+    payload: isRecord(raw.payload) ? { ...raw.payload } : {},
     createdAt: toNumber(raw.createdAt, 0),
+    ...(raw.settleOnly === true ? { settleOnly: true as const } : {}),
   };
 }
 

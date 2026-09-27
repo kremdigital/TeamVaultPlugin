@@ -1,7 +1,11 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   APPLIED_LIVE_MAX,
   DELETE_ASKED_MAX,
   OperationLog,
+  StateNotWrittenError,
+  isOpId,
   type FileMeta,
 } from '@/sync/operation-log';
 import type { LogStorage } from '@/utils/file-log-sink';
@@ -352,6 +356,7 @@ describe('OperationLog — persistence', () => {
       {
         id: op.id,
         bindingId: 'b1',
+        opId: op.opId,
         opType: 'RENAME',
         filePath: 'old.md',
         newPath: 'new.md',
@@ -786,5 +791,328 @@ describe('OperationLog — copies asked about after a server delete', () => {
     expect([...reopened.deleteAskedIds('b1')]).toEqual(['f7']);
     reopened.purgeBinding('b1');
     expect([...reopened.deleteAskedIds('b1')]).toEqual([]);
+  });
+});
+
+describe('OperationLog — operation ids', () => {
+  it('gives each queued operation an opId, and keeps one it is given', () => {
+    const log = makeLog();
+    const a = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    const b = log.enqueueOperation('b1', {
+      opType: 'DELETE',
+      filePath: 'b.md',
+      opId: '0f8d7c6b-5a4e-4d3c-8b2a-1f0e9d8c7b6a',
+    });
+    expect(isOpId(a.opId)).toBe(true);
+    expect(b.opId).toBe('0f8d7c6b-5a4e-4d3c-8b2a-1f0e9d8c7b6a');
+    expect(log.dequeueOperations('b1').map((op) => op.opId)).toEqual([a.opId, b.opId]);
+  });
+
+  it('keeps the opId when a queued operation is retargeted or amended', () => {
+    const log = makeLog();
+    const op = log.enqueueOperation('b1', {
+      opType: 'RENAME',
+      filePath: 'a.md',
+      newPath: 'b.md',
+      payload: { fileId: 'f1' },
+    });
+    log.retargetOperation(op.id, 'c.md');
+    log.amendOperation(op.id, { filePath: 'z.md', payload: { fileId: 'f1', x: 1 } });
+    expect(log.dequeueOperations('b1')).toEqual([
+      expect.objectContaining({ id: op.id, opId: op.opId, filePath: 'z.md', newPath: 'c.md' }),
+    ]);
+  });
+
+  it('keeps operations in flight out of the queue the drain reads', () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'queued.md' });
+    const out = log.recordInFlight('b1', {
+      opType: 'RENAME',
+      filePath: 'a.md',
+      newPath: 'b.md',
+      payload: { fileId: 'f1' },
+      opId: 'c1a2b3c4-d5e6-4f70-8192-a3b4c5d6e7f8',
+    });
+    expect(log.dequeueOperations('b1').map((op) => op.filePath)).toEqual(['queued.md']);
+    expect(log.inFlightOperations('b1').map((op) => op.opId)).toEqual([out.opId]);
+    expect(log.isInFlight('b1', out.opId)).toBe(true);
+    expect(log.findByOpId('b1', out.opId)).toEqual(out);
+    // Still unsettled: counted, and its paths are not uploaded as new files.
+    expect(log.pendingCount('b1')).toBe(2);
+    expect([...log.pendingPaths('b1')].sort()).toEqual(['a.md', 'b.md', 'queued.md']);
+    expect(log.listBindingIds()).toEqual(['b1']);
+  });
+
+  it('clears an operation in flight once answered', () => {
+    const log = makeLog();
+    const out = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'a.md', opId: opIdOf(1) });
+    expect(log.clearInFlight('b1', out.opId)).toBe(true);
+    expect(log.clearInFlight('b1', out.opId)).toBe(false);
+    expect(log.inFlightOperations('b1')).toEqual([]);
+    expect(log.pendingCount('b1')).toBe(0);
+  });
+
+  it('puts an operation in flight back in the queue at its place, rotated when voided', () => {
+    const log = makeLog();
+    const first = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'first.md' });
+    const out = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'a.md', opId: opIdOf(1) });
+    const later = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'later.md' });
+    const back = log.requeueInFlight('b1', out.opId);
+    expect(back?.opId).toBe(out.opId);
+    expect(log.dequeueOperations('b1').map((op) => op.id)).toEqual([first.id, out.id, later.id]);
+
+    const again = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'x.md', opId: opIdOf(2) });
+    const rotated = log.requeueInFlight('b1', again.opId, { rotate: true });
+    expect(rotated?.id).toBe(again.id);
+    expect(isOpId(rotated?.opId)).toBe(true);
+    expect(rotated?.opId).not.toBe(again.opId);
+    expect(log.requeueInFlight('b1', again.opId)).toBeNull();
+  });
+
+  it('rotates an opId and replaces an operation in its place', () => {
+    const log = makeLog();
+    const a = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    const b = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'b.md' });
+    const c = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'c.md' });
+    const rotated = log.rotateOpId('b1', b.id);
+    expect(isOpId(rotated)).toBe(true);
+    expect(rotated).not.toBe(b.opId);
+    expect(log.rotateOpId('b1', 999)).toBe('');
+
+    const replaced = log.replaceOperation('b1', b.id, {
+      opType: 'RENAME',
+      filePath: 'x.md',
+      newPath: 'b.md',
+      payload: { fileId: 'f2' },
+    });
+    expect(replaced?.id).toBe(b.id);
+    expect(replaced?.opId).not.toBe(rotated);
+    expect(log.dequeueOperations('b1').map((op) => `${op.id} ${op.opType} ${op.filePath}`)).toEqual(
+      [`${a.id} CREATE a.md`, `${b.id} RENAME x.md`, `${c.id} CREATE c.md`],
+    );
+    expect(log.replaceOperation('b1', 999, { opType: 'DELETE', filePath: 'q.md' })).toBeNull();
+  });
+
+  it('keeps the settle-only mark of an answer to a question', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    const out = log.recordInFlight('b1', {
+      opType: 'CREATE',
+      filePath: 'asked.md',
+      opId: opIdOf(3),
+      settleOnly: true,
+    });
+    await log.close();
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.dequeueOperations('b1')).toEqual([
+      expect.objectContaining({ opId: out.opId, settleOnly: true }),
+    ]);
+  });
+});
+
+/** A fixed operation id: `n` in its last group. */
+function opIdOf(n: number): string {
+  return `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`;
+}
+
+interface StoredDoc {
+  bindings: { b1: { inflight?: Array<{ opId: string }>; files: unknown[] } };
+}
+
+describe('OperationLog — operations in flight on disk', () => {
+  it('writes an operation in flight at once, before its emit', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    const out = log.recordInFlight('b1', {
+      opType: 'RENAME',
+      filePath: 'a.md',
+      newPath: 'b.md',
+      payload: { fileId: 'f1' },
+      opId: opIdOf(1),
+    });
+    await log.persistNow();
+    const doc = JSON.parse(files.get(PATH) ?? '{}') as StoredDoc;
+    expect((doc.bindings.b1.inflight ?? []).map((op) => op.opId)).toEqual([out.opId]);
+    await log.close();
+  });
+
+  it('loads operations in flight back into the queue, in id order', async () => {
+    const { storage } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    const a = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    const out = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'b.md', opId: opIdOf(2) });
+    const c = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'c.md' });
+    await log.close();
+
+    const reopened = new OperationLog({ storage, filePath: PATH, now });
+    await reopened.load();
+    expect(reopened.inFlightOperations('b1')).toEqual([]);
+    expect(reopened.dequeueOperations('b1').map((op) => [op.id, op.opId])).toEqual([
+      [a.id, a.opId],
+      [out.id, out.opId],
+      [c.id, c.opId],
+    ]);
+    // New operations keep climbing past both.
+    expect(reopened.enqueueOperation('b1', { opType: 'CREATE', filePath: 'd.md' }).id).toBe(
+      c.id + 1,
+    );
+  });
+
+  it('takes a 0.3.9 queue: gives ids, strips what said an entry went out, warns once', async () => {
+    const raw = readFileSync(join(__dirname, 'fixtures', 'state-0.3.9.json'), 'utf8');
+    const { storage } = makeStorage({ [PATH]: raw });
+    const warnings: Array<[string, Record<string, unknown>]> = [];
+    const onWarn = (message: string, detail: Record<string, unknown>): void => {
+      warnings.push([message, detail]);
+    };
+    const log = new OperationLog({ storage, filePath: PATH, now, onWarn });
+    await log.load();
+
+    const queued = log.dequeueOperations('b1');
+    expect(queued.map((op) => op.id)).toEqual([9, 10, 11, 12]);
+    for (const op of queued) expect(isOpId(op.opId)).toBe(true);
+    expect(new Set(queued.map((op) => op.opId)).size).toBe(4);
+    expect(queued.map((op) => op.payload)).toEqual([
+      { fileId: 'f1', lastSynced: ['h-old'] },
+      { fileType: 'TEXT', contentHash: 'h-untitled', size: 0 },
+      { fileId: 'f3' },
+      { fileId: 'f7', contentHash: 'h-photo-2', size: 2048 },
+    ]);
+    expect(warnings).toEqual([['legacy in-flight entries: 3', { entries: 3 }]]);
+    expect(log.getFileMeta('b1', 'a.md')?.serverFileId).toBe('f3');
+    expect(log.getBindingState('b1')?.lastVectorClock).toEqual({ 'device-1': 7, 'device-2': 4 });
+
+    // The ids given are kept: written once, loaded as they are.
+    log.setFileMeta(makeMeta({ relativePath: 'touch.md' }));
+    await log.close();
+    const again = new OperationLog({ storage, filePath: PATH, now, onWarn });
+    await again.load();
+    expect(again.dequeueOperations('b1').map((op) => op.opId)).toEqual(queued.map((op) => op.opId));
+    expect(warnings).toHaveLength(1);
+    expect(again.schemaVersion()).toBe(1);
+  });
+
+  it('gives a new id to an entry whose id is malformed or seen twice', async () => {
+    const doc = {
+      version: 1,
+      nextOpId: 4,
+      bindings: {
+        b1: {
+          pending: [
+            { id: 1, opType: 'DELETE', filePath: 'a.md', payload: {}, opId: 'NOT-A-UUID' },
+            { id: 2, opType: 'DELETE', filePath: 'b.md', payload: {}, opId: opIdOf(7) },
+          ],
+          inflight: [{ id: 3, opType: 'DELETE', filePath: 'c.md', payload: {}, opId: opIdOf(7) }],
+        },
+      },
+    };
+    const { storage } = makeStorage({ [PATH]: JSON.stringify(doc) });
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    await log.load();
+    const ids = log.dequeueOperations('b1').map((op) => op.opId);
+    expect(ids[1]).toBe(opIdOf(7));
+    expect(ids.every((id) => isOpId(id))).toBe(true);
+    expect(new Set(ids).size).toBe(3);
+  });
+});
+
+describe('OperationLog — persistNow and unwritten changes', () => {
+  it('resolves at once for a log without storage', async () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    await expect(log.persistNow()).resolves.toBeUndefined();
+    expect(log.hasUnwrittenChanges()).toBe(false);
+  });
+
+  it('writes what waits out the debounce, and reports nothing unwritten after', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    log.setFileMeta(makeMeta());
+    expect(log.hasUnwrittenChanges()).toBe(true);
+    expect(files.has(PATH)).toBe(false);
+    await log.persistNow();
+    expect(files.has(PATH)).toBe(true);
+    expect(log.hasUnwrittenChanges()).toBe(false);
+    await log.close();
+  });
+
+  it('counts a write under way as unwritten', async () => {
+    const { storage } = makeStorage();
+    let release!: () => void;
+    const held = new Promise<void>((r) => {
+      release = r;
+    });
+    const write = storage.write.bind(storage);
+    storage.write = async (p, data): Promise<void> => {
+      await held;
+      return write(p, data);
+    };
+    const log = new OperationLog({ storage, filePath: PATH, now });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(log.hasUnwrittenChanges()).toBe(true);
+    release();
+    await log.flush();
+    expect(log.hasUnwrittenChanges()).toBe(false);
+  });
+
+  it('rejects when the write fails, and the operation must not go out', async () => {
+    const { storage } = makeStorage();
+    storage.write = (): Promise<void> => Promise.reject(new Error('disk full'));
+    const errors: unknown[] = [];
+    const log = new OperationLog({
+      storage,
+      filePath: PATH,
+      now,
+      onError: (err) => errors.push(err),
+    });
+    log.recordInFlight('b1', { opType: 'DELETE', filePath: 'a.md', opId: opIdOf(1) });
+    await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+    expect(errors.length).toBeGreaterThan(0);
+    expect(log.hasUnwrittenChanges()).toBe(true);
+  });
+
+  it('rejects once a newer instance has taken the file over', async () => {
+    const { storage, files } = makeStorage();
+    let owns = true;
+    const log = new OperationLog({ storage, filePath: PATH, now, ownsFile: () => owns });
+    owns = false;
+    log.recordInFlight('b1', { opType: 'DELETE', filePath: 'a.md', opId: opIdOf(1) });
+    await expect(log.persistNow()).rejects.toThrow('taken_over');
+    expect(files.has(PATH)).toBe(false);
+  });
+
+  it('rejects when the file is taken over while the write is on its way', async () => {
+    const { storage } = makeStorage();
+    let owns = true;
+    const exists = storage.exists.bind(storage);
+    storage.exists = (p): Promise<boolean> => {
+      owns = false;
+      return exists(p);
+    };
+    const log = new OperationLog({ storage, filePath: PATH, now, ownsFile: () => owns });
+    log.setFileMeta(makeMeta());
+    await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+  });
+
+  it('writes an answered operation’s removal with the debounce, together with its result', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    const out = log.recordInFlight('b1', { opType: 'CREATE', filePath: 'n.md', opId: opIdOf(4) });
+    await log.persistNow();
+    // The answer: its result and the removal in one synchronous block.
+    log.setFileMeta(makeMeta({ relativePath: 'n.md', serverFileId: 'f9' }));
+    log.clearInFlight('b1', out.opId);
+    const before = JSON.parse(files.get(PATH) ?? '{}') as StoredDoc;
+    // Still the snapshot from before the answer: the entry, not the result.
+    expect(before.bindings.b1.inflight).toHaveLength(1);
+    expect(before.bindings.b1.files).toEqual([]);
+    expect(log.hasUnwrittenChanges()).toBe(true);
+    await log.persistNow();
+    const after = JSON.parse(files.get(PATH) ?? '{}') as StoredDoc;
+    expect(after.bindings.b1.inflight).toBeUndefined();
+    expect(after.bindings.b1.files).toHaveLength(1);
+    await log.close();
   });
 });

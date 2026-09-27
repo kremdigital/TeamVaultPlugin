@@ -169,7 +169,7 @@ type IndexedMeta = FileMeta & { fileId: string };
  * as it learns more (a binary edit's hash, say). The replay reads the disk
  * again anyway, so an entry handed over early is still correct.
  */
-type HeldChange = Required<PendingOperationInput>;
+type HeldChange = Required<Omit<PendingOperationInput, 'opId' | 'settleOnly'>>;
 
 /**
  * Where a local change comes from. A `queue` replay is held by the offline

@@ -1,0 +1,67 @@
+{
+  "version": 1,
+  "nextOpId": 13,
+  "bindings": {
+    "b1": {
+      "pending": [
+        {
+          "id": 12,
+          "bindingId": "b1",
+          "opType": "UPDATE",
+          "filePath": "img/photo.png",
+          "newPath": null,
+          "payload": { "fileId": "f7", "contentHash": "h-photo-2", "size": 2048, "sentCounter": 9 },
+          "createdAt": 1727000000300
+        },
+        {
+          "id": 10,
+          "bindingId": "b1",
+          "opType": "CREATE",
+          "filePath": "Renamed.md",
+          "newPath": null,
+          "payload": {
+            "fileType": "TEXT",
+            "contentHash": "h-untitled",
+            "size": 0,
+            "sentHashes": ["h-untitled"],
+            "sentAt": "Untitled.md"
+          },
+          "createdAt": 1727000000100
+        },
+        {
+          "id": 11,
+          "bindingId": "b1",
+          "opType": "RENAME",
+          "filePath": "a.md",
+          "newPath": "c.md",
+          "payload": { "fileId": "f3", "sentCounter": 7, "sentCounters": [5] },
+          "createdAt": 1727000000200
+        },
+        {
+          "id": 9,
+          "bindingId": "b1",
+          "opType": "DELETE",
+          "filePath": "old.md",
+          "newPath": null,
+          "payload": { "fileId": "f1", "lastSynced": ["h-old"] },
+          "createdAt": 1727000000000
+        }
+      ],
+      "files": [
+        {
+          "relativePath": "a.md",
+          "serverFileId": "f3",
+          "contentHash": "h-a",
+          "size": 3,
+          "fileType": "TEXT",
+          "lastSyncedAt": 1727000000000,
+          "foldedHash": "h-a"
+        }
+      ],
+      "state": {
+        "lastVectorClock": { "device-1": 7, "device-2": 4 },
+        "lastSyncedAt": 1727000000000
+      }
+    }
+  }
+}
