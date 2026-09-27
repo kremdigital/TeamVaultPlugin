@@ -31,6 +31,7 @@ import {
   json,
   markOf,
   expectQuietSince,
+  joinToAnswer,
   server as serverConfig,
   userRename,
   type Harness,
@@ -86,9 +87,7 @@ async function seeded(
 
 /** The pending `project:join` answered with the server's whole-journal catch-up; the server works. */
 async function answerJoin(h: Harness, server: FakeServer, docs: ServerDocs): Promise<void> {
-  h.socket()
-    .pending('project:join')
-    .ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
+  (await joinToAnswer(h)).ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
   await docs.drive();
 }
 
@@ -393,9 +392,7 @@ describe('Pause sync — the work of the connection it closes', () => {
     expect(queue(h)).toEqual(['RENAME a.md -> a2.md', 'DELETE b.md']);
 
     await h.engine.resume();
-    h.socket()
-      .pending('project:join')
-      .ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
+    (await joinToAnswer(h)).ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
     await flushAsync(30);
     // The drain sent the rename; its answer has not come.
     expect(h.socket().pending('file:rename')).toBeDefined();
@@ -484,9 +481,7 @@ describe('Pause sync — the work of the connection it closes', () => {
     h.routes.set(`GET /api/projects/p1/files/${theirs}`, () => bytes(encode('theirs')));
     // Resumed: their file waits for the name, and the drain sends the rename.
     await h.engine.resume();
-    h.socket()
-      .pending('project:join')
-      .ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
+    (await joinToAnswer(h)).ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
     await flushAsync(30);
     expect(h.socket().pending('file:rename')).toBeDefined();
 
@@ -536,9 +531,7 @@ describe('Pause sync — the work of the connection it closes', () => {
     expect(queue(h)).toEqual(['DELETE P.md']);
 
     await h.engine.resume();
-    h.socket()
-      .pending('project:join')
-      .ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
+    (await joinToAnswer(h)).ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
     await flushAsync(30);
     expect(h.socket().fetches.map((f) => f.fileId)).toEqual(['f1']);
 
@@ -561,12 +554,10 @@ describe('Pause sync — the work of the connection it closes', () => {
 
 describe('Pause sync — an operation the server applied before the pause cut its answer off', () => {
   /** The pending `project:join` answered for the clock it carried, as the server answers. */
-  function answerAsSent(h: Harness, server: FakeServer, docs: ServerDocs): void {
-    h.socket()
-      .pending('project:join')
-      .ack(
-        server.joinAnswer('whole journal', { yjsDocs: docs.snapshots(), clock: joinClockOf(h) }),
-      );
+  async function answerAsSent(h: Harness, server: FakeServer, docs: ServerDocs): Promise<void> {
+    (await joinToAnswer(h)).ack(
+      server.joinAnswer('whole journal', { yjsDocs: docs.snapshots(), clock: joinClockOf(h) }),
+    );
   }
 
   it('does not send a rename again, and a teammate’s rename of the note since stays', async () => {
@@ -577,7 +568,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     await userRename(h, 'x.md', 'y.md');
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await flushAsync(40);
     expect(h.socket().pending('file:rename')).toBeDefined();
 
@@ -592,7 +583,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     // Sent again, the rename moved the note back to `y.md` for the whole team.
     expect(server.applied).toEqual(['f1 x.md -> y.md', 'f1 y.md -> z.md']);
@@ -611,7 +602,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       versions.get(server.files.get('f2')?.contentHash ?? '');
     h.routes.set('GET /api/projects/p1/files/f2', () => bytes(encode(onServer() ?? '?')));
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
 
     // Saved online; paused while the update's answer is on its way, and the
@@ -634,7 +625,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     // Taken for a teammate's, the version uploaded from here brought up a
     // conflict prompt between the user's own two versions.
@@ -649,7 +640,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('does not send again a rename made online whose answer the pause cut off', async () => {
     const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
 
     await h.vault.rename('x.md', 'y.md');
@@ -666,7 +657,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     expect(server.applied).toEqual(['f1 x.md -> y.md', 'f1 y.md -> z.md']);
     expect(disk(h)).toEqual(['z.md=X\n']);
@@ -677,7 +668,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('sends a rename made while paused after the one whose answer the pause cut off', async () => {
     const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
 
     await h.vault.rename('x.md', 'y.md');
@@ -695,7 +686,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     // Taken for the rename to `y.md` the server has, it was dropped, and the
     // note went back to `y.md` here too.
@@ -716,7 +707,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('does not send again a rename made online whose answer the plugin’s stop cut off', async () => {
     const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
 
     const renamed = h.vault.rename('x.md', 'y.md');
@@ -735,7 +726,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     const next = restarted(h, server, docs);
     await next.engine.start();
-    answerAsSent(next, server, docs);
+    await answerAsSent(next, server, docs);
     await docs.drive();
     expect(server.applied).toEqual(['f1 x.md -> y.md', 'f1 y.md -> z.md']);
     expect(disk(next)).toEqual(['z.md=X\n']);
@@ -765,7 +756,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (how) => {
       const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       await userRename(h, 'x.md', 'b.md');
       await docs.drive();
@@ -782,7 +773,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       await userRename(h, 'y.md', 'b.md');
       expect(queue(h)).toEqual(['RENAME y.md -> b.md']);
       await back(h, how);
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       // The catch-up returns the answered rename to `b.md`, the device's last
       // operation. Taken for this one gone out already, the rename back was
@@ -840,7 +831,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (how) => {
       const { h, server, docs, onServer, downloads } = await attachment();
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       h.vault.files.set('p.png', encode('v2'));
       const saved = h.engine.handleVaultEvent(vaultEvent('modify', 'p.png'));
@@ -862,7 +853,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       expect(queue(h)).toEqual(['UPDATE p.png']);
       h.modal.binary.resolve('keep-server');
       await back(h, how);
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       // The catch-up returns the answered v2, the device's last operation.
       // Taken for the version synced here, it made the teammate's v3 new
@@ -881,7 +872,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('takes a teammate’s version after its own that the pause cut the answer of, asking nothing', async () => {
     const { h, server, docs, onServer, downloads } = await attachment();
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     // Saved while paused; the drain sends it on resume, and the pause cuts its
     // answer off. The server has it.
@@ -891,7 +882,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     await h.settle();
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     for (let i = 0; i < 100; i++) {
       if (h.socket().emits.some((e) => e.event === 'file:update-binary')) break;
       await flushAsync(1);
@@ -907,7 +898,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     h.modal.binary.resolve('keep-local');
     await h.engine.resume();
     await flushAsync(20);
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     // v2 went out from here: the teammate's v3 is the newer version, with no
     // edit here since. Taken for the version before v2, the copy here was an
@@ -934,7 +925,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (when, answer, name) => {
       const { h, server, docs, onServer, downloads, route } = await attachment(name);
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       // What `state.json` holds when the user saves: v1, and the clock of its
       // last write.
@@ -969,7 +960,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       route(next);
       next.modal.binary.resolve(answer);
       await next.engine.start();
-      answerAsSent(next, server, docs);
+      await answerAsSent(next, server, docs);
       await docs.drive();
       // With no record of the upload, v2 was taken for a teammate's, and the
       // copy here, v2, for an edit of v1: a "Content conflict" prompt against
@@ -988,7 +979,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (how) => {
       const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       // Renamed on before the first rename's answer came.
       const first = h.vault.rename('x.md', 'y.md');
@@ -1014,7 +1005,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       } else {
         await back(h, how);
       }
-      answerAsSent(cur, server, docs);
+      await answerAsSent(cur, server, docs);
       await docs.drive();
       // Folded into one, `x.md -> z.md`, the two kept the first one's mark
       // alone. The catch-up returns the second, and the rename went out
@@ -1031,7 +1022,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('takes its own attachment version for synced after a stop cut the answer off', async () => {
     const { h, server, docs, onServer } = await attachment();
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
 
     h.vault.files.set('p.png', encode('v2'));
@@ -1054,7 +1045,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     next.routes.set('GET /api/projects/p1/files/f2', () => bytes(encode(onServer() ?? '?')));
     next.modal.binary.resolve('keep-server');
     await next.engine.start();
-    answerAsSent(next, server, docs);
+    await answerAsSent(next, server, docs);
     await docs.drive();
     expect(next.calls).not.toContain('modal.resolveBinaryConflict');
     expect(onServer()).toBe('v3');
@@ -1068,7 +1059,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (how) => {
       const { h, server, docs, onServer, downloads } = await attachment();
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       h.vault.files.set('p.png', encode('v2'));
       const saved = h.engine.handleVaultEvent(vaultEvent('modify', 'p.png'));
@@ -1085,7 +1076,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
       h.modal.binary.resolve('keep-local');
       await back(h, how);
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       // The version synced here, v1, is the one the teammate's update brings.
       // Taken for that update applied here live, the upload was not known for
@@ -1106,7 +1097,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (how) => {
       const { h, server, docs, onServer, route } = await attachment();
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       h.vault.files.set('p.png', encode('v2'));
       const saved = h.engine.handleVaultEvent(vaultEvent('modify', 'p.png'));
@@ -1134,7 +1125,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
         await away(h, how);
         await back(h, how);
       }
-      answerAsSent(cur, server, docs);
+      await answerAsSent(cur, server, docs);
       await docs.drive();
       // The teammate saves a new version of their picture.
       cur.modal.binary.resolve('keep-local');
@@ -1176,7 +1167,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     async (_chain, names, applied) => {
       const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
       await h.engine.start();
-      answerAsSent(h, server, docs);
+      await answerAsSent(h, server, docs);
       await docs.drive();
       const renames = await renameAlong(h, names);
       // The plugin turned off with all of them on their way; the server
@@ -1189,7 +1180,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
       const next = restarted(h, server, docs);
       await next.engine.start();
-      answerAsSent(next, server, docs);
+      await answerAsSent(next, server, docs);
       await docs.drive();
       // The catch-up returns each rename the server applied. One in the middle
       // gives the name the chain ends at: taken for the chain landed, the
@@ -1207,7 +1198,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
   it('sends a rename made while paused back to a name in the middle of renames the server applied, after a restart', async () => {
     const { h, server, docs } = await seeded([['x.md', 'f1', 'X\n']]);
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     const renames = await renameAlong(h, ['y.md', 'z.md', 'w.md']);
     // Paused with all three on their way; the server has them.
@@ -1223,7 +1214,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     const next = restarted(h, server, docs);
     await next.engine.start();
-    answerAsSent(next, server, docs);
+    await answerAsSent(next, server, docs);
     await docs.drive();
     expect(server.applied).toEqual([
       'f1 x.md -> y.md',
@@ -1246,7 +1237,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
       ['c.md', 'f2', 'C\n'],
     ]);
     await h.engine.start();
-    answerAsSent(h, server, docs);
+    await answerAsSent(h, server, docs);
     await docs.drive();
     const renames = [h.vault.rename('x.md', 'b.md')];
     await emitted(h, 'file:rename', 1);
@@ -1263,7 +1254,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
 
     const next = restarted(h, server, docs);
     await next.engine.start();
-    answerAsSent(next, server, docs);
+    await answerAsSent(next, server, docs);
     await docs.drive();
     // Each queued rename is known by the last of its own the server applied,
     // not the note's: sent again, the first moved the note back to `b.md`.
@@ -1298,9 +1289,10 @@ describe('Pause sync — a file saved under the name of a teammate’s file not 
     await flushAsync(20);
     // The listing is in; the streamed catch-up has not come when the user
     // pauses again.
-    h.socket()
-      .pending('project:join')
-      .ack({ ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }), yjsStream: true });
+    (await joinToAnswer(h)).ack({
+      ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }),
+      yjsStream: true,
+    });
     await flushAsync(40);
     expect(h.engine.getStatus()).toBe('syncing');
     expect(h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
@@ -1433,9 +1425,10 @@ describe('Pause sync — a file saved under the name of a teammate’s file not 
     const theirs = await server.teammateCreate('Untitled.md', 'theirs\n');
     await h.engine.resume();
     await flushAsync(20);
-    h.socket()
-      .pending('project:join')
-      .ack({ ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }), yjsStream: true });
+    (await joinToAnswer(h)).ack({
+      ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }),
+      yjsStream: true,
+    });
     await flushAsync(40);
     expect(h.log.getFileMeta('b1', 'Untitled.md')?.notOnDisk).toBe(true);
     // Obsidian closed before the note came; a note saved under its name
@@ -1472,9 +1465,10 @@ describe('Pause sync — a file saved under the name of a teammate’s file not 
     const theirs = await server.teammateCreate('Untitled.md', 'theirs\n');
     await h.engine.resume();
     await flushAsync(20);
-    h.socket()
-      .pending('project:join')
-      .ack({ ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }), yjsStream: true });
+    (await joinToAnswer(h)).ack({
+      ...server.joinAnswer('whole journal', { clock: joinClockOf(h) }),
+      yjsStream: true,
+    });
     await flushAsync(40);
     await h.engine.stop();
     // The teammate deletes their note; a note of the user's is saved under

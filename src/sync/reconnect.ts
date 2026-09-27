@@ -78,6 +78,10 @@ export async function flushPendingQueue(
 
   for (const op of pending) {
     signal?.throwIfAborted();
+    // An answer to a question (see `PendingOperationInput.settleOnly`) is
+    // never replayed: it waits for the next connect to learn whether the
+    // server applied it.
+    if (op.settleOnly === true) continue;
     const outcome = await safeEmit(op, emit);
     signal?.throwIfAborted();
     if (outcome.ok) {

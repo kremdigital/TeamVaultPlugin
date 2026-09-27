@@ -15,6 +15,11 @@
  * back: without an edit, the rename was lost; with one, the team got the note
  * twice, `Untitled.md` and `Meeting.md`. Also when the catch-up brought the
  * DELETE along, the note being this device's own.
+ *
+ * Now the connect asks the server about the create (`ops:status`) before the
+ * catch-up: it records the note, sends the rename from the name the create
+ * went out under, and its clock moves past the create, which the catch-up no
+ * longer returns.
  */
 import {
   FakeServer,
@@ -24,6 +29,7 @@ import {
   encode,
   flushAsync,
   joinClockOf,
+  joinToAnswer,
   type CatchupForm,
   type Harness,
 } from './engine-test-kit';
@@ -47,13 +53,13 @@ async function reconnect(
   rows?: number,
 ): Promise<Record<string, unknown>> {
   h.socket().connect();
-  await flushAsync();
+  const join = await joinToAnswer(h);
   const answer = server.joinAnswer(form, {
     clock: joinClockOf(h),
     yjsDocs: docs.snapshots(),
     ...(rows !== undefined ? { rows } : {}),
   });
-  h.socket().pending('project:join').ack(answer);
+  join.ack(answer);
   await docs.drive();
   await h.settle();
   await docs.drive();
@@ -149,9 +155,13 @@ describe.each(cases)(
           seen === 'cut short' ? 'cut short' : 'whole journal',
           seen === 'cut short' ? 1 : undefined,
         );
-        const ops = (answer['operations'] as Array<{ opType: string }>).map((op) => op.opType);
-        expect(ops).toEqual(seen === 'live' ? ['DELETE', 'CREATE'] : ['CREATE']);
-        if (seen === 'cut short') expect(answer['operationsTruncated']).toBe(true);
+        // The connect learned from `ops:status` that its create landed, and
+        // its clock moved past it: the catch-up does not return it.
+        expect(server.statusAnswers.at(-1)?.applied).toHaveLength(1);
+        const own = (answer['operations'] as Array<{ clientId: string | null }>).filter(
+          (op) => op.clientId === 'device-1',
+        );
+        expect(own).toEqual([]);
 
         const others = seen === 'cut short' ? ['Other.md=other\n'] : [];
         expect(server.applied).toContain('f1 Untitled.md -> Meeting.md');

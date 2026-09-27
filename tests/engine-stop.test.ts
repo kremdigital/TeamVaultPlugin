@@ -211,6 +211,17 @@ class FakeSocket implements SocketLike {
     const ack = args[args.length - 1] as (response: unknown) => void;
     if (event === 'yjs:fetch') {
       this.fetches.push({ fileId: (args[0] as { fileId: string }).fileId, answer: ack });
+    } else if (event === 'ops:status') {
+      // A server that never got what was asked about: every id voided.
+      const { opIds } = args[0] as { opIds: string[] };
+      ack({ ok: true, applied: [], voided: opIds });
+    } else if (event === 'project:join') {
+      // The server this client needs says so (see `sync-protocol.md` §4.5).
+      this.emits.push({
+        event,
+        payload: args[0],
+        ack: (r) => ack(r !== null && typeof r === 'object' ? { opIdempotency: 1, ...r } : r),
+      });
     } else {
       this.emits.push({ event, payload: args[0], ack });
     }
@@ -429,12 +440,13 @@ async function flushAsync(times = 20): Promise<void> {
   }
 }
 
-/** Start and answer `project:join`. */
+/** Start and answer `project:join` — sent once the queue is asked about (`ops:status`). */
 async function connect(
   h: Harness,
   join: { operations?: ServerOperation[]; yjsDocs?: YjsDocSnapshot[] } = {},
 ): Promise<void> {
   await h.engine.start();
+  await flushAsync(2);
   h.socket()
     .pending('project:join')
     .ack({ ok: true, operations: join.operations ?? [], yjsDocs: join.yjsDocs ?? [] });

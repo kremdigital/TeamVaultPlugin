@@ -67,6 +67,8 @@ class FakeSocket implements SocketLike {
   static fresh: FakeSocket[] = [];
   connected = false;
   emits: Array<{ event: string; args: unknown[] }> = [];
+  /** `ops:status` questions (the ids asked about), answered as they come. */
+  statusQueries: string[][] = [];
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   constructor() {
@@ -84,6 +86,14 @@ class FakeSocket implements SocketLike {
     return this;
   }
   emit(event: string, ...args: unknown[]): SocketLike {
+    if (event === 'ops:status') {
+      // A server that never got what was asked about: every id voided.
+      const { opIds } = args[0] as { opIds: string[] };
+      const ack = args[args.length - 1] as (r: unknown) => void;
+      this.statusQueries.push(opIds);
+      ack({ ok: true, applied: [], voided: opIds });
+      return this;
+    }
     this.emits.push({ event, args });
     return this;
   }
@@ -104,7 +114,10 @@ class FakeSocket implements SocketLike {
   ackOk(extra: Record<string, unknown> = {}): void {
     const last = this.emits[this.emits.length - 1];
     const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
-    if (ack) ack({ ok: true, ...extra });
+    // The server this client needs says so in its join ack (see
+    // `sync-protocol.md` §4.5).
+    const idempotent = last?.event === 'project:join' ? { opIdempotency: 1 } : {};
+    if (ack) ack({ ok: true, ...idempotent, ...extra });
   }
 }
 

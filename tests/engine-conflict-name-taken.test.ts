@@ -22,6 +22,7 @@ import {
   connect,
   encode,
   flushAsync,
+  joinToAnswer,
   type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
@@ -55,10 +56,7 @@ async function reconnect(
   format: BroadcastFormat,
 ): Promise<void> {
   h.socket().connect();
-  await flushAsync();
-  h.socket()
-    .pending('project:join')
-    .ack(answer(server, docs, format));
+  (await joinToAnswer(h)).ack(answer(server, docs, format));
   await docs.drive();
   await h.settle();
   await docs.drive();
@@ -163,22 +161,16 @@ describe.each(['current', 'legacy'] as BroadcastFormat[])(
         }
         await reconnect(h, server, docs, format);
 
-        // An edit made since goes under a free name of its own.
-        const all = edited
-          ? [
-              'N.conflict-device-1-2.md=my N\nmore\n',
-              'N.conflict-device-1.md=my N\n',
-              'N.md=their N\n',
-            ]
-          : ['N.conflict-device-1.md=my N\n', 'N.md=their N\n'];
+        // The connect learns from `ops:status` where the note went: the copy
+        // here follows it to the conflict name, and an edit made since is an
+        // edit of that note.
+        expect(server.statusAnswers.at(-1)?.applied).toHaveLength(1);
+        const all = [`N.conflict-device-1.md=my N\n${edited ? 'more\n' : ''}`, 'N.md=their N\n'];
         expect(docs.live()).toEqual(all);
         expect(disk(h)).toEqual(all);
         expect(h.log.dequeueOperations('b1')).toEqual([]);
-        expect(h.socket().created()).toEqual(
-          edited && format === 'legacy'
-            ? ['N.md', 'N.conflict-device-1-2.md']
-            : ['N.md', ...(edited ? ['N.md'] : [])],
-        );
+        expect(h.socket().created()).toEqual(['N.md']);
+        expect(server.applied).toEqual(['create N.md', 'create N.conflict-device-1.md']);
 
         await drop(h);
         await reconnect(h, server, docs, format);

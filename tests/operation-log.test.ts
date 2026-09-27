@@ -837,8 +837,8 @@ describe('OperationLog — operation ids', () => {
     expect(log.inFlightOperations('b1').map((op) => op.opId)).toEqual([out.opId]);
     expect(log.isInFlight('b1', out.opId)).toBe(true);
     expect(log.findByOpId('b1', out.opId)).toEqual(out);
-    // Still unsettled: counted, and its paths are not uploaded as new files.
-    expect(log.pendingCount('b1')).toBe(2);
+    // Not queued, but unsettled: its paths are not uploaded as new files.
+    expect(log.pendingCount('b1')).toBe(1);
     expect([...log.pendingPaths('b1')].sort()).toEqual(['a.md', 'b.md', 'queued.md']);
     expect(log.listBindingIds()).toEqual(['b1']);
   });
@@ -1094,6 +1094,46 @@ describe('OperationLog — persistNow and unwritten changes', () => {
     const log = new OperationLog({ storage, filePath: PATH, now, ownsFile: () => owns });
     log.setFileMeta(makeMeta());
     await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+  });
+
+  it('tells whether an operation in flight is on disk yet: once a write begun after it went through', async () => {
+    const { storage } = makeStorage();
+    let failing = false;
+    const write = storage.write.bind(storage);
+    storage.write = (p, data): Promise<void> =>
+      failing ? Promise.reject(new Error('disk full')) : write(p, data);
+    const log = new OperationLog({
+      storage,
+      filePath: PATH,
+      now,
+      flushDelayMs: 60_000,
+      onError: () => undefined,
+    });
+    const a = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'a.md', opId: opIdOf(1) });
+    const b = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'b.md', opId: opIdOf(2) });
+    expect(log.inFlightWritten('b1', a.opId)).toBe(false);
+    await log.persistNow();
+    // Recorded together, written together: the second needs no write of its own.
+    expect(log.inFlightWritten('b1', a.opId)).toBe(true);
+    expect(log.inFlightWritten('b1', b.opId)).toBe(true);
+    // Recorded after that write, and the next one fails: not on disk.
+    failing = true;
+    const c = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'c.md', opId: opIdOf(3) });
+    await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+    expect(log.inFlightWritten('b1', c.opId)).toBe(false);
+    failing = false;
+    await log.persistNow();
+    expect(log.inFlightWritten('b1', c.opId)).toBe(true);
+    // Not in flight any more: answered, or back in the queue.
+    log.clearInFlight('b1', a.opId);
+    log.requeueInFlight('b1', b.opId);
+    expect(log.inFlightWritten('b1', a.opId)).toBe(false);
+    expect(log.inFlightWritten('b1', b.opId)).toBe(false);
+    // A log without storage has nothing to wait for.
+    const memory = makeLog();
+    const d = memory.recordInFlight('b1', { opType: 'DELETE', filePath: 'd.md', opId: opIdOf(4) });
+    expect(memory.inFlightWritten('b1', d.opId)).toBe(true);
+    await log.close();
   });
 
   it('writes an answered operation’s removal with the debounce, together with its result', async () => {

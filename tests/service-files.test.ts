@@ -86,6 +86,8 @@ class MemoryVault implements VaultAdapter {
 class FakeSocket implements SocketLike {
   connected = false;
   emits: Array<{ event: string; args: unknown[] }> = [];
+  /** `ops:status` questions (the ids asked about), answered as they come. */
+  statusQueries: string[][] = [];
   static last: FakeSocket | null = null;
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
@@ -104,6 +106,14 @@ class FakeSocket implements SocketLike {
     return this;
   }
   emit(event: string, ...args: unknown[]): SocketLike {
+    if (event === 'ops:status') {
+      // A server that never got what was asked about: every id voided.
+      const { opIds } = args[0] as { opIds: string[] };
+      const ack = args[args.length - 1] as (r: unknown) => void;
+      this.statusQueries.push(opIds);
+      ack({ ok: true, applied: [], voided: opIds });
+      return this;
+    }
     if (event === 'yjs:fetch') {
       const ack = args[args.length - 1] as (r: unknown) => void;
       ack({ ok: false, error: 'not_supported' });
@@ -128,7 +138,10 @@ class FakeSocket implements SocketLike {
   ackOk(extra: Record<string, unknown> = {}): void {
     const last = this.emits[this.emits.length - 1];
     const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
-    if (ack) ack({ ok: true, ...extra });
+    // The server this client needs says so in its join ack (see
+    // `sync-protocol.md` §4.5).
+    const idempotent = last?.event === 'project:join' ? { opIdempotency: 1 } : {};
+    if (ack) ack({ ok: true, ...idempotent, ...extra });
   }
   /** Paths of every `file:create` the engine sent. */
   createdPaths(): string[] {
@@ -248,9 +261,13 @@ function buildHarness(opts: { logger?: Logger } = {}): Harness {
   };
 }
 
-/** Start the engine and answer `project:join` with an empty catch-up. */
+/**
+ * Start the engine and answer `project:join` with an empty catch-up — sent
+ * once the queue is asked about (`ops:status`).
+ */
 async function startJoined(h: Harness): Promise<void> {
   await h.engine.start();
+  await flushAsync(2);
   h.socket().ackOk({ operations: [], yjsDocs: [] });
   await flushAsync(20);
 }

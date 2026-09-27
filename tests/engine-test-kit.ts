@@ -414,6 +414,8 @@ export interface Emit {
   ack: (response: unknown) => void;
   /** Order of the emit among every emit of the socket, `ops:status` included. */
   seq?: number;
+  /** A `project:join` the test has answered (see {@link joinToAnswer}). */
+  answered?: boolean;
 }
 
 /**
@@ -446,6 +448,7 @@ export class FakeSocket implements SocketLike {
    */
   statusResponder: (e: Emit) => void = voidAll;
   private seq = 0;
+  private killed = false;
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   on(event: string, cb: (...args: unknown[]) => void): SocketLike {
@@ -459,6 +462,8 @@ export class FakeSocket implements SocketLike {
     return this;
   }
   emit(event: string, ...args: unknown[]): SocketLike {
+    // A process that is gone sends nothing (see `kill`).
+    if (this.killed) return this;
     let ack = args[args.length - 1] as (response: unknown) => void;
     const seq = ++this.seq;
     if (event === 'yjs:fetch') {
@@ -467,8 +472,15 @@ export class FakeSocket implements SocketLike {
       const query: Emit = { event, payload: args[0], ack, seq };
       this.statusQueries.push(query);
       this.statusResponder(query);
+    } else if (event === 'project:join') {
+      const join: Emit = { event, payload: args[0], ack, seq };
+      const answer = withIdempotency(ack);
+      join.ack = (response): void => {
+        join.answered = true;
+        answer(response);
+      };
+      this.emits.push(join);
     } else {
-      if (event === 'project:join') ack = withIdempotency(ack);
       this.emits.push({ event, payload: args[0], ack, seq });
     }
     return this;
@@ -478,6 +490,7 @@ export class FakeSocket implements SocketLike {
    * comes back — no `disconnect` either.
    */
   kill(): void {
+    this.killed = true;
     this.connected = false;
     this.reachable = false;
     this.wantsConnect = false;
@@ -650,6 +663,13 @@ export interface HarnessOptions {
   diskSnapshotDebounceMs?: number;
   /** Start without network: the socket connects only after {@link goOnline}. */
   offline?: boolean;
+  /**
+   * Who answers `ops:status` instead of the {@link FakeServer} (or, without
+   * one, {@link voidAll}): a server that is busy, say.
+   */
+  statusResponder?: (e: Emit) => void;
+  /** The engine's pauses before it asks `ops:status` again (`SyncEngineDeps.opsStatusRetryMs`). */
+  opsStatusRetryMs?: readonly number[];
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -742,7 +762,8 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     if (opts.offline) built.reachable = false;
     built.statusResponder = (e): void => {
       const serving = routeRef?.server;
-      if (serving) serving.answerStatus(e);
+      if (opts.statusResponder) opts.statusResponder(e);
+      else if (serving) serving.answerStatus(e);
       else voidAll(e);
     };
     own = built;
@@ -769,6 +790,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     conflictResolver: track(resolver, 'modal', calls),
     diskSnapshotDebounceMs: opts.diskSnapshotDebounceMs ?? 0,
     ...(opts.logger ? { logger: opts.logger } : {}),
+    ...(opts.opsStatusRetryMs ? { opsStatusRetryMs: opts.opsStatusRetryMs } : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));
 
@@ -888,6 +910,20 @@ export async function goOnline(
 /** How many `project:join` the engine's socket has sent; 0 before it has one. */
 export function joinsOf(h: Harness): number {
   return h.socketIfBuilt()?.emits.filter((e) => e.event === 'project:join').length ?? 0;
+}
+
+/**
+ * The engine's `project:join` the test has not answered yet, once it is sent:
+ * with operations waiting for their answer, the engine asks `ops:status` first.
+ */
+export async function joinToAnswer(h: Harness): Promise<Emit> {
+  for (let i = 0; i < 50; i++) {
+    const joins = h.socketIfBuilt()?.emits.filter((e) => e.event === 'project:join') ?? [];
+    const last = joins[joins.length - 1];
+    if (last !== undefined && last.answered !== true) return last;
+    await flushAsync(2);
+  }
+  throw new Error('no project:join to answer');
 }
 
 /**
@@ -2127,6 +2163,8 @@ export class FakeStorage implements LogStorage {
   /** Every `state.json` the disk has held, in order (after each completed step). */
   readonly states: string[] = [];
   failWrites = false;
+  /** Called with each `state.json` as it lands on the disk (see {@link states}). */
+  onState: ((state: StoredState) => void) | null = null;
 
   exists(path: string): Promise<boolean> {
     return Promise.resolve(this.files.has(path));
@@ -2182,7 +2220,9 @@ export class FakeStorage implements LogStorage {
   private noteState(path: string): void {
     if (path !== STATE_PATH) return;
     const data = this.files.get(path);
-    if (data !== undefined) this.states.push(data);
+    if (data === undefined) return;
+    this.states.push(data);
+    this.onState?.(JSON.parse(data) as StoredState);
   }
 }
 

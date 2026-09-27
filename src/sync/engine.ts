@@ -3,12 +3,16 @@ import { ApiClient, ApiError } from '@/client/api';
 import type { ApiFile } from '@/client/types';
 import {
   OPERATIONS_CATCHUP,
+  OPS_STATUS_MAX,
   SocketClient,
-  type Ack,
+  type AckOk,
+  type AppliedOperation,
+  type FileAck,
   type FileCreatePayload,
   type FileDeletePayload,
   type FileEvent as SocketFileEvent,
   type FileUpdateBinaryPayload,
+  type OpsStatusResult,
   type ServerLogEntry,
   type ServerOperation,
   type YjsUpdateMessage,
@@ -156,6 +160,51 @@ export interface SyncEngineDeps {
    * such path at `warn` again. Default: a new set.
    */
   reportedRefusals?: Set<string>;
+  /**
+   * The pauses (ms) before each new try of an `ops:status` the server answered
+   * `busy` or never answered (see `SyncEngine.settleUnanswered`). Default: 2,
+   * 5 and 15 s.
+   */
+  opsStatusRetryMs?: readonly number[];
+}
+
+/** See {@link SyncEngineDeps.opsStatusRetryMs}. */
+const OPS_STATUS_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000];
+
+/**
+ * A file operation about to go out through {@link SyncEngine.sendOp}: what
+ * `state.json` records while it is on its way.
+ */
+interface OutgoingOp {
+  opType: OperationType;
+  filePath: string;
+  newPath: string | null;
+  payload: Record<string, unknown>;
+  opId: string;
+  /** An answer to a question: see `PendingOperationInput.settleOnly`. */
+  settleOnly?: true;
+}
+
+/**
+ * What became of an operation {@link SyncEngine.sendOp} sent: acknowledged
+ * (with what its handler made of the answer), refused for good by the server,
+ * or back in the offline queue (`entry`; `null` when it was not written
+ * there).
+ */
+type SendResult<T> =
+  | { kind: 'acked'; value: T }
+  | { kind: 'refused'; error: string }
+  | { kind: 'queued'; entry: PendingOperation | null };
+
+/**
+ * `ops:status` could not be answered in this connect: the connect flow ends
+ * with the status `error` (see {@link SyncEngine.settleUnanswered}).
+ */
+class OpsStatusError extends Error {
+  constructor(readonly reason: string) {
+    super('ops_status_failed');
+    this.name = 'OpsStatusError';
+  }
 }
 
 export type EngineStatus = 'stopped' | 'connecting' | 'syncing' | 'connected' | 'error' | 'offline';
@@ -168,9 +217,13 @@ type IndexedMeta = FileMeta & { fileId: string };
  * A local change the engine has taken on but not settled yet — the offline
  * queue entry `stop()` writes for it. Mutable: a handler fills the payload in
  * as it learns more (a binary edit's hash, say). The replay reads the disk
- * again anyway, so an entry handed over early is still correct.
+ * again anyway, so an entry handed over early is still correct. Its `opId`,
+ * given when it is taken on, is the one it goes out with, and the one it is
+ * queued under.
  */
-type HeldChange = Required<Omit<PendingOperationInput, 'opId' | 'settleOnly'>>;
+type HeldChange = Required<Omit<PendingOperationInput, 'opId' | 'settleOnly'>> & {
+  opId: string;
+};
 
 /**
  * Where a local change comes from. A `queue` replay is held by the offline
@@ -311,6 +364,14 @@ const LAST_SYNCED = 'lastSynced';
  * queue, like {@link RECHECK_DELETE}.
  */
 const DOC_STATE = 'docState';
+
+/**
+ * Payload of a queued attachment UPDATE that answers **Keep local**: the
+ * server's version the user chose the copy here over (see
+ * `SyncEngine.keepLocalVersion`). Local to the queue, like
+ * {@link RECHECK_DELETE}.
+ */
+const KEEP_OVER = 'keepOver';
 
 /** How many paths {@link SyncEngine.caseKey} remembers the key of before it starts over. */
 const CASE_KEYS_MAX = 50_000;
@@ -763,6 +824,35 @@ export class SyncEngine {
   /** `yjs:catchup` batches that arrived before the index was ready. */
   private pendingCatchup: YjsCatchupBatch[] = [];
 
+  /**
+   * `opId`s of the operations sent and not answered yet — live ones and the
+   * drain's. A broadcast carrying one of them is this device's own.
+   */
+  private readonly sending = new Set<string>();
+
+  /**
+   * Whether this connect has settled the operations whose answers were lost
+   * (see {@link settleUnanswered}); cleared on each connect. Until then a
+   * live change is queued, not sent.
+   */
+  private opsSettled = false;
+
+  /**
+   * `opId`s of this device's operations the server is known to have applied
+   * in this connect: closed by {@link settleUnanswered}, or answered since.
+   */
+  private readonly ownKnown = new Set<string>();
+
+  /**
+   * `opId`s of the operations this engine recorded in flight and has not
+   * cleared nor put back in the queue: `stop()` puts them back (see
+   * {@link handOverHeldChanges}), for the next engine to settle.
+   */
+  private readonly inflightHere = new Set<string>();
+
+  /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
+  private readonly opsStatusRetryMs: readonly number[];
+
   constructor(deps: SyncEngineDeps) {
     this.binding = deps.binding;
     this.server = deps.server;
@@ -791,6 +881,7 @@ export class SyncEngine {
     this.now = deps.now ?? Date.now;
     this.configDir = deps.configDir ?? DEFAULT_CONFIG_DIR;
     this.reportedRefusals = deps.reportedRefusals ?? new Set();
+    this.opsStatusRetryMs = deps.opsStatusRetryMs ?? OPS_STATUS_RETRY_MS;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -1141,6 +1232,18 @@ export class SyncEngine {
       this.localRenames.clear();
       this.ownCreates.clear();
       this.ownDeletes.clear();
+      // What became of the operations whose answers were lost — the server
+      // is asked before anything else (see `settleUnanswered`). Live changes
+      // are queued meanwhile. Nothing is asked when nothing waits: the join
+      // goes out at once.
+      this.opsSettled = false;
+      this.ownKnown.clear();
+      const unanswered = this.operationLog.dequeueOperations(this.binding.id);
+      if (unanswered.length > 0) {
+        await this.settleUnanswered(unanswered, online);
+        online.throwIfAborted();
+      }
+      this.opsSettled = true;
       // Arm the streamed-catch-up completion signal before the join so a fast
       // server stream can't resolve before we're waiting on it.
       const catchupDone = new Promise<void>((resolve) => {
@@ -1168,6 +1271,15 @@ export class SyncEngine {
       this.trackConnectFlow(filesPromise, { detach: false });
       const [result] = await Promise.all([joinPromise, filesPromise]);
       online.throwIfAborted();
+      // A server that does not keep operations idempotent (`opIdempotency`)
+      // would apply a resend twice: nothing is sent to it — the queue keeps
+      // what is made here until the server is updated.
+      if (result.ok && result.opIdempotency === undefined) {
+        this.opsSettled = false;
+        this.catchupResolve = null;
+        this.setStatus('error', 'server_outdated');
+        return;
+      }
       this.serverPicksFreeConflictName =
         result.ok && result.operationsCatchup === OPERATIONS_CATCHUP;
       // Operations this device applied live: the catch-up returns them again.
@@ -1297,8 +1409,454 @@ export class SyncEngine {
       // Cut short by the connection dropping: the status says so already, and
       // the next connect starts over.
       if (!this.socketLink.isConnected()) return;
+      if (err instanceof OpsStatusError) {
+        this.log.warn('could not ask the server about operations whose answers were lost', {
+          error: err.reason,
+        });
+      }
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
+  }
+
+  // -- Operations whose answers were lost ------------------------------------
+
+  /**
+   * Ask the server (`ops:status`) what became of the operations in the queue
+   * whose answers may have been lost — each one the queue holds: a restart
+   * does not know which of them went out. For each one the server applied,
+   * `state.json` takes what the answer would have brought (see
+   * {@link settleLanded}); each one it did not, it voids — it never applies
+   * it now, not even from a packet of the old connection that reaches it
+   * later — and the entry is sent again under a new `opId`. An answer to a
+   * question (`settleOnly`) the server did not apply is dropped: the question
+   * comes again.
+   *
+   * Operations recorded in flight by this engine are not asked about: their
+   * emit, buffered by socket.io, reaches the server before this question, and
+   * their answer comes.
+   *
+   * Before the join and the listing: what they bring is read against a queue
+   * that holds only what the server has not applied. Throws
+   * {@link OpsStatusError} when the server cannot answer.
+   */
+  private async settleUnanswered(
+    entries: readonly PendingOperation[],
+    online: AbortSignal,
+  ): Promise<void> {
+    let applied = 0;
+    let voided = 0;
+    for (let i = 0; i < entries.length; i += OPS_STATUS_MAX) {
+      const batch = entries.slice(i, i + OPS_STATUS_MAX).map((entry) => entry.opId);
+      const answer = await this.askOpsStatus(batch, online);
+      for (const row of answer.applied) {
+        const entry = this.operationLog.findByOpId(this.binding.id, row.opId);
+        this.ownKnown.add(row.opId);
+        this.adoptOwnCounter(row.vectorClock);
+        if (entry === null || this.operationLog.isInFlight(this.binding.id, row.opId)) continue;
+        applied += 1;
+        await this.settleLanded(entry, row);
+        online.throwIfAborted();
+      }
+      for (const opId of answer.voided) {
+        const entry = this.operationLog.findByOpId(this.binding.id, opId);
+        if (entry === null || this.operationLog.isInFlight(this.binding.id, opId)) continue;
+        voided += 1;
+        if (entry.settleOnly === true) this.operationLog.markSent([entry.id]);
+        else this.operationLog.rotateOpId(this.binding.id, entry.id);
+      }
+    }
+    this.persistVectorClock();
+    this.log.info('operations whose answers were lost, settled', {
+      asked: entries.length,
+      applied,
+      voided,
+    });
+    // Before anything goes out again: the new ids are on disk.
+    await this.operationLog.persistNow();
+  }
+
+  /**
+   * One `ops:status`, asked again after each of {@link opsStatusRetryMs} when
+   * the server is busy or does not answer. A lost connection ends the connect
+   * flow (the next connect asks again); anything else is an
+   * {@link OpsStatusError}.
+   */
+  private async askOpsStatus(
+    opIds: readonly string[],
+    online: AbortSignal,
+  ): Promise<Extract<OpsStatusResult, { ok: true }>> {
+    for (let attempt = 0; ; attempt++) {
+      const answer = await this.socket.opsStatus(this.binding.projectId, opIds);
+      online.throwIfAborted();
+      if (answer.ok) return answer;
+      if (answer.error === 'disconnected') throw new Error('disconnected');
+      const pause = this.opsStatusRetryMs[attempt];
+      const again = answer.error === 'busy' || answer.error === 'timeout';
+      if (!again || pause === undefined) throw new OpsStatusError(answer.error);
+      this.log.debug('ops:status not answered; asking again', { error: answer.error, pause });
+      await waitFor(pause, online);
+    }
+  }
+
+  /**
+   * An operation of the queue the server applied while its answer was lost
+   * (`row`, from `ops:status`): what its answer would have recorded here is
+   * recorded, from the data alone — `state.json`, the index, the queue. The
+   * disk is left as the live answer leaves it; the listing that comes next
+   * brings the paths along.
+   */
+  private async settleLanded(entry: PendingOperation, row: AppliedOperation): Promise<void> {
+    const outcome = (row.outcome ?? {}) as Record<string, unknown>;
+    this.log.info('an operation sent from here was applied before its answer was lost', {
+      opType: entry.opType,
+      path: entry.filePath,
+      outcome: outcome.kind,
+    });
+    switch (entry.opType) {
+      case 'CREATE':
+        await this.settleLandedCreate(entry, outcome);
+        return;
+      case 'UPDATE':
+        this.settleLandedUpdate(entry, outcome);
+        return;
+      case 'DELETE':
+        await this.settleLandedDelete(entry, outcome);
+        return;
+      case 'RENAME':
+      case 'MOVE':
+        // The file stays here where it is. Where the server put it (a
+        // conflict name) and a teammate's later rename come with the listing.
+        this.operationLog.markSent([entry.id]);
+        return;
+    }
+  }
+
+  /**
+   * A create of the queue the server applied (see {@link settleLanded}): the
+   * file `F` it stored under `S`, asked for as `A`; the entry says where the
+   * file is here now (`L`: a rename made here since moves the entry along).
+   *
+   * **Restore on server** (`settleOnly`) applied settles its question the way
+   * its live answer does: the copy is recorded as the file the server brought
+   * back from it, its history under the name started anew from the server's
+   * — also when a restart found the file's record from before the question
+   * in `state.json`. Kept, the copy's history here met the one the server
+   * made from its bytes: the text came back doubled.
+   */
+  private async settleLandedCreate(
+    entry: PendingOperation,
+    outcome: Record<string, unknown>,
+  ): Promise<void> {
+    const F = stringOf(outcome.fileId);
+    const conflict = outcome.kind === 'conflict_create_renamed';
+    const S = conflict ? stringOf(outcome.finalPath) : stringOf(outcome.path);
+    const A = conflict ? stringOf(outcome.originalPath) : stringOf(outcome.path);
+    const L = entry.filePath;
+    if (F === '' || (S === '' && A === '')) {
+      this.operationLog.markSent([entry.id]);
+      return;
+    }
+    const restored = entry.settleOnly === true;
+    /** The entry is closed as applied: so is the question it answered. */
+    const closed = (): void => {
+      if (restored) this.deleteAskedSettled(F);
+    };
+    const H = stringOf(outcome.contentHash) || stringOf(entry.payload['contentHash']);
+    const size =
+      typeof outcome.size === 'number'
+        ? outcome.size
+        : typeof entry.payload['size'] === 'number'
+          ? entry.payload['size']
+          : 0;
+    const typed = outcome.fileType ?? entry.payload['fileType'];
+    const fileType: FileType =
+      typed === 'TEXT' || typed === 'BINARY' ? typed : classifyFileType(S || A || L);
+    const merged = outcome.merged === true;
+    // Recorded already: its answer came after all, or it was recorded from
+    // another operation's.
+    if (this.fileIndex.byId.has(F) && !restored) {
+      this.operationLog.markSent([entry.id]);
+      return;
+    }
+    // Where the file is here now: under the name the entry has, under the one
+    // the server stored it at (a live answer's move there cut short), or
+    // under the one it went out under. Not a name another file holds.
+    let here: string | null = null;
+    for (const candidate of new Set([L, S, A])) {
+      if (candidate === '') continue;
+      const holder = this.fileIndex.byPath.get(candidate);
+      if (holder !== undefined && holder.fileId !== F) continue;
+      if (await this.vault.exists(candidate)) {
+        here = candidate;
+        break;
+      }
+    }
+    if (here === null) {
+      // Deleted here since it went out: the file the server has goes too.
+      this.operationLog.replaceOperation(this.binding.id, entry.id, {
+        opType: 'DELETE',
+        filePath: L,
+        payload: H !== '' ? { fileId: F, [LAST_SYNCED]: [H] } : { fileId: F },
+      });
+      closed();
+      return;
+    }
+    if (merged && here !== A) {
+      // The server gave back another device's file under the name asked for;
+      // the file here moved on since, and is a note of its own: a create
+      // under a new id, in the entry's place.
+      this.operationLog.replaceOperation(this.binding.id, entry.id, {
+        opType: 'CREATE',
+        filePath: here,
+        payload: entry.payload,
+      });
+      closed();
+      return;
+    }
+    const at = here;
+    if (at === A || at === S) {
+      // Where the answer would have recorded it. Still under the name asked
+      // for while the server stored it under a conflict name: the listing
+      // moves it there, and the teammate's file under the name comes in.
+      let recorded = false;
+      await this.recordCreatedFile(F, at, fileType, H, size, () => {
+        recorded = true;
+        // A note saved since is folded in when its doc comes (the catch-up).
+        if (fileType === 'BINARY') this.recheckAttachment(entry, F, at);
+        else this.operationLog.markSent([entry.id]);
+        closed();
+      });
+      if (!recorded) this.operationLog.markSent([entry.id]);
+      return;
+    }
+    // Renamed here since it went out: the rename goes out now.
+    let recorded = false;
+    await this.recordCreatedFile(F, at, fileType, H, size, () => {
+      recorded = true;
+      this.operationLog.replaceOperation(this.binding.id, entry.id, {
+        opType: 'RENAME',
+        filePath: S,
+        newPath: at,
+        payload: { fileId: F },
+      });
+      closed();
+    });
+    if (!recorded) this.operationLog.markSent([entry.id]);
+  }
+
+  /** An attachment update of the queue the server applied (see {@link settleLanded}). */
+  private settleLandedUpdate(entry: PendingOperation, outcome: Record<string, unknown>): void {
+    const F = stringOf(outcome.fileId) || queuedFileId(entry.payload);
+    const H = stringOf(outcome.contentHash) || stringOf(entry.payload['contentHash']);
+    if (outcome.kind === 'updated' && F !== '' && H !== '') {
+      // A later delete of the file here knew the file by this version too.
+      for (const later of this.operationLog.dequeueOperations(this.binding.id)) {
+        if (later.id <= entry.id || later.opType !== 'DELETE') continue;
+        if (queuedFileId(later.payload) !== F) continue;
+        const known = lastSyncedHashes(later.payload) ?? [];
+        if (known.includes(H)) continue;
+        this.operationLog.amendOperation(later.id, {
+          payload: { ...later.payload, [LAST_SYNCED]: [...known, H] },
+        });
+      }
+      const meta = this.fileIndex.byId.get(F);
+      if (meta !== undefined) {
+        meta.contentHash = H;
+        if (meta.fileType !== 'TEXT' && typeof outcome.size === 'number') {
+          meta.size = outcome.size;
+        }
+        this.operationLog.setFileMeta(meta);
+        if (meta.fileType !== 'TEXT') {
+          this.recheckAttachment(entry, F, meta.relativePath);
+          return;
+        }
+      }
+    }
+    this.operationLog.markSent([entry.id]);
+  }
+
+  /**
+   * An attachment whose create or update the server applied while its answer
+   * was lost, recorded at `path` by the version it went out with: its entry
+   * stays in the queue, in its place and under a new id, as an update the
+   * drain reads the disk for. A save made since — while the plugin was off,
+   * with no event to tell — goes out then; with none, nothing does. Taken out
+   * of the queue, the save stayed on this disk only.
+   */
+  private recheckAttachment(entry: PendingOperation, fileId: string, path: string): void {
+    this.operationLog.replaceOperation(this.binding.id, entry.id, {
+      opType: 'UPDATE',
+      filePath: path,
+      payload: { fileId },
+    });
+  }
+
+  /** A delete of the queue the server applied (see {@link settleLanded}). */
+  private async settleLandedDelete(
+    entry: PendingOperation,
+    outcome: Record<string, unknown>,
+  ): Promise<void> {
+    const F = stringOf(outcome.fileId) || queuedFileId(entry.payload);
+    // Checked against the disk when it was made: a file there now is a new one.
+    this.freedHere.add(entry.filePath);
+    const meta = F !== '' ? this.fileIndex.byId.get(F) : undefined;
+    if (meta === undefined) {
+      this.operationLog.markSent([entry.id]);
+      return;
+    }
+    const at = meta.relativePath;
+    this.fileIndex.byId.delete(F);
+    this.forgetPath(this.operationLog, F, at);
+    this.operationLog.markSent([entry.id]);
+    // Its history goes by its exact name, as the answer's would.
+    await this.dropDoc(this.docManager, F, at);
+  }
+
+  /**
+   * This device's counter in the vector clock, moved up to its counter in
+   * `clock` — the one the server logged an operation of this device's with,
+   * one past the one it went out with. A catch-up then leaves this device's
+   * own operations out. The other clients' counters are not taken: the
+   * catch-up brings their operations.
+   */
+  private adoptOwnCounter(clock: VectorClock | undefined): void {
+    const counter = clock?.[this.clientId];
+    if (typeof counter !== 'number' || !Number.isSafeInteger(counter)) return;
+    if (counter <= (this.vectorClock[this.clientId] ?? 0)) return;
+    this.vectorClock = { ...this.vectorClock, [this.clientId]: counter };
+  }
+
+  /** Whether a live operation can go out now: connected, and past `ops:status`. */
+  private canSendLive(): boolean {
+    return this.socket.isConnected() && this.opsSettled;
+  }
+
+  /**
+   * Send one live file operation, written ahead to `state.json`:
+   *
+   *   1. recorded in flight (`opId`, payload) and the log written to disk —
+   *      a restart finds it in the queue and asks the server about it; no
+   *      write, no emit (it goes out with the drain);
+   *   2. emitted with its `opId`, known in {@link sending} until answered;
+   *   3. answered: `onAck` records the result and calls `settle` in the same
+   *      synchronous block as its last write to `state.json` — the entry
+   *      leaves the log together with the result it brought (and this
+   *      device's counter moves up to the one the server logged it with). A
+   *      handler that records nothing is settled when it returns; one that
+   *      throws leaves the entry for the next connect to settle;
+   *   4. refused for good (`*_not_found`, …): the entry goes; for another
+   *      try (`busy`, …) or with no answer (the connection dropped, Pause
+   *      sync): the entry goes back to the queue — under a new `opId` when
+   *      the server voided the old one. `stop()` puts every entry still in
+   *      flight back there (see {@link handOverHeldChanges}).
+   *
+   * An answer to a question (`settleOnly`) the server refused goes: the
+   * question comes again.
+   */
+  private async sendOp<T>(
+    op: OutgoingOp,
+    emit: (opId: string) => Promise<FileAck>,
+    onAck: (
+      ack: AckOk<{ outcome?: unknown; log?: ServerLogEntry }>,
+      settle: () => void,
+    ) => Promise<T> | T,
+  ): Promise<SendResult<T | undefined>> {
+    const bindingId = this.binding.id;
+    if (!this.canSendLive()) {
+      // Recorded ahead with others (see `handleLocalFolderDelete`): queued.
+      if (this.operationLog.isInFlight(bindingId, op.opId)) {
+        return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
+      }
+      return { kind: 'queued', entry: this.queueOp(op) };
+    }
+    if (!this.operationLog.isInFlight(bindingId, op.opId)) {
+      this.operationLog.recordInFlight(bindingId, op);
+    }
+    this.inflightHere.add(op.opId);
+    try {
+      // Written together with others recorded ahead: nothing to wait for.
+      if (!this.operationLog.inFlightWritten(bindingId, op.opId)) {
+        await this.operationLog.persistNow();
+      }
+    } catch (err) {
+      this.throwIfStopped();
+      this.log.warn('state.json not written; the operation waits in the queue', {
+        opType: op.opType,
+        path: op.filePath,
+        error: describeError(err, 'state_not_written'),
+      });
+      return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
+    }
+    this.throwIfStopped();
+    if (!this.canSendLive()) return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
+    let ack: FileAck;
+    this.sending.add(op.opId);
+    try {
+      ack = await emit(op.opId);
+    } catch {
+      // No answer: the connection dropped, Pause sync closed it, or the engine
+      // stopped (which put the entry back itself).
+      this.throwIfStopped();
+      return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
+    } finally {
+      this.sending.delete(op.opId);
+    }
+    this.throwIfStopped();
+    if (!ack.ok) return this.afterRefusal(op, ack.error);
+    if (ack.duplicate === true) {
+      this.log.warn('a live operation was answered as a resend', { opType: op.opType });
+    }
+    let settled = false;
+    const settle = (): void => {
+      if (settled) return;
+      settled = true;
+      this.adoptOwnCounter(ack.log?.vectorClock);
+      this.persistVectorClock();
+      this.operationLog.clearInFlight(bindingId, op.opId);
+      this.inflightHere.delete(op.opId);
+      this.ownKnown.add(op.opId);
+    };
+    try {
+      const value = await onAck(ack, settle);
+      settle();
+      return { kind: 'acked', value };
+    } catch (err) {
+      // Applied, and its result not recorded: the next connect settles it.
+      if (!settled && !this.hasStopped) this.requeueInFlight(op.opId);
+      throw err;
+    }
+  }
+
+  /** {@link sendOp} refused by the server: see there. */
+  private afterRefusal(op: OutgoingOp, error: string): SendResult<never> {
+    if (error === 'invalid_op_id') {
+      this.log.warn('the server refused an operation id', { opType: op.opType, opId: op.opId });
+    }
+    const outcome = ackToOutcome({ ok: false, error });
+    // Nothing of it was applied: an answer to a question goes, and so does
+    // an operation refused for good.
+    if (op.settleOnly === true || (!outcome.ok && !outcome.retryable)) {
+      this.operationLog.clearInFlight(this.binding.id, op.opId);
+      this.inflightHere.delete(op.opId);
+      this.log.debug('operation refused by the server', { opType: op.opType, error });
+      return { kind: 'refused', error };
+    }
+    const entry = this.requeueInFlight(op.opId, { rotate: error === 'op_voided' });
+    return { kind: 'queued', entry };
+  }
+
+  /** Put operation `opId`, recorded in flight here, back in the queue. */
+  private requeueInFlight(opId: string, opts: { rotate?: boolean } = {}): PendingOperation | null {
+    this.inflightHere.delete(opId);
+    return this.operationLog.requeueInFlight(this.binding.id, opId, opts);
+  }
+
+  /** Queue `op` under its `opId`, unless the queue has it already. */
+  private queueOp(op: OutgoingOp): PendingOperation | null {
+    const known = this.operationLog.findByOpId(this.binding.id, op.opId);
+    if (known !== null) return known;
+    this.throwIfStopped();
+    return this.operationLog.enqueueOperation(this.binding.id, op);
   }
 
   /**
@@ -2815,21 +3373,6 @@ export class SyncEngine {
   }
 
   /**
-   * Record in queued operation `opId` this device's counter in `clock`, the
-   * vector clock it goes out with now (see {@link SENT_COUNTER}).
-   */
-  private noteSent(opId: number, clock: VectorClock): void {
-    const counter = clock[this.clientId];
-    const entry = this.operationLog
-      .dequeueOperations(this.binding.id)
-      .find((queued) => queued.id === opId);
-    if (counter === undefined || entry === undefined) return;
-    this.operationLog.amendOperation(opId, {
-      payload: { ...entry.payload, [SENT_COUNTER]: counter },
-    });
-  }
-
-  /**
    * Whether the server's doc of note `fileId` holds nothing that the note's
    * history here lacked when it was deleted (the queued DELETE's
    * {@link DOC_STATE}): no edit from anyone else reached the server since,
@@ -3263,8 +3806,9 @@ export class SyncEngine {
     const hash = await sha256Hex(buffer);
     const payload = { fileType, contentHash: hash, size: buffer.byteLength };
     if (change) change.payload = payload;
-    /** Out to the server, answered or not: it may have applied it. */
-    let sent = false;
+    // The change's id; a create a queued one turned into (see
+    // `createUnderOwnName`) is an operation of its own.
+    const opId = change?.opId ?? newOpId();
 
     // Join-window guard: between socket connect and the fileIndex refresh
     // the index can't tell a NEW file from a server-known one — emitting
@@ -3273,7 +3817,7 @@ export class SyncEngine {
     // this window and minted 120 `<name>.conflict-<clientId>.md` copies in
     // two seconds). Queue instead — the post-connect drain consults the
     // refreshed index and routes server-known paths through modify.
-    if (this.socket.isConnected() && this.indexReady) {
+    if (this.canSendLive() && this.indexReady) {
       // A name the server holds, on a server that would overwrite the file
       // under the conflict name it takes (see `createTarget`).
       const at = await this.createTarget(path);
@@ -3281,52 +3825,44 @@ export class SyncEngine {
         if (at !== null) await this.createUnderOwnName(path, at, 'watcher');
         return null;
       }
+      let data: ArrayBuffer | undefined;
       try {
         // Binary bytes are staged over REST; text rides inline (small).
-        const data = await this.stageBinaryBlob(fileType, hash, buffer);
-        this.throwIfStopped();
-        sent = true;
-        // Queued from here on, the entry says it went out (see `SENT_HASHES`).
-        if (change) change.payload = { ...payload, [SENT_HASHES]: [hash] };
-        const ack = await this.emitCreate({
-          projectId: this.binding.projectId,
-          clientId: this.clientId,
-          opId: newOpId(),
-          vectorClock: this.bumpClock(),
-          filePath: path,
-          fileType,
-          contentHash: hash,
-          size: buffer.byteLength,
-          ...(data !== undefined ? { data } : {}),
-        });
-        this.throwIfStopped();
-        if (ack.ok) {
-          // Server ack carries `outcome.{fileId, path}` — record the file in
-          // the local index immediately. Without this the broadcast event
-          // that follows would treat the file as new and try to BINARY-
-          // download it (404), and the next CREATE pass on this path would
-          // re-upload (creating server-side conflict-renamed copies).
-          const created = await this.recordCreateAck(
-            path,
-            (ack as { outcome?: unknown }).outcome,
-            fileType,
-            hash,
-            buffer.byteLength,
-          );
-          this.persistVectorClock();
-          return created;
-        }
-        // Refused: nothing of it is on the server.
-        sent = false;
+        data = await this.stageBinaryBlob(fileType, hash, buffer);
       } catch {
         this.throwIfStopped();
-        // Staging upload or emit failed (offline / server error) — fall through
-        // to the offline queue, which replays on the next reconnect.
-        this.log.debug('create staging/emit failed; queueing', path);
+        // Offline or a server error: the offline queue replays it.
+        this.log.debug('create staging failed; queueing', path);
+        this.queue('CREATE', path, null, payload, opId);
+        return null;
       }
+      this.throwIfStopped();
+      const sent = await this.sendOp(
+        { opType: 'CREATE', filePath: path, newPath: null, payload, opId },
+        (id) =>
+          this.emitCreate({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            opId: id,
+            vectorClock: this.bumpClock(),
+            filePath: path,
+            fileType,
+            contentHash: hash,
+            size: buffer.byteLength,
+            ...(data !== undefined ? { data } : {}),
+          }),
+        // Server ack carries `outcome.{fileId, path}` — record the file in
+        // the local index immediately. Without this the broadcast event
+        // that follows would treat the file as new and try to BINARY-
+        // download it (404), and the next CREATE pass on this path would
+        // re-upload (creating server-side conflict-renamed copies).
+        (ack, settle) =>
+          this.recordCreateAck(path, ack.outcome, fileType, hash, buffer.byteLength, settle),
+      );
+      return sent.kind === 'acked' ? (sent.value ?? null) : null;
     }
-    // Offline (or NACK) — queue and bail; the engine will replay on reconnect.
-    this.queue('CREATE', path, null, sent ? { ...payload, [SENT_HASHES]: [hash] } : payload);
+    // Offline — queue and bail; the engine will replay on reconnect.
+    this.queue('CREATE', path, null, payload, opId);
     return null;
   }
 
@@ -3359,13 +3895,15 @@ export class SyncEngine {
     fileType: FileType,
     contentHash: string,
     size: number,
+    /** What the answer settles, called with the file's record (see `sendOp`). */
+    settle?: () => void,
   ): Promise<CreatedHere | null> {
     const o = outcome as { fileId?: unknown; path?: unknown } | null | undefined;
     const fileId = typeof o?.fileId === 'string' ? o.fileId : '';
     if (fileId === '') return null;
     if (typeof o?.path === 'string' && o.path !== '') {
       const merged = this.knownAsAnothers(fileId, o.path);
-      await this.recordCreatedFile(fileId, o.path, fileType, contentHash, size);
+      await this.recordCreatedFile(fileId, o.path, fileType, contentHash, size, settle);
       if (merged && this.fileIndex.byId.get(fileId)?.relativePath === o.path) {
         await this.materializeMerged(fileId, o.path, fileType);
       }
@@ -3388,7 +3926,7 @@ export class SyncEngine {
         path,
         stored,
       });
-      await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
+      await this.recordCreatedFile(fileId, stored, fileType, contentHash, size, settle);
       await this.releaseName(path);
       return { fileId, merged: false };
     }
@@ -3405,7 +3943,9 @@ export class SyncEngine {
       }),
     );
     if (!moved) return null;
-    await this.recordCreatedFile(fileId, stored, fileType, contentHash, size);
+    // Moved on disk first: stopped in between, the next connect finds the
+    // file under the conflict name (see `settleLandedCreate`).
+    await this.recordCreatedFile(fileId, stored, fileType, contentHash, size, settle);
     await this.releaseName(path);
     return { fileId, merged: false };
   }
@@ -3613,6 +4153,12 @@ export class SyncEngine {
     fileType: FileType,
     contentHash: string,
     size: number,
+    /**
+     * Called right after the record is written, in the same synchronous
+     * block: what the create's answer settles (see `sendOp`). Not called when
+     * nothing is recorded.
+     */
+    onRecorded?: () => void,
   ): Promise<void> {
     // The path comes back from the server's ack and may differ from the one
     // we sent (conflict rename). From here it flows into `fileIndex` and
@@ -3639,6 +4185,7 @@ export class SyncEngine {
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(fileId, meta);
     this.operationLog.setFileMeta(meta);
+    onRecorded?.();
     if (fileType === 'TEXT') {
       this.startedSinceJoin.add(fileId);
       await this.startDoc(fileId, path);
@@ -3667,7 +4214,7 @@ export class SyncEngine {
    * `file:update-binary`, with its hash in {@link binaryUploads} until the
    * ack comes (or the emit fails).
    */
-  private async emitBinaryUpdate(payload: FileUpdateBinaryPayload): Promise<Ack> {
+  private async emitBinaryUpdate(payload: FileUpdateBinaryPayload): Promise<FileAck> {
     const { fileId, contentHash } = payload;
     const sending = this.binaryUploads.get(fileId) ?? [];
     sending.push(contentHash);
@@ -3793,44 +4340,41 @@ export class SyncEngine {
       size: buffer.byteLength,
     };
     if (change) change.payload = payload;
+    const opId = change?.opId ?? newOpId();
 
-    if (this.socket.isConnected()) {
-      /** Out from here, with no answer yet (see `SENT_COUNTER`). */
-      let sent: number | undefined;
+    if (this.canSendLive()) {
       try {
         // Binary bytes go to the REST staging area; the socket op is metadata-only.
         await this.uploadBlob(hash, buffer);
+      } catch {
         this.throwIfStopped();
-        const vectorClock = this.bumpClock();
-        sent = vectorClock[this.clientId];
-        // Handed over by `stop()` while on its way, it says so too.
-        if (change) change.payload = { ...payload, [SENT_COUNTER]: sent };
-        const ack = await this.emitBinaryUpdate({
-          projectId: this.binding.projectId,
-          clientId: this.clientId,
-          opId: newOpId(),
-          vectorClock,
-          fileId: meta.fileId,
-          contentHash: hash,
-          size: buffer.byteLength,
-        });
-        // Answered: not applied, when refused.
-        sent = undefined;
-        this.throwIfStopped();
-        if (ack.ok) {
+        this.log.debug('binary update staging failed; queueing', path);
+        this.queue('UPDATE', path, null, payload, opId);
+        return;
+      }
+      this.throwIfStopped();
+      await this.sendOp(
+        { opType: 'UPDATE', filePath: path, newPath: null, payload, opId },
+        (id) =>
+          this.emitBinaryUpdate({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            opId: id,
+            vectorClock: this.bumpClock(),
+            fileId: meta.fileId,
+            contentHash: hash,
+            size: buffer.byteLength,
+          }),
+        (_ack, settle) => {
           meta.contentHash = hash;
           meta.size = buffer.byteLength;
           this.operationLog.setFileMeta(meta);
-          this.persistVectorClock();
-          return;
-        }
-      } catch {
-        this.throwIfStopped();
-        this.log.debug('binary update staging/emit failed; queueing', path);
-      }
-      if (sent !== undefined) payload[SENT_COUNTER] = sent;
+          settle();
+        },
+      );
+      return;
     }
-    this.queue('UPDATE', path, null, payload);
+    this.queue('UPDATE', path, null, payload, opId);
   }
 
   /**
@@ -3863,6 +4407,7 @@ export class SyncEngine {
     // catch-up would otherwise write them back to disk. Checked already: the
     // folder is gone, so none of them can still be on disk.
     const held = children.map((path) => this.holdLocalDelete(path, { checked: true }));
+    const ahead = await this.recordDeletesAhead(held);
     try {
       for (const change of held) {
         // Obsidian's delete of each child came before the folder's; a chokidar
@@ -3874,7 +4419,43 @@ export class SyncEngine {
       }
     } finally {
       for (const change of held) this.settle(change);
+      // Recorded ahead and never sent: nothing went out for them.
+      if (!this.hasStopped) {
+        for (const opId of ahead) {
+          if (this.sending.has(opId)) continue;
+          if (this.operationLog.clearInFlight(this.binding.id, opId))
+            this.inflightHere.delete(opId);
+        }
+      }
     }
+  }
+
+  /**
+   * The deletes of a folder's files, recorded in flight all at once and
+   * written to `state.json` in one go, before the first of them goes out:
+   * they go out one after another (see `sendOp`), and a write before each
+   * cost a folder of hundreds of files seconds. The `opId`s recorded; none
+   * when nothing can go out now.
+   */
+  private async recordDeletesAhead(held: readonly HeldChange[]): Promise<string[]> {
+    if (!this.canSendLive()) return [];
+    const bindingId = this.binding.id;
+    const ahead: string[] = [];
+    for (const change of held) {
+      const fileId = queuedFileId(change.payload);
+      if (fileId === '') continue;
+      this.operationLog.recordInFlight(bindingId, { ...change, payload: { ...change.payload } });
+      this.inflightHere.add(change.opId);
+      ahead.push(change.opId);
+    }
+    if (ahead.length === 0) return ahead;
+    try {
+      await this.operationLog.persistNow();
+    } catch {
+      this.throwIfStopped();
+      // Each one tries on its own (see `sendOp`).
+    }
+    return ahead;
   }
 
   /**
@@ -3970,44 +4551,60 @@ export class SyncEngine {
       this.deletedIds.add(fileId);
       this.deletedSinceListing.add(fileId);
     }
-    if (this.socket.isConnected() && fileId) {
-      let ack: Ack;
-      try {
-        ack = await this.emitDelete({
-          projectId: this.binding.projectId,
-          clientId: this.clientId,
-          opId: newOpId(),
-          vectorClock: this.bumpClock(),
-          fileId,
+    const opId = change?.opId ?? newOpId();
+    if (this.canSendLive() && fileId) {
+      const sent = await this.sendOp(
+        {
+          opType: 'DELETE',
           filePath: path,
-        });
-      } catch {
-        // The connection dropped before the ack: queued below. A delete the
-        // server did apply is a delete of a tombstone when replayed.
-        this.throwIfStopped();
-        ack = { ok: false, error: 'disconnected' };
-      }
-      this.throwIfStopped();
-      if (ack.ok) {
-        // Only what is still this file's: a note renamed onto the name here
-        // while the delete was on its way is recorded there at once (see
-        // `handleLocalRename`). Wiped unconditionally, its record went, its
-        // next save was uploaded as a new file, and its history was deleted.
-        if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
-          this.fileIndex.byId.delete(fileId);
+          newPath: null,
+          payload: deletePayload(fileId, meta),
+          opId,
+        },
+        (id) =>
+          this.emitDelete({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            opId: id,
+            vectorClock: this.bumpClock(),
+            fileId,
+            filePath: path,
+          }),
+        async (_ack, settle) => {
+          // Only what is still this file's: a note renamed onto the name here
+          // while the delete was on its way is recorded there at once (see
+          // `handleLocalRename`). Wiped unconditionally, its record went, its
+          // next save was uploaded as a new file, and its history was deleted.
+          if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
+            this.fileIndex.byId.delete(fileId);
+          }
+          this.forgetPath(this.operationLog, fileId, path);
+          settle();
+          // A concurrent remote yjs:update may have scheduled a debounced disk
+          // snapshot for this path: cancelled, or it would recreate the
+          // just-deleted file. The doc and its store go too: left in place,
+          // they were the history of the next note created under this name —
+          // the same teardown applyServerDelete does.
+          await this.dropDoc(this.docManager, fileId, path);
+          this.forgetWaiting(fileId);
+          await this.releaseName(path);
+        },
+      );
+      if (sent.kind === 'acked') return;
+      if (sent.kind === 'queued' && sent.entry !== null) {
+        // Back in the queue, as a delete made offline is queued.
+        const docState = await this.noteStateVector(meta);
+        if (docState !== null) {
+          this.operationLog.amendOperation(sent.entry.id, {
+            payload: { ...sent.entry.payload, [DOC_STATE]: docState },
+          });
         }
-        this.forgetPath(this.operationLog, fileId, path);
-        // A concurrent remote yjs:update may have scheduled a debounced disk
-        // snapshot for this path: cancelled, or it would recreate the
-        // just-deleted file. The doc and its store go too: left in place, they
-        // were the history of the next note created under this name — the
-        // same teardown applyServerDelete does.
-        await this.dropDoc(this.docManager, fileId, path);
-        this.persistVectorClock();
-        this.forgetWaiting(fileId);
-        await this.releaseName(path);
-        return;
       }
+      // Queued, or refused for good (the server has no such file): gone here.
+      await this.forgetDeletedHere(fileId, path);
+      this.forgetWaiting(fileId);
+      await this.releaseName(path);
+      return;
     }
     if (!fileId) {
       // No live server file at this path (already deleted, or never synced).
@@ -4017,10 +4614,16 @@ export class SyncEngine {
       return;
     }
     const docState = await this.noteStateVector(meta);
-    this.queue('DELETE', path, null, {
-      ...deletePayload(fileId, meta),
-      ...(docState !== null ? { [DOC_STATE]: docState } : {}),
-    });
+    this.queue(
+      'DELETE',
+      path,
+      null,
+      {
+        ...deletePayload(fileId, meta),
+        ...(docState !== null ? { [DOC_STATE]: docState } : {}),
+      },
+      opId,
+    );
     await this.forgetDeletedHere(fileId, path);
     this.forgetWaiting(fileId);
     await this.releaseName(path);
@@ -4160,9 +4763,12 @@ export class SyncEngine {
   }
 
   /**
-   * A note renamed from `oldPath` to `newPath` whose create is queued after
-   * it went out (see {@link SENT_HASHES}): the entry moves to the new name
-   * and keeps the name it went out under. `false` when there is no such entry.
+   * A note renamed from `oldPath` to `newPath` whose create is queued: every
+   * create queued under the old name moves to the new one, each keeping its
+   * `opId` — `false` when there is none. One of them may have gone out, its
+   * answer lost: the next connect asks the server about it by its id, and
+   * the server's answer says the name it went out under (see
+   * `settleLandedCreate`, which sends the rename from there).
    *
    * Every create queued under the old name moves along. A save made offline
    * since queues one more, which never went out: taken for the note's only
@@ -4173,22 +4779,10 @@ export class SyncEngine {
    * team.
    */
   private followQueuedCreate(oldPath: string, newPath: string): boolean {
-    const entries = this.operationLog
-      .dequeueOperations(this.binding.id)
-      .filter((op) => op.opType === 'CREATE' && op.filePath === oldPath);
-    if (!entries.some((op) => sentHashes(op.payload).length > 0)) return false;
     let followed = false;
-    for (const entry of entries) {
-      if (sentHashes(entry.payload).length === 0) {
-        this.operationLog.amendOperation(entry.id, { filePath: newPath });
-        continue;
-      }
-      const sentAt = typeof entry.payload[SENT_AT] === 'string' ? entry.payload[SENT_AT] : oldPath;
-      const moved = this.operationLog.amendOperation(entry.id, {
-        filePath: newPath,
-        payload: { ...entry.payload, [SENT_AT]: sentAt },
-      });
-      followed = followed || moved;
+    for (const entry of this.operationLog.dequeueOperations(this.binding.id)) {
+      if (entry.opType !== 'CREATE' || entry.filePath !== oldPath) continue;
+      if (this.operationLog.amendOperation(entry.id, { filePath: newPath })) followed = true;
     }
     return followed;
   }
@@ -4211,9 +4805,7 @@ export class SyncEngine {
     this.localRenames.set(fileId, (this.localRenames.get(fileId) ?? 0) + 1);
     let docMoved: Promise<void> = Promise.resolve();
     /** What the server made of the rename, once it has acknowledged it. */
-    let acked: { outcome: unknown } | null = null;
-    /** Out from here with no answer, so maybe applied (see `SENT_COUNTER`). */
-    let unanswered: Record<string, unknown> = {};
+    const acked: { outcome?: unknown } = {};
     try {
       // The note is under its new name on disk already, so it is recorded
       // there at once — whether the server hears of the rename now or from
@@ -4228,36 +4820,41 @@ export class SyncEngine {
       this.switchRecords(target, oldPath, newPath);
       // The history follows, under both names' locks.
       docMoved = this.moveRenamedDoc(target, oldPath, newPath);
-      if (this.socket.isConnected() && this.supersedeQueuedMoves(fileId, newPath)) {
-        const vectorClock = this.bumpClock();
-        const counter = vectorClock[this.clientId];
-        // Handed over by `stop()` while on its way: see `SENT_COUNTER`.
-        change.payload = { fileId, [SENT_COUNTER]: counter };
-        try {
-          const ack = await this.socket.emitFileRename({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: newOpId(),
-            vectorClock,
-            fileId,
+      /** Sent, and whatever became of it is settled or queued already. */
+      let sent = false;
+      if (this.canSendLive() && this.supersedeQueuedMoves(fileId, newPath)) {
+        sent = true;
+        const result = await this.sendOp(
+          {
+            opType: 'RENAME',
             filePath: oldPath,
             newPath,
-          });
-          this.throwIfStopped();
-          if (ack.ok) {
-            this.persistVectorClock();
-            acked = { outcome: (ack as { outcome?: unknown }).outcome };
-          }
-        } catch {
-          // The connection dropped before the ack: queued, and the next
-          // connect tells whether the server applied it (see
-          // `dropLandedMoves`).
-          this.throwIfStopped();
-          this.log.debug('rename emit failed; queueing', { oldPath, newPath });
-          unanswered = { [SENT_COUNTER]: counter };
+            payload: { fileId },
+            opId: change.opId,
+          },
+          (id) =>
+            this.socket.emitFileRename({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId: id,
+              vectorClock: this.bumpClock(),
+              fileId,
+              filePath: oldPath,
+              newPath,
+            }),
+          (ack, settle) => {
+            // The records moved already (see `switchRecords`).
+            settle();
+            acked.outcome = ack.outcome ?? null;
+          },
+        );
+        if (result.kind === 'queued') {
+          // No answer: queued, and the next connect asks the server whether it
+          // applied it (see `settleUnanswered`).
+          this.log.debug('rename emit failed; queued', { oldPath, newPath });
         }
       }
-      if (acked === null) this.queue('RENAME', oldPath, newPath, { fileId, ...unanswered });
+      if (!sent) this.queue('RENAME', oldPath, newPath, { fileId }, change.opId);
     } finally {
       this.settle(change);
       // Acknowledged: a teammate's rename broadcast from here on was applied
@@ -4265,7 +4862,7 @@ export class SyncEngine {
       this.forgetLocalRename(fileId);
       await docMoved;
     }
-    if (acked !== null) await this.followStoredRename(fileId, acked.outcome);
+    if ('outcome' in acked) await this.followStoredRename(fileId, acked.outcome);
     // The name the note left may be what another file waits for.
     await this.releaseName(oldPath);
   }
@@ -4305,7 +4902,9 @@ export class SyncEngine {
       newPath,
       queued: mine.map((op) => `${op.filePath} -> ${op.newPath ?? ''}`),
     });
-    this.operationLog.markSent(mine.map((op) => op.id));
+    // Not one the drain has on its way: the server applies it before this
+    // one, and its answer takes it out of the queue.
+    this.operationLog.markSent(mine.filter((op) => !this.sending.has(op.opId)).map((op) => op.id));
     return true;
   }
 
@@ -4832,7 +5431,7 @@ export class SyncEngine {
    * `file:create`, with its path in {@link ownCreates} until the ack comes
    * (or the emit fails).
    */
-  private async emitCreate(payload: FileCreatePayload): Promise<Ack> {
+  private async emitCreate(payload: FileCreatePayload): Promise<FileAck> {
     const path = payload.filePath;
     this.ownCreates.set(path, (this.ownCreates.get(path) ?? 0) + 1);
     try {
@@ -4843,7 +5442,7 @@ export class SyncEngine {
   }
 
   /** `file:delete`, with its file id in {@link ownDeletes} until the ack comes. */
-  private async emitDelete(payload: FileDeletePayload): Promise<Ack> {
+  private async emitDelete(payload: FileDeletePayload): Promise<FileAck> {
     const { fileId } = payload;
     this.ownDeletes.set(fileId, (this.ownDeletes.get(fileId) ?? 0) + 1);
     try {
@@ -5510,6 +6109,9 @@ export class SyncEngine {
     if (versionHash !== undefined && versionHash !== '' && versionHash === meta.contentHash) {
       return;
     }
+    if (versionHash !== undefined && versionHash !== '' && this.keptOver(fileId, versionHash)) {
+      return;
+    }
     // A file never written here, with a file under its name: that one is
     // another (see `yieldNameNotWritten`). Compared with it, the user was
     // asked to choose between two different files.
@@ -5524,6 +6126,9 @@ export class SyncEngine {
     // Or the copy is gone, deleted here: written back, a version this device
     // had already let go of came back to its disk.
     if (newHash === meta.contentHash) return;
+    // The user chose the copy here over this very version; the update that
+    // says so waits to go out.
+    if (this.keptOver(fileId, newHash)) return;
     /** Where `keep-both` parks the local edits. */
     let aside: string | null = null;
 
@@ -5549,35 +6154,11 @@ export class SyncEngine {
         // The modal can be answered long after the plugin went away.
         this.throwIfStopped();
         if (resolution === 'keep-local') {
-          // Push our local content as the new server version. Bump clock,
-          // emit; if offline, queue. The server will then broadcast it
-          // back as `file:updated-binary` — by then `meta.contentHash`
-          // matches the local hash, so the second pass is a no-op.
-          if (this.socket.isConnected()) {
-            try {
-              await this.uploadBlob(localHash, localBuf);
-              this.throwIfStopped();
-              await this.emitBinaryUpdate({
-                projectId: this.binding.projectId,
-                clientId: this.clientId,
-                opId: newOpId(),
-                vectorClock: this.bumpClock(),
-                fileId,
-                contentHash: localHash,
-                size: localBuf.byteLength,
-              });
-              this.throwIfStopped();
-            } catch {
-              this.throwIfStopped();
-              this.log.debug(
-                'keep-local binary push failed; reconcile on reconnect',
-                meta.relativePath,
-              );
-            }
-          }
-          meta.contentHash = localHash;
-          meta.size = localBuf.byteLength;
-          this.operationLog.setFileMeta(meta);
+          // Push our local content as the new server version: an attachment
+          // update like any other, which the record takes only once the
+          // server has it. The server broadcasts it back before the ack; that
+          // is this device's own and changes nothing here.
+          await this.keepLocalVersion(meta, localBuf, localHash, newHash);
           return;
         }
         if (resolution === 'keep-both') {
@@ -5646,6 +6227,81 @@ export class SyncEngine {
         await io.vault.createBinary(path, newBuf);
       }
     });
+  }
+
+  /**
+   * **Keep local** about attachment `meta`: the copy here (`localHash`) goes
+   * to the server over its version `serverHash`, as an attachment update.
+   * `state.json` takes the new version only from the ack: sent and not
+   * answered, or not sent at all, the update waits in the queue, and until it
+   * goes out a catch-up bringing that same version asks nothing again (see
+   * {@link keptOver}); a newer version of a teammate's does.
+   */
+  private async keepLocalVersion(
+    meta: IndexedMeta,
+    localBuf: ArrayBuffer,
+    localHash: string,
+    serverHash: string,
+  ): Promise<void> {
+    const { fileId } = meta;
+    const payload: Record<string, unknown> = {
+      fileId,
+      contentHash: localHash,
+      size: localBuf.byteLength,
+      [KEEP_OVER]: serverHash,
+    };
+    const opId = newOpId();
+    if (!this.canSendLive()) {
+      this.queue('UPDATE', meta.relativePath, null, payload, opId);
+      return;
+    }
+    try {
+      await this.uploadBlob(localHash, localBuf);
+    } catch {
+      this.throwIfStopped();
+      this.log.debug('keep-local binary push failed; queued', meta.relativePath);
+      this.queue('UPDATE', meta.relativePath, null, payload, opId);
+      return;
+    }
+    this.throwIfStopped();
+    await this.sendOp(
+      { opType: 'UPDATE', filePath: meta.relativePath, newPath: null, payload, opId },
+      (id) =>
+        this.emitBinaryUpdate({
+          projectId: this.binding.projectId,
+          clientId: this.clientId,
+          opId: id,
+          vectorClock: this.bumpClock(),
+          fileId,
+          contentHash: localHash,
+          size: localBuf.byteLength,
+        }),
+      (_ack, settle) => {
+        meta.contentHash = localHash;
+        meta.size = localBuf.byteLength;
+        this.operationLog.setFileMeta(meta);
+        settle();
+      },
+    );
+  }
+
+  /**
+   * Whether an attachment update of file `fileId` waiting to go out, or on
+   * its way, is **Keep local** about version `hash` of the server's (see
+   * {@link keepLocalVersion}): the user has chosen the copy here over that
+   * very version already.
+   */
+  private keptOver(fileId: string, hash: string): boolean {
+    const bindingId = this.binding.id;
+    return [
+      ...this.operationLog.dequeueOperations(bindingId),
+      ...this.operationLog.inFlightOperations(bindingId),
+    ].some(
+      (op) =>
+        op.opType === 'UPDATE' &&
+        queuedFileId(op.payload) === fileId &&
+        op.payload[KEEP_OVER] === hash,
+    );
   }
 
   private async applyServerDelete(fileId: string): Promise<void> {
@@ -5806,27 +6462,52 @@ export class SyncEngine {
       const localHash = await sha256Hex(localBuf);
       this.throwIfStopped();
       // Push the local content as a fresh CREATE so the server
-      // un-deletes it. The recipient broadcast will reset our state.
-      if (this.socket.isConnected()) {
+      // un-deletes it. The recipient broadcast will reset our state. An
+      // answer to the question: never replayed. Its answer lost, the next
+      // connect closes it if the server applied it, and asks again if not.
+      if (this.canSendLive()) {
+        let data: ArrayBuffer | undefined;
         try {
-          const data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
+          data = await this.stageBinaryBlob(meta.fileType, localHash, localBuf);
+        } catch {
           this.throwIfStopped();
-          const ack = await this.emitCreate({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: newOpId(),
-            vectorClock: this.bumpClock(),
+          this.log.debug(
+            'restore-server push failed; asking again on reconnect',
+            meta.relativePath,
+          );
+          return 'done';
+        }
+        this.throwIfStopped();
+        await this.sendOp(
+          {
+            opType: 'CREATE',
             filePath: meta.relativePath,
-            fileType: meta.fileType,
-            contentHash: localHash,
-            size: localBuf.byteLength,
-            ...(data !== undefined ? { data } : {}),
-          });
-          this.throwIfStopped();
-          const outcome = ack.ok
-            ? (ack as { outcome?: { fileId?: string; path?: string } }).outcome
-            : undefined;
-          if (outcome?.fileId && outcome.path) {
+            newPath: null,
+            payload: {
+              fileType: meta.fileType,
+              contentHash: localHash,
+              size: localBuf.byteLength,
+            },
+            opId: newOpId(),
+            settleOnly: true,
+          },
+          (id) =>
+            this.emitCreate({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId: id,
+              vectorClock: this.bumpClock(),
+              filePath: meta.relativePath,
+              fileType: meta.fileType,
+              contentHash: localHash,
+              size: localBuf.byteLength,
+              ...(data !== undefined ? { data } : {}),
+            }),
+          async (ack, settle) => {
+            const outcome = ack.outcome as { fileId?: unknown; path?: unknown } | undefined;
+            const fileId = stringOf(outcome?.fileId);
+            const path = stringOf(outcome?.path);
+            if (fileId === '' || path === '') return;
             // The server revived the file under its id from this copy, the way
             // a note created here starts: recorded from the ack, its doc and
             // store dropped — by the exact name — for the server's. Kept, the
@@ -5836,19 +6517,18 @@ export class SyncEngine {
             // doubled; one that replaces it merged the two. And unindexed, the
             // next save went out as a second CREATE.
             await this.recordCreatedFile(
-              outcome.fileId,
-              outcome.path,
+              fileId,
+              path,
               meta.fileType,
               localHash,
               localBuf.byteLength,
+              () => {
+                this.deleteAskedSettled(meta.fileId);
+                settle();
+              },
             );
-            this.persistVectorClock();
-            this.deleteAskedSettled(meta.fileId);
-          }
-        } catch {
-          this.throwIfStopped();
-          this.log.debug('restore-server push failed; reconcile on reconnect', meta.relativePath);
-        }
+          },
+        );
       }
       // Don't drop the local copy — we want the file to stay.
       return 'done';
@@ -6302,35 +6982,44 @@ export class SyncEngine {
    */
   private async restoreMovedAway(meta: IndexedMeta, movedTo: string): Promise<void> {
     const path = meta.relativePath;
-    if (!this.socket.isConnected()) return;
+    if (!this.canSendLive()) return;
+    let result: SendResult<void>;
+    // On its way from here: its broadcast is this device's own.
+    this.localRenames.set(meta.fileId, (this.localRenames.get(meta.fileId) ?? 0) + 1);
     try {
-      // On its way from here: its broadcast is this device's own.
-      this.localRenames.set(meta.fileId, (this.localRenames.get(meta.fileId) ?? 0) + 1);
-      let ack: Ack;
-      try {
-        ack = await this.socket.emitFileRename({
-          projectId: this.binding.projectId,
-          clientId: this.clientId,
-          opId: newOpId(),
-          vectorClock: this.bumpClock(),
-          fileId: meta.fileId,
+      // An answer to the question: never replayed (see `sendOp`).
+      result = await this.sendOp(
+        {
+          opType: 'RENAME',
           filePath: movedTo,
           newPath: path,
-        });
-      } finally {
-        this.forgetLocalRename(meta.fileId);
-      }
-      this.throwIfStopped();
-      if (!ack.ok) {
-        this.log.warn('could not move a renamed file back', { path, movedTo, error: ack.error });
-        return;
-      }
-    } catch {
-      this.throwIfStopped();
+          payload: { fileId: meta.fileId },
+          opId: newOpId(),
+          settleOnly: true,
+        },
+        (id) =>
+          this.socket.emitFileRename({
+            projectId: this.binding.projectId,
+            clientId: this.clientId,
+            opId: id,
+            vectorClock: this.bumpClock(),
+            fileId: meta.fileId,
+            filePath: movedTo,
+            newPath: path,
+          }),
+        (_ack, settle) => settle(),
+      );
+    } finally {
+      this.forgetLocalRename(meta.fileId);
+    }
+    if (result.kind === 'refused') {
+      this.log.warn('could not move a renamed file back', { path, movedTo, error: result.error });
+      return;
+    }
+    if (result.kind === 'queued') {
       this.log.debug('moving a renamed file back failed; asking again on reconnect', path);
       return;
     }
-    this.persistVectorClock();
     await this.handleLocalModify(path);
   }
 
@@ -7152,21 +7841,22 @@ export class SyncEngine {
 
   // -- Pending queue --------------------------------------------------------
 
+  /**
+   * Queue a local change for the drain. `opId`: the change's (see
+   * `HeldChange`); a new one when absent. A change the queue holds already
+   * under that id — put back there by `sendOp` — is not queued twice.
+   */
   private queue(
     opType: OperationType,
     filePath: string,
     newPath: string | null,
     payload: Record<string, unknown>,
+    opId: string = newOpId(),
   ): void {
     // The fence refuses this too; spelled out because the queue is what the
     // next engine replays without asking.
     this.throwIfStopped();
-    this.operationLog.enqueueOperation(this.binding.id, {
-      opType,
-      filePath,
-      newPath,
-      payload,
-    });
+    this.queueOp({ opType, filePath, newPath, payload, opId });
   }
 
   /**
@@ -7312,18 +8002,11 @@ export class SyncEngine {
    * precondition the server checks: the expected source path, or the state
    * the file was deleted in.
    */
-  private async replayPending(op: {
-    /** The queue entry's id; absent for an operation not taken from the queue. */
-    id?: number;
-    opType: OperationType;
-    filePath: string;
-    newPath: string | null;
-    payload: Record<string, unknown>;
-  }): Promise<ReplayOutcome> {
+  private async replayPending(op: PendingOperation): Promise<ReplayOutcome> {
     // Taken out of the queue while the drain was on its way to it: a rename
     // of the file made since went out in its place (see
     // `supersedeQueuedMoves`).
-    if (op.id !== undefined && !this.operationLog.isPending(this.binding.id, op.id)) {
+    if (!this.operationLog.isPending(this.binding.id, op.id)) {
       return { ok: true };
     }
     // A queued op outlives the build that queued it: `state.json` survives the
@@ -7409,36 +8092,44 @@ export class SyncEngine {
           // note the server has never heard of, a save went out as a second
           // create — a conflict copy for everyone — and a rename left the old
           // name on the server.
-          const sent: { ack?: Ack } = {};
+          const sent: { ack?: FileAck } = {};
           await this.trackCreate(op.filePath, async () => {
-            // Out from here, answered or not (see `SENT_HASHES`).
-            if (op.id !== undefined) this.noteCreateSent(op.id, op.payload, contentHash);
-            const ack = await this.emitCreate({
-              projectId: this.binding.projectId,
-              clientId: this.clientId,
-              opId: newOpId(),
-              vectorClock: this.bumpClock(),
-              filePath: op.filePath,
-              fileType,
-              contentHash,
-              size: data.byteLength,
-              ...(inlineData !== undefined ? { data: inlineData } : {}),
-            });
+            const ack = await this.emitQueued(op, (opId) =>
+              this.emitCreate({
+                projectId: this.binding.projectId,
+                clientId: this.clientId,
+                opId,
+                vectorClock: this.bumpClock(),
+                filePath: op.filePath,
+                fileType,
+                contentHash,
+                size: data.byteLength,
+                ...(inlineData !== undefined ? { data: inlineData } : {}),
+              }),
+            );
             sent.ack = ack;
             this.throwIfStopped();
             if (!ack.ok) return null;
+            let settled = false;
             // Keep `fileIndex` authoritative so the initial-push pass that
             // runs right after the drain skips this file instead of
             // re-uploading it.
-            return this.recordCreateAck(
+            const created = await this.recordCreateAck(
               op.filePath,
-              (ack as { outcome?: unknown }).outcome,
+              ack.outcome,
               fileType,
               contentHash,
               data.byteLength,
+              () => {
+                settled = true;
+                this.settleDrained(op, ack);
+              },
             );
+            if (!settled) this.settleDrained(op, ack);
+            return created;
           });
-          return ackToOutcome(sent.ack ?? { ok: false, error: 'no_ack' });
+          const ack = sent.ack ?? { ok: false, error: 'no_ack' };
+          return ack.ok ? { ok: true } : this.drainRefusal(op, ack.error);
         }
         case 'UPDATE': {
           const fileId = queuedFileId(op.payload);
@@ -7479,28 +8170,27 @@ export class SyncEngine {
             return { ok: false, retryable: true, error: 'blob_staging_failed' };
           }
           this.throwIfStopped();
-          const vectorClock = this.bumpClock();
-          // Out from here, answered or not (see `SENT_COUNTER`).
-          if (op.id !== undefined) this.noteSent(op.id, vectorClock);
-          const ack = await this.emitBinaryUpdate({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: newOpId(),
-            vectorClock,
-            fileId,
-            contentHash,
-            size: data.byteLength,
-          });
+          const ack = await this.emitQueued(op, (opId) =>
+            this.emitBinaryUpdate({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId,
+              vectorClock: this.bumpClock(),
+              fileId,
+              contentHash,
+              size: data.byteLength,
+            }),
+          );
           this.throwIfStopped();
-          if (ack.ok) {
-            const meta = this.fileIndex.byId.get(fileId);
-            if (meta) {
-              meta.contentHash = contentHash;
-              meta.size = data.byteLength;
-              this.operationLog.setFileMeta(meta);
-            }
+          if (!ack.ok) return this.drainRefusal(op, ack.error);
+          const meta = this.fileIndex.byId.get(fileId);
+          if (meta) {
+            meta.contentHash = contentHash;
+            meta.size = data.byteLength;
+            this.operationLog.setFileMeta(meta);
           }
-          return ackToOutcome(ack);
+          this.settleDrained(op, ack);
+          return { ok: true };
         }
         case 'DELETE': {
           // Handed over by `stop()` before the stale-delete check had run
@@ -7529,30 +8219,33 @@ export class SyncEngine {
             );
             return { ok: false, retryable: false, error: 'no_file_id' };
           }
-          const ack = await this.emitDelete({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: newOpId(),
-            vectorClock: this.bumpClock(),
-            fileId,
-            filePath: op.filePath,
-          });
+          const deleted = fileId;
+          const ack = await this.emitQueued(op, (opId) =>
+            this.emitDelete({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId,
+              vectorClock: this.bumpClock(),
+              fileId: deleted,
+              filePath: op.filePath,
+            }),
+          );
           this.throwIfStopped();
-          if (ack.ok) {
-            // Checked against the disk, when it was queued or just above: a
-            // file there now is a new one.
-            this.freedHere.add(op.filePath);
-            const at = this.currentPathOf(fileId, op.filePath);
-            if (this.fileIndex.byId.get(fileId)?.relativePath === at) {
-              this.fileIndex.byId.delete(fileId);
-            }
-            this.forgetPath(this.operationLog, fileId, at);
-            if (at !== op.filePath) this.forgetPath(this.operationLog, fileId, op.filePath);
-            // Drop the doc + any pending snapshot so a debounced write can't
-            // recreate the deleted file (see handleLocalDelete).
-            await this.dropDoc(this.docManager, fileId, at);
+          if (!ack.ok) return this.drainRefusal(op, ack.error);
+          // Checked against the disk, when it was queued or just above: a
+          // file there now is a new one.
+          this.freedHere.add(op.filePath);
+          const at = this.currentPathOf(fileId, op.filePath);
+          if (this.fileIndex.byId.get(fileId)?.relativePath === at) {
+            this.fileIndex.byId.delete(fileId);
           }
-          return ackToOutcome(ack);
+          this.forgetPath(this.operationLog, fileId, at);
+          if (at !== op.filePath) this.forgetPath(this.operationLog, fileId, op.filePath);
+          this.settleDrained(op, ack);
+          // Drop the doc + any pending snapshot so a debounced write can't
+          // recreate the deleted file (see handleLocalDelete).
+          await this.dropDoc(this.docManager, fileId, at);
+          return { ok: true };
         }
         case 'RENAME':
         case 'MOVE': {
@@ -7561,27 +8254,27 @@ export class SyncEngine {
             return { ok: false, retryable: false, error: 'missing_target' };
           }
           const newPath = op.newPath;
-          const payload = {
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: newOpId(),
-            vectorClock: this.bumpClock(),
-            fileId,
-            filePath: op.filePath,
-            newPath,
-          };
-          // Out from here, answered or not (see `SENT_COUNTER`).
-          if (op.id !== undefined) this.noteSent(op.id, payload.vectorClock);
-          const ack =
-            op.opType === 'RENAME'
-              ? await this.socket.emitFileRename(payload)
-              : await this.socket.emitFileMove(payload);
+          const ack = await this.emitQueued(op, (opId) => {
+            const payload = {
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId,
+              vectorClock: this.bumpClock(),
+              fileId,
+              filePath: op.filePath,
+              newPath,
+            };
+            return op.opType === 'RENAME'
+              ? this.socket.emitFileRename(payload)
+              : this.socket.emitFileMove(payload);
+          });
           this.throwIfStopped();
-          if (ack.ok) {
+          if (!ack.ok) return this.drainRefusal(op, ack.error);
+          {
             // Out of the queue at once: the server has applied it, so a
             // teammate's rename of the file broadcast from now on came after
             // it and is followed (see `renamePendingHere`), not left to it.
-            if (op.id !== undefined) this.operationLog.markSent([op.id]);
+            this.settleDrained(op, ack);
             // The index has the file under the name it has here already (see
             // `queuedRenames`). One still under the queued source — a queue
             // entry the index refresh did not take up — moves now, so the
@@ -7595,9 +8288,9 @@ export class SyncEngine {
                 this.commitLocal((io) => this.relocate(io, meta, newPath)),
               );
             }
-            await this.followStoredRename(fileId, (ack as { outcome?: unknown }).outcome);
+            await this.followStoredRename(fileId, ack.outcome);
           }
-          return ackToOutcome(ack);
+          return { ok: true };
         }
       }
     } catch (err) {
@@ -7611,13 +8304,46 @@ export class SyncEngine {
     }
   }
 
-  /** Record in queued CREATE `opId` that it went out with `hash` (see {@link SENT_HASHES}). */
-  private noteCreateSent(opId: number, payload: Record<string, unknown>, hash: string): void {
-    const hashes = sentHashes(payload);
-    if (hashes.includes(hash)) return;
-    this.operationLog.amendOperation(opId, {
-      payload: { ...payload, [SENT_HASHES]: [...hashes, hash] },
-    });
+  /**
+   * Emit queued operation `op` for the drain: written ahead — its `opId` is
+   * on disk before it goes out (a write that fails halts the drain on it) —
+   * and known in {@link sending} until answered.
+   */
+  private async emitQueued(
+    op: PendingOperation,
+    emit: (opId: string) => Promise<FileAck>,
+  ): Promise<FileAck> {
+    await this.operationLog.persistNow();
+    this.throwIfStopped();
+    this.sending.add(op.opId);
+    try {
+      return await emit(op.opId);
+    } finally {
+      this.sending.delete(op.opId);
+    }
+  }
+
+  /**
+   * The drain's operation `op` answered, what it brought recorded: out of the
+   * queue, in the same synchronous block as that last record, and this
+   * device's counter moves up to the one the server logged it with.
+   */
+  private settleDrained(op: PendingOperation, ack: FileAck): void {
+    if (!ack.ok) return;
+    this.adoptOwnCounter(ack.log?.vectorClock);
+    this.persistVectorClock();
+    this.operationLog.markSent([op.id]);
+    this.ownKnown.add(op.opId);
+  }
+
+  /**
+   * The drain's operation `op` refused: see `ackToOutcome`. Voided — sent
+   * again after `ops:status` voided it, a packet of a connection gone that
+   * came late — it gets a new id for its next try.
+   */
+  private drainRefusal(op: PendingOperation, error: string): ReplayOutcome {
+    if (error === 'op_voided') this.operationLog.rotateOpId(this.binding.id, op.id);
+    return ackToOutcome({ ok: false, error });
   }
 
   /** Where file `fileId` is now, by the index; `queued` when it is not indexed. */
@@ -7694,7 +8420,7 @@ export class SyncEngine {
     // what it holds.
     this.throwIfStopped();
     if (from === 'queue') return null;
-    const change: HeldChange = { opType, filePath, newPath, payload };
+    const change: HeldChange = { opType, filePath, newPath, payload, opId: newOpId() };
     this.held.add(change);
     return change;
   }
@@ -7711,9 +8437,12 @@ export class SyncEngine {
    * right, and one the disk has since overtaken is dropped there.
    */
   private handOverHeldChanges(): void {
+    const bindingId = this.binding.id;
     for (const change of this.held) {
       try {
-        this.operationLog.enqueueOperation(this.binding.id, {
+        // On its way, or queued already after a try: it is there under its id.
+        if (this.operationLog.findByOpId(bindingId, change.opId) !== null) continue;
+        this.operationLog.enqueueOperation(bindingId, {
           ...change,
           payload: { ...change.payload },
         });
@@ -7726,6 +8455,17 @@ export class SyncEngine {
       }
     }
     this.held.clear();
+    // Every operation this engine has on its way goes back to the queue, in
+    // its place: its answer never reaches a stopped engine, and the next one
+    // asks the server what became of it (see `settleUnanswered`).
+    for (const opId of this.inflightHere) {
+      try {
+        this.operationLog.requeueInFlight(bindingId, opId);
+      } catch (err) {
+        this.log.warn('could not queue an operation in flight at stop', { opId, err });
+      }
+    }
+    this.inflightHere.clear();
   }
 
   /**
@@ -7921,6 +8661,30 @@ function isCounter(value: unknown): value is number {
 function queuedFileId(payload: Record<string, unknown>): string {
   const value = payload['fileId'];
   return typeof value === 'string' ? value : '';
+}
+
+/** `value` when it is a string, else `''`: for fields that come off the wire. */
+function stringOf(value: unknown): string {
+  return typeof value === 'string' ? value : '';
+}
+
+/** Resolves after `ms`, or rejects with the reason of `signal` once it aborts. */
+function waitFor(ms: number, signal: AbortSignal): Promise<void> {
+  return new Promise<void>((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason as Error);
+      return;
+    }
+    const onAbort = (): void => {
+      window.clearTimeout(timer);
+      reject(signal.reason as Error);
+    };
+    const timer = window.setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
 }
 
 /** A queued RENAME or MOVE. */
@@ -8180,7 +8944,11 @@ function ackToOutcome(ack: { ok: true } | { ok: false; error: string }): ReplayO
     error.endsWith('_not_found') ||
     error === 'forbidden' ||
     error === 'invalid_path' ||
-    error === 'path_is_directory';
+    error === 'path_is_directory' ||
+    // The id belongs to another client's or another kind of operation (see
+    // `sync-protocol.md`, «Идемпотентность операций»): a resend gets the same.
+    error === 'op_id_conflict' ||
+    error === 'not_text';
   const retryable = !permanent;
   return { ok: false, retryable, error };
 }

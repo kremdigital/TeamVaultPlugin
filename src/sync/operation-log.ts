@@ -261,6 +261,12 @@ export class OperationLog {
   private chain: Promise<boolean> = Promise.resolve(true);
   /** Writes under way — see {@link hasUnwrittenChanges}. */
   private writing = 0;
+  /** Counts the changes to the document: one more on each. */
+  private generation = 0;
+  /** The {@link generation} the last successful write put on disk. */
+  private writtenGeneration = 0;
+  /** Operations in flight by `opId`: the {@link generation} that recorded them. */
+  private readonly inflightGeneration = new Map<string, number>();
   private closed = false;
 
   constructor(options: OperationLogOptions = {}) {
@@ -360,7 +366,21 @@ export class OperationLog {
     const entry = this.entryOf(bindingId, op);
     this.bucket(bindingId).inflight.push(entry);
     this.touch({ immediate: true });
+    this.inflightGeneration.set(entry.opId, this.generation);
     return copyOf(entry);
+  }
+
+  /**
+   * Whether operation `opId`, in flight, is on disk already: a write that
+   * began after it was recorded went through. Operations recorded together
+   * go out one after another without a write each (a folder deleted: one
+   * write for all its files).
+   */
+  inFlightWritten(bindingId: string, opId: string): boolean {
+    if (!this.isInFlight(bindingId, opId)) return false;
+    if (!this.persistent) return true;
+    const recorded = this.inflightGeneration.get(opId);
+    return recorded !== undefined && recorded <= this.writtenGeneration;
   }
 
   /**
@@ -373,6 +393,7 @@ export class OperationLog {
     const at = bucket?.inflight.findIndex((op) => op.opId === opId) ?? -1;
     if (!bucket || at < 0) return false;
     bucket.inflight.splice(at, 1);
+    this.inflightGeneration.delete(opId);
     this.touch();
     return true;
   }
@@ -393,6 +414,7 @@ export class OperationLog {
     if (!bucket || at < 0) return null;
     const [entry] = bucket.inflight.splice(at, 1);
     if (!entry) return null;
+    this.inflightGeneration.delete(opId);
     if (opts.rotate === true) entry.opId = newOpId();
     insertById(bucket.pending, entry);
     this.touch({ immediate: true });
@@ -478,19 +500,16 @@ export class OperationLog {
   }
 
   /**
-   * Number of operations not settled yet — queued or in flight — for one
-   * binding, or across all of them.
+   * Number of queued operations for one binding, or across all of them.
+   * Operations in flight are not counted: see {@link inFlightOperations}.
    */
   pendingCount(bindingId?: string): number {
     if (bindingId === undefined) {
       let total = 0;
-      for (const bucket of this.bindings.values()) {
-        total += bucket.pending.length + bucket.inflight.length;
-      }
+      for (const bucket of this.bindings.values()) total += bucket.pending.length;
       return total;
     }
-    const bucket = this.bindings.get(bindingId);
-    return bucket ? bucket.pending.length + bucket.inflight.length : 0;
+    return this.bindings.get(bindingId)?.pending.length ?? 0;
   }
 
   /**
@@ -782,6 +801,7 @@ export class OperationLog {
   /** Mark the document dirty and schedule (or force) a write. */
   private touch(opts: { immediate?: boolean } = {}): void {
     if (!this.persistent) return;
+    this.generation += 1;
     this.dirty = true;
     // After `close()` there is no timer to wait for — but Obsidian does not
     // await `onunload`, so work an engine had already started (a catch-up, a
@@ -825,6 +845,7 @@ export class OperationLog {
   private async writeDocument(): Promise<boolean> {
     const storage = this.storage!;
     const path = this.filePath!;
+    const generation = this.generation;
     let payload: string;
     try {
       payload = JSON.stringify(this.serialize());
@@ -860,6 +881,7 @@ export class OperationLog {
         this.onError(cleanupErr);
       }
     }
+    this.writtenGeneration = Math.max(this.writtenGeneration, generation);
     return true;
   }
 
