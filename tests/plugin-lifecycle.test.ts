@@ -4,6 +4,11 @@ import TeamVaultPlugin from '@/main';
 import { handOffTeardown } from '@/integration/plugin-teardown';
 import { SyncSettingsTab } from '@/settings/tab';
 import { t } from '@/i18n';
+import { ApiClient } from '@/client/api';
+import { SocketClient } from '@/client/socket';
+import { OperationLog } from '@/sync/operation-log';
+import { DocManager } from '@/crdt/doc-manager';
+import type { EngineManager } from '@/sync/engine-manager';
 
 /**
  * `main.ts` itself, for the one thing only it decides: what `onload` still
@@ -88,6 +93,15 @@ function fakeApp(
     files,
   };
   return app as unknown as FakeApp;
+}
+
+/** An element that takes every DOM call the status bar makes. */
+function anyEl(): HTMLElement {
+  const el: HTMLElement = new Proxy(
+    {},
+    { get: (_target, key) => (key === 'then' ? undefined : () => el) },
+  ) as HTMLElement;
+  return el;
 }
 
 /** The plugin's private parts the tests look at. */
@@ -640,15 +654,6 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
 });
 
 describe('plugin lifecycle — atomic-write leftovers', () => {
-  /** An element that takes every DOM call the status bar makes. */
-  function anyEl(): HTMLElement {
-    const el: HTMLElement = new Proxy(
-      {},
-      { get: (_target, key) => (key === 'then' ? undefined : () => el) },
-    ) as HTMLElement;
-    return el;
-  }
-
   beforeEach(() => {
     jest.useFakeTimers();
   });
@@ -714,6 +719,144 @@ describe('plugin lifecycle — atomic-write leftovers', () => {
 
     expect(app.files.has(leftover)).toBe(false);
     expect(app.files.get('note.md')).toBe('x');
+    plugin.onunload();
+    await jest.advanceTimersByTimeAsync(100);
+  });
+});
+
+describe('plugin lifecycle — a server moved to a new address', () => {
+  beforeEach(() => {
+    jest.useFakeTimers();
+    Notice.shown = [];
+  });
+  afterEach(() => {
+    jest.useRealTimers();
+    jest.restoreAllMocks();
+  });
+
+  // On 2026-09-27 the team's server moved to a new address. The settings tab
+  // could only remove the server — switching its binding off — and a binding
+  // made again starts from scratch; users hand-edited data.json instead.
+  it('moves the binding to the address edited in the settings tab, its queue kept', async () => {
+    // Where each engine's socket connects; nothing goes out.
+    const connected: string[] = [];
+    jest.spyOn(SocketClient.prototype, 'connect').mockImplementation(function (this: SocketClient) {
+      connected.push((this as unknown as { url: string }).url);
+    });
+    const tested: string[] = [];
+    jest.spyOn(ApiClient.prototype, 'getMe').mockImplementation(async function (this: ApiClient) {
+      tested.push((this as unknown as { baseUrl: string }).baseUrl);
+      return { id: 'u1', email: 'me@example.com', name: null };
+    });
+    jest
+      .spyOn(ApiClient.prototype, 'getProjects')
+      .mockResolvedValue([
+        { id: 'p1', slug: 'notes', name: 'Notes', description: null, iconEmoji: null },
+      ]);
+    const purgedLog = jest.spyOn(OperationLog.prototype, 'purgeBinding');
+    const purgedDocs = jest.spyOn(DocManager.prototype, 'purgeBinding');
+
+    const id = `team-vault-moved-${++seq}`;
+    const dir = `.obsidian/plugins/${id}`;
+    const server = {
+      id: 's1',
+      name: 'Work',
+      url: 'https://old.example.com',
+      apiKey: 'osk_1',
+      addedAt: 1,
+    };
+    const binding = {
+      id: 'binding-1',
+      serverId: 's1',
+      projectId: 'p1',
+      projectName: 'Notes',
+      localFolder: '/',
+      enabled: true,
+      lastSyncedAt: 1,
+      lastVectorClock: {},
+    };
+    const data = JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [binding],
+      clientId: 'client-1',
+    });
+    const state = JSON.stringify({
+      version: 1,
+      nextOpId: 2,
+      bindings: {
+        'binding-1': {
+          pending: [
+            {
+              id: 1,
+              bindingId: 'binding-1',
+              opType: 'UPDATE',
+              filePath: 'note.md',
+              newPath: null,
+              payload: {},
+              createdAt: 1,
+            },
+          ],
+          files: [],
+          state: null,
+        },
+      },
+    });
+    const app = fakeApp({ seed: { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state } });
+    const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    Object.assign(plugin, {
+      addSettingTab: jest.fn(),
+      registerView: jest.fn(),
+      addStatusBarItem: anyEl,
+      addCommand: jest.fn(),
+      registerEvent: jest.fn(),
+    });
+    const loading = plugin.onload();
+    await jest.advanceTimersByTimeAsync(5000);
+    await loading;
+
+    const manager = internals(plugin).engineManager as EngineManager;
+    const before = manager.getEngine('binding-1');
+    expect(before).toBeDefined();
+    expect(connected).toEqual(['https://old.example.com']);
+
+    // Settings → Team Vault → Servers → Edit: a new URL, the key left empty.
+    Setting.all = [];
+    new SyncSettingsTab(app, plugin).display();
+    const edit = Setting.all
+      .find((s) => s.name === 'Work')
+      ?.settingButtons.find((b) => b.text === t('settings.servers.edit'));
+    if (!edit) throw new Error('the settings tab has no Edit button on the server');
+    const from = Setting.all.length;
+    edit.click();
+    const modal = Setting.all.slice(from);
+    const button = (text: string): ButtonComponent => {
+      const found = modal.flatMap((s) => s.settingButtons).find((b) => b.text === text);
+      if (!found) throw new Error(`the server modal has no "${text}" button`);
+      return found;
+    };
+    modal
+      .find((s) => s.name === t('modal.addServer.url.label'))
+      ?.settingInputs[0]?.change('https://teamvault.example.com/');
+    button(t('modal.addServer.test')).click();
+    await jest.advanceTimersByTimeAsync(100);
+    button(t('modal.addServer.save')).click();
+    await jest.advanceTimersByTimeAsync(100);
+
+    expect(tested).toEqual(['https://teamvault.example.com']);
+    const saved = JSON.parse(app.files.get(`${dir}/data.json`) ?? '{}') as Record<string, unknown>;
+    expect(saved.servers).toEqual([{ ...server, url: 'https://teamvault.example.com' }]);
+    expect(saved.bindings).toEqual([binding]);
+    // A new engine on the new address, for the same binding.
+    const after = manager.getEngine('binding-1');
+    expect(after).toBeDefined();
+    expect(after).not.toBe(before);
+    expect(connected).toEqual(['https://old.example.com', 'https://teamvault.example.com']);
+    // Its local state went with it: nothing purged, the edit still queued.
+    expect(purgedLog).not.toHaveBeenCalled();
+    expect(purgedDocs).not.toHaveBeenCalled();
+    expect((internals(plugin).operationLog as OperationLog).pendingCount('binding-1')).toBe(1);
+
     plugin.onunload();
     await jest.advanceTimersByTimeAsync(100);
   });

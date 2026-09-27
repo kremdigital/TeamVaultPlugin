@@ -42,6 +42,9 @@ export interface AggregateStatus {
 
 export type AggregateListener = (status: AggregateStatus) => void;
 
+/** What an engine connects with: fixed in it for its whole life. */
+type ServerConnection = Pick<ServerConfig, 'url' | 'apiKey'>;
+
 export interface EngineManagerDeps {
   /** Live settings — re-read on every refresh; lets the UI tweak debounce
    *  / log level / etc. without a restart. */
@@ -86,6 +89,15 @@ export class EngineManager {
   private readonly subs = new Map<string, () => void>();
   /** Last status known per engine — feeds the aggregate. */
   private readonly statuses = new Map<string, EngineStatus>();
+  /**
+   * Per engine, the server address and API key it was spawned with. An engine
+   * builds its REST and socket clients from them once, and the settings tab
+   * may replace the server entry or change it in place — so a refresh
+   * compares the settings with this, not with the entry the engine was given.
+   */
+  private readonly connections = new Map<string, ServerConnection>();
+  /** Bindings whose engine is being replaced by one on a new address or key. */
+  private readonly restarting = new Set<string>();
   /**
    * Per binding, the server paths its engines have already refused at `warn`
    * (`SyncEngineDeps.reportedRefusals`). Here and not in the engine:
@@ -132,6 +144,7 @@ export class EngineManager {
     this.subs.clear();
     this.engines.clear();
     this.statuses.clear();
+    this.connections.clear();
     await Promise.all(stops);
     this.notifyAggregate();
   }
@@ -140,6 +153,8 @@ export class EngineManager {
    * Reconcile the engine roster with the current settings:
    *   - new enabled bindings → create + start an engine,
    *   - bindings turned off / removed → stop + drop the engine,
+   *   - bindings whose server got a new address or API key → a new engine
+   *     on it, with the binding's local state kept (see `restartEngine`),
    *   - everything else → leave alone.
    *
    * While paused too: a binding added meanwhile gets an engine that is paused
@@ -167,6 +182,8 @@ export class EngineManager {
       desired.add(binding.id);
       if (!this.engines.has(binding.id)) {
         await this.spawn(binding, server);
+      } else if (connectionChanged(this.connections.get(binding.id), server)) {
+        await this.restartEngine(binding.id);
       }
     }
 
@@ -300,6 +317,7 @@ export class EngineManager {
       : new SyncEngine(engineDeps);
 
     this.engines.set(binding.id, engine);
+    this.connections.set(binding.id, { url: server.url, apiKey: server.apiKey });
     const off = engine.onStatus((status, detail) => {
       this.statuses.set(binding.id, status);
       // `connected` is the catch-up-complete transition: the binding has
@@ -323,6 +341,55 @@ export class EngineManager {
   }
 
   /**
+   * Replace a binding's engine with one on its server's new address or API
+   * key — the server entry was edited in the settings tab. As when the
+   * binding is switched off and on: the old engine stops, queuing the changes
+   * it still held, and the new one starts from the binding's local state.
+   * Nothing of it is purged — the offline queue, the file index, the offline
+   * documents in IndexedDB — so the new engine catches up and sends what was
+   * queued, on the new address. A paused manager spawns it paused.
+   *
+   * Refreshes run side by side (every connect saves the settings, and a save
+   * refreshes), so one that comes while the engine stops leaves this binding
+   * to this call. And the settings are read again once it has stopped: a
+   * refresh meanwhile may have dropped the engine (the binding switched off
+   * or removed, and purged then), or the server may have changed once more.
+   */
+  private async restartEngine(id: string): Promise<void> {
+    const engine = this.engines.get(id);
+    if (!engine || this.restarting.has(id)) return;
+    this.restarting.add(id);
+    this.deps.logger?.info('server address or API key changed; restarting the engine', {
+      bindingId: id,
+    });
+    // Its `stopped` is not the binding's state: the status bar keeps the last
+    // one until the new engine reports its own.
+    this.subs.get(id)?.();
+    this.subs.delete(id);
+    try {
+      await engine.stop();
+    } finally {
+      this.restarting.delete(id);
+    }
+    if (this.engines.get(id) !== engine) return;
+    this.forget(id);
+    const { servers, bindings } = this.deps.getSettings();
+    const binding = bindings.find((b) => b.id === id);
+    const server = binding ? servers.find((s) => s.id === binding.serverId) : undefined;
+    if (binding?.enabled && server) await this.spawn(binding, server);
+    else this.notifyAggregate();
+  }
+
+  /** Let go of an engine's bookkeeping; the engine itself is stopped already. */
+  private forget(id: string): void {
+    this.subs.get(id)?.();
+    this.subs.delete(id);
+    this.engines.delete(id);
+    this.statuses.delete(id);
+    this.connections.delete(id);
+  }
+
+  /**
    * Stop and forget an engine. `purge` additionally erases the binding's
    * local state from the operation log — set only when the binding is gone
    * from settings for good (see {@link refreshFromSettings}), never on a
@@ -331,11 +398,8 @@ export class EngineManager {
   private async dropEngine(id: string, opts: { purge?: boolean } = {}): Promise<void> {
     const engine = this.engines.get(id);
     if (engine) await engine.stop();
-    const off = this.subs.get(id);
-    if (off) off();
-    this.engines.delete(id);
-    this.subs.delete(id);
-    this.statuses.delete(id);
+    // Unless a restart has put a new engine in its place meanwhile.
+    if (this.engines.get(id) === engine) this.forget(id);
     if (opts.purge) {
       // Capture the tracked file list BEFORE wiping the log — purgeBinding
       // clears file_meta, which the doc-manager purge uses as a fallback to
@@ -383,6 +447,15 @@ export class EngineManager {
       }
     }
   }
+}
+
+/**
+ * Whether the server now has another address or API key than the engine was
+ * spawned with. Its name is only a label: a new one restarts nothing.
+ */
+function connectionChanged(spawned: ServerConnection | undefined, server: ServerConfig): boolean {
+  if (!spawned) return false;
+  return spawned.url !== server.url || spawned.apiKey !== server.apiKey;
 }
 
 /**

@@ -8,7 +8,7 @@ import {
   type ServerConfig,
   type VaultBinding,
 } from './settings';
-import { AddServerModal } from './modals/server-modal';
+import { ServerModal } from './modals/server-modal';
 import { AddBindingModal } from './modals/binding-modal';
 import { LogViewerModal } from '@/ui/modals/log-viewer-modal';
 import { confirmAction } from '@/ui/modals/confirm-modal';
@@ -16,7 +16,8 @@ import { normalizeFolderPath } from './folder-utils';
 
 /**
  * Top-level settings UI. Three sections, in order:
- *   1. Servers       — per-server entry with "test" and "remove" buttons.
+ *   1. Servers       — per-server entry with "test", "edit" and "remove"
+ *                      buttons.
  *   2. Bindings      — vault ↔ project link (one per vault; bindings made by
  *                      older versions may point to a subfolder).
  *   3. Behavior      — global options (language, debounce, notices, log).
@@ -70,7 +71,7 @@ export class SyncSettingsTab extends PluginSettingTab {
         .setButtonText(t('settings.servers.add'))
         .setCta()
         .onClick(() => {
-          new AddServerModal(this.app, async (server) => {
+          new ServerModal(this.app, async (server) => {
             this.plugin.settings.servers.push(server);
             await this.plugin.saveSettings();
             this.display();
@@ -97,6 +98,9 @@ export class SyncSettingsTab extends PluginSettingTab {
         }),
       )
       .addButton((btn) =>
+        btn.setButtonText(t('settings.servers.edit')).onClick(() => this.editServer(server)),
+      )
+      .addButton((btn) =>
         btn
           .setButtonText(t('settings.servers.remove'))
           .setWarning()
@@ -119,6 +123,31 @@ export class SyncSettingsTab extends PluginSettingTab {
             this.display();
           }),
       );
+  }
+
+  /**
+   * The server modal, on this server. Saving puts the edited entry in place
+   * of this one, under the same id, so every binding stays on it; the engine
+   * manager then moves the bindings whose server got a new URL or API key onto
+   * it, their local state kept (`EngineManager.refreshFromSettings`). Removing
+   * the server and adding it again was the only way before: it switched the
+   * bindings off, and a new binding starts from scratch.
+   */
+  private editServer(server: ServerConfig): void {
+    const bindings = this.plugin.settings.bindings.filter((b) => b.serverId === server.id);
+    new ServerModal(
+      this.app,
+      async (edited) => {
+        const servers = this.plugin.settings.servers;
+        const index = servers.findIndex((s) => s.id === edited.id);
+        // Removed while the modal was open: nothing left to edit.
+        if (index === -1) return;
+        servers[index] = edited;
+        await this.plugin.saveSettings();
+        this.display();
+      },
+      { server, bindings },
+    ).open();
   }
 
   // -- Bindings ---------------------------------------------------------------

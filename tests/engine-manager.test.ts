@@ -629,3 +629,339 @@ describe('EngineManager — проводка configDir', () => {
     await manager.stop();
   });
 });
+
+/**
+ * A server edited in the settings tab: a new URL or API key. The bindings stay
+ * on the server (same id), and their engines move to the new address with
+ * their local state — the offline queue, the file index, the offline
+ * documents — kept. Removing the server and adding it again was the only way
+ * before: it switched the bindings off, and a new binding starts from scratch.
+ */
+describe('EngineManager — server address or key changed', () => {
+  interface Spawned {
+    bindingId: string;
+    url: string;
+    apiKey: string;
+    engine: FakeEngine;
+  }
+
+  /** Deps whose engines record what server they were spawned with. */
+  function recordingDeps(
+    servers: ServerConfig[],
+    bindings: VaultBinding[],
+    over: Partial<EngineManagerDeps> = {},
+    make: (bindingId: string) => FakeEngine = (id) => new FakeEngine(id),
+  ): { deps: EngineManagerDeps; spawned: Spawned[] } {
+    const spawned: Spawned[] = [];
+    const deps = makeDeps(servers, bindings, {
+      engineFactory: (engineDeps) => {
+        const engine = make(engineDeps.binding.id);
+        spawned.push({
+          bindingId: engineDeps.binding.id,
+          url: engineDeps.server.url,
+          apiKey: engineDeps.server.apiKey,
+          engine,
+        });
+        return engine as unknown as SyncEngine;
+      },
+      ...over,
+    });
+    return { deps, spawned };
+  }
+
+  function spawnedFor(spawned: Spawned[], bindingId: string): Spawned[] {
+    return spawned.filter((s) => s.bindingId === bindingId);
+  }
+
+  /** Engines whose `stop()` waits for the test to open the gate. */
+  function slowStop(gate: Promise<void>): (bindingId: string) => FakeEngine {
+    class SlowStopEngine extends FakeEngine {
+      override async stop(): Promise<void> {
+        this.stopCalls++;
+        this.calls.push('stop');
+        await gate;
+        this.setStatus('stopped');
+      }
+    }
+    return (id) => new SlowStopEngine(id);
+  }
+
+  function gate(): { promise: Promise<void>; open: () => void } {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => {
+      open = resolve;
+    });
+    return { promise, open };
+  }
+
+  const s1 = (): ServerConfig => ({ ...server, id: 's1', url: 'https://old.example.com' });
+  const s2 = (): ServerConfig => ({ ...server, id: 's2', url: 'https://home.example.com' });
+
+  it('restarts exactly the engines of the server with a new URL, keeping their local state', async () => {
+    const servers = [s1(), s2()];
+    const bindings = [
+      makeBinding({ id: 'a' }),
+      makeBinding({ id: 'b' }),
+      makeBinding({ id: 'c', serverId: 's2' }),
+    ];
+    const idb = makeFakeIdb(['team-vault-a-note.md', 'team-vault-c-note.md']);
+    const { deps, spawned } = recordingDeps(servers, bindings, {
+      docManager: new DocManager({ idb: idb.registry }),
+    });
+    deps.operationLog.enqueueOperation('a', { opType: 'UPDATE', filePath: 'note.md' });
+    deps.operationLog.setFileMeta({
+      bindingId: 'a',
+      relativePath: 'note.md',
+      serverFileId: 'f1',
+      contentHash: 'h1',
+      size: 1,
+      fileType: 'TEXT',
+      lastSyncedAt: 1,
+    });
+    const m = new EngineManager(deps);
+    await m.start();
+    const [firstC] = spawnedFor(spawned, 'c');
+
+    // What the settings tab saves: the same entry, same id, a new URL.
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    await m.refreshFromSettings();
+
+    for (const id of ['a', 'b']) {
+      const runs = spawnedFor(spawned, id);
+      expect(runs.map((r) => r.url)).toEqual([
+        'https://old.example.com',
+        'https://teamvault.example.com',
+      ]);
+      expect(runs[0]?.engine.calls).toEqual(['start', 'stop']);
+      expect(runs[1]?.engine.calls).toEqual(['start']);
+      expect(m.getEngine(id)).toBe(runs[1]?.engine);
+    }
+    // The other server's engine is left alone.
+    expect(spawnedFor(spawned, 'c')).toHaveLength(1);
+    expect(firstC?.engine.calls).toEqual(['start']);
+    // Nothing purged: the queue, the file index, the offline documents.
+    expect(deps.operationLog.pendingCount('a')).toBe(1);
+    expect(deps.operationLog.listFileMeta('a').map((f) => f.relativePath)).toEqual(['note.md']);
+    expect(idb.deleted).toEqual([]);
+    expect([...idb.names]).toEqual(['team-vault-a-note.md', 'team-vault-c-note.md']);
+    await m.stop();
+  });
+
+  it('restarts on a new API key, even one written into the same server object', async () => {
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(servers, [makeBinding({ id: 'a' })]);
+    const m = new EngineManager(deps);
+    await m.start();
+
+    (servers[0] as ServerConfig).apiKey = 'osk_new';
+    await m.refreshFromSettings();
+
+    expect(spawnedFor(spawned, 'a').map((r) => r.apiKey)).toEqual(['k', 'osk_new']);
+    await m.stop();
+  });
+
+  it('restarts nothing for a new name, or when nothing changed', async () => {
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(servers, [makeBinding({ id: 'a' })]);
+    const m = new EngineManager(deps);
+    await m.start();
+
+    await m.refreshFromSettings();
+    servers[0] = { ...s1(), name: 'Renamed' };
+    await m.refreshFromSettings();
+
+    expect(spawned).toHaveLength(1);
+    expect(spawned[0]?.engine.calls).toEqual(['start']);
+    await m.stop();
+  });
+
+  it('while paused, spawns the new engine paused, and it connects on resume', async () => {
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(servers, [makeBinding({ id: 'a' })]);
+    const m = new EngineManager(deps);
+    await m.start();
+    await m.pause();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    await m.refreshFromSettings();
+
+    const [first, second] = spawnedFor(spawned, 'a');
+    expect(first?.engine.calls).toEqual(['start', 'pause', 'stop']);
+    expect(second?.url).toBe('https://teamvault.example.com');
+    expect(second?.engine.calls).toEqual(['pause', 'start']);
+    expect(m.getAggregateStatus().state).toBe('paused');
+
+    await m.resume();
+    expect(second?.engine.calls).toEqual(['pause', 'start', 'resume']);
+    await m.stop();
+  });
+
+  it('leaves a binding that is switched off without an engine', async () => {
+    const servers = [s1()];
+    const bindings = [makeBinding({ id: 'off', enabled: false }), makeBinding({ id: 'on' })];
+    const { deps, spawned } = recordingDeps(servers, bindings);
+    deps.operationLog.enqueueOperation('on', { opType: 'UPDATE', filePath: 'note.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    await m.refreshFromSettings();
+    expect(spawnedFor(spawned, 'off')).toHaveLength(0);
+
+    // Switched off in the same save as a new URL: stopped, not restarted.
+    (bindings[1] as VaultBinding).enabled = false;
+    servers[0] = { ...s1(), url: 'https://again.example.com' };
+    await m.refreshFromSettings();
+    expect(spawnedFor(spawned, 'on')).toHaveLength(2);
+    expect(m.getEngine('on')).toBeUndefined();
+    expect(deps.operationLog.pendingCount('on')).toBe(1);
+    await m.stop();
+  });
+
+  it('keeps the status bar off "offline" while an engine restarts', async () => {
+    const servers = [s1()];
+    const { deps } = recordingDeps(servers, [makeBinding({ id: 'a' })]);
+    const m = new EngineManager(deps);
+    await m.start();
+    FakeEngine.lastFor('a')?.setStatus('connected');
+    const seen: string[] = [];
+    m.onAggregateStatus((s) => seen.push(s.state));
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    await m.refreshFromSettings();
+
+    expect(seen).not.toContain('offline');
+    expect(seen).not.toContain('idle');
+    expect(seen[seen.length - 1]).toBe('connecting');
+    await m.stop();
+  });
+
+  it('restarts once however many refreshes come while the engine stops', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      [makeBinding({ id: 'a' })],
+      {},
+      slowStop(stopping.promise),
+    );
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const first = m.refreshFromSettings();
+    // Every connect saves the settings, and every save refreshes.
+    const second = m.refreshFromSettings();
+    const third = m.refreshFromSettings();
+    stopping.open();
+    await Promise.all([first, second, third]);
+
+    const runs = spawnedFor(spawned, 'a');
+    expect(runs).toHaveLength(2);
+    expect(runs[0]?.engine.stopCalls).toBe(1);
+    expect(m.getEngine('a')).toBe(runs[1]?.engine);
+    await m.stop();
+  });
+
+  it('respawns with the settings as they are once the engine has stopped', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      [makeBinding({ id: 'a' })],
+      {},
+      slowStop(stopping.promise),
+    );
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const refreshing = m.refreshFromSettings();
+    // Corrected while the old engine was still stopping.
+    servers[0] = { ...s1(), url: 'https://teamvault.example.org' };
+    stopping.open();
+    await refreshing;
+    await m.refreshFromSettings();
+
+    expect(spawnedFor(spawned, 'a').map((r) => r.url)).toEqual([
+      'https://old.example.com',
+      'https://teamvault.example.org',
+    ]);
+    await m.stop();
+  });
+
+  it('purges and does not respawn a binding removed while its engine restarts', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const bindings = [makeBinding({ id: 'a' })];
+    const { deps, spawned } = recordingDeps(servers, bindings, {}, slowStop(stopping.promise));
+    deps.operationLog.enqueueOperation('a', { opType: 'UPDATE', filePath: 'note.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    bindings.pop();
+    const removing = m.refreshFromSettings();
+    stopping.open();
+    await Promise.all([restarting, removing]);
+
+    expect(spawnedFor(spawned, 'a')).toHaveLength(1);
+    expect(m.getEngine('a')).toBeUndefined();
+    expect(deps.operationLog.pendingCount('a')).toBe(0);
+    await m.stop();
+  });
+
+  it('keeps the new engine when the binding is switched off and on while it restarts', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const bindings = [makeBinding({ id: 'a' })];
+    const { deps, spawned } = recordingDeps(servers, bindings, {}, slowStop(stopping.promise));
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    (bindings[0] as VaultBinding).enabled = false;
+    const switchedOff = m.refreshFromSettings();
+    // Back on before the old engine has stopped: the restart finds it on.
+    (bindings[0] as VaultBinding).enabled = true;
+    stopping.open();
+    await Promise.all([restarting, switchedOff]);
+
+    const runs = spawnedFor(spawned, 'a');
+    expect(runs.map((r) => r.url)).toEqual([
+      'https://old.example.com',
+      'https://teamvault.example.com',
+    ]);
+    // The switch-off's drop, finishing last, leaves the new engine in place:
+    // forgotten, it would run on with nothing to stop it.
+    expect(m.getEngine('a')).toBe(runs[1]?.engine);
+    await m.stop();
+    expect(runs[1]?.engine.stopCalls).toBe(1);
+  });
+
+  it('spawns nothing when the plugin unloads while an engine restarts', async () => {
+    const stopping = gate();
+    const servers = [s1()];
+    const { deps, spawned } = recordingDeps(
+      servers,
+      [makeBinding({ id: 'a' })],
+      {},
+      slowStop(stopping.promise),
+    );
+    deps.operationLog.enqueueOperation('a', { opType: 'UPDATE', filePath: 'note.md' });
+    const m = new EngineManager(deps);
+    await m.start();
+
+    servers[0] = { ...s1(), url: 'https://teamvault.example.com' };
+    const restarting = m.refreshFromSettings();
+    const stopped = m.stop();
+    stopping.open();
+    await Promise.all([restarting, stopped]);
+
+    expect(spawnedFor(spawned, 'a')).toHaveLength(1);
+    expect(m.getEngine('a')).toBeUndefined();
+    expect(deps.operationLog.pendingCount('a')).toBe(1);
+  });
+});

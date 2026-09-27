@@ -158,22 +158,39 @@ export class ButtonComponent {
   }
 }
 
-/** A dropdown, text field or toggle: takes the calls, keeps nothing. */
-class InputComponent {
+/**
+ * A dropdown, text field or toggle: keeps what it is given — its value,
+ * placeholder and change handler — for tests to read, and `change()` for them
+ * to type into it.
+ */
+export class InputComponent {
+  value: unknown = undefined;
+  placeholder = '';
+  disabled = false;
+  private changeHandler: ((value: never) => unknown) | null = null;
   addOption(_value: string, _display: string): this {
     return this;
   }
-  setValue(_value: unknown): this {
+  setValue(value: unknown): this {
+    this.value = value;
     return this;
   }
-  setPlaceholder(_placeholder: string): this {
+  setPlaceholder(placeholder: string): this {
+    this.placeholder = placeholder;
     return this;
   }
-  setDisabled(_disabled: boolean): this {
+  setDisabled(disabled: boolean): this {
+    this.disabled = disabled;
     return this;
   }
-  onChange(_handler: (value: never) => unknown): this {
+  onChange(handler: (value: never) => unknown): this {
+    this.changeHandler = handler;
     return this;
+  }
+  /** Test helper: what typing into the field (or picking an option) does. */
+  change(value: unknown): void {
+    this.value = value;
+    void this.changeHandler?.(value as never);
   }
 }
 
@@ -186,6 +203,8 @@ export class Setting {
   desc = '';
   /** This setting's own buttons, in order. */
   readonly settingButtons: ButtonComponent[] = [];
+  /** This setting's own dropdowns, text fields and toggles, in order. */
+  readonly settingInputs: InputComponent[] = [];
   constructor(_containerEl: unknown) {
     Setting.all.push(this);
   }
@@ -208,15 +227,18 @@ export class Setting {
     return this;
   }
   addDropdown(build: (dropdown: InputComponent) => unknown): this {
-    build(new InputComponent());
-    return this;
+    return this.addInput(build);
   }
   addText(build: (text: InputComponent) => unknown): this {
-    build(new InputComponent());
-    return this;
+    return this.addInput(build);
   }
   addToggle(build: (toggle: InputComponent) => unknown): this {
-    build(new InputComponent());
+    return this.addInput(build);
+  }
+  private addInput(build: (input: InputComponent) => unknown): this {
+    const input = new InputComponent();
+    this.settingInputs.push(input);
+    build(input);
     return this;
   }
 }
