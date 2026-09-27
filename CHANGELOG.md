@@ -85,6 +85,17 @@ uses [Semantic Versioning](https://semver.org/).
   they deleted stayed under the name until their next version of the new one.
 - A note's edit that the server sends for a file that isn't a note is
   ignored: it no longer writes over an attachment.
+- **Saving a note you rewrote no longer freezes Obsidian.** Team Vault took a
+  saved note in by working out every character that changed, with no limit,
+  so a large rewrite — text pasted over the note, a long list sorted, a note
+  an external tool generated again — kept Obsidian from responding for
+  seconds, over twenty for a 20 KB note. A large change now goes line by
+  line, or as one block from the first difference to the last, within a
+  quarter of a second, as the server already does; small edits go character
+  by character as before. When a teammate edited the same note meanwhile,
+  both changes are kept, though the teammate's edit inside the part you
+  rewrote may not keep its place; `sync.log` then gets a `warn` line
+  `coarse merge`.
 
 ## [0.3.9] — 2026-09-27
 

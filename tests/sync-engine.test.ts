@@ -3090,6 +3090,85 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
     await h.engine.stop();
   });
 
+  it('a rewritten note merges with a remote edit in bounded time and logs a coarse merge', async () => {
+    const Y = await import('yjs');
+    const entries: LogEntry[] = [];
+    const logger = new Logger('debug', {
+      write: (e) => {
+        entries.push(e);
+      },
+    });
+    const h = buildHarness({ logger, snapshotMs: 30 });
+    const lines = (word: string): string =>
+      Array.from({ length: 400 }, (_, i) => `${word} line ${i} of the note\n`).join('');
+    const original = lines('original');
+    const serverDoc = await syncedNote(h, original);
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await foldedAt(h, original);
+    const written = nextWrite(h);
+
+    // Upper case: no letter of it is in the note, so the character diff that
+    // recovers the teammate's edit has one answer. "remote\n" before
+    // "original…" has two equally short ones — "rem" + "o" kept + "te\no" —
+    // and the merge keeps the split (before 0.4.0 as well).
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'REMOTE\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    // The user rewrites every line — far past the character diff's edit
+    // limit. The merge goes by lines, keeps the teammate's line, and says so.
+    const rewritten = lines('rewritten');
+    const started = Date.now();
+    await saveLocally(h, rewritten);
+    const expected = `REMOTE\n${rewritten}`;
+    expect(await written).toBe(expected);
+    expect(Date.now() - started).toBeLessThan(3000);
+    await drainToServer(h, serverDoc);
+
+    expect(h.doc.getText('b1', PATH)).toBe(expected);
+    expect(serverDoc.getText('content').toJSON()).toBe(expected);
+    const coarse = entries.filter((e) => e.level === 'warn' && e.message.includes('coarse merge'));
+    expect(coarse).toHaveLength(1);
+    expect(coarse[0]?.args[0]).toEqual({ path: PATH, ours: 'lines', theirs: 'chars' });
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
+  it('a small edit merged with a remote edit logs no coarse merge', async () => {
+    const Y = await import('yjs');
+    const entries: LogEntry[] = [];
+    const logger = new Logger('debug', {
+      write: (e) => {
+        entries.push(e);
+      },
+    });
+    const h = buildHarness({ logger, snapshotMs: 30 });
+    const serverDoc = await syncedNote(h, 'first\nsecond\n');
+    await h.engine.start();
+    h.socket().ackOk({ operations: [], yjsDocs: [] });
+    await flushAsync(10);
+    h.socket().fire('yjs:update', {
+      fileId: 'f1',
+      update: Array.from(Y.encodeStateAsUpdate(serverDoc)),
+    });
+    await foldedAt(h, 'first\nsecond\n');
+    const written = nextWrite(h);
+    const remote = await editOnOtherDevice(serverDoc, (t) => t.insert(0, 'remote\n'));
+    Y.applyUpdate(serverDoc, remote);
+    h.socket().fire('yjs:update', { fileId: 'f1', update: Array.from(remote) });
+    await saveLocally(h, 'first\nsecond\nlocal\n');
+    expect(await written).toBe('remote\nfirst\nsecond\nlocal\n');
+
+    expect(entries.some((e) => e.message.includes('coarse merge'))).toBe(false);
+    serverDoc.destroy();
+    await h.engine.stop();
+  });
+
   it('a save landing while a snapshot is between reading and writing the note is folded in, not written over', async () => {
     const Y = await import('yjs');
     const h = buildHarness({ snapshotMs: 0 });

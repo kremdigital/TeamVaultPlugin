@@ -6905,7 +6905,12 @@ export class SyncEngine {
         this.log.info('fold without a verified base, disk content wins', path);
       }
     } else if (base !== docText) {
-      next = mergeText3(base, diskText, docText);
+      // A rewrite on either side merges by lines or one span, within bounded
+      // time: every edit is kept, but a teammate's edit inside the rewritten
+      // part keeps its text, not necessarily its place — worth a line.
+      next = mergeText3(base, diskText, docText, {
+        onCoarse: (paths) => this.log.warn('coarse merge', { path, ...paths }),
+      });
     }
     this.docManager.setText(this.binding.id, path, next);
     await this.markFolded(meta, diskText, diskHash);
