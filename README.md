@@ -100,6 +100,22 @@ In Obsidian → **Settings → Team Vault → Servers**:
    `GET /api/auth/me` and prints the matching email on success.
 4. Click **Save**.
 
+#### Editing a server
+
+To change a server's name, URL or API key, click **Edit** next to it. The
+form opens with the name and URL filled in. The API key field is empty: leave
+it empty to keep the current key (the form never shows it), or paste a new
+one. A new URL or key needs a passing **Test** before **Save**, as when
+adding a server; a new name alone doesn't. When vaults are bound to the
+server, a passing **Test** also checks that the server lists their projects,
+and a notice names any it doesn't.
+
+The server keeps its bindings. On **Save**, the vaults bound to it reconnect
+to the new address at once, with their unsent offline changes and offline
+documents: nothing syncs from scratch. Change the URL only when the same
+server has moved to a new address. Another server has projects of its own,
+and a vault bound here would stop syncing there with "project not found".
+
 ### 3. Bind the vault to a project
 
 1. Make sure the project exists on the server (create it via the web UI;
@@ -310,6 +326,13 @@ you copied an extra space. Generate a fresh one in the web UI.
 **"Test" fails with a network error** — confirm the URL (no trailing slash
 needed; the plugin trims it) and that the server is reachable from this
 machine. Try `curl -H "X-API-Key: osk_…" https://your-server/api/auth/me`.
+
+**The server moved to a new address** — click **Edit** next to the server in
+**Team Vault → Servers**, enter the new URL, click **Test**, then **Save**
+(see [Editing a server](#editing-a-server)). Don't remove the server and
+add it again: removing it switches its bindings off, and a binding made again
+starts from scratch — the unsent offline changes stay behind with the old
+binding. Nor is there any need to edit `data.json` by hand any more.
 
 **Status stays at `connecting…`** — the plugin handles the WebSocket
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`
