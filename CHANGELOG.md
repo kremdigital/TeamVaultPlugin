@@ -6,6 +6,24 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Edit a server's address, name or API key.** Each server in **Settings →
+  Team Vault → Servers** now has an **Edit** button next to **Test** and
+  **Remove**. It opens the server form with the name and URL filled in; the
+  API key field stays empty — leave it empty to keep the current key, which
+  the form never shows. A new URL or key needs a passing **Test** before
+  **Save**, as when adding a server; a new name alone doesn't. The server
+  keeps its place and its bindings, and the vaults bound to it reconnect to
+  the new address at once, their unsent offline changes and offline
+  documents kept — nothing syncs from scratch. When a server moves to a new
+  address, this is the way to follow it: removing the server switches its
+  bindings off, and a binding made again starts from scratch, while editing
+  `data.json` by hand needed Obsidian closed. The form warns that the address
+  must stay the same server's: another server has projects of its own. And if
+  the tested server doesn't list a project bound to it, a notice names the
+  project — its vault would stop syncing there with "project not found".
+
 ## [0.3.8] — 2026-09-27
 
 ### Security
