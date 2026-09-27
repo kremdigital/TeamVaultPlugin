@@ -289,7 +289,15 @@ describe('quit — a teammate’s note written here just before it', () => {
   // The log's own delay never runs out in these tests: only the quit writes.
   const NEVER = 3_600_000;
 
-  async function writtenThenQuit(after: 'typed' | 'deleted' | 'untouched'): Promise<{
+  /**
+   * `lag`: the listing's hash is the note's first text while its doc holds
+   * more — the server's snapshot of a note waits 5 s after its last edit.
+   * Without it, the listing has caught up: a control.
+   */
+  async function writtenThenQuit(
+    after: 'typed' | 'deleted' | 'untouched',
+    lag = true,
+  ): Promise<{
     next: Harness;
     server: FakeServer;
     docs: ServerDocs;
@@ -311,6 +319,7 @@ describe('quit — a teammate’s note written here just before it', () => {
     h.engine.pause();
     const id = await server.teammateCreate('n.md', 'theirs\n');
     typeOn(docs, h, id, 'typing\n');
+    if (!lag) await snapshotCatchesUp(server, docs, id);
     await h.engine.resume();
     (await joinToAnswer(h)).ack(server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }));
     await docs.drive();
@@ -353,6 +362,16 @@ describe('quit — a teammate’s note written here just before it', () => {
     expect(uploaded).toEqual([]);
     expect(server.pathOf(id)).toBeNull();
     expect(disk(next)).toEqual(['a.md=A\n']);
+    await next.engine.stop();
+  });
+
+  it('takes the teammate’s later text when the listing had caught up (control)', async () => {
+    const { next, docs, id, uploaded } = await writtenThenQuit('typed', false);
+
+    expect(uploaded).toEqual([]);
+    expect(docs.text(id)).toBe('theirs\ntyping\nmore\n');
+    expect(disk(next)).toEqual(['a.md=A\n', 'n.md=theirs\ntyping\nmore\n']);
+    expect(next.calls.filter((c) => c.startsWith('modal.'))).toEqual([]);
     await next.engine.stop();
   });
 
