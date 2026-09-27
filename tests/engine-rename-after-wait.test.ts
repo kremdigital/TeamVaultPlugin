@@ -33,7 +33,6 @@ import {
   serverDocWith,
   snapshotOf,
   userRename,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -54,11 +53,9 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
 }
 
 /** One synced note, on disk, in `state.json` and on the server; connected. */
-async function oneNote(
-  format: BroadcastFormat = 'current',
-): Promise<{ h: Harness; server: FakeServer; d1: Y.Doc }> {
+async function oneNote(): Promise<{ h: Harness; server: FakeServer; d1: Y.Doc }> {
   const h = buildHarness();
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   const hash = await remember(h, 'a.md', 'f1', 'A\n');
   server.add({ id: 'f1', path: 'a.md', fileType: 'TEXT', contentHash: hash, size: 2 });
   const d1 = serverDocWith('A\n');
@@ -149,68 +146,65 @@ describe('SyncEngine — a rename from the server that waited for the note’s n
   });
 });
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a teammate’s rename right after this device’s own, %s broadcasts',
-  (format) => {
-    it('is followed while the note moves to the conflict name its rename was stored under', async () => {
-      const { h, server } = await oneNote(format);
-      // A teammate's note at `b.md` this device has not heard of yet.
-      server.add({ id: 'f9', path: 'b.md', fileType: 'TEXT', contentHash: 'x', size: 1 });
-      // The note's move to the conflict name waits on the disk: the first
-      // rename is the user's own, in Obsidian.
-      const toConflict = h.vault.gate('rename', 1);
+describe('SyncEngine — a teammate’s rename right after this device’s own', () => {
+  it('is followed while the note moves to the conflict name its rename was stored under', async () => {
+    const { h, server } = await oneNote();
+    // A teammate's note at `b.md` this device has not heard of yet.
+    server.add({ id: 'f9', path: 'b.md', fileType: 'TEXT', contentHash: 'x', size: 1 });
+    // The note's move to the conflict name waits on the disk: the first
+    // rename is the user's own, in Obsidian.
+    const toConflict = h.vault.gate('rename', 1);
 
-      const renaming = h.vault.rename('a.md', 'b.md');
-      await server.pump();
-      await toConflict.reached;
-      expect(server.pathOf('f1')).toBe('b.conflict-device-1.md');
-      // The teammate renames the note; the server applies it after this
-      // device's rename.
-      server.teammateRename('f1', 'd.md');
-      await flushAsync(20);
-      toConflict.release();
-      await renaming;
-      await server.pump();
-      await h.settle();
-      await flushAsync(20);
+    const renaming = h.vault.rename('a.md', 'b.md');
+    await server.pump();
+    await toConflict.reached;
+    expect(server.pathOf('f1')).toBe('b.conflict-device-1.md');
+    // The teammate renames the note; the server applies it after this
+    // device's rename.
+    server.teammateRename('f1', 'd.md');
+    await flushAsync(20);
+    toConflict.release();
+    await renaming;
+    await server.pump();
+    await h.settle();
+    await flushAsync(20);
 
-      expect(server.pathOf('f1')).toBe('d.md');
-      expect([...h.vault.files.keys()]).toEqual(['d.md']);
-      expect(h.vault.text('d.md')).toBe('A\n');
-      expect(h.engine.getFileIdForPath('d.md')).toBe('f1');
-      expect(h.socket().emits.filter((e) => e.event === 'file:rename')).toHaveLength(1);
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.pathOf('f1')).toBe('d.md');
+    expect([...h.vault.files.keys()]).toEqual(['d.md']);
+    expect(h.vault.text('d.md')).toBe('A\n');
+    expect(h.engine.getFileIdForPath('d.md')).toBe('f1');
+    expect(h.socket().emits.filter((e) => e.event === 'file:rename')).toHaveLength(1);
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('is followed while the drain moves the records of a rename made offline', async () => {
-      const { h, server } = await oneNote(format);
-      server.add({ id: 'f9', path: 'b.md', fileType: 'TEXT', contentHash: 'x', size: 1 });
-      h.socket().disconnect();
-      await flushAsync();
-      await userRename(h, 'a.md', 'b.md');
-      const toConflict = h.vault.gate('rename');
+  it('is followed while the drain moves the records of a rename made offline', async () => {
+    const { h, server } = await oneNote();
+    server.add({ id: 'f9', path: 'b.md', fileType: 'TEXT', contentHash: 'x', size: 1 });
+    h.socket().disconnect();
+    await flushAsync();
+    await userRename(h, 'a.md', 'b.md');
+    const toConflict = h.vault.gate('rename');
 
-      h.socket().connect();
-      await flushAsync();
-      h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: [] });
-      await flushAsync(20);
-      server.serveNext();
-      await toConflict.reached;
-      expect(server.pathOf('f1')).toBe('b.conflict-device-1.md');
-      server.teammateRename('f1', 'd.md');
-      await flushAsync(20);
-      toConflict.release();
-      await server.pump();
-      await h.settle();
-      await flushAsync(20);
+    h.socket().connect();
+    await flushAsync();
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: [] });
+    await flushAsync(20);
+    server.serveNext();
+    await toConflict.reached;
+    expect(server.pathOf('f1')).toBe('b.conflict-device-1.md');
+    server.teammateRename('f1', 'd.md');
+    await flushAsync(20);
+    toConflict.release();
+    await server.pump();
+    await h.settle();
+    await flushAsync(20);
 
-      expect(server.pathOf('f1')).toBe('d.md');
-      expect([...h.vault.files.keys()]).toEqual(['d.md']);
-      expect(h.engine.getFileIdForPath('d.md')).toBe('f1');
-      expect(h.log.dequeueOperations('b1')).toEqual([]);
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
-  },
-);
+    expect(server.pathOf('f1')).toBe('d.md');
+    expect([...h.vault.files.keys()]).toEqual(['d.md']);
+    expect(h.engine.getFileIdForPath('d.md')).toBe('f1');
+    expect(h.log.dequeueOperations('b1')).toEqual([]);
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
+});

@@ -18,7 +18,6 @@ import {
   deferred,
   encode,
   flushAsync,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -45,9 +44,9 @@ function disk(h: Harness): string[] {
   return [...h.vault.files.keys()].sort().map((p) => `${p}=${h.vault.text(p) ?? ''}`);
 }
 
-function joinAnswer(server: FakeServer, format: BroadcastFormat, count: number) {
+function joinAnswer(server: FakeServer, count: number) {
   return {
-    ...server.joinAnswer(format === 'current' ? 'whole journal' : 'first rows'),
+    ...server.joinAnswer('whole journal'),
     yjsStream: true,
     yjsCount: count,
   };
@@ -64,28 +63,24 @@ function asked(h: Harness): number {
 type Listing = 'taken before the delete' | 'taken after the delete';
 type Answer = 'delete-local' | 'restore-server';
 
-const cases: Array<[BroadcastFormat, Listing, Answer]> = [];
-for (const format of ['legacy', 'current'] as BroadcastFormat[]) {
-  cases.push([format, 'taken before the delete', 'delete-local']);
-  cases.push([format, 'taken before the delete', 'restore-server']);
-  cases.push([format, 'taken after the delete', 'delete-local']);
-}
+const cases: Array<[Listing, Answer]> = [];
+cases.push(['taken before the delete', 'delete-local']);
+cases.push(['taken before the delete', 'restore-server']);
+cases.push(['taken after the delete', 'delete-local']);
 
 describe.each(cases)(
-  'SyncEngine — a note deleted by a teammate while this device connects with an edit of it, %s server, listing %s',
-  (format, listingTaken, answer) => {
+  'SyncEngine — a note deleted by a teammate while this device connects with an edit of it, listing %s',
+  (listingTaken, answer) => {
     it(`asks once, and the answer holds (${answer})`, async () => {
       const h = buildHarness();
-      const server = new FakeServer(h, format);
-      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+      const server = new FakeServer(h);
+      const docs = new ServerDocs(server, h);
       await remember(h, 'Plan.md', 'f1', 'old plan\n');
       await docs.add('f1', 'Plan.md', 'old plan\n');
       await remember(h, 'Other.md', 'f2', 'other\n');
       await docs.add('f2', 'Other.md', 'other\n');
       await h.engine.start();
-      h.socket()
-        .pending('project:join')
-        .ack(joinAnswer(server, format, 2));
+      h.socket().pending('project:join').ack(joinAnswer(server, 2));
       await flushAsync(3);
       stream(h, docs.snapshots());
       await docs.drive();
@@ -111,9 +106,7 @@ describe.each(cases)(
       h.socket().connect();
       await flushAsync();
       const before = docs.snapshots();
-      h.socket()
-        .pending('project:join')
-        .ack(joinAnswer(server, format, 2));
+      h.socket().pending('project:join').ack(joinAnswer(server, 2));
       await flushAsync(3);
       stream(h, before);
       await flushAsync(10);
@@ -148,9 +141,7 @@ describe.each(cases)(
       await flushAsync();
       h.socket().connect();
       await flushAsync();
-      h.socket()
-        .pending('project:join')
-        .ack(joinAnswer(server, format, docs.snapshots().length));
+      h.socket().pending('project:join').ack(joinAnswer(server, docs.snapshots().length));
       await flushAsync(3);
       stream(h, docs.snapshots());
       await flushAsync(40);

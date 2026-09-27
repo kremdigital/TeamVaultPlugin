@@ -17,10 +17,12 @@
 import { sha256Hex } from '@/sync/hash';
 import { EngineManager } from '@/sync/engine-manager';
 import type { SyncEngine } from '@/sync/engine';
+import type { OperationLog } from '@/sync/operation-log';
 import type { VaultEvent } from '@/watcher/obsidian-events';
 import { Logger, type LogEntry } from '@/utils/logger';
 import {
   FakeServer,
+  FakeStorage,
   ServerDocs,
   buildHarness,
   bytes,
@@ -32,6 +34,8 @@ import {
   markOf,
   expectQuietSince,
   joinToAnswer,
+  logOn,
+  restartFromDisk,
   server as serverConfig,
   userRename,
   type Harness,
@@ -47,9 +51,12 @@ type Seed = ReadonlyArray<readonly [path: string, fileId: string, content: strin
 async function seeded(
   notes: Seed,
   attachments: Seed = [],
-  opts: { logger?: Logger } = {},
+  opts: { logger?: Logger; log?: OperationLog } = {},
 ): Promise<{ h: Harness; server: FakeServer; docs: ServerDocs }> {
-  const h = buildHarness(opts.logger ? { logger: opts.logger } : {});
+  const h = buildHarness({
+    ...(opts.logger ? { logger: opts.logger } : {}),
+    ...(opts.log ? { log: opts.log } : {}),
+  });
   const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   for (const [path, fileId, text] of notes) {
@@ -793,7 +800,10 @@ describe('Pause sync — an operation the server applied before the pause cut it
    * what the server has, noted in `downloads`. `route` sets the download up
    * for an engine started after `h`.
    */
-  async function attachment(name = 'p.png'): Promise<{
+  async function attachment(
+    name = 'p.png',
+    log?: OperationLog,
+  ): Promise<{
     h: Harness;
     server: FakeServer;
     docs: ServerDocs;
@@ -801,7 +811,7 @@ describe('Pause sync — an operation the server applied before the pause cut it
     downloads: string[];
     route: (to: Harness) => void;
   }> {
-    const { h, server, docs } = await seeded([], [[name, 'f2', 'v1']]);
+    const { h, server, docs } = await seeded([], [[name, 'f2', 'v1']], log ? { log } : {});
     const versions = new Map<string, string>();
     for (const v of ['v1', 'v2', 'v3', 'v4']) versions.set(await sha256Hex(encode(v)), v);
     const onServer = (): string | undefined =>
@@ -923,40 +933,43 @@ describe('Pause sync — an operation the server applied before the pause cut it
   ] as const)(
     'takes a teammate’s version after its own upload (%s) whose record Obsidian’s quit lost, asking nothing (%s, %s)',
     async (when, answer, name) => {
-      const { h, server, docs, onServer, downloads, route } = await attachment(name);
+      // `state.json` on a disk whose write waits out a delay longer than the
+      // test: the quit finds it as the upload's write-ahead left it.
+      const storage = new FakeStorage();
+      const { h, server, docs, onServer, downloads, route } = await attachment(
+        name,
+        await logOn(storage, 3_600_000),
+      );
       await h.engine.start();
       await answerAsSent(h, server, docs);
       await docs.drive();
-      // What `state.json` holds when the user saves: v1, and the clock of its
-      // last write.
-      const written = h.log.getFileMeta('b1', name);
-      const clock = h.log.getBindingState('b1')?.lastVectorClock ?? {};
+      // What `state.json` holds when the user saves: v1, and the clock of the connect.
+      await h.log.persistNow();
       h.vault.files.set(name, encode('v2'));
       const saved = h.engine.handleVaultEvent(vaultEvent('modify', name));
+      const upload = h.socket().emits.length;
       await emitted(h, 'file:update-binary');
       if (when === 'answered') {
         expect(server.serveNext()).toBe(true);
         await saved;
         expect(queue(h)).toEqual([]);
-        await h.engine.stop();
       } else {
-        await h.engine.stop();
-        await saved.catch(() => undefined);
+        // Obsidian quits with the answer on its way: the server applies the
+        // upload, and its answer finds no one.
+        const sent = h
+          .socket()
+          .emits.slice(upload)
+          .find((e) => e.event === 'file:update-binary');
+        if (sent) sent.ack = (): void => undefined;
         expect(server.serveNext()).toBe(true);
-        await flushAsync(20);
-        // A process that ends hands nothing over: Obsidian does not unload a
-        // plugin on quit.
-        h.log.markSent(h.log.dequeueOperations('b1').map((op) => op.id));
       }
       expect(onServer()).toBe('v2');
-      // Obsidian quits before `state.json` is written again: the version and
-      // the clock wait out their write's debounce.
-      h.log.setFileMeta(written!);
-      h.log.updateLastVectorClock('b1', clock);
+      // Obsidian quits before `state.json` is written again: the version, the
+      // clock and the upload's answer wait out their write's delay.
+      const { next } = await restartFromDisk(h, storage, { server, docs });
+      await saved.catch(() => undefined);
       // A teammate saves v3 over v2 before the next start.
       await server.teammateUpdate('f2', encode('v3'));
-
-      const next = restarted(h, server, docs);
       route(next);
       next.modal.binary.resolve(answer);
       await next.engine.start();
@@ -971,6 +984,8 @@ describe('Pause sync — an operation the server applied before the pause cut it
       expect(downloads).toEqual(['v3']);
       expect(queue(next)).toEqual([]);
       await next.engine.stop();
+      // The old process's log: its delay no longer runs.
+      await h.log.close();
     },
   );
 

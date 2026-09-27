@@ -24,7 +24,6 @@ import {
   flushAsync,
   goOnline,
   userRename,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -46,11 +45,8 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
   });
 }
 
-async function note(
-  h: Harness,
-  format: BroadcastFormat,
-): Promise<{ server: FakeServer; docs: ServerDocs }> {
-  const server = new FakeServer(h, format);
+async function note(h: Harness): Promise<{ server: FakeServer; docs: ServerDocs }> {
+  const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   await remember(h, 'a.md', 'f1', 'A\n');
   await docs.add('f1', 'a.md', 'A\n');
@@ -78,160 +74,145 @@ function holdListing(h: Harness): () => void {
   return () => gate.resolve();
 }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a rename made while the connect’s listing is on its way, %s broadcasts',
-  (format) => {
-    /** The user renames the note, and the server has the rename, before the listing comes. */
-    async function renameBeforeListing(
-      h: Harness,
-      server: FakeServer,
-      release: () => void,
-    ): Promise<void> {
-      await userRename(h, 'a.md', 'b.md');
-      await server.pump();
-      expect(server.pathOf('f1')).toBe('b.md');
-      release();
-    }
+describe('SyncEngine — a rename made while the connect’s listing is on its way', () => {
+  /** The user renames the note, and the server has the rename, before the listing comes. */
+  async function renameBeforeListing(
+    h: Harness,
+    server: FakeServer,
+    release: () => void,
+  ): Promise<void> {
+    await userRename(h, 'a.md', 'b.md');
+    await server.pump();
+    expect(server.pathOf('f1')).toBe('b.md');
+    release();
+  }
 
-    it('keeps the new name at the start of a session', async () => {
-      const h = buildHarness();
-      const { server, docs } = await note(h, format);
-      const release = holdListing(h);
+  it('keeps the new name at the start of a session', async () => {
+    const h = buildHarness();
+    const { server, docs } = await note(h);
+    const release = holdListing(h);
 
-      await h.engine.start();
-      await flushAsync();
-      await renameBeforeListing(h, server, release);
-      h.socket()
-        .pending('project:join')
-        .ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
-      await docs.drive();
+    await h.engine.start();
+    await flushAsync();
+    await renameBeforeListing(h, server, release);
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-      expect(server.pathOf('f1')).toBe('b.md');
-      expect(disk(h)).toEqual(['b.md=A\n']);
-      expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
-      expect(h.engine.getFileIdForPath('a.md')).toBeNull();
-      expect(recorded(h)).toEqual(['f1:b.md']);
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
+    expect(server.pathOf('f1')).toBe('b.md');
+    expect(disk(h)).toEqual(['b.md=A\n']);
+    expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
+    expect(h.engine.getFileIdForPath('a.md')).toBeNull();
+    expect(recorded(h)).toEqual(['f1:b.md']);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('keeps the new name on a reconnect', async () => {
+    const h = buildHarness();
+    const { server, docs } = await note(h);
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+    h.socket().disconnect();
+    await flushAsync();
+    const release = holdListing(h);
+
+    h.socket().connect();
+    await flushAsync();
+    await renameBeforeListing(h, server, release);
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    expect(server.pathOf('f1')).toBe('b.md');
+    expect(disk(h)).toEqual(['b.md=A\n']);
+    expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
+    expect(recorded(h)).toEqual(['f1:b.md']);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+});
+
+describe('SyncEngine — a delete made while the connect’s listing is on its way', () => {
+  // Sent at once, after the listing and the join's catch-up were taken:
+  // indexed again from them, the note was written back to disk, and stayed
+  // there, never synced again (the server holds a tombstone).
+  it('keeps the note deleted', async () => {
+    const h = buildHarness();
+    const { server, docs } = await note(h);
+    const release = holdListing(h);
+    const stale = docs.snapshots();
+
+    await h.engine.start();
+    await flushAsync();
+    h.vault.files.delete('a.md');
+    const deleted = h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'delete',
+      path: 'a.md',
+      source: 'obsidian',
     });
+    await server.pump();
+    await deleted;
+    expect(server.pathOf('f1')).toBeNull();
+    release();
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: stale });
+    await docs.drive();
 
-    it('keeps the new name on a reconnect', async () => {
-      const h = buildHarness();
-      const { server, docs } = await note(h, format);
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-      h.socket().disconnect();
-      await flushAsync();
-      const release = holdListing(h);
+    expect(disk(h)).toEqual([]);
+    expect(h.engine.getFileIdForPath('a.md')).toBeNull();
+    expect(recorded(h)).toEqual([]);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+});
 
-      h.socket().connect();
-      await flushAsync();
-      await renameBeforeListing(h, server, release);
-      h.socket()
-        .pending('project:join')
-        .ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
-      await docs.drive();
+describe('SyncEngine — renamed and renamed back offline while a teammate renamed it', () => {
+  async function expectFollowed(h: Harness, server: FakeServer, docs: ServerDocs): Promise<void> {
+    expect(server.applied).toEqual(['f1 a.md -> z.md']);
+    expect(disk(h)).toEqual(['z.md=A\n']);
+    expect(h.engine.getFileIdForPath('z.md')).toBe('f1');
+    expect(h.log.dequeueOperations('b1')).toEqual([]);
 
-      expect(server.pathOf('f1')).toBe('b.md');
-      expect(disk(h)).toEqual(['b.md=A\n']);
-      expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
-      expect(recorded(h)).toEqual(['f1:b.md']);
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
-    });
-  },
-);
+    // A teammate then creates a new `a.md`: a note of its own here too.
+    const id = await server.teammateCreate('a.md', 'new a\n');
+    await docs.drive();
+    expect(disk(h)).toEqual(['a.md=new a\n', 'z.md=A\n']);
+    expect(docs.live()).toEqual(['a.md=new a\n', 'z.md=A\n']);
+    expect(h.engine.getFileIdForPath('a.md')).toBe(id);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a delete made while the connect’s listing is on its way, %s broadcasts',
-  (format) => {
-    // Sent at once, after the listing and the join's catch-up were taken:
-    // indexed again from them, the note was written back to disk, and stayed
-    // there, never synced again (the server holds a tombstone).
-    it('keeps the note deleted', async () => {
-      const h = buildHarness();
-      const { server, docs } = await note(h, format);
-      const release = holdListing(h);
-      const stale = docs.snapshots();
+  it('follows the teammate’s rename when the session started offline', async () => {
+    const h = buildHarness({ offline: true });
+    const { server, docs } = await note(h);
+    server.teammateRename('f1', 'z.md');
 
-      await h.engine.start();
-      await flushAsync();
-      h.vault.files.delete('a.md');
-      const deleted = h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'delete',
-        path: 'a.md',
-        source: 'obsidian',
-      });
-      await server.pump();
-      await deleted;
-      expect(server.pathOf('f1')).toBeNull();
-      release();
-      h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: stale });
-      await docs.drive();
+    await h.engine.start();
+    await flushAsync();
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'b.md', 'a.md');
+    await goOnline(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-      expect(disk(h)).toEqual([]);
-      expect(h.engine.getFileIdForPath('a.md')).toBeNull();
-      expect(recorded(h)).toEqual([]);
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
-    });
-  },
-);
+    await expectFollowed(h, server, docs);
+  });
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — renamed and renamed back offline while a teammate renamed it, %s broadcasts',
-  (format) => {
-    async function expectFollowed(h: Harness, server: FakeServer, docs: ServerDocs): Promise<void> {
-      expect(server.applied).toEqual(['f1 a.md -> z.md']);
-      expect(disk(h)).toEqual(['z.md=A\n']);
-      expect(h.engine.getFileIdForPath('z.md')).toBe('f1');
-      expect(h.log.dequeueOperations('b1')).toEqual([]);
+  it('follows the teammate’s rename after a reconnect', async () => {
+    const h = buildHarness();
+    const { server, docs } = await note(h);
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+    h.socket().disconnect();
+    await flushAsync();
 
-      // A teammate then creates a new `a.md`: a note of its own here too.
-      const id = await server.teammateCreate('a.md', 'new a\n');
-      await docs.drive();
-      expect(disk(h)).toEqual(['a.md=new a\n', 'z.md=A\n']);
-      expect(docs.live()).toEqual(['a.md=new a\n', 'z.md=A\n']);
-      expect(h.engine.getFileIdForPath('a.md')).toBe(id);
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
-    }
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'b.md', 'a.md');
+    server.teammateRename('f1', 'z.md');
+    h.socket().connect();
+    await flushAsync();
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-    it('follows the teammate’s rename when the session started offline', async () => {
-      const h = buildHarness({ offline: true });
-      const { server, docs } = await note(h, format);
-      server.teammateRename('f1', 'z.md');
-
-      await h.engine.start();
-      await flushAsync();
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'b.md', 'a.md');
-      await goOnline(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      await expectFollowed(h, server, docs);
-    });
-
-    it('follows the teammate’s rename after a reconnect', async () => {
-      const h = buildHarness();
-      const { server, docs } = await note(h, format);
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-      h.socket().disconnect();
-      await flushAsync();
-
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'b.md', 'a.md');
-      server.teammateRename('f1', 'z.md');
-      h.socket().connect();
-      await flushAsync();
-      h.socket()
-        .pending('project:join')
-        .ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      await expectFollowed(h, server, docs);
-    });
-  },
-);
+    await expectFollowed(h, server, docs);
+  });
+});

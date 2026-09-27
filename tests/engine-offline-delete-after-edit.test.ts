@@ -24,7 +24,6 @@ import {
   encode,
   flushAsync,
   json,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -52,11 +51,10 @@ async function snapshot(server: FakeServer, docs: ServerDocs, id: string): Promi
  * again.
  */
 async function editedOnlineThenOffline(
-  format: BroadcastFormat,
   docs?: FakeIndexedDb,
 ): Promise<{ h: Harness; server: FakeServer; serverDocs: ServerDocs }> {
   const h = buildHarness(docs ? { docs: docs.manager() } : {});
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   const serverDocs = new ServerDocs(server, h);
   // New to this device: the catch-up writes it out.
   h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: [] }));
@@ -96,61 +94,58 @@ async function reconnect(h: Harness, serverDocs: ServerDocs): Promise<void> {
   await serverDocs.drive();
 }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a note edited online, then offline, then deleted offline, %s broadcasts',
-  (format) => {
-    it('sends the delete: nobody else changed the note', async () => {
-      const { h, server, serverDocs } = await editedOnlineThenOffline(format);
-      await deleteHere(h);
+describe('SyncEngine — a note edited online, then offline, then deleted offline', () => {
+  it('sends the delete: nobody else changed the note', async () => {
+    const { h, server, serverDocs } = await editedOnlineThenOffline();
+    await deleteHere(h);
 
-      await reconnect(h, serverDocs);
+    await reconnect(h, serverDocs);
 
-      expect(server.pathOf('f1')).toBeNull();
-      expect(disk(h)).toEqual([]);
-      expect(h.log.dequeueOperations('b1')).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.pathOf('f1')).toBeNull();
+    expect(disk(h)).toEqual([]);
+    expect(h.log.dequeueOperations('b1')).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('sends the delete after a restart in between, from the history in the store', async () => {
-      const idb = new FakeIndexedDb();
-      const { h, server, serverDocs } = await editedOnlineThenOffline(format, idb);
-      await h.engine.stop();
-      // Obsidian started again without network: the note's history is in
-      // the store only.
-      const next = buildHarness({ predecessor: h, docs: idb.manager(), offline: true });
-      server.attach(next);
-      serverDocs.attach(next);
-      await next.engine.start();
-      await flushAsync();
-      await deleteHere(next);
+  it('sends the delete after a restart in between, from the history in the store', async () => {
+    const idb = new FakeIndexedDb();
+    const { h, server, serverDocs } = await editedOnlineThenOffline(idb);
+    await h.engine.stop();
+    // Obsidian started again without network: the note's history is in
+    // the store only.
+    const next = buildHarness({ predecessor: h, docs: idb.manager(), offline: true });
+    server.attach(next);
+    serverDocs.attach(next);
+    await next.engine.start();
+    await flushAsync();
+    await deleteHere(next);
 
-      next.socket().goOnline();
-      await flushAsync();
-      next
-        .socket()
-        .pending('project:join')
-        .ack({ ok: true, operations: [], yjsDocs: serverDocs.snapshots() });
-      await serverDocs.drive();
+    next.socket().goOnline();
+    await flushAsync();
+    next
+      .socket()
+      .pending('project:join')
+      .ack({ ok: true, operations: [], yjsDocs: serverDocs.snapshots() });
+    await serverDocs.drive();
 
-      expect(server.pathOf('f1')).toBeNull();
-      expect(disk(next)).toEqual([]);
-      await next.engine.stop();
-    });
+    expect(server.pathOf('f1')).toBeNull();
+    expect(disk(next)).toEqual([]);
+    await next.engine.stop();
+  });
 
-    it('holds the delete back when a teammate edited the note meanwhile', async () => {
-      const { h, server, serverDocs } = await editedOnlineThenOffline(format);
-      await deleteHere(h);
-      // A teammate's edit the server got while this device was offline.
-      const doc = serverDocs.docs.get('f1') as Y.Doc;
-      doc.getText('content').insert(0, 'theirs\n');
-      await snapshot(server, serverDocs, 'f1');
+  it('holds the delete back when a teammate edited the note meanwhile', async () => {
+    const { h, server, serverDocs } = await editedOnlineThenOffline();
+    await deleteHere(h);
+    // A teammate's edit the server got while this device was offline.
+    const doc = serverDocs.docs.get('f1') as Y.Doc;
+    doc.getText('content').insert(0, 'theirs\n');
+    await snapshot(server, serverDocs, 'f1');
 
-      await reconnect(h, serverDocs);
+    await reconnect(h, serverDocs);
 
-      expect(server.pathOf('f1')).toBe('P.md');
-      expect(serverDocs.text('f1')).toBe('theirs\nA\nB\n');
-      expect(disk(h)).toEqual(['P.md=theirs\nA\nB\n']);
-      await h.engine.stop();
-    });
-  },
-);
+    expect(server.pathOf('f1')).toBe('P.md');
+    expect(serverDocs.text('f1')).toBe('theirs\nA\nB\n');
+    expect(disk(h)).toEqual(['P.md=theirs\nA\nB\n']);
+    await h.engine.stop();
+  });
+});

@@ -1,7 +1,8 @@
 /**
  * A teammate deletes a note and creates it again under its name while this
- * device connects, on a server that replaces a revived note's history (every
- * server before 0.3.8's, production when it came out).
+ * device connects — also on a server that replaces a revived note's history
+ * (every server before 0.3.8's did; the server this client needs continues
+ * it, but a project seeded anew has new histories all the same).
  *
  * The server encodes each doc of the catch-up when it sends it, and the
  * engine keeps what arrives before the listing — slow on a large vault. So
@@ -22,7 +23,6 @@ import {
   deferred,
   encode,
   flushAsync,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -49,14 +49,14 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
 /** How the server delivers the docs: in the join's answer, or streamed after it. */
 type Delivery = 'inline' | 'streamed';
 
-/** Production's answer to the join: the journal's first rows, no echo. */
+/** The server's answer to the join: the whole journal. */
 async function answerJoin(
   h: Harness,
   server: FakeServer,
   delivery: Delivery,
   docs: YjsDocSnapshot[],
 ): Promise<void> {
-  const answer = server.joinAnswer('first rows');
+  const answer = server.joinAnswer('whole journal');
   if (delivery === 'inline') {
     h.socket()
       .pending('project:join')
@@ -75,11 +75,10 @@ async function answerJoin(
  * whose catch-up docs are encoded before the teammate deletes Plan.md and
  * creates it again with `text`.
  */
-async function revivedWhileConnecting(delivery: Delivery, text: string, format: BroadcastFormat) {
+async function revivedWhileConnecting(delivery: Delivery, text: string, replaced: boolean) {
   const h = buildHarness();
-  const server = new FakeServer(h, format);
-  // A server that sends `clientId` continues the history instead.
-  const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+  const server = new FakeServer(h);
+  const docs = new ServerDocs(server, h, { replaceOnRevive: replaced });
   await remember(h, 'Plan.md', 'f1', OLD);
   await docs.add('f1', 'Plan.md', OLD);
   await remember(h, 'Other.md', 'f2', 'other\n');
@@ -124,17 +123,18 @@ function conflictCopies(h: Harness): string[] {
 }
 
 describe.each([
-  ['streamed', 'legacy'],
-  ['inline', 'legacy'],
-  ['streamed', 'current'],
+  ['streamed', 'replaced'],
+  ['inline', 'replaced'],
+  ['streamed', 'continued'],
 ] as const)(
-  'SyncEngine — a note revived while this device connects, docs %s, %s broadcasts',
-  (delivery, format) => {
+  'SyncEngine — a note revived while this device connects, docs %s, its history %s',
+  (delivery, history) => {
+    const replaced = history === 'replaced';
     it.each([
       ['the same text', OLD],
       ['another text', 'new plan\n'],
     ])('keeps the new note, created again with %s, and an edit to it once', async (_, text) => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, text, format);
+      const { h, server, docs } = await revivedWhileConnecting(delivery, text, replaced);
       expect(h.vault.text('Plan.md')).toBe(text);
       expect(docs.text('f1')).toBe(text);
 
@@ -159,7 +159,7 @@ describe.each([
     });
 
     it('sends an edit made to it offline into it', async () => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', format);
+      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', replaced);
       h.socket().disconnect();
       await flushAsync();
       h.vault.files.set('Plan.md', encode('new plan\nmine\n'));
@@ -179,7 +179,7 @@ describe.each([
     });
 
     it('sends a delete of it made offline', async () => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', format);
+      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', replaced);
       h.socket().disconnect();
       await flushAsync();
       h.vault.files.delete('Plan.md');
@@ -202,7 +202,7 @@ describe.each([
 describe('SyncEngine — a note deleted here and created again while this device connects', () => {
   it('keeps the new note', async () => {
     const h = buildHarness();
-    const server = new FakeServer(h, 'legacy');
+    const server = new FakeServer(h);
     const docs = new ServerDocs(server, h, { replaceOnRevive: true });
     await remember(h, 'Untitled.md', 'f1', OLD);
     await docs.add('f1', 'Untitled.md', OLD);
@@ -219,7 +219,7 @@ describe('SyncEngine — a note deleted here and created again while this device
     const stale = docs.snapshots();
     h.socket()
       .pending('project:join')
-      .ack({ ...server.joinAnswer('first rows'), yjsStream: true, yjsCount: 1 });
+      .ack({ ...server.joinAnswer('whole journal'), yjsStream: true, yjsCount: 1 });
     await flushAsync(20);
     // The user deletes the note, and Ctrl+N makes a new "Untitled".
     h.vault.files.delete('Untitled.md');

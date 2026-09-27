@@ -25,7 +25,6 @@ import {
   encode,
   flushAsync,
   joinClockOf,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -55,13 +54,8 @@ function asked(h: Harness): number {
 }
 
 /** Answer the join for the clock it carried, the way each server does. */
-async function join(
-  h: Harness,
-  server: FakeServer,
-  docs: ServerDocs,
-  format: BroadcastFormat,
-): Promise<string[]> {
-  const answer = server.joinAnswer(format === 'current' ? 'whole journal' : 'first rows', {
+async function join(h: Harness, server: FakeServer, docs: ServerDocs): Promise<string[]> {
+  const answer = server.joinAnswer('whole journal', {
     clock: joinClockOf(h),
     yjsDocs: docs.snapshots(),
   });
@@ -84,22 +78,20 @@ type Unsettled = 'Obsidian closed before an answer' | 'Restore on server without
  */
 type History = 'with its history' | 'without it';
 
-const cases: Array<[BroadcastFormat, Unsettled, History]> = [];
-for (const format of ['current', 'legacy'] as BroadcastFormat[]) {
-  for (const history of ['with its history', 'without it'] as History[]) {
-    cases.push([format, 'Obsidian closed before an answer', history]);
-    cases.push([format, 'Restore on server without a connection', history]);
-  }
+const cases: Array<[Unsettled, History]> = [];
+for (const history of ['with its history', 'without it'] as History[]) {
+  cases.push(['Obsidian closed before an answer', history]);
+  cases.push(['Restore on server without a connection', history]);
 }
 
 describe.each(cases)(
-  'SyncEngine — a note deleted by a teammate, its question unsettled (%s server, %s, %s here), created again while Obsidian is closed',
-  (format, unsettled, history) => {
+  'SyncEngine — a note deleted by a teammate, its question unsettled (%s, %s here), created again while Obsidian is closed',
+  (unsettled, history) => {
     it('keeps the new note as it is, the offline edit in a copy of its own', async () => {
       const idb = new FakeIndexedDb();
       const h = buildHarness({ docs: idb.manager() });
-      const server = new FakeServer(h, format);
-      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+      const server = new FakeServer(h);
+      const docs = new ServerDocs(server, h);
       const first = history === 'with its history' ? 'old\n' : 'old plan\n';
       await remember(h, 'Plan.md', 'f1', first);
       await docs.add('f1', 'Plan.md', first);
@@ -133,7 +125,7 @@ describe.each(cases)(
       // The connect asks about the copy; the DELETE reaches the clock.
       h.socket().connect();
       await flushAsync();
-      expect(await join(h, server, docs, format)).toEqual(['DELETE']);
+      expect(await join(h, server, docs)).toEqual(['DELETE']);
       await flushAsync(20);
       expect(asked(h)).toBe(1);
       expect(disk(h)).toEqual(['Other.md=other\n', 'Plan.md=old plan\nmine\n']);
@@ -156,7 +148,7 @@ describe.each(cases)(
       docs.attach(next);
       await next.engine.start();
       await flushAsync();
-      expect(await join(next, server, docs, format)).toEqual(['CREATE']);
+      expect(await join(next, server, docs)).toEqual(['CREATE']);
       await flushAsync(40);
       await docs.drive();
 
@@ -177,7 +169,7 @@ describe.each(cases)(
       await flushAsync();
       next.socket().connect();
       await flushAsync();
-      await join(next, server, docs, format);
+      await join(next, server, docs);
       await flushAsync(40);
       await docs.drive();
       expect(docs.live()).toEqual(all);
@@ -195,7 +187,7 @@ describe('SyncEngine — a note deleted by a teammate, its question settled', ()
     async (answer) => {
       const idb = new FakeIndexedDb();
       const h = buildHarness({ docs: idb.manager() });
-      const server = new FakeServer(h, 'current');
+      const server = new FakeServer(h);
       const docs = new ServerDocs(server, h);
       await remember(h, 'Plan.md', 'f1', 'old\n');
       await docs.add('f1', 'Plan.md', 'old\n');
@@ -218,7 +210,7 @@ describe('SyncEngine — a note deleted by a teammate, its question settled', ()
       server.teammateDelete('f1');
       h.socket().connect();
       await flushAsync();
-      await join(h, server, docs, 'current');
+      await join(h, server, docs);
       await flushAsync(20);
       expect(asked(h)).toBe(1);
       expect(h.log.deleteAskedIds('b1')).toEqual(new Set(['f1']));
@@ -240,75 +232,72 @@ describe('SyncEngine — a note deleted by a teammate, its question settled', ()
 // the new note from then on, and the question is no longer about it. An
 // offline edit of the new note made after merges into it on the next
 // connect — not taken for an edit of the deleted one, set aside.
-describe.each(['current', 'legacy'] as BroadcastFormat[])(
-  'SyncEngine — a note deleted by a teammate and created again while its question is open (%s server)',
-  (format) => {
-    it('takes an offline edit of the new note for one, on the next connect', async () => {
-      const idb = new FakeIndexedDb();
-      const h = buildHarness({ docs: idb.manager() });
-      const server = new FakeServer(h, format);
-      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
-      await remember(h, 'Plan.md', 'f1', 'old\n');
-      await docs.add('f1', 'Plan.md', 'old\n');
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-      await docs.restWrite('f1', 'old plan\n');
-      await docs.drive();
-      await h.settle();
+describe('SyncEngine — a note deleted by a teammate and created again while its question is open', () => {
+  it('takes an offline edit of the new note for one, on the next connect', async () => {
+    const idb = new FakeIndexedDb();
+    const h = buildHarness({ docs: idb.manager() });
+    const server = new FakeServer(h);
+    const docs = new ServerDocs(server, h);
+    await remember(h, 'Plan.md', 'f1', 'old\n');
+    await docs.add('f1', 'Plan.md', 'old\n');
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+    await docs.restWrite('f1', 'old plan\n');
+    await docs.drive();
+    await h.settle();
 
-      h.socket().disconnect();
-      await flushAsync();
-      h.vault.files.set('Plan.md', encode('old plan\nmine\n'));
-      await h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'modify',
-        path: 'Plan.md',
-        source: 'obsidian',
-      });
-      await flushAsync(20);
-      server.teammateDelete('f1');
-      h.socket().connect();
-      await flushAsync();
-      await join(h, server, docs, format);
-      await flushAsync(20);
-      expect(asked(h)).toBe(1);
-
-      // Not answered; the teammate creates the note again, live.
-      await server.teammateCreate('Plan.md', 'new plan\n');
-      await docs.drive();
-      await h.settle();
-      await docs.drive();
-      const copies = (): string[] =>
-        [...h.vault.files.keys()].filter((p) => p.startsWith('Plan.conflict-'));
-      expect(copies()).toHaveLength(1);
-      const copy = copies()[0] ?? '';
-      expect(h.vault.text('Plan.md')).toBe('new plan\n');
-      expect(h.log.deleteAskedIds('b1')).toEqual(new Set());
-
-      // Typed into the new note offline.
-      h.socket().disconnect();
-      await flushAsync();
-      h.vault.files.set('Plan.md', encode('new plan\nlater\n'));
-      await h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'modify',
-        path: 'Plan.md',
-        source: 'obsidian',
-      });
-      await flushAsync(20);
-      h.socket().connect();
-      await flushAsync();
-      await join(h, server, docs, format);
-      await flushAsync(40);
-      await docs.drive();
-
-      const all = [`${copy}=old plan\nmine\n`, 'Plan.md=new plan\nlater\n'];
-      expect(docs.live()).toEqual(all);
-      expect(disk(h)).toEqual(all);
-      await h.engine.stop();
+    h.socket().disconnect();
+    await flushAsync();
+    h.vault.files.set('Plan.md', encode('old plan\nmine\n'));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Plan.md',
+      source: 'obsidian',
     });
-  },
-);
+    await flushAsync(20);
+    server.teammateDelete('f1');
+    h.socket().connect();
+    await flushAsync();
+    await join(h, server, docs);
+    await flushAsync(20);
+    expect(asked(h)).toBe(1);
+
+    // Not answered; the teammate creates the note again, live.
+    await server.teammateCreate('Plan.md', 'new plan\n');
+    await docs.drive();
+    await h.settle();
+    await docs.drive();
+    const copies = (): string[] =>
+      [...h.vault.files.keys()].filter((p) => p.startsWith('Plan.conflict-'));
+    expect(copies()).toHaveLength(1);
+    const copy = copies()[0] ?? '';
+    expect(h.vault.text('Plan.md')).toBe('new plan\n');
+    expect(h.log.deleteAskedIds('b1')).toEqual(new Set());
+
+    // Typed into the new note offline.
+    h.socket().disconnect();
+    await flushAsync();
+    h.vault.files.set('Plan.md', encode('new plan\nlater\n'));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Plan.md',
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+    h.socket().connect();
+    await flushAsync();
+    await join(h, server, docs);
+    await flushAsync(40);
+    await docs.drive();
+
+    const all = [`${copy}=old plan\nmine\n`, 'Plan.md=new plan\nlater\n'];
+    expect(docs.live()).toEqual(all);
+    expect(disk(h)).toEqual(all);
+    await h.engine.stop();
+  });
+});
 
 // Asked about on a connect, the note deleted while this device was away, and
 // the question left open across a reconnect (the connection gone with the
@@ -316,65 +305,62 @@ describe.each(['current', 'legacy'] as BroadcastFormat[])(
 // reconnect's listing has it under the id the question is about, and the
 // catch-up's doc of it is the new note's. This device has no history of the
 // note — the catch-up skipped its doc, and the offline edit stayed on disk.
-describe.each(['current', 'legacy'] as BroadcastFormat[])(
-  'SyncEngine — a note deleted while away, created again while its question stays open across a reconnect (%s server)',
-  (format) => {
-    it('keeps the new note as it is, the offline edit in a copy of its own', async () => {
-      const h = buildHarness();
-      const server = new FakeServer(h, format);
-      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
-      await remember(h, 'Plan.md', 'f1', 'old plan\n');
-      await docs.add('f1', 'Plan.md', 'old plan\n');
-      await remember(h, 'Other.md', 'f2', 'other\n');
-      await docs.add('f2', 'Other.md', 'other\n');
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
+describe('SyncEngine — a note deleted while away, created again while its question stays open across a reconnect', () => {
+  it('keeps the new note as it is, the offline edit in a copy of its own', async () => {
+    const h = buildHarness();
+    const server = new FakeServer(h);
+    const docs = new ServerDocs(server, h);
+    await remember(h, 'Plan.md', 'f1', 'old plan\n');
+    await docs.add('f1', 'Plan.md', 'old plan\n');
+    await remember(h, 'Other.md', 'f2', 'other\n');
+    await docs.add('f2', 'Other.md', 'other\n');
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-      h.socket().disconnect();
-      await flushAsync();
-      h.vault.files.set('Plan.md', encode('old plan\nmine\n'));
-      await h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'modify',
-        path: 'Plan.md',
-        source: 'obsidian',
-      });
-      await flushAsync(20);
-      server.teammateDelete('f1');
-      h.socket().connect();
-      await flushAsync();
-      await join(h, server, docs, format);
-      await flushAsync(20);
-      expect(asked(h)).toBe(1);
-
-      // The connection goes, the question on screen; Plan.md is made again.
-      h.socket().disconnect();
-      await flushAsync();
-      await server.teammateCreate('Plan.md', 'new plan\n');
-      h.socket().connect();
-      await flushAsync();
-      await join(h, server, docs, format);
-      await flushAsync(40);
-      await docs.drive();
-
-      const copies = (): string[] =>
-        [...h.vault.files.keys()].filter((p) => p.startsWith('Plan.conflict-'));
-      expect(copies()).toHaveLength(1);
-      const copy = copies()[0] ?? '';
-      const all = ['Other.md=other\n', `${copy}=old plan\nmine\n`, 'Plan.md=new plan\n'];
-      expect(docs.text('f1')).toBe('new plan\n');
-      expect(docs.live()).toEqual(all);
-      expect(disk(h)).toEqual(all);
-
-      // The answer finds the name another note's and changes nothing.
-      h.modal.del.resolve('delete-local');
-      await flushAsync(40);
-      await docs.drive();
-      await h.settle();
-      expect(docs.live()).toEqual(all);
-      expect(disk(h)).toEqual(all);
-      expect(h.log.deleteAskedIds('b1')).toEqual(new Set());
-      await h.engine.stop();
+    h.socket().disconnect();
+    await flushAsync();
+    h.vault.files.set('Plan.md', encode('old plan\nmine\n'));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Plan.md',
+      source: 'obsidian',
     });
-  },
-);
+    await flushAsync(20);
+    server.teammateDelete('f1');
+    h.socket().connect();
+    await flushAsync();
+    await join(h, server, docs);
+    await flushAsync(20);
+    expect(asked(h)).toBe(1);
+
+    // The connection goes, the question on screen; Plan.md is made again.
+    h.socket().disconnect();
+    await flushAsync();
+    await server.teammateCreate('Plan.md', 'new plan\n');
+    h.socket().connect();
+    await flushAsync();
+    await join(h, server, docs);
+    await flushAsync(40);
+    await docs.drive();
+
+    const copies = (): string[] =>
+      [...h.vault.files.keys()].filter((p) => p.startsWith('Plan.conflict-'));
+    expect(copies()).toHaveLength(1);
+    const copy = copies()[0] ?? '';
+    const all = ['Other.md=other\n', `${copy}=old plan\nmine\n`, 'Plan.md=new plan\n'];
+    expect(docs.text('f1')).toBe('new plan\n');
+    expect(docs.live()).toEqual(all);
+    expect(disk(h)).toEqual(all);
+
+    // The answer finds the name another note's and changes nothing.
+    h.modal.del.resolve('delete-local');
+    await flushAsync(40);
+    await docs.drive();
+    await h.settle();
+    expect(docs.live()).toEqual(all);
+    expect(disk(h)).toEqual(all);
+    expect(h.log.deleteAskedIds('b1')).toEqual(new Set());
+    await h.engine.stop();
+  });
+});

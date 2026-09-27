@@ -3,13 +3,12 @@
  * `sync-protocol.md`, «Подключение»), and what the engine concludes from each.
  *
  * The plugin asks for every operation its clock has not seen, from the whole
- * journal (`operationsCatchup: 2`). A server that knows the flag says so in
- * its answer, and may cut a long catch-up short to its newest operations
- * (`operationsTruncated`). One that does not — production when 0.3.8 came out
- * — answers with the unseen operations among the journal's first 500 rows:
- * none at all on a longer project. Only a whole catch-up, echoed and not cut
- * short, tells by what it leaves out; from any other, a missing operation
- * proves nothing.
+ * journal (`operationsCatchup: 2`). The server says so in its answer, and may
+ * cut a long catch-up short to its newest operations (`operationsTruncated`).
+ * Only a whole catch-up tells by what it leaves out; from one cut short, a
+ * missing operation proves nothing. (A server that gave the unseen operations
+ * among the journal's first 500 rows instead — production when 0.3.8 came
+ * out — is one this client no longer connects to: it lacks `opIdempotency`.)
  *
  * Before: a catch-up cut short between a note's DELETE and its CREATE took the
  * note for the deleted one, and merged what this device had done to that one
@@ -29,7 +28,6 @@ import {
   flushAsync,
   json,
   remoteEdit,
-  type BroadcastFormat,
   type CatchupForm,
   type Harness,
 } from './engine-test-kit';
@@ -84,13 +82,11 @@ async function drop(h: Harness): Promise<void> {
   await flushAsync();
 }
 
-async function withNotes(format: BroadcastFormat, notes: Array<[string, string, string]>) {
+async function withNotes(notes: Array<[string, string, string]>) {
   const idb = new FakeIndexedDb();
   const h = buildHarness({ docs: idb.manager() });
-  const server = new FakeServer(h, format);
-  // The server of the `legacy` format replaces a revived note's history, as
-  // production did when 0.3.8 came out.
-  const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+  const server = new FakeServer(h);
+  const docs = new ServerDocs(server, h);
   for (const [id, path, text] of notes) {
     await remember(h, path, id, text);
     await docs.add(id, path, text);
@@ -101,9 +97,9 @@ async function withNotes(format: BroadcastFormat, notes: Array<[string, string, 
 
 describe('SyncEngine — the catch-up asked for', () => {
   it('is the whole journal, at every connect', async () => {
-    const { h, server, docs } = await withNotes('current', [['f1', 'a.md', 'A\n']]);
+    const { h, server, docs } = await withNotes([['f1', 'a.md', 'A\n']]);
     await drop(h);
-    await join(h, server, docs, 'first rows');
+    await join(h, server, docs, 'cut short');
 
     const joins = h.socket().emits.filter((e) => e.event === 'project:join');
     expect(joins).toHaveLength(2);
@@ -122,81 +118,67 @@ describe('SyncEngine — the catch-up asked for', () => {
  */
 type Here = 'its history' | 'no history' | 'no history, versions';
 
-// A server that continues the history cuts the catch-up short; the one before
-// it gives the first rows, and starts a revived note's history anew.
 describe.each(
-  (
-    [
-      ['current', 'whole journal'],
-      ['current', 'cut short'],
-      ['legacy', 'first rows'],
-    ] as const
-  ).flatMap(([format, form]) =>
+  (['whole journal', 'cut short'] as const).flatMap((form) =>
     (['its history', 'no history', 'no history, versions'] as Here[]).map(
-      (here) => [format, form, here] as const,
+      (here) => [form, here] as const,
     ),
   ),
-)(
-  'SyncEngine — a note deleted and created again while away, %s server, %s, %s here',
-  (format, form, here) => {
-    it('keeps what this device did to the deleted note and never sent out of the new one', async () => {
-      const { h, server, docs } = await withNotes(format, [['f1', 'Untitled.md', 'old text\n']]);
-      h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: [] }));
-      let synced = 'old text\n';
-      if (here === 'its history') {
-        // A teammate's edit brings the note's history into its store here.
-        remoteEdit(h, docs.docs.get('f1') as Y.Doc, 'f1', 'shared\n');
-        await docs.drive();
-        synced = 'shared\nold text\n';
-        expect(h.vault.text('Untitled.md')).toBe(synced);
-      } else if (here === 'no history, versions') {
-        const versions = [
-          { id: 'v2', text: 'S2 text\n' },
-          { id: 'v1', text: 'old text\n' },
-        ];
-        const listed: Array<Record<string, unknown>> = [];
-        for (const [n, v] of versions.entries()) {
-          const hash = await sha256Hex(v.text);
-          listed.push({ id: v.id, versionNumber: 2 - n, contentHash: hash, createdAt: '' });
-          h.routes.set(`GET /api/projects/p1/files/f1/versions/${v.id}`, () =>
-            bytes(encode(v.text)),
-          );
-        }
-        h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: listed }));
+)('SyncEngine — a note deleted and created again while away, %s, %s here', (form, here) => {
+  it('keeps what this device did to the deleted note and never sent out of the new one', async () => {
+    const { h, server, docs } = await withNotes([['f1', 'Untitled.md', 'old text\n']]);
+    h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: [] }));
+    let synced = 'old text\n';
+    if (here === 'its history') {
+      // A teammate's edit brings the note's history into its store here.
+      remoteEdit(h, docs.docs.get('f1') as Y.Doc, 'f1', 'shared\n');
+      await docs.drive();
+      synced = 'shared\nold text\n';
+      expect(h.vault.text('Untitled.md')).toBe(synced);
+    } else if (here === 'no history, versions') {
+      const versions = [
+        { id: 'v2', text: 'S2 text\n' },
+        { id: 'v1', text: 'old text\n' },
+      ];
+      const listed: Array<Record<string, unknown>> = [];
+      for (const [n, v] of versions.entries()) {
+        const hash = await sha256Hex(v.text);
+        listed.push({ id: v.id, versionNumber: 2 - n, contentHash: hash, createdAt: '' });
+        h.routes.set(`GET /api/projects/p1/files/f1/versions/${v.id}`, () => bytes(encode(v.text)));
       }
+      h.routes.set('GET /api/projects/p1/files/f1/versions', () => json({ versions: listed }));
+    }
 
-      // Typed offline, never sent.
-      await drop(h);
-      const typed = `${synced}unsent line\n`;
-      h.vault.files.set('Untitled.md', encode(typed));
-      await h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'modify',
-        path: 'Untitled.md',
-        source: 'obsidian',
-      });
-      await flushAsync(20);
-      // Meanwhile a teammate deletes it and creates a new Untitled.md.
-      server.teammateDelete('f1');
-      await server.teammateCreate('Untitled.md', 'S2 text\n');
-      const ops = server.joinAnswer(form).operations as ServerOperation[];
-      const revived = format === 'current' ? 'CREATE revived' : 'CREATE';
-      expect(ops.map((op) => kindOf(op))).toEqual(
-        form === 'cut short' ? [revived] : ['DELETE', revived],
-      );
-
-      await join(h, server, docs, form, form === 'cut short' ? 1 : undefined);
-
-      expect(docs.text('f1')).toBe('S2 text\n');
-      expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
-      const copies = [...h.vault.files.keys()].filter((p) => p.includes('.conflict-'));
-      expect(copies).toHaveLength(1);
-      expect(h.vault.text(copies[0] ?? '')).toBe(typed);
-      expect(docs.live()).toEqual([`${copies[0] ?? ''}=${typed}`, 'Untitled.md=S2 text\n']);
-      await h.engine.stop();
+    // Typed offline, never sent.
+    await drop(h);
+    const typed = `${synced}unsent line\n`;
+    h.vault.files.set('Untitled.md', encode(typed));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'Untitled.md',
+      source: 'obsidian',
     });
-  },
-);
+    await flushAsync(20);
+    // Meanwhile a teammate deletes it and creates a new Untitled.md.
+    server.teammateDelete('f1');
+    await server.teammateCreate('Untitled.md', 'S2 text\n');
+    const ops = server.joinAnswer(form).operations as ServerOperation[];
+    expect(ops.map((op) => kindOf(op))).toEqual(
+      form === 'cut short' ? ['CREATE revived'] : ['DELETE', 'CREATE revived'],
+    );
+
+    await join(h, server, docs, form, form === 'cut short' ? 1 : undefined);
+
+    expect(docs.text('f1')).toBe('S2 text\n');
+    expect(h.vault.text('Untitled.md')).toBe('S2 text\n');
+    const copies = [...h.vault.files.keys()].filter((p) => p.includes('.conflict-'));
+    expect(copies).toHaveLength(1);
+    expect(h.vault.text(copies[0] ?? '')).toBe(typed);
+    expect(docs.live()).toEqual([`${copies[0] ?? ''}=${typed}`, 'Untitled.md=S2 text\n']);
+    await h.engine.stop();
+  });
+});
 
 // The DELETE of a note the teammate made again was seen on an earlier
 // connect; the CREATE was applied live and not remembered as such — a
@@ -205,7 +187,7 @@ describe.each(
 // here is the new one, and what was done to it offline goes out.
 describe('SyncEngine — a whole catch-up with a revived CREATE whose DELETE the clock has seen', () => {
   it('sends the offline rename and edit of the note, and makes no conflict copy', async () => {
-    const { h, server, docs } = await withNotes('current', [['f1', 'Untitled.md', 'old\n']]);
+    const { h, server, docs } = await withNotes([['f1', 'Untitled.md', 'old\n']]);
     server.teammateDelete('f1');
     await docs.drive();
     await drop(h);
@@ -247,11 +229,9 @@ describe('SyncEngine — a whole catch-up with a revived CREATE whose DELETE the
 describe.each([
   ['whole journal', undefined],
   ['cut short', 1],
-  // A project longer than the window: no operations at all.
-  ['first rows', 0],
 ] as const)('SyncEngine — a catch-up, %s', (form, rows) => {
   it('brings an attachment a teammate added while this device was away', async () => {
-    const { h, server, docs } = await withNotes('current', [
+    const { h, server, docs } = await withNotes([
       ['f1', 'a.md', 'A\n'],
       ['f2', 'b.md', 'B\n'],
     ]);
@@ -271,7 +251,7 @@ describe.each([
   });
 
   it('forgets what was applied live only when it is whole', async () => {
-    const { h, server, docs } = await withNotes('current', [
+    const { h, server, docs } = await withNotes([
       ['f1', 'a.md', 'A\n'],
       ['f2', 'b.md', 'B\n'],
     ]);
@@ -287,8 +267,8 @@ describe.each([
 
     expect(h.vault.text('n.md')).toBe('N\n');
     expect(h.vault.text('c.md')).toBe('B\n');
-    // Returned by the whole catch-up: the clock has it now. Left out of the
-    // others, it may come again.
+    // Returned by the whole catch-up: the clock has it now. Left out of one
+    // cut short, it may come again.
     if (form === 'whole journal') expect(h.log.appliedLiveIds('b1')).not.toContain(created);
     else expect(h.log.appliedLiveIds('b1')).toContain(created);
     await h.engine.stop();

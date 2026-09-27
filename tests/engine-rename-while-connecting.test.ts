@@ -22,7 +22,6 @@ import {
   flushAsync,
   json,
   userRename,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -40,11 +39,10 @@ function queue(h: Harness): string[] {
 
 /** `a.md` on disk, in `state.json` and on the server; renamed to `b.md` offline. */
 async function renamedOffline(
-  format: BroadcastFormat,
   before: (h: Harness) => Promise<void> = () => Promise.resolve(),
 ): Promise<{ h: Harness; server: FakeServer; docs: ServerDocs }> {
   const h = buildHarness();
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   const hash = await sha256Hex('A\n');
   h.vault.files.set('a.md', encode('A\n'));
@@ -80,97 +78,94 @@ async function answerJoin(h: Harness, docs: ServerDocs): Promise<void> {
   await docs.drive();
 }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a note renamed offline, renamed again while sync connects, %s broadcasts',
-  (format) => {
-    it('keeps the last rename while the join is answered', async () => {
-      const { h, server, docs } = await renamedOffline(format);
-      await connecting(h);
-      await userRename(h, 'b.md', 'c.md');
-      await answerJoin(h, docs);
+describe('SyncEngine — a note renamed offline, renamed again while sync connects', () => {
+  it('keeps the last rename while the join is answered', async () => {
+    const { h, server, docs } = await renamedOffline();
+    await connecting(h);
+    await userRename(h, 'b.md', 'c.md');
+    await answerJoin(h, docs);
 
-      expect(server.applied).toEqual(['f1 a.md -> c.md']);
-      expect(disk(h)).toEqual(['c.md=A\n']);
-      expect(queue(h)).toEqual([]);
+    expect(server.applied).toEqual(['f1 a.md -> c.md']);
+    expect(disk(h)).toEqual(['c.md=A\n']);
+    expect(queue(h)).toEqual([]);
 
-      // And the next connect leaves it there.
-      h.socket().disconnect();
-      await flushAsync();
-      await connecting(h);
-      await answerJoin(h, docs);
-      expect(server.applied).toEqual(['f1 a.md -> c.md']);
-      expect(docs.live()).toEqual(['c.md=A\n']);
-      expect(disk(h)).toEqual(['c.md=A\n']);
-      await h.engine.stop();
-    });
+    // And the next connect leaves it there.
+    h.socket().disconnect();
+    await flushAsync();
+    await connecting(h);
+    await answerJoin(h, docs);
+    expect(server.applied).toEqual(['f1 a.md -> c.md']);
+    expect(docs.live()).toEqual(['c.md=A\n']);
+    expect(disk(h)).toEqual(['c.md=A\n']);
+    await h.engine.stop();
+  });
 
-    it('keeps the last rename while the drain waits for an attachment upload', async () => {
-      // Before the rename, an attachment was added offline: the drain sends
-      // it first, and its upload takes a while.
-      const { h, server, docs } = await renamedOffline(format, async (h) => {
-        h.vault.files.set('pic.png', encode('picture'));
-        await h.engine.handleVaultEvent({
-          bindingId: 'b1',
-          type: 'create',
-          path: 'pic.png',
-          source: 'obsidian',
-        });
+  it('keeps the last rename while the drain waits for an attachment upload', async () => {
+    // Before the rename, an attachment was added offline: the drain sends
+    // it first, and its upload takes a while.
+    const { h, server, docs } = await renamedOffline(async (h) => {
+      h.vault.files.set('pic.png', encode('picture'));
+      await h.engine.handleVaultEvent({
+        bindingId: 'b1',
+        type: 'create',
+        path: 'pic.png',
+        source: 'obsidian',
       });
-      expect(queue(h)).toEqual(['CREATE pic.png', 'RENAME a.md -> b.md']);
-      const upload = deferred<void>();
-      h.routes.set('PUT /blobs', async () => {
-        await upload.promise;
-        return json({ ok: true });
-      });
-      await connecting(h);
-      h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: [] });
-      await flushAsync(20);
-      expect(h.requests.some((r) => r.method === 'PUT')).toBe(true);
-
-      await userRename(h, 'b.md', 'c.md');
-      upload.resolve();
-      await docs.drive();
-
-      expect(server.applied).toEqual(['f1 a.md -> c.md', 'create pic.png']);
-      expect(server.pathOf('f1')).toBe('c.md');
-      expect(disk(h)).toEqual(['c.md=A\n', 'pic.png=picture']);
-      expect(queue(h)).toEqual([]);
-      await h.engine.stop();
     });
-
-    it('uploads no second note when the connection drops before the join is answered', async () => {
-      const { h, server, docs } = await renamedOffline(format);
-      await connecting(h);
-      await userRename(h, 'b.md', 'c.md');
-      h.socket().disconnect();
-      await flushAsync();
-      await connecting(h);
-      await answerJoin(h, docs);
-
-      expect(server.applied).toEqual(['f1 a.md -> c.md']);
-      expect(docs.live()).toEqual(['c.md=A\n']);
-      expect(disk(h)).toEqual(['c.md=A\n']);
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
+    expect(queue(h)).toEqual(['CREATE pic.png', 'RENAME a.md -> b.md']);
+    const upload = deferred<void>();
+    h.routes.set('PUT /blobs', async () => {
+      await upload.promise;
+      return json({ ok: true });
     });
+    await connecting(h);
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: [] });
+    await flushAsync(20);
+    expect(h.requests.some((r) => r.method === 'PUT')).toBe(true);
 
-    it('uploads no second note after Pause sync before the drain', async () => {
-      const { h, server, docs } = await renamedOffline(format);
-      await connecting(h);
-      await userRename(h, 'b.md', 'c.md');
-      await h.engine.stop();
+    await userRename(h, 'b.md', 'c.md');
+    upload.resolve();
+    await docs.drive();
 
-      const next = buildHarness({ predecessor: h });
-      server.attach(next);
-      docs.attach(next);
-      await connect(next, { yjsDocs: docs.snapshots() });
-      await docs.drive();
+    expect(server.applied).toEqual(['f1 a.md -> c.md', 'create pic.png']);
+    expect(server.pathOf('f1')).toBe('c.md');
+    expect(disk(h)).toEqual(['c.md=A\n', 'pic.png=picture']);
+    expect(queue(h)).toEqual([]);
+    await h.engine.stop();
+  });
 
-      expect(server.applied).toEqual(['f1 a.md -> c.md']);
-      expect(docs.live()).toEqual(['c.md=A\n']);
-      expect(disk(next)).toEqual(['c.md=A\n']);
-      expect(next.socket().created()).toEqual([]);
-      await next.engine.stop();
-    });
-  },
-);
+  it('uploads no second note when the connection drops before the join is answered', async () => {
+    const { h, server, docs } = await renamedOffline();
+    await connecting(h);
+    await userRename(h, 'b.md', 'c.md');
+    h.socket().disconnect();
+    await flushAsync();
+    await connecting(h);
+    await answerJoin(h, docs);
+
+    expect(server.applied).toEqual(['f1 a.md -> c.md']);
+    expect(docs.live()).toEqual(['c.md=A\n']);
+    expect(disk(h)).toEqual(['c.md=A\n']);
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('uploads no second note after Pause sync before the drain', async () => {
+    const { h, server, docs } = await renamedOffline();
+    await connecting(h);
+    await userRename(h, 'b.md', 'c.md');
+    await h.engine.stop();
+
+    const next = buildHarness({ predecessor: h });
+    server.attach(next);
+    docs.attach(next);
+    await connect(next, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    expect(server.applied).toEqual(['f1 a.md -> c.md']);
+    expect(docs.live()).toEqual(['c.md=A\n']);
+    expect(disk(next)).toEqual(['c.md=A\n']);
+    expect(next.socket().created()).toEqual([]);
+    await next.engine.stop();
+  });
+});

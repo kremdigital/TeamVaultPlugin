@@ -783,9 +783,9 @@ describe('SyncEngine — state.json lost, offline stores from before 0.3.8 intac
 });
 
 describe('SyncEngine — the lineage check without the catch-up’s word', () => {
-  // A server's catch-up can leave the DELETE and CREATE out: the one in
-  // production lists operations from the first 500 of the project's journal,
-  // and every project past that gets none. The histories have to tell.
+  // A server's catch-up can leave the DELETE and CREATE out: one cut short to
+  // its newest operations, or the window of the journal's first 500 rows a
+  // server before 0.3.8's gave. The histories have to tell.
   it.each([
     ['under its name (Ctrl+N)', 'Untitled.md'],
     ['renamed since (a title typed in)', 'Meeting.md'],

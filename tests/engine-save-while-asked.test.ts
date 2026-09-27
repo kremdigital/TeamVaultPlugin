@@ -24,7 +24,6 @@ import {
   deferred,
   encode,
   flushAsync,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -51,9 +50,9 @@ function disk(h: Harness): string[] {
   return [...h.vault.files.keys()].sort().map((p) => `${p}=${h.vault.text(p) ?? ''}`);
 }
 
-function joinAnswer(server: FakeServer, format: BroadcastFormat, count: number) {
+function joinAnswer(server: FakeServer, count: number) {
   return {
-    ...server.joinAnswer(format === 'current' ? 'whole journal' : 'first rows'),
+    ...server.joinAnswer('whole journal'),
     yjsStream: true,
     yjsCount: count,
   };
@@ -78,15 +77,8 @@ function modify(h: Harness, path: string): Promise<void> {
   return h.engine.handleVaultEvent({ bindingId: 'b1', type: 'modify', path, source: 'obsidian' });
 }
 
-async function connectWith(
-  h: Harness,
-  server: FakeServer,
-  docs: ServerDocs,
-  format: BroadcastFormat,
-): Promise<void> {
-  h.socket()
-    .pending('project:join')
-    .ack(joinAnswer(server, format, docs.snapshots().length));
+async function connectWith(h: Harness, server: FakeServer, docs: ServerDocs): Promise<void> {
+  h.socket().pending('project:join').ack(joinAnswer(server, docs.snapshots().length));
   await flushAsync(3);
   stream(h, docs.snapshots());
   await flushAsync(40);
@@ -98,27 +90,25 @@ async function connectWith(
 type When = 'once connected' | 'while connecting' | 'deleted while away';
 type Answer = 'delete-local' | 'restore-server';
 
-const cases: Array<[BroadcastFormat, When, Answer]> = [];
-for (const format of ['legacy', 'current'] as BroadcastFormat[]) {
-  cases.push([format, 'once connected', 'delete-local']);
-  cases.push([format, 'once connected', 'restore-server']);
-  cases.push([format, 'while connecting', 'delete-local']);
-  cases.push([format, 'deleted while away', 'restore-server']);
-}
+const cases: Array<[When, Answer]> = [];
+cases.push(['once connected', 'delete-local']);
+cases.push(['once connected', 'restore-server']);
+cases.push(['while connecting', 'delete-local']);
+cases.push(['deleted while away', 'restore-server']);
 
 describe.each(cases)(
-  'SyncEngine — a save of a note deleted by a teammate while the user is asked, %s server, %s',
-  (format, when, answer) => {
+  'SyncEngine — a save of a note deleted by a teammate while the user is asked, %s',
+  (when, answer) => {
     it(`is left to the answer (${answer})`, async () => {
       const h = buildHarness();
-      const server = new FakeServer(h, format);
-      const docs = new ServerDocs(server, h, { replaceOnRevive: format === 'legacy' });
+      const server = new FakeServer(h);
+      const docs = new ServerDocs(server, h);
       await remember(h, 'Plan.md', 'f1', 'old plan\n');
       await docs.add('f1', 'Plan.md', 'old plan\n');
       await remember(h, 'Other.md', 'f2', 'other\n');
       await docs.add('f2', 'Other.md', 'other\n');
       await h.engine.start();
-      await connectWith(h, server, docs, format);
+      await connectWith(h, server, docs);
 
       if (when === 'once connected') {
         // Obsidian saved the note; the event waits in the watcher's debounce.
@@ -136,7 +126,7 @@ describe.each(cases)(
           server.teammateDelete('f1');
           h.socket().connect();
           await flushAsync();
-          await connectWith(h, server, docs, format);
+          await connectWith(h, server, docs);
         } else {
           // The listing of the connect is late; the teammate deletes the note
           // meanwhile, and the question comes up while connecting.
@@ -147,9 +137,7 @@ describe.each(cases)(
           h.socket().connect();
           await flushAsync();
           const before = docs.snapshots();
-          h.socket()
-            .pending('project:join')
-            .ack(joinAnswer(server, format, 2));
+          h.socket().pending('project:join').ack(joinAnswer(server, 2));
           await flushAsync(3);
           stream(h, before);
           await flushAsync(10);
@@ -203,7 +191,7 @@ describe.each(cases)(
       await flushAsync();
       h.socket().connect();
       await flushAsync();
-      await connectWith(h, server, docs, format);
+      await connectWith(h, server, docs);
       expect(docs.live()).toEqual(all);
       expect(disk(h)).toEqual(all);
       expect(asked(h)).toBe(1);

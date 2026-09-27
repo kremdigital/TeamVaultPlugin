@@ -28,7 +28,6 @@ import {
   eventLog,
   flushAsync,
   json,
-  type BroadcastFormat,
   type CatchupForm,
   type Harness,
 } from './engine-test-kit';
@@ -72,10 +71,10 @@ function lines(text: string | null): string[] {
  * for a note written through REST, and its version history holds the text
  * this device synced: the base the fold of an offline edit merges from.
  */
-async function withNote(format: BroadcastFormat, text = 'old\n') {
+async function withNote(text = 'old\n') {
   const idb = new FakeIndexedDb();
   const h = buildHarness({ docs: idb.manager() });
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   await remember(h, 'a.md', 'f1', text);
   await docs.add('f1', 'a.md', text);
@@ -131,21 +130,16 @@ function expectMerged(idb: FakeIndexedDb, h: Harness, docs: ServerDocs): void {
   expect(h.socket().created()).toEqual([]);
 }
 
-// Production today, and the server that knows the flag: the whole journal,
-// without the UPDATE rows of notes.
-const SERVERS = [
-  ['legacy', 'first rows'],
-  ['current', 'whole journal'],
-] as const;
-
-describe.each(SERVERS)(
-  'SyncEngine — a note written through MCP and edited offline, %s broadcasts, %s',
-  (format, form) => {
+// The server's catch-up is the whole journal, without the UPDATE rows of
+// notes; one cut short, the newest of it.
+describe.each(['whole journal', 'cut short'] as const)(
+  'SyncEngine — a note written through MCP and edited offline, %s',
+  (form) => {
     // U-X: the MCP write comes while this device is away.
     it.each(['keep-server', 'keep-local', 'keep-both'] as const)(
       'written while this device was away: no question, both edits kept (a %s answer is never asked for)',
       async (answer) => {
-        const { idb, h, server, docs } = await withNote(format);
+        const { idb, h, server, docs } = await withNote();
         h.modal.binary.resolve(answer);
 
         await drop(h);
@@ -164,7 +158,7 @@ describe.each(SERVERS)(
     it.each(['keep-server', 'keep-local', 'keep-both'] as const)(
       'written while this device was online, then edited offline: both edits kept (%s never asked for)',
       async (answer) => {
-        const { idb, h, server, docs } = await withNote(format);
+        const { idb, h, server, docs } = await withNote();
         h.modal.binary.resolve(answer);
 
         await docs.restWrite('f1', 'old\nmcp\n');
@@ -204,7 +198,7 @@ describe('SyncEngine — a note with its history here, edited offline and writte
     ['a word replaced', 'ALPHA beta\ngamma\ndelta\n', 'ALPHA beta\nGAMMA\ndelta\n'],
     ['a line added at the end', `${base}offline\n`, `${written}offline\n`],
   ])('keeps %s where it was', async (_what, offline, merged) => {
-    const { idb, h, server, docs } = await withNote('current', 'alpha beta\ngamma\n');
+    const { idb, h, server, docs } = await withNote('alpha beta\ngamma\n');
     await docs.restWrite('f1', base);
     await docs.drive();
     expect(h.vault.text('a.md')).toBe(base);
@@ -226,25 +220,22 @@ describe('SyncEngine — a note with its history here, edited offline and writte
 });
 
 describe('SyncEngine — an attachment update of a note, live', () => {
-  it.each(['legacy', 'current'] as const)(
-    'is left alone: the note keeps its text and its doc (%s broadcasts)',
-    async (format) => {
-      const { idb, h, server, docs } = await withNote(format);
-      // A 0.3.x teammate answered "Keep local" about the note: its bytes went
-      // to the server as an attachment update.
-      h.routes.set('GET /api/projects/p1/files/f1', () => bytes(encode('stale bytes\n')));
-      await server.teammateUpdate('f1', encode('stale bytes\n'));
-      await flushAsync(40);
-      await docs.drive();
+  it('is left alone: the note keeps its text and its doc', async () => {
+    const { idb, h, server, docs } = await withNote();
+    // A 0.3.x teammate answered "Keep local" about the note: its bytes went
+    // to the server as an attachment update.
+    h.routes.set('GET /api/projects/p1/files/f1', () => bytes(encode('stale bytes\n')));
+    await server.teammateUpdate('f1', encode('stale bytes\n'));
+    await flushAsync(40);
+    await docs.drive();
 
-      expect(h.requests.filter((r) => r.path === '/api/projects/p1/files/f1')).toEqual([]);
-      expect(h.vault.text('a.md')).toBe('old\n');
-      expect(docs.text('f1')).toBe('old\n');
-      expect(idb.textOf(dbNameOf('a.md'))).toBeNull();
-      expect(modals(h)).toEqual([]);
-      await h.engine.stop();
-    },
-  );
+    expect(h.requests.filter((r) => r.path === '/api/projects/p1/files/f1')).toEqual([]);
+    expect(h.vault.text('a.md')).toBe('old\n');
+    expect(docs.text('f1')).toBe('old\n');
+    expect(idb.textOf(dbNameOf('a.md'))).toBeNull();
+    expect(modals(h)).toEqual([]);
+    await h.engine.stop();
+  });
 });
 
 describe('SyncEngine — a queued attachment update of a note', () => {

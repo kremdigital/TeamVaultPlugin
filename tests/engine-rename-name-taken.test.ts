@@ -27,7 +27,6 @@ import {
   goOnline,
   remoteEdit,
   userRename,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -52,10 +51,9 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
 /** Synced notes: on disk, in `state.json`, and on the server with their docs. */
 async function notes(
   h: Harness,
-  format: BroadcastFormat,
   list: ReadonlyArray<readonly [path: string, fileId: string, text: string]>,
 ): Promise<{ server: FakeServer; docs: ServerDocs }> {
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   for (const [path, fileId, text] of list) {
     await remember(h, path, fileId, text);
@@ -97,169 +95,155 @@ async function expectSettled(h: Harness, server: FakeServer, docs: ServerDocs): 
   await next.engine.stop();
 }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a rename here to a name a teammate gave another note, %s broadcasts',
-  (format) => {
-    it('offline from the start: the other note moves in once this one has moved out', async () => {
-      const h = buildHarness({ offline: true });
-      const { server, docs } = await notes(h, format, A_AND_D);
-      server.teammateRename('f2', 'c.md');
+describe('SyncEngine — a rename here to a name a teammate gave another note', () => {
+  it('offline from the start: the other note moves in once this one has moved out', async () => {
+    const h = buildHarness({ offline: true });
+    const { server, docs } = await notes(h, A_AND_D);
+    server.teammateRename('f2', 'c.md');
 
-      await h.engine.start();
-      await flushAsync();
-      await userRename(h, 'a.md', 'c.md');
-      await goOnline(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
+    await h.engine.start();
+    await flushAsync();
+    await userRename(h, 'a.md', 'c.md');
+    await goOnline(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-      await expectSettled(h, server, docs);
+    await expectSettled(h, server, docs);
+  });
+
+  it('offline after a connect, both renames made while the socket was down', async () => {
+    const h = buildHarness();
+    const { server, docs } = await notes(h, A_AND_D);
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+    h.socket().disconnect();
+    await flushAsync();
+
+    await userRename(h, 'a.md', 'c.md');
+    server.teammateRename('f2', 'c.md');
+    h.socket().connect();
+    await flushAsync();
+    h.socket().pending('project:join').ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    await expectSettled(h, server, docs);
+  });
+
+  it('online, the two renames crossing on the way', async () => {
+    const h = buildHarness();
+    const { server, docs } = await notes(h, A_AND_D);
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    // The rename goes out; the server has not got to it yet.
+    await h.vault.rename('a.md', 'c.md');
+    await flushAsync();
+    expect(h.socket().pending('file:rename').payload).toMatchObject({ fileId: 'f1' });
+    // The teammate's rename reaches the server first; its broadcast reaches
+    // this device while this rename waits for its ack.
+    server.teammateRename('f2', 'c.md');
+    await flushAsync(20);
+    await docs.drive();
+
+    await expectSettled(h, server, docs);
+  });
+});
+
+describe('SyncEngine — a rename here to a name a teammate gave a new note', () => {
+  it('brings the new note in once this one has moved out, and follows its edits', async () => {
+    const h = buildHarness({ offline: true });
+    const { docs } = await notes(h, [['Untitled.md', 'f1', 'A\n']]);
+    // Created by a teammate while this device was offline.
+    await docs.add('s9', 'Meeting.md', 'teammate meeting\n');
+
+    await h.engine.start();
+    await flushAsync();
+    await userRename(h, 'Untitled.md', 'Meeting.md');
+    await goOnline(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    expect(disk(h)).toEqual(['Meeting.conflict-device-1.md=A\n', 'Meeting.md=teammate meeting\n']);
+    expect(h.engine.getFileIdForPath('Meeting.md')).toBe('s9');
+    expect(docs.live()).toEqual([
+      'Meeting.conflict-device-1.md=A\n',
+      'Meeting.md=teammate meeting\n',
+    ]);
+
+    const theirs = docs.docs.get('s9');
+    if (!theirs) throw new Error('no doc');
+    remoteEdit(h, theirs, 's9', 'agenda\n');
+    await flushAsync(40);
+    expect(h.vault.text('Meeting.md')).toBe('agenda\nteammate meeting\n');
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+
+  it('online: a new note created under the name while this rename is on its way', async () => {
+    const h = buildHarness();
+    const { server, docs } = await notes(h, [['a.md', 'f1', 'A\n']]);
+    await connect(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
+
+    // The rename goes out; the server has not got to it yet.
+    await h.vault.rename('a.md', 'c.md');
+    await flushAsync();
+    expect(h.socket().pending('file:rename').payload).toMatchObject({ fileId: 'f1' });
+    const id = await server.teammateCreate('c.md', 'theirs\n');
+    await flushAsync(20);
+    await docs.drive();
+
+    expect(disk(h)).toEqual(['c.conflict-device-1.md=A\n', 'c.md=theirs\n']);
+    expect(docs.live()).toEqual(['c.conflict-device-1.md=A\n', 'c.md=theirs\n']);
+    expect(h.engine.getFileIdForPath('c.md')).toBe(id);
+    expect(h.engine.getFileIdForPath('c.conflict-device-1.md')).toBe('f1');
+    expect(h.socket().created()).toEqual([]);
+    await h.engine.stop();
+  });
+});
+
+describe('SyncEngine — a note created here offline under a name a teammate gave a new note', () => {
+  // The server stores the create under a conflict name. The copy here used
+  // to stay unrecorded under the name asked for: the teammate's note,
+  // indexed there, took it for its own and the fold sent its text into the
+  // teammate's note, for everyone. Uploaded again on each save, it left one
+  // more conflict copy on the server each time.
+  it('keeps both: this one moves to the conflict name, the teammate’s comes in', async () => {
+    const h = buildHarness({ offline: true });
+    const { server, docs } = await notes(h, []);
+    // Created by a teammate while this device was offline.
+    await docs.add('s9', 'c.md', 'theirs\n');
+
+    await h.engine.start();
+    await flushAsync();
+    h.vault.files.set('c.md', encode('mine\n'));
+    await h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'create',
+      path: 'c.md',
+      source: 'obsidian',
     });
+    expect(h.log.dequeueOperations('b1').map((o) => o.opType)).toEqual(['CREATE']);
+    await goOnline(h, { yjsDocs: docs.snapshots() });
+    await docs.drive();
 
-    it('offline after a connect, both renames made while the socket was down', async () => {
-      const h = buildHarness();
-      const { server, docs } = await notes(h, format, A_AND_D);
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-      h.socket().disconnect();
-      await flushAsync();
+    expect(disk(h)).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
+    expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
+    expect(server.applied).toEqual(['create c.conflict-device-1.md']);
+    expect(h.engine.getFileIdForPath('c.md')).toBe('s9');
+    expect(h.engine.getFileIdForPath('c.conflict-device-1.md')).not.toBeNull();
 
-      await userRename(h, 'a.md', 'c.md');
-      server.teammateRename('f2', 'c.md');
-      h.socket().connect();
-      await flushAsync();
-      h.socket()
-        .pending('project:join')
-        .ack({ ok: true, operations: [], yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      await expectSettled(h, server, docs);
+    // A save goes to the note it belongs to, and nothing is uploaded again.
+    h.vault.files.set('c.conflict-device-1.md', encode('mine\nmore\n'));
+    const saved = h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'modify',
+      path: 'c.conflict-device-1.md',
+      source: 'obsidian',
     });
-
-    it('online, the two renames crossing on the way', async () => {
-      const h = buildHarness();
-      const { server, docs } = await notes(h, format, A_AND_D);
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      // The rename goes out; the server has not got to it yet.
-      await h.vault.rename('a.md', 'c.md');
-      await flushAsync();
-      expect(h.socket().pending('file:rename').payload).toMatchObject({ fileId: 'f1' });
-      // The teammate's rename reaches the server first; its broadcast reaches
-      // this device while this rename waits for its ack.
-      server.teammateRename('f2', 'c.md');
-      await flushAsync(20);
-      await docs.drive();
-
-      await expectSettled(h, server, docs);
-    });
-  },
-);
-
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a rename here to a name a teammate gave a new note, %s broadcasts',
-  (format) => {
-    it('brings the new note in once this one has moved out, and follows its edits', async () => {
-      const h = buildHarness({ offline: true });
-      const { docs } = await notes(h, format, [['Untitled.md', 'f1', 'A\n']]);
-      // Created by a teammate while this device was offline.
-      await docs.add('s9', 'Meeting.md', 'teammate meeting\n');
-
-      await h.engine.start();
-      await flushAsync();
-      await userRename(h, 'Untitled.md', 'Meeting.md');
-      await goOnline(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      expect(disk(h)).toEqual([
-        'Meeting.conflict-device-1.md=A\n',
-        'Meeting.md=teammate meeting\n',
-      ]);
-      expect(h.engine.getFileIdForPath('Meeting.md')).toBe('s9');
-      expect(docs.live()).toEqual([
-        'Meeting.conflict-device-1.md=A\n',
-        'Meeting.md=teammate meeting\n',
-      ]);
-
-      const theirs = docs.docs.get('s9');
-      if (!theirs) throw new Error('no doc');
-      remoteEdit(h, theirs, 's9', 'agenda\n');
-      await flushAsync(40);
-      expect(h.vault.text('Meeting.md')).toBe('agenda\nteammate meeting\n');
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
-    });
-
-    it('online: a new note created under the name while this rename is on its way', async () => {
-      const h = buildHarness();
-      const { server, docs } = await notes(h, format, [['a.md', 'f1', 'A\n']]);
-      await connect(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      // The rename goes out; the server has not got to it yet.
-      await h.vault.rename('a.md', 'c.md');
-      await flushAsync();
-      expect(h.socket().pending('file:rename').payload).toMatchObject({ fileId: 'f1' });
-      const id = await server.teammateCreate('c.md', 'theirs\n');
-      await flushAsync(20);
-      await docs.drive();
-
-      expect(disk(h)).toEqual(['c.conflict-device-1.md=A\n', 'c.md=theirs\n']);
-      expect(docs.live()).toEqual(['c.conflict-device-1.md=A\n', 'c.md=theirs\n']);
-      expect(h.engine.getFileIdForPath('c.md')).toBe(id);
-      expect(h.engine.getFileIdForPath('c.conflict-device-1.md')).toBe('f1');
-      expect(h.socket().created()).toEqual([]);
-      await h.engine.stop();
-    });
-  },
-);
-
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — a note created here offline under a name a teammate gave a new note, %s broadcasts',
-  (format) => {
-    // The server stores the create under a conflict name. The copy here used
-    // to stay unrecorded under the name asked for: the teammate's note,
-    // indexed there, took it for its own and the fold sent its text into the
-    // teammate's note, for everyone. Uploaded again on each save, it left one
-    // more conflict copy on the server each time.
-    it('keeps both: this one moves to the conflict name, the teammate’s comes in', async () => {
-      const h = buildHarness({ offline: true });
-      const { server, docs } = await notes(h, format, []);
-      // Created by a teammate while this device was offline.
-      await docs.add('s9', 'c.md', 'theirs\n');
-
-      await h.engine.start();
-      await flushAsync();
-      h.vault.files.set('c.md', encode('mine\n'));
-      await h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'create',
-        path: 'c.md',
-        source: 'obsidian',
-      });
-      expect(h.log.dequeueOperations('b1').map((o) => o.opType)).toEqual(['CREATE']);
-      await goOnline(h, { yjsDocs: docs.snapshots() });
-      await docs.drive();
-
-      expect(disk(h)).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
-      expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\n', 'c.md=theirs\n']);
-      expect(server.applied).toEqual(['create c.conflict-device-1.md']);
-      expect(h.engine.getFileIdForPath('c.md')).toBe('s9');
-      expect(h.engine.getFileIdForPath('c.conflict-device-1.md')).not.toBeNull();
-
-      // A save goes to the note it belongs to, and nothing is uploaded again.
-      h.vault.files.set('c.conflict-device-1.md', encode('mine\nmore\n'));
-      const saved = h.engine.handleVaultEvent({
-        bindingId: 'b1',
-        type: 'modify',
-        path: 'c.conflict-device-1.md',
-        source: 'obsidian',
-      });
-      await docs.drive();
-      await saved;
-      await docs.drive();
-      expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\nmore\n', 'c.md=theirs\n']);
-      expect(h.socket().created()).toEqual(['c.md']);
-      await h.engine.stop();
-    });
-  },
-);
+    await docs.drive();
+    await saved;
+    await docs.drive();
+    expect(docs.live()).toEqual(['c.conflict-device-1.md=mine\nmore\n', 'c.md=theirs\n']);
+    expect(h.socket().created()).toEqual(['c.md']);
+    await h.engine.stop();
+  });
+});

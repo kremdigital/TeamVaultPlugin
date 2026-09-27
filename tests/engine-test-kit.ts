@@ -22,8 +22,9 @@
  *     closed is {@link MemoryVault.move}.
  *   - The server's broadcasts. The server sends every file operation to the
  *     whole project room, the sender included, right before its ack. The
- *     {@link FakeServer} does that, in the current format (the sender's
- *     `clientId`, the path the file was stored at) or the old one.
+ *     {@link FakeServer} does that as the server this client needs does:
+ *     with the sender's `clientId`, the operation's `opId` and the path the
+ *     file was stored at.
  *   - A start without network. `offline: true` builds an engine whose socket
  *     cannot connect until {@link goOnline}.
  *
@@ -1062,20 +1063,8 @@ export interface ServerFileRecord {
   deleted: boolean;
 }
 
-/**
- * Which server the {@link FakeServer} is. `current` broadcasts the sender's
- * `clientId` and the path the file was stored at, and stores a file whose
- * name is taken under the first FREE `<name>.conflict-<clientId>[-n]`.
- * `legacy` is production when 0.3.8 came out (8a6d925): broadcasts without
- * `clientId` and with the path the client asked for, even when the file was
- * stored under a conflict name, and always the first `<name>.conflict-<clientId>`
- * — a CREATE overwrites a file there in place with a new history, a RENAME
- * there fails on the unique index.
- */
-export type BroadcastFormat = 'current' | 'legacy';
-
 /** How the {@link FakeServer} answers `project:join`: see {@link FakeServer.joinAnswer}. */
-export type CatchupForm = 'whole journal' | 'first rows' | 'cut short';
+export type CatchupForm = 'whole journal' | 'cut short';
 
 /** The `fileId` of a journal row's payload, `''` when it has none. */
 function fileIdOf(op: ServerOperation): string {
@@ -1133,9 +1122,9 @@ function authorOf(clientId: string): string {
  * its own and its teammates' changes. Like `Project/server` (`handleMove`,
  * `applyMove`): a RENAME or MOVE is applied by file id without a precondition
  * on the source path, a collision stores the file under the first free
- * `<name>.conflict-<clientId>[-n]` (the `legacy` server: the first one, see
- * {@link BroadcastFormat}), and the operation is broadcast to the whole room —
- * the sender included — right before the ack. CREATE, DELETE and a binary
+ * `<name>.conflict-<clientId>[-n]`, and the operation is broadcast to the
+ * whole room — the sender included, with its `clientId`, its `opId` and the
+ * path the file was stored at — right before the ack. CREATE, DELETE and a binary
  * UPDATE are applied the same way, without file contents. A CREATE on a name
  * taken by a live file with the same non-empty content is that file (`merged`);
  * one on a tombstone brings its id back.
@@ -1185,10 +1174,7 @@ export class FakeServer {
   private readonly delayed = new WeakSet<Emit>();
   private seq = 0;
 
-  constructor(
-    private harness: Harness,
-    readonly format: BroadcastFormat = 'current',
-  ) {
+  constructor(private harness: Harness) {
     harness.route.server = this;
   }
 
@@ -1214,16 +1200,12 @@ export class FakeServer {
   /**
    * The operations of the catch-up `project:join` answers a client whose
    * vector clock is `clock` (by default what the harness's engine last
-   * persisted): every one with a counter the clock has not reached. `window`
-   * looks only at the journal's first rows, as a server before the
-   * whole-journal catch-up did (500 rows; `0` for a longer journal).
+   * persisted): every one with a counter the clock has not reached.
    */
   catchupFor(
     clock: Record<string, number> = this.harness.log.getBindingState('b1')?.lastVectorClock ?? {},
-    opts: { window?: number } = {},
   ): ServerOperation[] {
-    const rows = opts.window === undefined ? this.journal : this.journal.slice(0, opts.window);
-    return rows.filter((row) =>
+    return this.journal.filter((row) =>
       Object.entries(row.vectorClock).some(([client, n]) => n > (clock[client] ?? 0)),
     );
   }
@@ -1231,17 +1213,15 @@ export class FakeServer {
   /**
    * The answer to `project:join` in one of the server's catch-up forms (see
    * `sync-protocol.md`, «Подключение»), for the vector clock the harness's
-   * engine last persisted:
+   * engine last persisted, with `opIdempotency: 1` and the echo
+   * `operationsCatchup: 2`:
    *
-   *   - `whole journal`: every operation the clock has not seen, and the echo
-   *     `operationsCatchup: 2` — what a server that knows the flag answers;
-   *   - `first rows`: the unseen ones among the journal's first `rows` rows
-   *     (500 on a real server), without the echo — every server before it;
-   *   - `cut short`: the newest `rows` unseen ones, with the echo and
-   *     `operationsTruncated` when that left some out.
+   *   - `whole journal`: every operation the clock has not seen;
+   *   - `cut short`: the newest `rows` unseen ones, and `operationsTruncated`
+   *     when that left some out.
    *
-   * The UPDATE rows of notes (a write through REST or MCP) come only in the
-   * first rows: a server that knows the flag leaves them out of both forms.
+   * The UPDATE rows of notes (a write through REST or MCP) are left out, as
+   * the server leaves them out.
    *
    * `clock`: the clock to answer for, instead of the one persisted — the one
    * the join carried (see {@link joinClockOf}), as the server answers. They
@@ -1253,10 +1233,6 @@ export class FakeServer {
     opts: { rows?: number; yjsDocs?: YjsDocSnapshot[]; clock?: Record<string, number> } = {},
   ): Record<string, unknown> {
     const docs = { yjsDocs: opts.yjsDocs ?? [] };
-    if (form === 'first rows') {
-      const window = opts.rows === undefined ? {} : { window: opts.rows };
-      return { ok: true, operations: this.catchupFor(opts.clock, window), ...docs };
-    }
     const unseen = this.catchupFor(opts.clock).filter(
       (op) => op.opType !== 'UPDATE' || this.files.get(fileIdOf(op))?.fileType !== 'TEXT',
     );
@@ -1559,14 +1535,6 @@ export class FakeServer {
         (f) => f !== file && !f.deleted && f.path === requested,
       );
       if (taken) {
-        if (this.format === 'legacy') {
-          // 8a6d925: the first conflict name, and a row there — another
-          // file's, or a tombstone — fails the update on the unique index.
-          const first = conflictName(requested, clientId);
-          if ([...this.files.values()].some((f) => f.path === first && f.id !== id)) {
-            return { error: 'Unique constraint failed on the fields: (`projectId`,`path`)' };
-          }
-        }
         // A row there is taken over when it is a tombstone or this very file.
         stored = this.conflictPath(requested, clientId, (f) => f.deleted || f.id === id);
         this.dropTombstoneAt(stored);
@@ -1589,7 +1557,7 @@ export class FakeServer {
       opType === 'RENAME' ? 'file:renamed' : 'file:moved',
       {
         fileId: id,
-        newPath: this.format === 'current' ? stored : requested,
+        newPath: stored,
         requestedPath: requested,
         outcome,
         log,
@@ -1661,9 +1629,8 @@ export class FakeServer {
   /**
    * A teammate writes note `id` through REST or MCP (`write_note`) with
    * `text`: the file takes its hash, and the journal gets the UPDATE the
-   * server logs — `fileType` in its payload from a server of the `current`
-   * format, none from one before. No file event goes out: the REST bridge
-   * sends none for a note. The doc is {@link ServerDocs.restWrite}'s.
+   * server logs, `fileType` in its payload. No file event goes out: the REST
+   * bridge sends none for a note. The doc is {@link ServerDocs.restWrite}'s.
    */
   async restWrite(id: string, text: string): Promise<void> {
     const file = this.files.get(id);
@@ -1681,7 +1648,7 @@ export class FakeServer {
         fileId: id,
         contentHash: file.contentHash,
         size: file.size,
-        ...(this.format === 'current' ? { fileType: file.fileType } : {}),
+        fileType: file.fileType,
       },
       {
         clientId: 'rest:u2',
@@ -1760,17 +1727,10 @@ export class FakeServer {
         merged: true,
       };
     } else {
-      // A row on the conflict name is taken over when it is a tombstone. The
-      // `legacy` server takes the first conflict name whatever is there, and
-      // overwrites a live file under it in place.
-      at = !live
-        ? path
-        : this.format === 'legacy'
-          ? conflictName(path, p.clientId)
-          : this.conflictPath(path, p.clientId, (f) => f.deleted);
+      // A row on the conflict name is taken over when it is a tombstone.
+      at = !live ? path : this.conflictPath(path, p.clientId, (f) => f.deleted);
       const row = [...this.files.values()].find((f) => f.path === at);
       revived = row?.deleted === true;
-      const overwritten = this.format === 'legacy' && row !== undefined && !revived;
       fileId = row?.id ?? `s${++this.seq}`;
       this.files.set(fileId, {
         id: fileId,
@@ -1782,8 +1742,7 @@ export class FakeServer {
       });
       this.applied.push(`create ${at}`);
       this.publish();
-      // Overwritten, a note's doc is seeded anew (see `ServerDocs`).
-      if (row === undefined || revived || overwritten) added = { id: fileId, revived };
+      if (row === undefined || revived) added = { id: fileId, revived };
       outcome = live
         ? { kind: 'conflict_create_renamed', fileId, originalPath: path, finalPath: at, ...content }
         : { kind: 'created', fileId, path: at, ...content };
@@ -1800,7 +1759,7 @@ export class FakeServer {
         contentHash: content.contentHash,
         size: content.size,
         originalPath: path,
-        ...(revived && this.format === 'current' ? { revived: true } : {}),
+        ...(revived ? { revived: true } : {}),
       },
       { clientId: p.clientId, opId: p.opId, outcome },
     );
@@ -1809,9 +1768,9 @@ export class FakeServer {
       'file:created',
       {
         result: { outcome, log },
-        ...(this.format === 'current'
-          ? { fileId, path: stored?.path ?? at, fileType: stored?.fileType ?? content.fileType }
-          : {}),
+        fileId,
+        path: stored?.path ?? at,
+        fileType: stored?.fileType ?? content.fileType,
         revived,
         log,
       },
@@ -1878,10 +1837,7 @@ export class FakeServer {
     });
   }
 
-  /**
-   * Send `event` to the room. The `current` server says who sent it and the
-   * operation's `opId`; the `legacy` one neither.
-   */
+  /** Send `event` to the room, saying who sent it and the operation's `opId`. */
   private broadcast(
     event: string,
     payload: Record<string, unknown>,
@@ -1890,7 +1846,7 @@ export class FakeServer {
   ): void {
     const socket = this.harness.socketIfBuilt();
     if (!socket?.connected) return;
-    socket.fire(event, this.format === 'current' ? { ...payload, clientId, opId } : payload);
+    socket.fire(event, { ...payload, clientId, opId });
   }
 
   /**
@@ -1925,12 +1881,10 @@ export class FakeServer {
 /**
  * The notes' Yjs docs on a {@link FakeServer}, kept the way `Project/server`
  * keeps them. A text CREATE seeds a doc from the bytes sent. On a tombstone,
- * the new text goes on top of the stored history, as the server that
- * continues histories does — or, with `replaceOnRevive`, a new history
- * replaces it, as the server before it did (production when 0.3.8 came out).
- * A live file the `legacy` server overwrites under a conflict name gets a new
- * history. Either way the doc's full state follows `file:created` to the
- * whole room as a `yjs:update`. What the client sends is applied by
+ * the new text goes on top of the stored history, as the server does — or,
+ * with `replaceOnRevive`, a new history replaces it, as every server before
+ * 0.3.8's did (and as a project seeded anew has new histories). Either way the
+ * doc's full state follows `file:created` to the whole room as a `yjs:update`. What the client sends is applied by
  * {@link absorb}; `yjs:fetch` is answered by {@link answerFetches}.
  */
 export class ServerDocs {
@@ -1971,9 +1925,8 @@ export class ServerDocs {
   /**
    * A teammate writes note `id` through REST or MCP (`write_note`): the doc
    * takes `text` the way the server writes it — as the smallest edit that
-   * makes it (see {@link serverTextEdit}), or, on the `legacy` server, by
-   * deleting the whole text and inserting the new one. The change goes to the
-   * room as a `yjs:update`; the file and the journal follow (see
+   * makes it (see {@link serverTextEdit}). The change goes to the room as a
+   * `yjs:update`; the file and the journal follow (see
    * {@link FakeServer.restWrite}).
    */
   async restWrite(id: string, text: string): Promise<void> {
@@ -1982,14 +1935,7 @@ export class ServerDocs {
     const seen = Y.encodeStateVector(doc);
     const ytext = doc.getText('content');
     if (ytext.toJSON() !== text) {
-      doc.transact(() => {
-        if (this.server.format === 'current') {
-          serverTextEdit(ytext, text);
-        } else {
-          ytext.delete(0, ytext.length);
-          ytext.insert(0, text);
-        }
-      });
+      doc.transact(() => serverTextEdit(ytext, text));
     }
     const socket = this.harness.socketIfBuilt();
     if (socket?.connected) {

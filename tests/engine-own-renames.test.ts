@@ -10,13 +10,14 @@
  * that move the server renamed the note `b ↔ c` forever.
  *
  * Now a chain of renames of one note is sent as one, broadcasts of this
- * device's own operations are recognised (by `clientId`, or, from a server
- * that does not send it, by the rename still queued or in flight), a
+ * device's own operations are recognised (by the `opId` of the rename on its
+ * way), a
  * teammate's rename of a note whose own rename is still on its way is left
  * to that rename, and a rename is applied under the name the server stored.
  */
 import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
+import { newOpId } from '@/sync/operation-log';
 import {
   FakeServer,
   buildHarness,
@@ -27,7 +28,6 @@ import {
   serverDocWith,
   snapshotOf,
   userRename,
-  type BroadcastFormat,
   type Harness,
 } from './engine-test-kit';
 
@@ -49,11 +49,10 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
 
 /** Synced notes on disk, in `state.json` and on the server; connected. */
 async function connectedNotes(
-  format: BroadcastFormat,
   notes: ReadonlyArray<readonly [path: string, fileId: string, text: string]>,
 ): Promise<{ h: Harness; server: FakeServer }> {
   const h = buildHarness();
-  const server = new FakeServer(h, format);
+  const server = new FakeServer(h);
   for (const [path, fileId, text] of notes) {
     const hash = await remember(h, path, fileId, text);
     server.add({ id: fileId, path, fileType: 'TEXT', contentHash: hash, size: text.length });
@@ -106,135 +105,132 @@ function recordDiskRenames(h: Harness): string[] {
   return moves;
 }
 
-describe.each(['current', 'legacy'] as const)(
-  'SyncEngine — renames made offline, %s server broadcasts',
-  (format) => {
-    it('sends a chain of renames of one note as one, and leaves the disk alone', async () => {
-      const { h, server } = await connectedNotes(format, [['a.md', 'f1', 'A\n']]);
-      await goOffline(h);
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'b.md', 'c.md');
-      const moves = recordDiskRenames(h);
+describe('SyncEngine — renames made offline', () => {
+  it('sends a chain of renames of one note as one, and leaves the disk alone', async () => {
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+    await goOffline(h);
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'b.md', 'c.md');
+    const moves = recordDiskRenames(h);
 
-      await reconnect(h, server);
+    await reconnect(h, server);
 
-      expect(server.applied).toEqual(['f1 a.md -> c.md']);
-      expect(moves).toEqual([]);
-      expect([...h.vault.files.keys()]).toEqual(['c.md']);
-      expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
-      expect(h.log.dequeueOperations('b1')).toEqual([]);
-      expect(h.socket().created()).toEqual([]);
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.applied).toEqual(['f1 a.md -> c.md']);
+    expect(moves).toEqual([]);
+    expect([...h.vault.files.keys()]).toEqual(['c.md']);
+    expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
+    expect(h.log.dequeueOperations('b1')).toEqual([]);
+    expect(h.socket().created()).toEqual([]);
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('keeps another note given the intermediate name where it is', async () => {
-      const { h, server } = await connectedNotes(format, [
-        ['a.md', 'f1', 'A\n'],
-        ['d.md', 'f2', 'D\n'],
-      ]);
-      await goOffline(h);
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'b.md', 'c.md');
-      await userRename(h, 'd.md', 'b.md');
-      const moves = recordDiskRenames(h);
+  it('keeps another note given the intermediate name where it is', async () => {
+    const { h, server } = await connectedNotes([
+      ['a.md', 'f1', 'A\n'],
+      ['d.md', 'f2', 'D\n'],
+    ]);
+    await goOffline(h);
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'b.md', 'c.md');
+    await userRename(h, 'd.md', 'b.md');
+    const moves = recordDiskRenames(h);
 
-      await reconnect(h, server);
+    await reconnect(h, server);
 
-      expect(server.pathOf('f1')).toBe('c.md');
-      expect(server.pathOf('f2')).toBe('b.md');
-      expect(moves).toEqual([]);
-      expect([...h.vault.files.keys()].sort()).toEqual(['b.md', 'c.md']);
-      expect(h.vault.text('b.md')).toBe('D\n');
-      expect(h.vault.text('c.md')).toBe('A\n');
-      expect(h.engine.getFileIdForPath('b.md')).toBe('f2');
-      expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
-      expect(h.socket().created()).toEqual([]);
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.pathOf('f1')).toBe('c.md');
+    expect(server.pathOf('f2')).toBe('b.md');
+    expect(moves).toEqual([]);
+    expect([...h.vault.files.keys()].sort()).toEqual(['b.md', 'c.md']);
+    expect(h.vault.text('b.md')).toBe('D\n');
+    expect(h.vault.text('c.md')).toBe('A\n');
+    expect(h.engine.getFileIdForPath('b.md')).toBe('f2');
+    expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
+    expect(h.socket().created()).toEqual([]);
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('sends nothing for a note renamed and renamed back', async () => {
-      const { h, server } = await connectedNotes(format, [['a.md', 'f1', 'A\n']]);
-      await goOffline(h);
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'b.md', 'a.md');
+  it('sends nothing for a note renamed and renamed back', async () => {
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+    await goOffline(h);
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'b.md', 'a.md');
 
-      await reconnect(h, server);
+    await reconnect(h, server);
 
-      expect(server.applied).toEqual([]);
-      expect(h.socket().emits.map((e) => e.event)).not.toContain('file:rename');
-      expect([...h.vault.files.keys()]).toEqual(['a.md']);
-      expect(h.log.dequeueOperations('b1')).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.applied).toEqual([]);
+    expect(h.socket().emits.map((e) => e.event)).not.toContain('file:rename');
+    expect([...h.vault.files.keys()]).toEqual(['a.md']);
+    expect(h.log.dequeueOperations('b1')).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('sends step by step a chain another rename depends on, without moving the disk', async () => {
-      const { h, server } = await connectedNotes(format, [
-        ['a.md', 'f1', 'A\n'],
-        ['c.md', 'f2', 'C\n'],
-      ]);
-      await goOffline(h);
-      // `c.md` becomes free only by the rename in between: sent as one,
-      // `a → c` would find it taken.
-      await userRename(h, 'a.md', 'b.md');
-      await userRename(h, 'c.md', 'a.md');
-      await userRename(h, 'b.md', 'c.md');
-      const moves = recordDiskRenames(h);
+  it('sends step by step a chain another rename depends on, without moving the disk', async () => {
+    const { h, server } = await connectedNotes([
+      ['a.md', 'f1', 'A\n'],
+      ['c.md', 'f2', 'C\n'],
+    ]);
+    await goOffline(h);
+    // `c.md` becomes free only by the rename in between: sent as one,
+    // `a → c` would find it taken.
+    await userRename(h, 'a.md', 'b.md');
+    await userRename(h, 'c.md', 'a.md');
+    await userRename(h, 'b.md', 'c.md');
+    const moves = recordDiskRenames(h);
 
-      await reconnect(h, server);
+    await reconnect(h, server);
 
-      expect(server.applied).toEqual(['f1 a.md -> b.md', 'f2 c.md -> a.md', 'f1 b.md -> c.md']);
-      expect(moves).toEqual([]);
-      expect(h.vault.text('a.md')).toBe('C\n');
-      expect(h.vault.text('c.md')).toBe('A\n');
-      expect(h.engine.getFileIdForPath('a.md')).toBe('f2');
-      expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
-      expect(h.socket().created()).toEqual([]);
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.applied).toEqual(['f1 a.md -> b.md', 'f2 c.md -> a.md', 'f1 b.md -> c.md']);
+    expect(moves).toEqual([]);
+    expect(h.vault.text('a.md')).toBe('C\n');
+    expect(h.vault.text('c.md')).toBe('A\n');
+    expect(h.engine.getFileIdForPath('a.md')).toBe('f2');
+    expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
+    expect(h.socket().created()).toEqual([]);
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('leaves a teammate’s rename to the rename still on its way', async () => {
-      const { h, server } = await connectedNotes(format, [['a.md', 'f1', 'A\n']]);
-      // The user's rename goes out; before it reaches the server, a teammate
-      // renames the same note, and that broadcast arrives first.
-      const mine = userRename(h, 'a.md', 'b.md');
-      await flushAsync();
-      server.teammateRename('f1', 'c.md');
-      await flushAsync(20);
-      await server.pump();
-      await mine;
-      await h.settle();
+  it('leaves a teammate’s rename to the rename still on its way', async () => {
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+    // The user's rename goes out; before it reaches the server, a teammate
+    // renames the same note, and that broadcast arrives first.
+    const mine = userRename(h, 'a.md', 'b.md');
+    await flushAsync();
+    server.teammateRename('f1', 'c.md');
+    await flushAsync(20);
+    await server.pump();
+    await mine;
+    await h.settle();
 
-      expect(server.pathOf('f1')).toBe('b.md');
-      expect([...h.vault.files.keys()]).toEqual(['b.md']);
-      expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
-      expect(h.eventErrors).toEqual([]);
-      await h.engine.stop();
-    });
+    expect(server.pathOf('f1')).toBe('b.md');
+    expect([...h.vault.files.keys()]).toEqual(['b.md']);
+    expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
+    expect(h.eventErrors).toEqual([]);
+    await h.engine.stop();
+  });
 
-    it('still follows a teammate’s rename that comes after its own', async () => {
-      const { h, server } = await connectedNotes(format, [['a.md', 'f1', 'A\n']]);
-      await renameOnline(h, server, 'a.md', 'b.md');
+  it('still follows a teammate’s rename that comes after its own', async () => {
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+    await renameOnline(h, server, 'a.md', 'b.md');
 
-      await h.settle();
+    await h.settle();
 
-      server.teammateRename('f1', 'c.md');
-      await server.pump();
-      await h.settle();
+    server.teammateRename('f1', 'c.md');
+    await server.pump();
+    await h.settle();
 
-      expect(server.applied).toEqual(['f1 a.md -> b.md', 'f1 b.md -> c.md']);
-      expect([...h.vault.files.keys()]).toEqual(['c.md']);
-      expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
-      await h.engine.stop();
-    });
-  },
-);
+    expect(server.applied).toEqual(['f1 a.md -> b.md', 'f1 b.md -> c.md']);
+    expect([...h.vault.files.keys()]).toEqual(['c.md']);
+    expect(h.engine.getFileIdForPath('c.md')).toBe('f1');
+    await h.engine.stop();
+  });
+});
 
 describe('SyncEngine — what the server stored', () => {
   it('moves the note to the conflict name the server stored its rename under', async () => {
-    const { h, server } = await connectedNotes('current', [['a.md', 'f1', 'A\n']]);
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
     // A teammate's note at `b.md` the server has and this device has not seen.
     server.add({ id: 'f9', path: 'b.md', fileType: 'TEXT', contentHash: 'x', size: 1 });
 
@@ -250,11 +246,15 @@ describe('SyncEngine — what the server stored', () => {
   });
 
   it('applies a teammate’s rename under the name the server stored, not the one asked for', async () => {
-    const { h } = await connectedNotes('legacy', [['a.md', 'f1', 'A\n']]);
-    // What a server without `clientId` sent for a rename that collided.
+    const { h } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+    // What the server sends for a teammate's rename that collided: `newPath`
+    // is where it stored the file.
     h.socket().fire('file:renamed', {
       fileId: 'f1',
-      newPath: 'b.md',
+      newPath: 'b.conflict-device-2.md',
+      requestedPath: 'b.md',
+      clientId: 'device-2',
+      opId: newOpId(),
       outcome: {
         kind: 'conflict_create_renamed',
         fileId: 'f1',
@@ -279,47 +279,44 @@ describe('SyncEngine — what the server stored', () => {
   // on the server, and a new note a teammate then created under the name it
   // had here was folded into it — its text went to the server as the new
   // note's.
-  describe.each(['current', 'legacy'] as const)(
-    'a teammate’s rename back to a name the note had here, %s server',
-    (format) => {
-      it('is followed after a chain of renames (Draft → Plan → Plan v2, back to Plan)', async () => {
-        const { h, server } = await connectedNotes(format, [['Draft.md', 'f1', 'A\n']]);
-        await renameOnline(h, server, 'Draft.md', 'Plan.md');
-        await renameOnline(h, server, 'Plan.md', 'Plan v2.md');
+  describe('a teammate’s rename back to a name the note had here', () => {
+    it('is followed after a chain of renames (Draft → Plan → Plan v2, back to Plan)', async () => {
+      const { h, server } = await connectedNotes([['Draft.md', 'f1', 'A\n']]);
+      await renameOnline(h, server, 'Draft.md', 'Plan.md');
+      await renameOnline(h, server, 'Plan.md', 'Plan v2.md');
 
-        server.teammateRename('f1', 'Plan.md');
-        await flushAsync(40);
-        await h.settle();
+      server.teammateRename('f1', 'Plan.md');
+      await flushAsync(40);
+      await h.settle();
 
-        expect(server.pathOf('f1')).toBe('Plan.md');
-        expect([...h.vault.files.keys()]).toEqual(['Plan.md']);
-        expect(h.vault.text('Plan.md')).toBe('A\n');
-        expect(h.engine.getFileIdForPath('Plan.md')).toBe('f1');
-        expect(h.engine.getFileIdForPath('Plan v2.md')).toBeNull();
-        await h.engine.stop();
-      });
+      expect(server.pathOf('f1')).toBe('Plan.md');
+      expect([...h.vault.files.keys()]).toEqual(['Plan.md']);
+      expect(h.vault.text('Plan.md')).toBe('A\n');
+      expect(h.engine.getFileIdForPath('Plan.md')).toBe('f1');
+      expect(h.engine.getFileIdForPath('Plan v2.md')).toBeNull();
+      await h.engine.stop();
+    });
 
-      it('is followed after a rename undone (a → b → a, then to b)', async () => {
-        const { h, server } = await connectedNotes(format, [['a.md', 'f1', 'A\n']]);
-        await renameOnline(h, server, 'a.md', 'b.md');
-        await renameOnline(h, server, 'b.md', 'a.md');
+    it('is followed after a rename undone (a → b → a, then to b)', async () => {
+      const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
+      await renameOnline(h, server, 'a.md', 'b.md');
+      await renameOnline(h, server, 'b.md', 'a.md');
 
-        server.teammateRename('f1', 'b.md');
-        await flushAsync(40);
-        await h.settle();
+      server.teammateRename('f1', 'b.md');
+      await flushAsync(40);
+      await h.settle();
 
-        expect(server.pathOf('f1')).toBe('b.md');
-        expect([...h.vault.files.keys()]).toEqual(['b.md']);
-        expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
-        await h.engine.stop();
-      });
-    },
-  );
+      expect(server.pathOf('f1')).toBe('b.md');
+      expect([...h.vault.files.keys()]).toEqual(['b.md']);
+      expect(h.engine.getFileIdForPath('b.md')).toBe('f1');
+      await h.engine.stop();
+    });
+  });
 });
 
 describe('SyncEngine — a teammate’s rename waiting behind a save', () => {
   it('is dropped once the note has been renamed here meanwhile', async () => {
-    const { h, server } = await connectedNotes('current', [['a.md', 'f1', 'A\n']]);
+    const { h, server } = await connectedNotes([['a.md', 'f1', 'A\n']]);
     // A save whose fold waits for the note's state holds the name.
     h.vault.files.set('a.md', encode('A\ntyped\n'));
     const save = h.engine.handleVaultEvent({

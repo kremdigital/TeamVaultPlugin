@@ -95,7 +95,7 @@ describe.each(cases)(
       'keeps the rename made before the drop, one note for the team (typed into after: %s)',
       async (typed) => {
         const h = buildHarness();
-        const server = new FakeServer(h, 'current');
+        const server = new FakeServer(h);
         const docs = new ServerDocs(server, h);
         h.vault.files.set('Untitled.md', encode('old\n'));
         await docs.add('f1', 'Untitled.md', 'old\n');

@@ -207,13 +207,16 @@ describe('SyncEngine — a note renamed while away to a name this client never w
     await start(h, b.doc);
     h.modal.del.resolve('restore-server');
     await flushAsync(20);
-    // Broadcast to the whole room, this device included, before the ack.
+    // Broadcast to the whole room, this device included, before the ack:
+    // with the `opId` the move back went out under.
+    const moveBack = h.socket().pending('file:rename');
     h.socket().fire('file:renamed', {
       fileId: 'f1',
       newPath: 'note.md',
       requestedPath: 'note.md',
       outcome: { kind: 'renamed', fileId: 'f1', from: 'note?.md', to: 'note.md' },
       clientId: 'device-1',
+      opId: (moveBack.payload as { opId: string }).opId,
       log: eventLog,
     });
     h.socket().pending('file:rename').ack({ ok: true });
