@@ -24,7 +24,11 @@ reconnect, and every file keeps its version history. Companion to the
   (keep-server / keep-local / keep-both).
 - **Offline-first** — edits made while disconnected, or while sync is
   paused, queue in a local operation log; the engine drains the queue on
-  reconnect with exponential-backoff reconnect to the server.
+  reconnect with exponential-backoff reconnect to the server. Every change
+  to a file goes out under an operation id that is written to the log
+  before it is sent, and the server applies each id once: when an answer is
+  lost (the connection drops, sync is paused, Obsidian quits or crashes),
+  the next connect asks the server what it applied and sends only the rest.
 - **External edits** — chokidar watches the filesystem, so changes from CLI
   scripts and AI agents propagate the same way as in-app edits.
 - **Version history** — right-pane view shows every server-side version of
@@ -78,6 +82,17 @@ Install manually until the directory listing lands:
 
 Those three files are all there is — since 0.3.0 the plugin has no native
 dependencies, so there is no `node_modules` to install next to it.
+
+**Server version.** Team Vault 0.4.0 and later need a Team Vault server that
+keeps operation ids (it says so when a vault joins a project: `opIdempotency`
+in the answer). Update the server first. With an older server the plugin
+sends nothing: the status bar shows an error, the notice and `sync.log` say
+`server_outdated`, and your changes wait in the offline queue until the
+server is updated. The updated server keeps the file changes of older plugin
+versions (new files, renames, moves, deletes, attachment uploads) in their
+offline queue until they update; edits of a note's text still sync. Go back
+to an older version only while nothing waits to go out (the status bar says
+**Synced**): it doesn't know the changes 0.4.0 has on their way.
 
 ## Configuration
 
@@ -334,6 +349,17 @@ machine. Try `curl -H "X-API-Key: osk_…" https://your-server/api/auth/me`.
 add it again: removing it switches its bindings off, and a binding made again
 starts from scratch — the unsent offline changes stay behind with the old
 binding. Nor is there any need to edit `data.json` by hand any more.
+
+**"Error: server_outdated"** — the server is older than the plugin and
+doesn't keep operation ids (see [Installation](#installation)). Nothing is
+sent until the server is updated; your changes wait in the offline queue and
+go out at the next connect after the update.
+
+**"Error: ops_status_failed"** — the server didn't answer the question the
+plugin asks at each connect about changes whose answers were lost, after
+four tries. Nothing is lost or sent twice: the plugin asks again at the next
+connect (**Pause sync** and **Resume sync** make one). If it keeps failing,
+check that the server is up to date and running.
 
 **Status stays at `connecting…`** — the plugin handles the WebSocket
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`

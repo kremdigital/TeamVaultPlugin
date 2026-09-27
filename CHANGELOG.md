@@ -6,6 +6,86 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **This version needs the Team Vault server updated first.** Every change to
+  a file — a new note or attachment, an attachment saved again, a rename, a
+  move, a delete — now goes to the server under an operation id, and the
+  server applies each id once. A server without operation ids gets nothing
+  from this version: the status bar shows an error, the notice and `sync.log`
+  say `server_outdated`, and your changes wait in the offline queue until the
+  server is updated. The updated server, in turn, keeps the file changes of
+  older versions — new files, renames, moves, deletes, attachment uploads —
+  waiting in their offline queue until they update (edits of a note's text
+  still sync), so update every device soon after the server; what they
+  queued goes out then. Going back to 0.3.9 is safe only while nothing waits
+  to go out (the status bar says **Synced**): 0.3.9 doesn't know the changes
+  this version has on their way.
+- **Two empty notes created under one name at the same moment are two
+  notes.** When you and a teammate both made an `Untitled.md` (Obsidian's new
+  note) within a moment of each other, the server took the second for the
+  first — both were empty — and a template that renamed one renamed the
+  other's too. The second is now kept as `Untitled.conflict-<device>.md`.
+  Notes with the same text that isn't empty, such as daily notes made from one
+  template on two devices, are still one note.
+
+### Fixed
+
+- **A change whose answer from the server never came is no longer sent a
+  second time, nor lost.** This happens when the connection drops, you pause
+  sync or turn the plugin off, or Obsidian quits or crashes while a change is
+  on its way. Team Vault now writes each change to `state.json` before it
+  sends it, and when it connects again it asks the server which of them it
+  applied before it syncs anything else. What the server applied counts as
+  done; what it never got goes out again, and should the lost copy reach the
+  server late, the server refuses it. In 0.3.8 and 0.3.9 only the last rename
+  or attachment upload sent was recognised. What that fixes:
+  - **Renames are no longer applied twice or undone.** A rename sent again
+    moved the note back to your name after a teammate had renamed it — for
+    everyone, and for each of several notes moved into a folder at once. After
+    a quit, the last of several renames could be lost instead. Now each note
+    ends up under the last name you gave it, or under the teammate's when
+    they renamed it after you.
+  - **No "Content conflict" prompt against your own upload.** Team Vault could
+    take the attachment or canvas version you had uploaded for a teammate's,
+    or a teammate's for your own: **Keep local** then wrote an older version
+    over a teammate's for everyone, and **Keep both** made a copy of it. The
+    two cases 0.3.8 still listed are gone too: a teammate putting back the
+    version you had before your upload, and a teammate deleting the file and
+    adding another under its name. After a lost answer, the prompt comes up
+    only when you and a teammate both changed the file.
+  - **A new note or attachment whose answer was lost counts as created,
+    whatever you did with it since.** Edited, renamed or deleted before the
+    connection came back, it reaches the server edited, renamed or deleted,
+    and isn't uploaded again next to the first upload. When the server had
+    taken it for a teammate's file with the same text and you renamed yours
+    meanwhile, yours stays a note of its own.
+- **Keep local on an attachment is no longer lost when the connection drops
+  before it goes out.** Your version was recorded as synced at once, so it
+  was never sent afterwards. It is now recorded when the server has it, and
+  sent when the connection is back; you aren't asked again about the same
+  version of the teammate's, only about a newer one. **Restore on server**,
+  and moving a file back to its name, count as done when the server applied
+  them though the answer was lost; when the server never got them, you are
+  asked again.
+- **Quitting Obsidian no longer loses what Team Vault recorded in its last
+  moment.** `state.json` takes a change half a second after it is made, and
+  Obsidian doesn't turn plugins off when it quits. A teammate's new note
+  written to your disk just before the quit was then taken for your own at
+  the next start: everyone got a conflict copy of it if the teammate had
+  edited it meanwhile, and it came back for everyone if they had deleted it.
+  Obsidian's quit now waits until `state.json` and `sync.log` are written,
+  for two seconds at most; "Saving..." shows only when there is something to
+  write. After a crash, or when Obsidian's process is killed, this can still
+  happen.
+- **A teammate's new file that the server stored under a conflict name comes
+  to your vault at once**, not only at the next connect.
+- **An attachment a teammate deleted and replaced with another under the same
+  name while you were away comes down when you connect.** Your copy of the one
+  they deleted stayed under the name until their next version of the new one.
+- A note's edit that the server sends for a file that isn't a note is
+  ignored: it no longer writes over an attachment.
+
 ## [0.3.9] — 2026-09-27
 
 ### Added

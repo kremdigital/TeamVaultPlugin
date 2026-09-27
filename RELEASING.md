@@ -70,6 +70,35 @@ Community directory ([community.obsidian.md](https://community.obsidian.md)).
    - on the portal, the entry shows the new version. If it doesn't yet, open
      the entry's **...** menu → **Check for new releases**.
 
+## Releases that need the server updated
+
+Some releases change the sync protocol and work only with a server that has
+the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
+— the server answers `ops:status` and says `opIdempotency: 1` in its
+`project:join` answer). For such a release:
+
+- Deploy the server first: tag the plugin only once production runs it.
+  0.4.0 connected to an older server sends nothing and reports
+  `server_outdated`.
+- Then release the plugin without delay. The server of 0.4.0 refuses the
+  file operations of older plugins (`invalid_op_id`, an error they retry):
+  their new files, renames, moves, deletes and attachment uploads wait in
+  their offline queue until they update. Edits of notes' text still sync.
+- Say so at the top of the version's `CHANGELOG.md` section, under
+  **Changed**, and in the README's **Server version** note.
+- A change 0.3.9 queued has no operation id; 0.4.0 gives it one when it
+  loads `state.json` (`sync.log` warns `legacy in-flight entries` for those
+  0.3.9 had sent). One the old server applied while its answer was lost can
+  therefore reach the server once more — the risk 0.3.9 had anyway. What
+  0.3.9 queued after the server update was refused, never applied, and is
+  safe.
+
+Going back from 0.4.0 to 0.3.9 is safe only in the same state: 0.3.9 drops
+the operations 0.4.0 keeps in flight in `state.json` (`inflight`) and knows
+nothing of their ids. Rolling the server back to a revision without
+operation ids makes 0.4.0 stop sending — roll it back only together with the
+plugin.
+
 ## Build verification
 
 After every release the directory builds the plugin from the source at the
@@ -231,6 +260,8 @@ appear.
 - [ ] `CHANGELOG.md` has a `## [X.Y.Z] — YYYY-MM-DD` section for the new
       version (`node scripts/release-notes.mjs X.Y.Z` prints it), in English.
 - [ ] All gates green.
+- [ ] A release that needs the server updated: production runs that server
+      (see [Releases that need the server updated](#releases-that-need-the-server-updated)).
 - [ ] `minAppVersion` still accurate for any new API usage.
 - [ ] Two `pnpm build` runs give the same `sha256sum main.js`.
 - [ ] `grep -o 'require("[^"]*")' main.js` lists only `obsidian` and
