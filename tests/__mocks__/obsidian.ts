@@ -152,8 +152,20 @@ export class ButtonComponent {
     this.clickHandler = handler;
     return this;
   }
-  /** Test helper: what a click on the button does. */
+  /**
+   * Test helper: what a click on the button does. Nothing on a disabled one,
+   * as in Obsidian: its `ButtonComponent` ignores the click (and a disabled
+   * `<button>` fires none).
+   */
   click(): void {
+    if (this.disabled) return;
+    void this.clickHandler?.();
+  }
+  /**
+   * Test helper: the click handler run even on a disabled button, which
+   * Obsidian never does — for a handler's own guard against it.
+   */
+  runClickHandler(): void {
     void this.clickHandler?.();
   }
 }

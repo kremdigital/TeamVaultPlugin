@@ -220,8 +220,14 @@ describe('settings tab — editing a server', () => {
 
     modal.field(URL_LABEL()).change(' https://teamvault.example.com/ ');
     expect(modal.button(SAVE()).disabled).toBe(true);
-    // Clicked anyway (the button is only greyed out): refused.
+    // A click on the disabled button does nothing: no notice, no save.
     modal.button(SAVE()).click();
+    await settle();
+    expect(plugin.saves).not.toHaveBeenCalled();
+    expect(Notice.shown).toEqual([]);
+    // Obsidian never runs the handler of a disabled button; were it run, its
+    // own guard refuses too.
+    modal.button(SAVE()).runClickHandler();
     await settle();
     expect(plugin.saves).not.toHaveBeenCalled();
     expect(Notice.shown.map((n) => n.message)).toEqual([t('modal.addServer.errors.testFirst')]);
