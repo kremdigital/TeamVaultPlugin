@@ -2253,3 +2253,315 @@ export function shapeOf(value: unknown): unknown {
   }
   return typeof value;
 }
+
+// -- An attachment whose uploads lose their answers -------------------------------
+
+/**
+ * How the connection of an {@link AttachmentBench} is cut
+ * ({@link AttachmentBench.cut}), and comes back ({@link AttachmentBench.back}):
+ *
+ *   - `pause`: Pause sync, then Resume sync;
+ *   - `drop`: the connection drops, and connects again;
+ *   - `stop`: the plugin is turned off and on (one log, in memory);
+ *   - `quit`: Obsidian quits — its quit writes `state.json` — and starts again;
+ *   - `crash`: the process dies; the next start finds the disk as it was.
+ */
+export type Cut = 'pause' | 'drop' | 'stop' | 'quit' | 'crash';
+
+/** A debounce `state.json` never waits out in a test: only writes made at once, or at quit. */
+export const NEVER_FLUSHED = 3_600_000;
+
+/** The versions an {@link AttachmentBench} uploads, named by their hashes. */
+const ATTACHMENT_VERSIONS = ['v1', 'v2', 'v3', 'v4', 'v5', 'v6', 'R', 'R2'] as const;
+
+/**
+ * One attachment, file `f2`, synced as `v1` — on disk, in `state.json` (a
+ * {@link FakeStorage} whose debounce never runs out) and on the server — and
+ * connected. Versions are the bytes of their names (`v2`, `R`), so the disk,
+ * the record and the server read as names. Downloads of `f2` serve what the
+ * server has now; "Content conflict", should it come up, gets `answer`.
+ */
+export class AttachmentBench {
+  /** The logs of every bench: their debounce never runs out (see {@link closeAll}). */
+  private static readonly opened: OperationLog[] = [];
+
+  /** The engine now; {@link back} replaces it after a stop, a quit or a crash. */
+  h: Harness;
+  /** Every engine of the bench, the current one last. */
+  readonly all: Harness[];
+  /** The versions downloaded, in order. */
+  readonly downloads: string[] = [];
+
+  private constructor(
+    h: Harness,
+    readonly server: FakeServer,
+    readonly docs: ServerDocs,
+    public storage: FakeStorage,
+    readonly name: string,
+    private readonly names: ReadonlyMap<string, string>,
+    private readonly answer: BinaryConflictResolution,
+  ) {
+    this.h = h;
+    this.all = [h];
+  }
+
+  /** Close the logs of every bench made so far: call after each test. */
+  static async closeAll(): Promise<void> {
+    for (const log of AttachmentBench.opened.splice(0)) await log.close();
+  }
+
+  static async online(
+    name = 'p.png',
+    answer: BinaryConflictResolution = 'keep-local',
+  ): Promise<AttachmentBench> {
+    const storage = new FakeStorage();
+    const log = await logOn(storage, NEVER_FLUSHED);
+    AttachmentBench.opened.push(log);
+    const h = buildHarness({ log });
+    const server = new FakeServer(h);
+    const docs = new ServerDocs(server, h);
+    const names = new Map<string, string>();
+    for (const v of ATTACHMENT_VERSIONS) names.set(await sha256Hex(encode(v)), v);
+    const data = encode('v1');
+    const hash = await sha256Hex(data);
+    h.vault.files.set(name, data);
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: name,
+      serverFileId: 'f2',
+      contentHash: hash,
+      size: data.byteLength,
+      fileType: 'BINARY',
+      lastSyncedAt: 1,
+    });
+    server.add({
+      id: 'f2',
+      path: name,
+      fileType: 'BINARY',
+      contentHash: hash,
+      size: data.byteLength,
+    });
+    const b = new AttachmentBench(h, server, docs, storage, name, names, answer);
+    b.wire(h);
+    await connect(h);
+    await docs.drive();
+    await h.log.persistNow();
+    return b;
+  }
+
+  /** What the server has of file `id`: a version's name, or `deleted`. */
+  onServer(id = 'f2'): string {
+    const file = this.server.files.get(id);
+    if (!file || file.deleted) return 'deleted';
+    return this.names.get(file.contentHash) ?? '?';
+  }
+
+  /** Every live file on the server as `path=version`. */
+  serverFiles(): string[] {
+    return [...this.server.files.values()]
+      .filter((f) => !f.deleted)
+      .map((f) => `${f.path}=${this.names.get(f.contentHash) ?? '?'}`)
+      .sort();
+  }
+
+  /** Every file on disk as `path=content`. */
+  disk(): string[] {
+    return [...this.h.vault.files.keys()].sort().map((p) => `${p}=${this.h.vault.text(p) ?? ''}`);
+  }
+
+  /** The version the record of the attachment says this device has; `none` without one. */
+  recorded(): string {
+    const meta = this.h.log.getFileMeta('b1', this.name);
+    return meta ? (this.names.get(meta.contentHash) ?? meta.contentHash) : 'none';
+  }
+
+  /** How many times "Content conflict" came up, on any engine of the bench. */
+  conflicts(): number {
+    return this.all.flatMap((h) => h.calls).filter((c) => c === 'modal.resolveBinaryConflict')
+      .length;
+  }
+
+  /** A vault event of the attachment. */
+  event(type: VaultEvent['type']): VaultEvent {
+    return { bindingId: 'b1', type, path: this.name, source: 'obsidian' } as VaultEvent;
+  }
+
+  /** The uploads the engine has sent. */
+  uploads(): Emit[] {
+    return this.h.socket().emits.filter((e) => e.event === 'file:update-binary');
+  }
+
+  /** The user saves `version` over the attachment; resolves once its upload is out, not answered. */
+  async uploadOut(version: string): Promise<{ out: Emit; done: Promise<void> }> {
+    const before = this.uploads().length;
+    this.h.vault.files.set(this.name, encode(version));
+    const done = this.h.engine.handleVaultEvent(this.event('modify'));
+    done.catch(() => undefined);
+    for (let i = 0; i < 100; i++) {
+      const out = this.uploads()[before];
+      if (out !== undefined) return { out, done };
+      await flushAsync(2);
+    }
+    throw new Error(`the upload of ${version} did not go out`);
+  }
+
+  /** The user saves `version`; the server applies it and answers. */
+  async uploaded(version: string): Promise<void> {
+    const { done } = await this.uploadOut(version);
+    expect(this.server.serveNext()).toBe(true);
+    await done;
+    await this.h.settle();
+  }
+
+  /**
+   * The user deletes the attachment in Obsidian, or creates it with
+   * `version`; the server answers what goes out.
+   */
+  async userDoes(type: 'create' | 'delete', version = ''): Promise<void> {
+    if (type === 'delete') this.h.vault.files.delete(this.name);
+    else this.h.vault.files.set(this.name, encode(version));
+    const handled = this.h.engine.handleVaultEvent(this.event(type));
+    await this.settleLive();
+    await handled;
+  }
+
+  /** Let what the server broadcasts reach the disk, and answer what goes out. */
+  async settleLive(): Promise<void> {
+    for (let i = 0; i < 3; i++) {
+      await flushAsync(40);
+      await this.h.settle();
+      await this.server.pump();
+    }
+  }
+
+  /**
+   * The teammate deletes the attachment and adds `version` under its name: the
+   * server brings the old id back. Applied here live when connected.
+   */
+  async replacedByTeammate(version = 'R'): Promise<void> {
+    this.server.teammateDelete('f2');
+    await this.settleLive();
+    expect(await this.server.teammateUpload(this.name, encode(version))).toBe('f2');
+    await this.settleLive();
+  }
+
+  /** The teammate saves `version` over the attachment; applied here live when connected. */
+  async savedByTeammate(version: string, id = 'f2'): Promise<void> {
+    await this.server.teammateUpdate(id, encode(version));
+    await this.settleLive();
+  }
+
+  /**
+   * Cut the connection (see {@link Cut}): the answers on their way never reach
+   * the device. The disk the next start finds, after a quit or a crash.
+   */
+  async cut(how: Cut): Promise<FakeStorage | null> {
+    for (const e of this.h.socket().emits) {
+      if (e.event.startsWith('file:')) e.ack = (): void => undefined;
+    }
+    let disk: FakeStorage | null = null;
+    switch (how) {
+      case 'pause':
+        this.h.engine.pause();
+        break;
+      case 'drop':
+        this.h.socket().connected = false;
+        this.h.socket().fire('disconnect', 'transport close');
+        break;
+      case 'stop':
+        await this.h.engine.stop();
+        break;
+      case 'quit':
+        // What the quit hook of `main.ts` waits for.
+        await this.h.log.flush();
+        disk = this.storage.snapshot();
+        this.h.socket().kill();
+        break;
+      case 'crash':
+        disk = this.storage.snapshot();
+        this.h.socket().kill();
+        break;
+    }
+    await flushAsync(20);
+    return disk;
+  }
+
+  /**
+   * Connect again after {@link cut}, from `disk` after a quit or a crash; the
+   * join answered for the clock it carries, and the catch-up done.
+   */
+  async back(how: Cut, disk: FakeStorage | null): Promise<void> {
+    switch (how) {
+      case 'pause':
+        await this.h.engine.resume();
+        break;
+      case 'drop':
+        this.h.socket().connect();
+        break;
+      case 'stop': {
+        const next = buildHarness({ predecessor: this.h });
+        this.server.attach(next);
+        this.docs.attach(next);
+        this.use(next);
+        await next.engine.start();
+        break;
+      }
+      case 'quit':
+      case 'crash': {
+        const { next, storage } = await restartFromDisk(this.h, disk ?? this.storage, {
+          server: this.server,
+          docs: this.docs,
+        });
+        AttachmentBench.opened.push(next.log);
+        this.storage = storage;
+        this.use(next);
+        await next.engine.start();
+        break;
+      }
+    }
+    (await joinToAnswer(this.h)).ack(
+      this.server.joinAnswer('whole journal', {
+        yjsDocs: this.docs.snapshots(),
+        clock: joinClockOf(this.h),
+      }),
+    );
+    await this.docs.drive();
+    await this.settleLive();
+  }
+
+  /** {@link cut}, then {@link back}. */
+  async cutAndBack(how: Cut): Promise<void> {
+    await this.back(how, await this.cut(how));
+  }
+
+  /**
+   * The attachment is `version` here, in the record and on the server, and
+   * nothing waits: no "Content conflict" came up, nothing is queued or in
+   * flight, and the server applied no operation twice (R1, R2).
+   */
+  expectEverywhere(version: string): void {
+    expect(this.conflicts()).toBe(0);
+    expect(this.onServer()).toBe(version);
+    expect(this.disk()).toEqual([`${this.name}=${version}`]);
+    expect(this.recorded()).toBe(version);
+    expect(this.h.log.dequeueOperations('b1')).toEqual([]);
+    expect(this.h.log.inFlightOperations('b1')).toEqual([]);
+    expect(this.server.duplicates).toEqual([]);
+    expect(new Set(this.server.appliedOpIds).size).toBe(this.server.appliedOpIds.length);
+  }
+
+  private use(h: Harness): void {
+    this.h = h;
+    this.all.push(h);
+    this.wire(h);
+  }
+
+  private wire(h: Harness): void {
+    h.routes.set('GET /api/projects/p1/files/f2', () => {
+      const version = this.onServer();
+      this.downloads.push(version);
+      return bytes(encode(version));
+    });
+    h.modal.binary.resolve(this.answer);
+  }
+}

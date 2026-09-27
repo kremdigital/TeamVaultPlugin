@@ -1199,6 +1199,9 @@ export class SyncEngine {
         appliedLive,
         { truncated: result.ok && result.operationsTruncated === true },
       );
+      // Replaced by a teammate while this device was away (see
+      // `reconcileAttachments`).
+      const replacedAway: ReadonlySet<string> = new Set(this.recreated);
       const askedBack = this.deleteAskedBack();
       for (const id of askedBack) this.recreated.add(id);
       // Before any catch-up doc or operation lands: the files the queue's
@@ -1237,9 +1240,9 @@ export class SyncEngine {
       // A catch-up cut short to its newest operations may have left some out:
       // attachments are checked against the listing instead (see
       // `reconcileAttachments`). After a whole one, the attachments new to
-      // this device only.
+      // this device only, and those deleted and created again under their id.
       const partial = result.operationsTruncated === true;
-      await this.reconcileAttachments(online, { onlyNew: !partial });
+      await this.reconcileAttachments(online, { onlyNew: !partial, replaced: replacedAway });
       online.throwIfAborted();
 
       // Hydrate Yjs docs. New servers STREAM them via `yjs:catchup` (handled by
@@ -3257,7 +3260,7 @@ export class SyncEngine {
     // Its queued rename is gone: the catch-up's renames apply again.
     this.renamedHere.delete(fileId);
     const meta = this.fileIndex.byId.get(fileId);
-    if (meta !== undefined) await this.letGoOfOldCopy(meta, listed.path);
+    if (meta !== undefined) await this.letGoOfOldCopy(meta, listed);
     const path = listed.path;
     const shadow = { path, fileType: listed.fileType };
     if (!this.isLocalName(path)) {
@@ -3292,14 +3295,21 @@ export class SyncEngine {
    * See {@link takeBackOvertaken}: the index, `state.json` and history this
    * device has of `meta` go, and its copy on disk with them when the server
    * had that content. A copy with content the server never had stays, set
-   * aside under a conflict name when the file coming back takes its name.
+   * aside under a conflict name when the file coming back (`coming`) takes its
+   * name.
+   *
+   * A copy with the content of the file coming back is that file: written
+   * here from its broadcast just before the process ended, and the record of
+   * the write lost with it. Kept aside, it went to the server as a new file —
+   * a copy of the teammate's file for the whole team.
    */
-  private async letGoOfOldCopy(meta: IndexedMeta, comingTo: string): Promise<void> {
+  private async letGoOfOldCopy(meta: IndexedMeta, coming: ApiFile): Promise<void> {
     const path = meta.relativePath;
     const localHash = await this.hashFile(this.vault, path);
     const serverHad =
       localHash === null ||
       localHash === meta.contentHash ||
+      localHash === coming.contentHash ||
       (meta.fileType === 'TEXT' && (await this.serverHadVersion(meta.fileId, localHash)));
     this.throwIfStopped();
     await this.commitLocal(async (io) => {
@@ -3314,7 +3324,7 @@ export class SyncEngine {
         await io.vault.delete(path);
         return;
       }
-      if (path !== comingTo) return;
+      if (path !== coming.path) return;
       const aside = buildConflictPath(path, this.now());
       this.log.warn('a file the server has anew had local edits; kept aside', { path, aside });
       io.echo.mark(path, ECHO_COUNT_RENAME);
@@ -5343,14 +5353,28 @@ export class SyncEngine {
    * listing indexed it at the next connect, recorded as synced, and it never
    * came; a file saved under the name here was then sent as its new version,
    * over the teammate's.
+   *
+   * `replaced`: attachments the catch-up shows deleted and created again under
+   * their id (see `notesRecreated`) — a teammate deleted one and added another
+   * under its name while this device was away — are checked too. The catch-up
+   * skips the DELETE of a file it lists, and the CREATE of one on this disk
+   * downloads nothing (see {@link applyServerCreate}): the teammate's file
+   * came only with their next version, and this device's copy of the deleted
+   * one stayed under the name meanwhile.
    */
   private async reconcileAttachments(
     online: AbortSignal,
-    opts: { onlyNew?: boolean } = {},
+    opts: { onlyNew?: boolean; replaced?: ReadonlySet<string> } = {},
   ): Promise<void> {
     for (const meta of [...this.fileIndex.byId.values()]) {
       if (meta.fileType !== 'BINARY') continue;
-      if (opts.onlyNew === true && !this.newHere.has(meta.fileId)) continue;
+      if (
+        opts.onlyNew === true &&
+        !this.newHere.has(meta.fileId) &&
+        opts.replaced?.has(meta.fileId) !== true
+      ) {
+        continue;
+      }
       const listed = this.lastListing.get(meta.fileId);
       if (listed === undefined) continue;
       // Deleted since the pass began: not brought back.
