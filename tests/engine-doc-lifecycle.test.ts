@@ -184,15 +184,21 @@ describe('SyncEngine — a teammate’s edit arriving while their rename moves t
     await flushAsync(5);
     expect(h.vault.text('b.md')).toBe('A\n');
 
-    await new Promise((r) => setTimeout(r, 300));
-    for (const f of h.socket().fetches.splice(0)) {
-      f.answer({
-        ok: true,
-        sync1: Array.from(Y.encodeStateAsUpdate(d1)),
-        stateVector: Array.from(Y.encodeStateVector(d1)),
-      });
+    // The snapshot's debounce starts once the move ends, and how long the move
+    // takes depends on the machine (under a loaded CI runner it ran past a fixed
+    // 300 ms wait): answer the doc fetches as they come, until the teammate's line
+    // is on the disk or 5 s have passed.
+    for (let i = 0; i < 100 && h.vault.text('b.md') !== 'A\nT\n'; i++) {
+      await new Promise((r) => setTimeout(r, 50));
+      for (const f of h.socket().fetches.splice(0)) {
+        f.answer({
+          ok: true,
+          sync1: Array.from(Y.encodeStateAsUpdate(d1)),
+          stateVector: Array.from(Y.encodeStateVector(d1)),
+        });
+      }
+      await flushAsync(5);
     }
-    await flushAsync(30);
 
     expect([...h.vault.files.keys()]).toEqual(['b.md']);
     expect(h.vault.text('b.md')).toBe('A\nT\n');
