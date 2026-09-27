@@ -75,6 +75,9 @@ const factory: SocketFactory = (url, options) => new FakeSocket(url, options);
 
 const server = { url: 'https://sync.example.com/', apiKey: 'osk_secret' };
 const clientId = 'device-1';
+/** Operation ids of the tests. */
+const OP = '3f1c2e4a-9b7d-4c1e-8f2a-0d5b6c7e8f90';
+const OP2 = '9a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d';
 
 /** Wrap the factory so each test can keep a handle to the FakeSocket. */
 function captureSocket(): {
@@ -221,6 +224,7 @@ describe('SocketClient — emits', () => {
     const promise = client.emitFileCreate({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       filePath: 'note.md',
       fileType: 'TEXT',
       contentHash: 'h',
@@ -250,6 +254,7 @@ describe('SocketClient — emits', () => {
     const rename = client.emitFileRename({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       fileId: 'f1',
       filePath: 'a.md',
       newPath: 'b.md',
@@ -270,6 +275,7 @@ describe('SocketClient — emits', () => {
     const create = client.emitFileDelete({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       fileId: 'f1',
       filePath: 'a.md',
     });
@@ -280,6 +286,7 @@ describe('SocketClient — emits', () => {
     const next = client.emitFileDelete({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       fileId: 'f2',
       filePath: 'b.md',
     });
@@ -307,6 +314,7 @@ describe('SocketClient — emits', () => {
     void client.emitFileRename({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       fileId: 'f1',
       filePath: 'old.md',
       newPath: 'new.md',
@@ -315,6 +323,7 @@ describe('SocketClient — emits', () => {
     void client.emitFileMove({
       projectId: 'p1',
       clientId: 'device-1',
+      opId: OP,
       fileId: 'f1',
       filePath: 'a/old.md',
       newPath: 'b/new.md',
@@ -459,5 +468,207 @@ describe('SocketClient — incoming events', () => {
     client.connect();
     expect(() => socket().fire('yjs:update', { fileId: 'f1', update: [1] })).not.toThrow();
     expect(ok).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SocketClient — operation ids', () => {
+  it('sends the operation’s opId in the envelope of every file operation', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const base = { projectId: 'p1', clientId: 'device-1', opId: OP };
+    void client.emitFileCreate({
+      ...base,
+      filePath: 'n.md',
+      fileType: 'TEXT',
+      contentHash: 'h',
+      size: 0,
+    });
+    void client.emitFileUpdateBinary({ ...base, fileId: 'f1', contentHash: 'h', size: 1 });
+    void client.emitFileDelete({ ...base, fileId: 'f1', filePath: 'a.md' });
+    void client.emitFileRename({ ...base, fileId: 'f1', filePath: 'a.md', newPath: 'b.md' });
+    void client.emitFileMove({ ...base, fileId: 'f1', filePath: 'a.md', newPath: 'd/b.md' });
+    expect(socket().emits.map((e) => (e.args[0] as { opId?: unknown }).opId)).toEqual([
+      OP,
+      OP,
+      OP,
+      OP,
+      OP,
+    ]);
+    await Promise.resolve();
+  });
+
+  it('resolves a file operation with the outcome, the log row and the duplicate mark', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const del = client.emitFileDelete({
+      projectId: 'p1',
+      clientId: 'device-1',
+      opId: OP,
+      fileId: 'f1',
+      filePath: 'a.md',
+    });
+    const log = { id: 'cl_1', vectorClock: { 'device-1': 8 }, createdAt: '2026-10-01' };
+    socket().ackLast({
+      ok: true,
+      outcome: { kind: 'deleted', fileId: 'f1' },
+      log,
+      duplicate: true,
+    });
+    await expect(del).resolves.toEqual({
+      ok: true,
+      outcome: { kind: 'deleted', fileId: 'f1' },
+      log,
+      duplicate: true,
+    });
+  });
+
+  it('passes the join’s idempotency mark and the rows’ clientId and opId through', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const join = client.joinProject('p1', {}, true);
+    const row = {
+      id: 'cl_3',
+      opType: 'RENAME',
+      filePath: 'z.md',
+      newPath: 'w.md',
+      authorId: 'u2',
+      clientId: 'c-B',
+      opId: OP,
+      vectorClock: { 'c-B': 4 },
+      payload: { fileId: 'f1' },
+      createdAt: '2026-10-01',
+    };
+    const old = { ...row, id: 'cl_1', clientId: null, opId: null };
+    socket().ackLast({ ok: true, opIdempotency: 1, operationsCatchup: 2, operations: [old, row] });
+    await expect(join).resolves.toEqual({
+      ok: true,
+      opIdempotency: 1,
+      operationsCatchup: 2,
+      operations: [old, row],
+    });
+  });
+
+  it('opsStatus asks about the ids and resolves with what was applied and voided', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const asked = client.opsStatus('p1', [OP, OP2]);
+    expect(socket().emits[0]?.event).toBe('ops:status');
+    expect(socket().emits[0]?.args[0]).toEqual({ projectId: 'p1', opIds: [OP, OP2] });
+    const applied = {
+      opId: OP,
+      opType: 'RENAME',
+      logId: 'cl_9',
+      filePath: 'x.md',
+      newPath: 'y.md',
+      outcome: { kind: 'renamed', fileId: 'f1', from: 'x.md', to: 'y.md' },
+      vectorClock: { 'device-1': 12 },
+      createdAt: '2026-10-01T10:00:00.000Z',
+    };
+    socket().ackLast({ ok: true, applied: [applied, { opId: 42 }], voided: [OP2, 7] });
+    await expect(asked).resolves.toEqual({ ok: true, applied: [applied], voided: [OP2] });
+  });
+
+  it('opsStatus passes the server’s refusal on, and a malformed answer is an error', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const busy = client.opsStatus('p1', [OP]);
+    socket().ackLast({ ok: false, error: 'busy' });
+    await expect(busy).resolves.toEqual({ ok: false, error: 'busy' });
+    const odd = client.opsStatus('p1', [OP]);
+    socket().ackLast({ ok: true, applied: 'nope' });
+    await expect(odd).resolves.toEqual({ ok: false, error: 'invalid_ack' });
+  });
+
+  it('opsStatus times out on window.setTimeout and clears it on the ack', async () => {
+    const win = stubWindow();
+    try {
+      const { client, socket } = captureSocket();
+      client.connect();
+      const late = client.opsStatus('p1', [OP], 5);
+      await expect(late).resolves.toEqual({ ok: false, error: 'timeout' });
+      const answered = client.opsStatus('p1', [OP], 60_000);
+      socket().ackLast({ ok: true, applied: [], voided: [OP] });
+      await expect(answered).resolves.toEqual({ ok: true, applied: [], voided: [OP] });
+      expect(win.setTimeout.mock.calls.map(([, ms]) => ms)).toEqual([5, 60_000]);
+      expect(win.clearTimeout).toHaveBeenCalledTimes(2);
+    } finally {
+      win.restore();
+    }
+  });
+
+  it('opsStatus answers disconnected when the connection drops, and when the client disconnects', async () => {
+    const { client, socket } = captureSocket();
+    client.connect();
+    const dropped = client.opsStatus('p1', [OP]);
+    socket().disconnect();
+    await expect(dropped).resolves.toEqual({ ok: false, error: 'disconnected' });
+    socket().connect();
+    const closed = client.opsStatus('p1', [OP]);
+    client.disconnect();
+    await expect(closed).resolves.toEqual({ ok: false, error: 'disconnected' });
+  });
+
+  it('opsStatus resolves (does not reject) before connect', async () => {
+    const client = new SocketClient({ server, clientId, factory });
+    await expect(client.opsStatus('p1', [OP])).resolves.toEqual({
+      ok: false,
+      error: 'socket_not_connected',
+    });
+  });
+
+  it('reads the opId and the sender of every file event, and where file:created stored it', () => {
+    const { client, socket } = captureSocket();
+    const fileCb = jest.fn();
+    client.onFileEvent(fileCb);
+    client.connect();
+    const log = { id: 'cl_4', vectorClock: { 'c-B': 5 }, createdAt: '2026-10-01' };
+    const outcome = {
+      kind: 'conflict_create_renamed',
+      fileId: 'f2',
+      originalPath: 'notes/a.md',
+      finalPath: 'notes/a.conflict-c-B.md',
+    };
+    socket().fire('file:created', {
+      result: { outcome, log },
+      fileId: 'f2',
+      path: 'notes/a.conflict-c-B.md',
+      fileType: 'TEXT',
+      clientId: 'c-B',
+      opId: OP,
+      revived: false,
+      log,
+    });
+    socket().fire('file:deleted', { fileId: 'f4', clientId: 'rest:u2', opId: OP2, log });
+    socket().fire('file:updated-binary', {
+      fileId: 'f3',
+      contentHash: 'h',
+      clientId: '',
+      opId: 12,
+      log,
+    });
+    expect(fileCb).toHaveBeenNthCalledWith(1, {
+      type: 'created',
+      result: { outcome, log },
+      fileId: 'f2',
+      path: 'notes/a.conflict-c-B.md',
+      fileType: 'TEXT',
+      clientId: 'c-B',
+      opId: OP,
+      log,
+    });
+    expect(fileCb).toHaveBeenNthCalledWith(2, {
+      type: 'deleted',
+      fileId: 'f4',
+      clientId: 'rest:u2',
+      opId: OP2,
+      log,
+    });
+    // Fields that are not what they should be are left out.
+    expect(fileCb).toHaveBeenNthCalledWith(3, {
+      type: 'updated-binary',
+      fileId: 'f3',
+      contentHash: 'h',
+      log,
+    });
   });
 });

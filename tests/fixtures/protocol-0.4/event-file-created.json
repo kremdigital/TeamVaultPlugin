@@ -1,0 +1,33 @@
+{
+  "result": {
+    "outcome": {
+      "kind": "conflict_create_renamed",
+      "fileId": "f2",
+      "originalPath": "notes/a.md",
+      "finalPath": "notes/a.conflict-c-B.md",
+      "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "size": 12,
+      "fileType": "TEXT"
+    },
+    "log": {
+      "id": "cl_4",
+      "vectorClock": {
+        "c-B": 5
+      },
+      "createdAt": "2026-10-01T10:00:01.000Z"
+    }
+  },
+  "fileId": "f2",
+  "path": "notes/a.conflict-c-B.md",
+  "fileType": "TEXT",
+  "clientId": "c-B",
+  "opId": "77aa5b6c-7d8e-4f90-a1b2-c3d4e5f60718",
+  "revived": false,
+  "log": {
+    "id": "cl_4",
+    "vectorClock": {
+      "c-B": 5
+    },
+    "createdAt": "2026-10-01T10:00:01.000Z"
+  }
+}

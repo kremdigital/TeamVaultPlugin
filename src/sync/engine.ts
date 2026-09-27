@@ -20,6 +20,7 @@ import { DocManager, type MoveResult, type OpenResult } from '@/crdt/doc-manager
 import { mergeText3 } from '@/crdt/text-merge';
 import {
   OperationLog,
+  newOpId,
   type FileMeta,
   type OperationType,
   type PendingOperation,
@@ -3290,6 +3291,7 @@ export class SyncEngine {
         const ack = await this.emitCreate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
+          opId: newOpId(),
           vectorClock: this.bumpClock(),
           filePath: path,
           fileType,
@@ -3806,6 +3808,7 @@ export class SyncEngine {
         const ack = await this.emitBinaryUpdate({
           projectId: this.binding.projectId,
           clientId: this.clientId,
+          opId: newOpId(),
           vectorClock,
           fileId: meta.fileId,
           contentHash: hash,
@@ -3973,6 +3976,7 @@ export class SyncEngine {
         ack = await this.emitDelete({
           projectId: this.binding.projectId,
           clientId: this.clientId,
+          opId: newOpId(),
           vectorClock: this.bumpClock(),
           fileId,
           filePath: path,
@@ -4233,6 +4237,7 @@ export class SyncEngine {
           const ack = await this.socket.emitFileRename({
             projectId: this.binding.projectId,
             clientId: this.clientId,
+            opId: newOpId(),
             vectorClock,
             fileId,
             filePath: oldPath,
@@ -5555,6 +5560,7 @@ export class SyncEngine {
               await this.emitBinaryUpdate({
                 projectId: this.binding.projectId,
                 clientId: this.clientId,
+                opId: newOpId(),
                 vectorClock: this.bumpClock(),
                 fileId,
                 contentHash: localHash,
@@ -5808,6 +5814,7 @@ export class SyncEngine {
           const ack = await this.emitCreate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
+            opId: newOpId(),
             vectorClock: this.bumpClock(),
             filePath: meta.relativePath,
             fileType: meta.fileType,
@@ -6304,6 +6311,7 @@ export class SyncEngine {
         ack = await this.socket.emitFileRename({
           projectId: this.binding.projectId,
           clientId: this.clientId,
+          opId: newOpId(),
           vectorClock: this.bumpClock(),
           fileId: meta.fileId,
           filePath: movedTo,
@@ -7408,6 +7416,7 @@ export class SyncEngine {
             const ack = await this.emitCreate({
               projectId: this.binding.projectId,
               clientId: this.clientId,
+              opId: newOpId(),
               vectorClock: this.bumpClock(),
               filePath: op.filePath,
               fileType,
@@ -7476,6 +7485,7 @@ export class SyncEngine {
           const ack = await this.emitBinaryUpdate({
             projectId: this.binding.projectId,
             clientId: this.clientId,
+            opId: newOpId(),
             vectorClock,
             fileId,
             contentHash,
@@ -7522,6 +7532,7 @@ export class SyncEngine {
           const ack = await this.emitDelete({
             projectId: this.binding.projectId,
             clientId: this.clientId,
+            opId: newOpId(),
             vectorClock: this.bumpClock(),
             fileId,
             filePath: op.filePath,
@@ -7553,6 +7564,7 @@ export class SyncEngine {
           const payload = {
             projectId: this.binding.projectId,
             clientId: this.clientId,
+            opId: newOpId(),
             vectorClock: this.bumpClock(),
             fileId,
             filePath: op.filePath,

@@ -282,13 +282,19 @@ describe.each(['current', 'legacy'] as const)(
   },
 );
 
-describe('SyncEngine — a note renamed right after its create, a teammate made the same note first', () => {
-  it('does not rename their note: this one goes out under the new name', async () => {
+describe('SyncEngine — a note renamed right after its create, a teammate made the same empty note first', () => {
+  it('does not rename their note: this one is a note of its own, under the new name', async () => {
     const { h, server, docs } = await renamedRightAfter('current', 'broadcast-first', '', '');
 
-    // The server gave this device's create the teammate's note (same content).
-    expect(ids(server)).toEqual(['s1:Untitled.md', 's4:Meeting.md']);
-    expect(server.applied).toEqual(['create Untitled.md', 'create Meeting.md']);
+    // Two empty notes are not one (see `sync-protocol.md`, CREATE-vs-CREATE):
+    // the server stored this device's under a conflict name, and its rename
+    // took it from there.
+    expect(ids(server)).toEqual(['s1:Untitled.md', 's3:Meeting.md']);
+    expect(server.applied).toEqual([
+      'create Untitled.md',
+      'create Untitled.conflict-device-1.md',
+      's3 Untitled.conflict-device-1.md -> Meeting.md',
+    ]);
     expect(docs.live()).toEqual(['Meeting.md=', 'Untitled.md=']);
     expect(disk(h)).toEqual(['Meeting.md=', 'Untitled.md=']);
     await h.engine.stop();

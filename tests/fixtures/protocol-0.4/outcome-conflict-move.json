@@ -1,0 +1,6 @@
+{
+  "kind": "conflict_create_renamed",
+  "fileId": "f5",
+  "originalPath": "b.md",
+  "finalPath": "b.conflict-c-A.md"
+}

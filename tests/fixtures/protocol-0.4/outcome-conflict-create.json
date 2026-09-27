@@ -1,0 +1,9 @@
+{
+  "kind": "conflict_create_renamed",
+  "fileId": "f2",
+  "originalPath": "notes/a.md",
+  "finalPath": "notes/a.conflict-c-A.md",
+  "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "size": 12,
+  "fileType": "TEXT"
+}

@@ -26,11 +26,23 @@
  *     `clientId`, the path the file was stored at) or the old one.
  *   - A start without network. `offline: true` builds an engine whose socket
  *     cannot connect until {@link goOnline}.
+ *
+ * The {@link FakeServer} keeps the contract of `sync-protocol.md` §4 of the
+ * 0.4 protocol (operation ids): it applies an `opId` once and answers a resend
+ * with the original outcome (`duplicate`), answers `ops:status` — voiding what
+ * it never applied — once the operations received before it are applied, and
+ * puts `opId`s into its acks, journal rows and broadcasts. Its answers have the
+ * shapes of the contract's examples, `tests/fixtures/protocol-0.4/`. And a
+ * {@link FakeStorage} keeps `state.json` the way the disk has it: a restart
+ * from it ({@link restartFromDisk}) sees only what was written.
  */
+import { readFileSync } from 'node:fs';
+import { join as joinPath } from 'node:path';
 import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
 import { SyncEngine, type EngineStatus } from '@/sync/engine';
-import { OperationLog } from '@/sync/operation-log';
+import { OperationLog, isOpId, newOpId } from '@/sync/operation-log';
+import type { LogStorage } from '@/utils/file-log-sink';
 import {
   DocManager,
   type DocPersistence,
@@ -400,6 +412,17 @@ export interface Emit {
   event: string;
   payload: unknown;
   ack: (response: unknown) => void;
+  /** Order of the emit among every emit of the socket, `ops:status` included. */
+  seq?: number;
+}
+
+/**
+ * How an `ops:status` is answered when no {@link FakeServer} serves the
+ * engine: every operation asked about is voided — the server never got it.
+ */
+function voidAll(e: Emit): void {
+  const { opIds } = e.payload as { opIds: string[] };
+  e.ack({ ok: true, applied: [], voided: [...opIds] });
 }
 
 /** Socket.IO stand-in: emits wait for the test to answer them. */
@@ -412,6 +435,17 @@ export class FakeSocket implements SocketLike {
   emits: Emit[] = [];
   /** `yjs:fetch` requests, answered by the test through `answer`. */
   fetches: Array<{ fileId: string; answer: (response: unknown) => void }> = [];
+  /**
+   * `ops:status` questions, in order. Kept out of {@link emits}, and answered
+   * as they come by {@link statusResponder}.
+   */
+  statusQueries: Emit[] = [];
+  /**
+   * Answers an `ops:status` as it is emitted: the {@link FakeServer} serving
+   * the engine, or else {@link voidAll}.
+   */
+  statusResponder: (e: Emit) => void = voidAll;
+  private seq = 0;
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
   on(event: string, cb: (...args: unknown[]) => void): SocketLike {
@@ -425,13 +459,29 @@ export class FakeSocket implements SocketLike {
     return this;
   }
   emit(event: string, ...args: unknown[]): SocketLike {
-    const ack = args[args.length - 1] as (response: unknown) => void;
+    let ack = args[args.length - 1] as (response: unknown) => void;
+    const seq = ++this.seq;
     if (event === 'yjs:fetch') {
       this.fetches.push({ fileId: (args[0] as { fileId: string }).fileId, answer: ack });
+    } else if (event === 'ops:status') {
+      const query: Emit = { event, payload: args[0], ack, seq };
+      this.statusQueries.push(query);
+      this.statusResponder(query);
     } else {
-      this.emits.push({ event, payload: args[0], ack });
+      if (event === 'project:join') ack = withIdempotency(ack);
+      this.emits.push({ event, payload: args[0], ack, seq });
     }
     return this;
+  }
+  /**
+   * The process is gone: nothing more goes out on this socket and nothing
+   * comes back — no `disconnect` either.
+   */
+  kill(): void {
+    this.connected = false;
+    this.reachable = false;
+    this.wantsConnect = false;
+    this.listeners.clear();
   }
   connect(): SocketLike {
     if (!this.reachable) {
@@ -485,6 +535,22 @@ export class FakeSocket implements SocketLike {
   }
 }
 
+/**
+ * The server this client needs says so in its join ack (`opIdempotency: 1`,
+ * see `sync-protocol.md` §4.5): an answer a test gives without it gets it. A
+ * test of an older server gives the key itself, `undefined`.
+ */
+function withIdempotency(ack: (response: unknown) => void): (response: unknown) => void {
+  return (response) => {
+    const r = response as Record<string, unknown> | null;
+    if (r !== null && typeof r === 'object' && r.ok === true && !('opIdempotency' in r)) {
+      ack({ ...r, opIdempotency: 1 });
+      return;
+    }
+    ack(response);
+  };
+}
+
 // -- Harness --------------------------------------------------------------------
 
 export const server: ServerConfig = {
@@ -526,7 +592,7 @@ export interface EchoRoute {
   /** What those handlers threw: in the plugin, an unhandled rejection. */
   errors: unknown[];
   /** The {@link FakeServer} answering this vault's engines, if any. */
-  server: { serveNext(): boolean } | null;
+  server: { serveNext(): boolean; answerStatus(e: Emit): void } | null;
 }
 
 export interface Harness {
@@ -567,6 +633,11 @@ export interface Harness {
 export interface HarnessOptions {
   /** The engine this one replaces: same vault, log, docs and echo set. */
   predecessor?: Harness;
+  /**
+   * The operation log, instead of a memory-only one (or the predecessor's):
+   * one loaded from a {@link FakeStorage} (see {@link restartFromDisk}).
+   */
+  log?: OperationLog;
   /** Bind to a subfolder instead of the vault root. */
   localFolder?: string;
   logger?: Logger;
@@ -620,7 +691,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   const requests: Request[] = [];
   const routes = new Map<string, Responder>();
   const vault = predecessor?.vault ?? new MemoryVault();
-  const log = predecessor?.log ?? new OperationLog();
+  const log = opts.log ?? predecessor?.log ?? new OperationLog();
   const doc = opts.docs ?? predecessor?.doc ?? new DocManager();
   const ra = predecessor?.echo ?? new RecentlyApplied();
 
@@ -664,10 +735,18 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   // Each engine gets its own socket, so a predecessor's late emits stay
   // apart from its successor's.
   let own: FakeSocket | null = null;
+  // Built below; the socket asks it who answers `ops:status`.
+  let routeRef: EchoRoute | null = null;
   const factory: SocketFactory = () => {
-    own = new FakeSocket();
-    if (opts.offline) own.reachable = false;
-    return own;
+    const built = new FakeSocket();
+    if (opts.offline) built.reachable = false;
+    built.statusResponder = (e): void => {
+      const serving = routeRef?.server;
+      if (serving) serving.answerStatus(e);
+      else voidAll(e);
+    };
+    own = built;
+    return built;
   };
   const socket = new SocketClient({ server, clientId: 'device-1', factory });
   const resolver: ConflictResolver = {
@@ -695,6 +774,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
 
   const echoRoute = predecessor?.route ?? watchVault(vault, ra, engineBinding);
   echoRoute.engine = engine;
+  routeRef = echoRoute;
 
   return Object.assign(h, {
     engine,
@@ -794,12 +874,34 @@ export async function goOnline(
   h: Harness,
   join: { operations?: ServerOperation[]; yjsDocs?: YjsDocSnapshot[] } = {},
 ): Promise<void> {
+  const before = joinsOf(h);
   h.socket().goOnline();
   await flushAsync();
-  h.socket()
-    .pending('project:join')
-    .ack({ ok: true, operations: join.operations ?? [], yjsDocs: join.yjsDocs ?? [] });
+  (await nextJoin(h, before)).ack({
+    ok: true,
+    operations: join.operations ?? [],
+    yjsDocs: join.yjsDocs ?? [],
+  });
   await flushAsync();
+}
+
+/** How many `project:join` the engine's socket has sent; 0 before it has one. */
+export function joinsOf(h: Harness): number {
+  return h.socketIfBuilt()?.emits.filter((e) => e.event === 'project:join').length ?? 0;
+}
+
+/**
+ * The `project:join` after the first `before` ones, once the engine sends it:
+ * with operations waiting for their answer, it asks `ops:status` first.
+ */
+export async function nextJoin(h: Harness, before: number): Promise<Emit> {
+  for (let i = 0; i < 50; i++) {
+    const joins = h.socketIfBuilt()?.emits.filter((e) => e.event === 'project:join') ?? [];
+    const join = joins[before];
+    if (join !== undefined) return join;
+    await flushAsync(2);
+  }
+  throw new Error('no project:join sent');
 }
 
 export async function flushAsync(times = 20): Promise<void> {
@@ -821,10 +923,13 @@ export async function connect(
   h: Harness,
   join: { operations?: ServerOperation[]; yjsDocs?: YjsDocSnapshot[] } = {},
 ): Promise<void> {
+  const before = joinsOf(h);
   await h.engine.start();
-  h.socket()
-    .pending('project:join')
-    .ack({ ok: true, operations: join.operations ?? [], yjsDocs: join.yjsDocs ?? [] });
+  (await nextJoin(h, before)).ack({
+    ok: true,
+    operations: join.operations ?? [],
+    yjsDocs: join.yjsDocs ?? [],
+  });
   await flushAsync();
 }
 
@@ -882,6 +987,11 @@ export function remoteEdit(h: Harness, serverDoc: Y.Doc, fileId: string, line: s
 /** The `log` field every server file event carries. */
 export const eventLog = { id: 'l1', vectorClock: { 'device-2': 2 }, createdAt: '2026-01-01' };
 
+/** A teammate's operation id: `clock` in its last group. */
+export function teammateOpId(clock: number): string {
+  return `00000000-0000-4000-8000-${String(clock).padStart(12, '0')}`;
+}
+
 /** One entry of the join's operation list, authored by a teammate. */
 export function op(
   opType: ServerOperation['opType'],
@@ -896,6 +1006,8 @@ export function op(
     filePath,
     newPath,
     authorId: 'u2',
+    clientId: 'device-2',
+    opId: teammateOpId(clock),
     vectorClock: { 'device-2': clock },
     payload,
     createdAt: '2026-01-01',
@@ -944,6 +1056,42 @@ const SERVED = new Set([
   'file:update-binary',
 ]);
 
+/** The operation type a file event stands for; RENAME and MOVE are one for a resend. */
+const OP_TYPE_OF: Record<string, ServerOperation['opType']> = {
+  'file:create': 'CREATE',
+  'file:update-binary': 'UPDATE',
+  'file:delete': 'DELETE',
+  'file:rename': 'RENAME',
+  'file:move': 'MOVE',
+};
+
+/** Whether two operation types are the same for an `opId` (RENAME ≡ MOVE). */
+function sameOpKind(a: ServerOperation['opType'], b: ServerOperation['opType']): boolean {
+  const kind = (t: ServerOperation['opType']): string => (t === 'MOVE' ? 'RENAME' : t);
+  return kind(a) === kind(b);
+}
+
+/** A log entry as acks and broadcasts carry it. */
+interface LogEntry {
+  id: string;
+  vectorClock: Record<string, number>;
+  createdAt: string;
+}
+
+/** What the {@link FakeServer} keeps of an operation it applied, by `opId`. */
+interface AppliedOp {
+  clientId: string;
+  opType: ServerOperation['opType'];
+  outcome: unknown;
+  log: LogEntry;
+  row: ServerOperation;
+}
+
+/** The user a client of the {@link FakeServer} works as: `device-1` is this device's. */
+function authorOf(clientId: string): string {
+  return clientId === 'device-1' ? 'u1' : 'u2';
+}
+
 /**
  * The server's side of file operations, enough to see what a client makes of
  * its own and its teammates' changes. Like `Project/server` (`handleMove`,
@@ -953,14 +1101,23 @@ const SERVED = new Set([
  * {@link BroadcastFormat}), and the operation is broadcast to the whole room —
  * the sender included — right before the ack. CREATE, DELETE and a binary
  * UPDATE are applied the same way, without file contents. A CREATE on a name
- * taken by a file with the same content is that file (an idempotent replay);
+ * taken by a live file with the same non-empty content is that file (`merged`);
  * one on a tombstone brings its id back.
  *
+ * Operations are keyed by `opId` (`sync-protocol.md` §4): one without a valid
+ * one is refused (`invalid_op_id`), one applied already is answered with its
+ * original outcome and log row, `duplicate: true`, without being applied or
+ * broadcast again (`op_id_conflict` when another client or another kind of
+ * operation uses the id), and one `ops:status` voided is refused
+ * (`op_voided`). The ack carries the operation's log row.
+ *
  * Nothing is answered until {@link FakeServer.pump}: the test decides when
- * the server gets to work. The listing (`h.serverFiles`, tombstones in
- * `h.deletedFiles`) follows every change, and every operation goes to the
- * {@link FakeServer.journal} the catch-up is taken from
- * ({@link FakeServer.catchupFor}).
+ * the server gets to work. `ops:status` is answered as it is asked — once the
+ * operations the client sent before it are applied, as the server's project
+ * queue does — unless {@link holdStatus} leaves it for {@link serveNext}. The
+ * listing (`h.serverFiles`, tombstones in `h.deletedFiles`) follows every
+ * change, and every operation goes to the {@link FakeServer.journal} the
+ * catch-up is taken from ({@link FakeServer.catchupFor}).
  */
 export class FakeServer {
   readonly files = new Map<string, ServerFileRecord>();
@@ -974,7 +1131,22 @@ export class FakeServer {
    * vector clock and log id its broadcast carried.
    */
   readonly journal: ServerOperation[] = [];
+  /** The `opId` of every operation applied, in order: never one twice. */
+  readonly appliedOpIds: string[] = [];
+  /** Operations answered as a resend of one applied already (`duplicate`), by `opId`. */
+  readonly duplicates: string[] = [];
+  /** Every `ops:status` answered: the ids asked about, applied and voided. */
+  readonly statusAnswers: Array<{ asked: string[]; applied: string[]; voided: string[] }> = [];
+  /**
+   * Leave `ops:status` for {@link serveNext}, in its order among the client's
+   * emits — an operation received before it still being applied.
+   */
+  holdStatus = false;
+  private readonly byOpId = new Map<string, AppliedOp>();
+  private readonly voided = new Set<string>();
   private readonly served = new WeakSet<Emit>();
+  /** Emits that reach the server only when the test says (see {@link delay}). */
+  private readonly delayed = new WeakSet<Emit>();
   private seq = 0;
 
   constructor(
@@ -1056,6 +1228,7 @@ export class FakeServer {
       form === 'cut short' ? unseen.slice(Math.max(0, unseen.length - (opts.rows ?? 1))) : unseen;
     return {
       ok: true,
+      opIdempotency: 1,
       operations: kept,
       operationsCatchup: 2,
       ...(kept.length < unseen.length ? { operationsTruncated: true } : {}),
@@ -1084,24 +1257,112 @@ export class FakeServer {
 
   /** Answer the client's oldest operation not answered yet; `false` when there is none. */
   serveNext(): boolean {
-    const next = this.harness
-      .socketIfBuilt()
-      ?.emits.find((e) => SERVED.has(e.event) && !this.served.has(e));
+    const socket = this.harness.socketIfBuilt();
+    if (!socket) return false;
+    const candidates = [
+      ...socket.emits.filter((e) => SERVED.has(e.event)),
+      ...socket.statusQueries,
+    ].filter((e) => !this.served.has(e) && !this.delayed.has(e));
+    candidates.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
+    const next = candidates[0];
     if (!next) return false;
     this.served.add(next);
-    this.answer(next);
+    if (next.event === 'ops:status') this.answerStatusNow(next);
+    else this.answer(next);
     return true;
+  }
+
+  /**
+   * `emit` reaches the server only through {@link deliverLate}: a packet of a
+   * connection that is gone, which the server gets after the client asked
+   * `ops:status` on the next one.
+   */
+  delay(emit: Emit): void {
+    this.delayed.add(emit);
+  }
+
+  /** The late packet of {@link delay} arrives now, and is answered. */
+  deliverLate(emit: Emit): void {
+    this.delayed.delete(emit);
+    if (this.served.has(emit)) return;
+    this.served.add(emit);
+    this.answer(emit);
+  }
+
+  /**
+   * An `ops:status` asked (see `FakeSocket.statusResponder`): answered now,
+   * once every operation the client sent before it is applied — the server
+   * queues it behind them — or left for {@link serveNext} while
+   * {@link holdStatus} is set.
+   */
+  answerStatus(e: Emit): void {
+    if (this.holdStatus) return;
+    const socket = this.harness.socketIfBuilt();
+    const before = (socket?.emits ?? []).filter(
+      (other) =>
+        SERVED.has(other.event) &&
+        !this.served.has(other) &&
+        !this.delayed.has(other) &&
+        (other.seq ?? 0) < (e.seq ?? 0),
+    );
+    for (const other of before) {
+      this.served.add(other);
+      this.answer(other);
+    }
+    this.served.add(e);
+    this.answerStatusNow(e);
+  }
+
+  /** `ops:status`, answered (see `sync-protocol.md` §4.4). */
+  private answerStatusNow(e: Emit): void {
+    const { opIds } = e.payload as { opIds?: unknown };
+    if (
+      !Array.isArray(opIds) ||
+      opIds.length === 0 ||
+      opIds.length > 500 ||
+      !opIds.every((id) => isOpId(id))
+    ) {
+      e.ack({ ok: false, error: 'invalid_payload' });
+      return;
+    }
+    const asked = opIds;
+    const found = asked
+      .map((opId) => ({ opId, applied: this.byOpId.get(opId) }))
+      .filter(
+        (hit): hit is { opId: string; applied: AppliedOp } =>
+          hit.applied !== undefined && authorOf(hit.applied.clientId) === 'u1',
+      )
+      .sort((a, b) => this.journal.indexOf(a.applied.row) - this.journal.indexOf(b.applied.row));
+    // Another user's operation under the id: neither reported nor voided.
+    const voided = asked.filter((opId) => !this.byOpId.has(opId));
+    for (const opId of voided) this.voided.add(opId);
+    this.statusAnswers.push({ asked, applied: found.map((hit) => hit.opId), voided });
+    e.ack({
+      ok: true,
+      applied: found.map(({ opId, applied }) => ({
+        opId,
+        opType: applied.row.opType,
+        logId: applied.log.id,
+        filePath: applied.row.filePath,
+        newPath: applied.row.newPath,
+        outcome: applied.outcome,
+        vectorClock: applied.log.vectorClock,
+        createdAt: applied.log.createdAt,
+      })),
+      voided,
+    });
   }
 
   /** A teammate (`device-2`) renames file `id`; the broadcast reaches the engine. */
   teammateRename(id: string, newPath: string): void {
-    const result = this.move(id, newPath, 'device-2', 'RENAME');
+    const result = this.move(id, newPath, 'device-2', 'RENAME', newOpId());
     if ('error' in result) throw new Error(result.error);
   }
 
   private answer(e: Emit): void {
     const p = e.payload as {
       clientId: string;
+      opId?: unknown;
       vectorClock?: Record<string, number>;
       fileId?: string;
       filePath: string;
@@ -1110,6 +1371,28 @@ export class FakeServer {
       contentHash?: string;
       size?: number;
     };
+    const opType = OP_TYPE_OF[e.event];
+    if (opType === undefined) return;
+    if (!isOpId(p.opId)) {
+      e.ack({ ok: false, error: 'invalid_op_id' });
+      return;
+    }
+    const opId = p.opId;
+    if (this.voided.has(opId)) {
+      e.ack({ ok: false, error: 'op_voided' });
+      return;
+    }
+    const earlier = this.byOpId.get(opId);
+    if (earlier !== undefined) {
+      if (earlier.clientId !== p.clientId || !sameOpKind(earlier.opType, opType)) {
+        e.ack({ ok: false, error: 'op_id_conflict' });
+        return;
+      }
+      // Applied already: the answer it got, and nothing else.
+      this.duplicates.push(opId);
+      e.ack({ ok: true, outcome: earlier.outcome, log: earlier.log, duplicate: true });
+      return;
+    }
     switch (e.event) {
       case 'file:rename':
       case 'file:move': {
@@ -1118,18 +1401,40 @@ export class FakeServer {
           p.newPath ?? '',
           p.clientId,
           e.event === 'file:rename' ? 'RENAME' : 'MOVE',
+          opId,
           p.vectorClock,
         );
-        e.ack('error' in result ? { ok: false, error: result.error } : { ok: true, ...result });
+        e.ack(
+          'error' in result
+            ? { ok: false, error: result.error }
+            : { ok: true, outcome: result.outcome, log: result.log },
+        );
         return;
       }
-      case 'file:create':
-        e.ack({ ok: true, outcome: this.create(p.filePath, p) });
+      case 'file:create': {
+        const created = this.create(p.filePath, { ...p, opId });
+        e.ack({ ok: true, outcome: created.outcome, log: created.log });
         return;
+      }
       case 'file:update-binary': {
         const file = this.files.get(p.fileId ?? '');
-        if (!file || file.deleted) {
+        if (!file) {
           e.ack({ ok: false, error: 'file_not_found' });
+          return;
+        }
+        if (file.deleted) {
+          // DELETE wins over UPDATE: logged, nothing changes.
+          const log = this.log(p.clientId, p.vectorClock);
+          const outcome = { kind: 'no_op', reason: 'tombstone', fileId: file.id };
+          this.record(
+            log,
+            'UPDATE',
+            file.path,
+            null,
+            { fileId: file.id, fileType: file.fileType, suppressed: 'tombstone' },
+            { clientId: p.clientId, opId, outcome },
+          );
+          e.ack({ ok: true, outcome, log });
           return;
         }
         file.contentHash = p.contentHash ?? '';
@@ -1137,33 +1442,62 @@ export class FakeServer {
         this.applied.push(`update ${file.id}`);
         this.publish();
         const log = this.log(p.clientId, p.vectorClock);
-        this.record(log, 'UPDATE', file.path, null, {
+        const outcome = {
+          kind: 'updated',
           fileId: file.id,
           contentHash: file.contentHash,
           size: file.size,
-          fileType: file.fileType,
-        });
+        };
+        this.record(
+          log,
+          'UPDATE',
+          file.path,
+          null,
+          {
+            fileId: file.id,
+            contentHash: file.contentHash,
+            size: file.size,
+            fileType: file.fileType,
+          },
+          { clientId: p.clientId, opId, outcome },
+        );
         this.broadcast(
           'file:updated-binary',
           { fileId: file.id, contentHash: file.contentHash, log },
           p.clientId,
+          opId,
         );
-        e.ack({ ok: true, outcome: { kind: 'updated', fileId: file.id } });
+        e.ack({ ok: true, outcome, log });
         return;
       }
       case 'file:delete': {
         const file = this.files.get(p.fileId ?? '');
-        if (!file || file.deleted) {
+        if (!file) {
           e.ack({ ok: false, error: 'file_not_found' });
           return;
         }
-        file.deleted = true;
-        this.applied.push(`delete ${file.id}`);
-        this.publish();
+        // A tombstone stays one: logged and broadcast, nothing changes.
+        if (!file.deleted) {
+          file.deleted = true;
+          this.applied.push(`delete ${file.id}`);
+          this.publish();
+        }
         const log = this.log(p.clientId, p.vectorClock);
-        this.record(log, 'DELETE', file.path, null, { fileId: file.id });
-        this.broadcast('file:deleted', { fileId: file.id, log }, p.clientId);
-        e.ack({ ok: true, outcome: { kind: 'deleted', fileId: file.id } });
+        const outcome = { kind: 'deleted', fileId: file.id };
+        this.record(
+          log,
+          'DELETE',
+          file.path,
+          null,
+          { fileId: file.id },
+          {
+            clientId: p.clientId,
+            opId,
+            outcome,
+          },
+        );
+        this.broadcast('file:deleted', { fileId: file.id, log }, p.clientId, opId);
+        e.ack({ ok: true, outcome, log });
         return;
       }
     }
@@ -1174,15 +1508,16 @@ export class FakeServer {
     requested: string,
     clientId: string,
     opType: 'RENAME' | 'MOVE',
+    opId: string,
     sentClock?: Record<string, number>,
-  ): { outcome: unknown } | { error: string } {
+  ): { outcome: unknown; log: LogEntry } | { error: string } {
     const file = this.files.get(id);
     if (!file || file.deleted) return { error: 'file_not_found' };
     let outcome: unknown;
     let stored = requested;
     const from = file.path;
     if (file.path === requested) {
-      outcome = { kind: 'no_op', reason: 'same_path' };
+      outcome = { kind: 'no_op', reason: 'same_path', fileId: id };
     } else {
       const taken = [...this.files.values()].some(
         (f) => f !== file && !f.deleted && f.path === requested,
@@ -1213,18 +1548,20 @@ export class FakeServer {
       this.publish();
     }
     const log = this.log(clientId, sentClock);
-    this.record(log, opType, from, stored, { fileId: id });
+    this.record(log, opType, from, stored, { fileId: id }, { clientId, opId, outcome });
     this.broadcast(
       opType === 'RENAME' ? 'file:renamed' : 'file:moved',
       {
         fileId: id,
         newPath: this.format === 'current' ? stored : requested,
+        requestedPath: requested,
         outcome,
         log,
       },
       clientId,
+      opId,
     );
-    return { outcome };
+    return { outcome, log };
   }
 
   /**
@@ -1237,25 +1574,27 @@ export class FakeServer {
   /** A teammate (`device-2`) creates `path` with `text`; the broadcast reaches the engine. */
   async teammateCreate(path: string, text: string): Promise<string> {
     const bytes = encode(text);
-    const outcome = this.create(path, {
+    const { outcome } = this.create(path, {
       clientId: 'device-2',
+      opId: newOpId(),
       fileType: 'TEXT',
       contentHash: await sha256Hex(text),
       size: bytes.byteLength,
       data: bytes,
-    }) as { fileId: string };
-    return outcome.fileId;
+    });
+    return (outcome as { fileId: string }).fileId;
   }
 
   /** A teammate (`device-2`) uploads an attachment to `path`; the broadcast reaches the engine. */
   async teammateUpload(path: string, content: ArrayBuffer): Promise<string> {
-    const outcome = this.create(path, {
+    const { outcome } = this.create(path, {
       clientId: 'device-2',
+      opId: newOpId(),
       fileType: 'BINARY',
       contentHash: await sha256Hex(content),
       size: content.byteLength,
-    }) as { fileId: string };
-    return outcome.fileId;
+    });
+    return (outcome as { fileId: string }).fileId;
   }
 
   /** A teammate (`device-2`) deletes file `id`; the broadcast reaches the engine. */
@@ -1266,8 +1605,21 @@ export class FakeServer {
     this.applied.push(`delete ${id}`);
     this.publish();
     const log = this.log('device-2');
-    this.record(log, 'DELETE', file.path, null, { fileId: id });
-    this.broadcast('file:deleted', { fileId: id, log }, 'device-2');
+    const opId = newOpId();
+    const outcome = { kind: 'deleted', fileId: id };
+    this.record(
+      log,
+      'DELETE',
+      file.path,
+      null,
+      { fileId: id },
+      {
+        clientId: 'device-2',
+        opId,
+        outcome,
+      },
+    );
+    this.broadcast('file:deleted', { fileId: id, log }, 'device-2', opId);
   }
 
   /**
@@ -1284,12 +1636,23 @@ export class FakeServer {
     file.size = encode(text).byteLength;
     this.applied.push(`write ${id}`);
     this.publish();
-    this.record(this.log('rest:u2'), 'UPDATE', file.path, null, {
-      fileId: id,
-      contentHash: file.contentHash,
-      size: file.size,
-      ...(this.format === 'current' ? { fileType: file.fileType } : {}),
-    });
+    this.record(
+      this.log('rest:u2'),
+      'UPDATE',
+      file.path,
+      null,
+      {
+        fileId: id,
+        contentHash: file.contentHash,
+        size: file.size,
+        ...(this.format === 'current' ? { fileType: file.fileType } : {}),
+      },
+      {
+        clientId: 'rest:u2',
+        opId: newOpId(),
+        outcome: { kind: 'updated', fileId: id, contentHash: file.contentHash, size: file.size },
+      },
+    );
   }
 
   /**
@@ -1304,16 +1667,24 @@ export class FakeServer {
     this.applied.push(`update ${id}`);
     this.publish();
     const log = this.log('device-2');
-    this.record(log, 'UPDATE', file.path, null, {
-      fileId: id,
-      contentHash: file.contentHash,
-      size: file.size,
-      fileType: file.fileType,
-    });
+    const opId = newOpId();
+    this.record(
+      log,
+      'UPDATE',
+      file.path,
+      null,
+      { fileId: id, contentHash: file.contentHash, size: file.size, fileType: file.fileType },
+      {
+        clientId: 'device-2',
+        opId,
+        outcome: { kind: 'updated', fileId: id, contentHash: file.contentHash, size: file.size },
+      },
+    );
     this.broadcast(
       'file:updated-binary',
       { fileId: id, contentHash: file.contentHash, log },
       'device-2',
+      opId,
     );
     return file.contentHash;
   }
@@ -1322,36 +1693,45 @@ export class FakeServer {
     path: string,
     p: {
       clientId: string;
+      opId: string;
       vectorClock?: Record<string, number>;
       fileType?: 'TEXT' | 'BINARY';
       contentHash?: string;
       size?: number;
       data?: unknown;
     },
-  ): unknown {
+  ): { outcome: unknown; log: LogEntry } {
     const live = [...this.files.values()].find((f) => !f.deleted && f.path === path);
-    let outcome: unknown;
+    let outcome: Record<string, unknown>;
     let added: { id: string; revived: boolean } | null = null;
     let fileId: string;
     let at = path;
     let revived = false;
-    if (live && live.contentHash === p.contentHash) {
+    const content = {
+      contentHash: p.contentHash ?? '',
+      size: p.size ?? 0,
+      fileType: p.fileType ?? 'TEXT',
+    };
+    if (live && live.contentHash === p.contentHash && (p.size ?? 0) > 0) {
+      // A live file with the same non-empty content: that file (§5.4).
       fileId = live.id;
-      outcome = { kind: 'created', fileId, path };
+      outcome = {
+        kind: 'created',
+        fileId,
+        path,
+        ...content,
+        fileType: live.fileType,
+        merged: true,
+      };
     } else {
-      // A row on the conflict name is taken over when it is a tombstone or
-      // holds this very content: the same CREATE retried after a lost ack. The
+      // A row on the conflict name is taken over when it is a tombstone. The
       // `legacy` server takes the first conflict name whatever is there, and
       // overwrites a live file under it in place.
       at = !live
         ? path
         : this.format === 'legacy'
           ? conflictName(path, p.clientId)
-          : this.conflictPath(
-              path,
-              p.clientId,
-              (f) => f.deleted || f.contentHash === p.contentHash,
-            );
+          : this.conflictPath(path, p.clientId, (f) => f.deleted);
       const row = [...this.files.values()].find((f) => f.path === at);
       revived = row?.deleted === true;
       const overwritten = this.format === 'legacy' && row !== undefined && !revived;
@@ -1369,21 +1749,41 @@ export class FakeServer {
       // Overwritten, a note's doc is seeded anew (see `ServerDocs`).
       if (row === undefined || revived || overwritten) added = { id: fileId, revived };
       outcome = live
-        ? { kind: 'conflict_create_renamed', fileId, originalPath: path, finalPath: at }
-        : { kind: 'created', fileId, path: at };
+        ? { kind: 'conflict_create_renamed', fileId, originalPath: path, finalPath: at, ...content }
+        : { kind: 'created', fileId, path: at, ...content };
     }
     const log = this.log(p.clientId, p.vectorClock);
-    this.record(log, 'CREATE', at, null, {
-      fileId,
-      fileType: p.fileType ?? 'TEXT',
-      contentHash: p.contentHash ?? '',
-      size: p.size ?? 0,
-      originalPath: path,
-      ...(revived && this.format === 'current' ? { revived: true } : {}),
-    });
-    this.broadcast('file:created', { result: { outcome, log }, log }, p.clientId);
+    this.record(
+      log,
+      'CREATE',
+      at,
+      null,
+      {
+        fileId,
+        fileType: content.fileType,
+        contentHash: content.contentHash,
+        size: content.size,
+        originalPath: path,
+        ...(revived && this.format === 'current' ? { revived: true } : {}),
+      },
+      { clientId: p.clientId, opId: p.opId, outcome },
+    );
+    const stored = this.files.get(fileId);
+    this.broadcast(
+      'file:created',
+      {
+        result: { outcome, log },
+        ...(this.format === 'current'
+          ? { fileId, path: stored?.path ?? at, fileType: stored?.fileType ?? content.fileType }
+          : {}),
+        revived,
+        log,
+      },
+      p.clientId,
+      p.opId,
+    );
     if (added !== null) this.onCreate?.(added.id, p.data, added.revived);
-    return outcome;
+    return { outcome, log };
   }
 
   /**
@@ -1407,30 +1807,54 @@ export class FakeServer {
     for (const [id, f] of this.files) if (f.deleted && f.path === path) this.files.delete(id);
   }
 
-  /** Add an applied operation to the {@link journal}. */
+  /**
+   * Add an applied operation to the {@link journal}, with the client and the
+   * `opId` it came with and the outcome the client was answered.
+   */
   private record(
-    log: { id: string; vectorClock: Record<string, number>; createdAt: string },
+    log: LogEntry,
     opType: ServerOperation['opType'],
     filePath: string,
     newPath: string | null,
     payload: Record<string, unknown>,
+    origin: { clientId: string; opId: string; outcome: unknown },
   ): void {
-    this.journal.push({
+    const row: ServerOperation = {
       id: log.id,
       opType,
       filePath,
       newPath,
-      authorId: 'u1',
+      authorId: authorOf(origin.clientId),
+      clientId: origin.clientId,
+      opId: origin.opId,
       vectorClock: log.vectorClock,
       payload,
       createdAt: log.createdAt,
+    };
+    this.journal.push(row);
+    this.appliedOpIds.push(origin.opId);
+    this.byOpId.set(origin.opId, {
+      clientId: origin.clientId,
+      opType,
+      outcome: origin.outcome,
+      log,
+      row,
     });
   }
 
-  private broadcast(event: string, payload: Record<string, unknown>, clientId: string): void {
+  /**
+   * Send `event` to the room. The `current` server says who sent it and the
+   * operation's `opId`; the `legacy` one neither.
+   */
+  private broadcast(
+    event: string,
+    payload: Record<string, unknown>,
+    clientId: string,
+    opId: string,
+  ): void {
     const socket = this.harness.socketIfBuilt();
     if (!socket?.connected) return;
-    socket.fire(event, this.format === 'current' ? { ...payload, clientId } : payload);
+    socket.fire(event, this.format === 'current' ? { ...payload, clientId, opId } : payload);
   }
 
   /**
@@ -1440,14 +1864,7 @@ export class FakeServer {
    * returns a client's latest operation, and not the ones before it, which
    * its next bump covers.
    */
-  private log(
-    clientId: string,
-    sent?: Record<string, number>,
-  ): {
-    id: string;
-    vectorClock: Record<string, number>;
-    createdAt: string;
-  } {
+  private log(clientId: string, sent?: Record<string, number>): LogEntry {
     this.seq += 1;
     const vectorClock =
       sent === undefined
@@ -1692,4 +2109,161 @@ function conflictName(path: string, clientId: string, attempt = 1): string {
   const slash = path.lastIndexOf('/');
   if (dot > slash) return `${path.slice(0, dot)}.conflict-${tag}${path.slice(dot)}`;
   return `${path}.conflict-${tag}`;
+}
+
+// -- The disk under state.json --------------------------------------------------
+
+/** Where the plugin keeps `state.json` (vault-relative). */
+export const STATE_PATH = '.obsidian/plugins/team-vault/state.json';
+
+/**
+ * `LogStorage` of an in-memory disk: a file holds what the last completed
+ * write left there. {@link snapshot} is the disk as it is now — what the next
+ * start of Obsidian would find, whatever the process still holds in memory.
+ * `failWrites` makes every write fail (a full disk).
+ */
+export class FakeStorage implements LogStorage {
+  readonly files = new Map<string, string>();
+  /** Every `state.json` the disk has held, in order (after each completed step). */
+  readonly states: string[] = [];
+  failWrites = false;
+
+  exists(path: string): Promise<boolean> {
+    return Promise.resolve(this.files.has(path));
+  }
+  stat(path: string): Promise<{ size: number } | null> {
+    const data = this.files.get(path);
+    return Promise.resolve(data === undefined ? null : { size: data.length });
+  }
+  append(path: string, data: string): Promise<void> {
+    if (this.failWrites) return Promise.reject(new Error('ENOSPC'));
+    this.files.set(path, (this.files.get(path) ?? '') + data);
+    return Promise.resolve();
+  }
+  write(path: string, data: string): Promise<void> {
+    if (this.failWrites) return Promise.reject(new Error('ENOSPC'));
+    this.files.set(path, data);
+    this.noteState(path);
+    return Promise.resolve();
+  }
+  rename(from: string, to: string): Promise<void> {
+    const data = this.files.get(from);
+    if (data === undefined) return Promise.reject(new Error(`ENOENT ${from}`));
+    this.files.delete(from);
+    this.files.set(to, data);
+    this.noteState(to);
+    return Promise.resolve();
+  }
+  remove(path: string): Promise<void> {
+    this.files.delete(path);
+    return Promise.resolve();
+  }
+  read(path: string): Promise<string> {
+    const data = this.files.get(path);
+    return data === undefined ? Promise.reject(new Error(`ENOENT ${path}`)) : Promise.resolve(data);
+  }
+  mkdir(): Promise<void> {
+    return Promise.resolve();
+  }
+
+  /** The disk as it is now: a copy the process no longer writes to. */
+  snapshot(): FakeStorage {
+    const copy = new FakeStorage();
+    for (const [path, data] of this.files) copy.files.set(path, data);
+    return copy;
+  }
+
+  /** The `state.json` on disk now, parsed; `null` when there is none. */
+  state(): StoredState | null {
+    const raw = this.files.get(STATE_PATH) ?? this.files.get(`${STATE_PATH}.tmp`);
+    return raw === undefined ? null : (JSON.parse(raw) as StoredState);
+  }
+
+  private noteState(path: string): void {
+    if (path !== STATE_PATH) return;
+    const data = this.files.get(path);
+    if (data !== undefined) this.states.push(data);
+  }
+}
+
+/** `state.json` as the tests read it. */
+export interface StoredState {
+  version: number;
+  nextOpId: number;
+  bindings: Record<
+    string,
+    {
+      pending: Array<{ id: number; opId: string; opType: string; filePath: string }>;
+      inflight?: Array<{ id: number; opId: string; opType: string; filePath: string }>;
+      files: Array<{ relativePath: string; serverFileId: string; contentHash: string }>;
+      state: { lastVectorClock: Record<string, number> } | null;
+    }
+  >;
+}
+
+/**
+ * An operation log on `storage`, loaded from it as the plugin loads
+ * `state.json` at start. `flushDelayMs`: the debounce of its writes (the
+ * plugin's is 500 ms).
+ */
+export async function logOn(storage: FakeStorage, flushDelayMs = 500): Promise<OperationLog> {
+  const log = new OperationLog({ storage, filePath: STATE_PATH, flushDelayMs });
+  await log.load();
+  return log;
+}
+
+/**
+ * Obsidian quits, or the process dies, now: the next start finds the vault's
+ * disk and `state.json` as they are at this moment — not what the log holds
+ * in memory — and a new engine starts from them (not connected yet). The old
+ * engine's socket goes quiet; the old engine is then stopped, only so that it
+ * does nothing more (what it writes then goes to the old disk's copy of
+ * `state.json`, which nobody reads). `server` and `docs` serve the new engine.
+ */
+export async function restartFromDisk(
+  h: Harness,
+  storage: FakeStorage,
+  opts: { server?: FakeServer; docs?: ServerDocs; manager?: DocManager; offline?: boolean } = {},
+): Promise<{ next: Harness; storage: FakeStorage }> {
+  const disk = storage.snapshot();
+  h.socketIfBuilt()?.kill();
+  await h.engine.stop();
+  const log = await logOn(disk);
+  const next = buildHarness({
+    predecessor: h,
+    log,
+    ...(opts.manager ? { docs: opts.manager } : {}),
+    ...(opts.offline ? { offline: true } : {}),
+  });
+  opts.server?.attach(next);
+  opts.docs?.attach(next);
+  return { next, storage: disk };
+}
+
+// -- The protocol's contract examples -------------------------------------------
+
+/** One example of `tests/fixtures/protocol-0.4/` (`sync-protocol.md` §4), parsed. */
+export function protocolFixture(name: string): unknown {
+  const raw = readFileSync(joinPath(__dirname, 'fixtures', 'protocol-0.4', `${name}.json`), 'utf8');
+  return JSON.parse(raw) as unknown;
+}
+
+/**
+ * The shape of a JSON value: its keys, all the way down (an array by its
+ * first element), and the type of each leaf. Two values of one shape have
+ * the same fields where the contract's examples have them. A vector clock is
+ * a map of clients: its shape is `'VectorClock'`, whoever is in it.
+ */
+export function shapeOf(value: unknown): unknown {
+  if (Array.isArray(value)) return value.length === 0 ? [] : [shapeOf(value[0])];
+  if (value === null) return 'null';
+  if (typeof value === 'object') {
+    const out: Record<string, unknown> = {};
+    for (const key of Object.keys(value).sort()) {
+      const field = (value as Record<string, unknown>)[key];
+      out[key] = key === 'vectorClock' ? 'VectorClock' : shapeOf(field);
+    }
+    return out;
+  }
+  return typeof value;
 }

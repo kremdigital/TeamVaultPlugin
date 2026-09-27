@@ -1,0 +1,10 @@
+{
+  "projectId": "p1",
+  "clientId": "c-A",
+  "vectorClock": {
+    "c-A": 7
+  },
+  "opId": "3f1c2e4a-9b7d-4c1e-8f2a-0d5b6c7e8f90",
+  "fileId": "f4",
+  "filePath": "old.md"
+}

@@ -35,11 +35,50 @@ export interface ServerOperation {
   filePath: string;
   newPath: string | null;
   authorId: string | null;
+  /**
+   * The client the operation came from: a device's `clientId`, or
+   * `rest:<userId>` for a write through REST. `null` on rows logged before the
+   * server recorded it.
+   */
+  clientId: string | null;
+  /** The operation's idempotency key; `null` on rows logged before the server recorded it. */
+  opId: string | null;
   vectorClock: VectorClock;
   payload: unknown;
   /** Wire format from the server is a Date string, not a Date object. */
   createdAt: string;
 }
+
+/**
+ * What the server made of a file operation (`ApplyOutcome` on the server, see
+ * `sync-protocol.md`): the ack's `outcome`, stored with the operation's log
+ * row, so a resend of the same `opId` gets it again. Read defensively — it
+ * comes off the wire.
+ */
+export type OpOutcome =
+  | {
+      kind: 'created';
+      fileId: string;
+      path: string;
+      contentHash?: string;
+      size?: number;
+      fileType?: 'TEXT' | 'BINARY';
+      /** The server gave back a live file with the same non-empty content under the name. */
+      merged?: true;
+    }
+  | {
+      kind: 'conflict_create_renamed';
+      fileId: string;
+      originalPath: string;
+      finalPath: string;
+      contentHash?: string;
+      size?: number;
+      fileType?: 'TEXT' | 'BINARY';
+    }
+  | { kind: 'updated'; fileId: string; contentHash?: string; size?: number }
+  | { kind: 'no_op'; reason: string; fileId?: string }
+  | { kind: 'deleted'; fileId: string }
+  | { kind: 'renamed'; fileId: string; from: string; to: string };
 
 export interface YjsDocSnapshot {
   fileId: string;
@@ -68,10 +107,22 @@ export interface YjsDocSnapshot {
  */
 export const OPERATIONS_CATCHUP = 2;
 
+/**
+ * The server keeps operations idempotent by `opId` and answers `ops:status`
+ * when it says `opIdempotency` in the join ack; this client needs one that
+ * does (see `SyncEngine`, `server_outdated`).
+ */
+export const OP_IDEMPOTENCY = 1;
+
 export type JoinResult =
   | {
       ok: true;
       operations: ServerOperation[];
+      /**
+       * {@link OP_IDEMPOTENCY} from a server that keeps operations idempotent;
+       * absent from an older one.
+       */
+      opIdempotency?: number;
       /**
        * {@link OPERATIONS_CATCHUP} when `operations` is the whole-journal
        * catch-up asked for; absent from a server that gave the old window.
@@ -101,17 +152,27 @@ export interface YjsCatchupBatch {
 
 /**
  * Who made the change a file event reports: the `clientId` of the device
- * whose operation it was. The server broadcasts an operation to the whole
- * project room, its sender included, and a client recognises its own by this
- * field. Absent from servers that predate it.
+ * whose operation it was (`rest:<userId>` for a write through REST), and the
+ * operation's `opId`. The server broadcasts an operation to the whole project
+ * room, its sender included, and a client recognises its own by the `opId` of
+ * an operation it has on its way. Absent from servers that predate them.
  */
 export interface FileEventOrigin {
   clientId?: string;
+  opId?: string;
 }
 
 export type FileEvent = FileEventOrigin &
   (
-    | { type: 'created'; result: unknown; log: ServerLogEntry }
+    | {
+        type: 'created';
+        result: unknown;
+        log: ServerLogEntry;
+        /** The file's id, where the server stored it and its type; absent from older servers. */
+        fileId?: string;
+        path?: string;
+        fileType?: 'TEXT' | 'BINARY';
+      }
     | { type: 'updated-binary'; fileId: string; contentHash: string; log: ServerLogEntry }
     | { type: 'deleted'; fileId: string; log: ServerLogEntry }
     | {
@@ -153,10 +214,93 @@ export type YjsFetchResult =
 /** How long {@link SocketClient.fetchYjsDoc} waits for the ack. */
 export const YJS_FETCH_TIMEOUT_MS = 15_000;
 
-/** The `clientId` a file event carries, when it is a non-empty string. */
+/**
+ * `ops:status` ack: the operations of the ones asked about that the server
+ * applied — with what it made of them, in the order it applied them — and the
+ * ones it voided (it never applies them now). `error: 'timeout'` and
+ * `'disconnected'` are synthesized client-side.
+ */
+export type OpsStatusResult =
+  | { ok: true; applied: AppliedOperation[]; voided: string[] }
+  | { ok: false; error: string };
+
+/** One operation `ops:status` reports applied (see {@link OpsStatusResult}). */
+export interface AppliedOperation {
+  opId: string;
+  opType: ServerOperation['opType'];
+  /** The id of its log row. */
+  logId: string;
+  filePath: string;
+  newPath: string | null;
+  outcome: unknown;
+  vectorClock: VectorClock;
+  createdAt: string;
+}
+
+/** How long {@link SocketClient.opsStatus} waits for the ack. */
+export const OPS_STATUS_TIMEOUT_MS = 15_000;
+
+/** The most operations one `ops:status` asks about (the server refuses more). */
+export const OPS_STATUS_MAX = 500;
+
+/** The `clientId` and `opId` a file event carries, when they are non-empty strings. */
 function originOf(data: object): FileEventOrigin {
-  const clientId = (data as { clientId?: unknown }).clientId;
-  return typeof clientId === 'string' && clientId !== '' ? { clientId } : {};
+  const { clientId, opId } = data as { clientId?: unknown; opId?: unknown };
+  return {
+    ...(typeof clientId === 'string' && clientId !== '' ? { clientId } : {}),
+    ...(typeof opId === 'string' && opId !== '' ? { opId } : {}),
+  };
+}
+
+/** The top-level fields of `file:created` that say where the file went. */
+function createdPlacement(data: object): {
+  fileId?: string;
+  path?: string;
+  fileType?: 'TEXT' | 'BINARY';
+} {
+  const { fileId, path, fileType } = data as {
+    fileId?: unknown;
+    path?: unknown;
+    fileType?: unknown;
+  };
+  return {
+    ...(typeof fileId === 'string' && fileId !== '' ? { fileId } : {}),
+    ...(typeof path === 'string' && path !== '' ? { path } : {}),
+    ...(fileType === 'TEXT' || fileType === 'BINARY' ? { fileType } : {}),
+  };
+}
+
+const OPERATION_TYPES: ReadonlySet<unknown> = new Set([
+  'CREATE',
+  'UPDATE',
+  'DELETE',
+  'RENAME',
+  'MOVE',
+]);
+
+/** A row of `ops:status`'s `applied`, or `null` when it is not one. */
+function toAppliedOperation(raw: unknown): AppliedOperation | null {
+  if (typeof raw !== 'object' || raw === null) return null;
+  const row = raw as Record<string, unknown>;
+  const { opId, opType, logId, filePath, newPath, vectorClock, createdAt } = row;
+  if (typeof opId !== 'string' || typeof filePath !== 'string') return null;
+  if (!OPERATION_TYPES.has(opType)) return null;
+  const clock: VectorClock = {};
+  if (typeof vectorClock === 'object' && vectorClock !== null) {
+    for (const [k, v] of Object.entries(vectorClock)) {
+      if (typeof v === 'number' && Number.isFinite(v)) clock[k] = v;
+    }
+  }
+  return {
+    opId,
+    opType: opType as ServerOperation['opType'],
+    logId: typeof logId === 'string' ? logId : '',
+    filePath,
+    newPath: typeof newPath === 'string' ? newPath : null,
+    outcome: row.outcome ?? null,
+    vectorClock: clock,
+    createdAt: typeof createdAt === 'string' ? createdAt : '',
+  };
 }
 
 // -- Outgoing payloads --------------------------------------------------------
@@ -165,8 +309,18 @@ interface BaseEnvelope {
   projectId: string;
   /** Stable per-device identifier — also used as the vector clock key. */
   clientId: string;
-  /** The pre-bump clock; the server bumps `clientId`'s counter itself. */
+  /**
+   * The device's clock, its own counter already moved on for this operation.
+   * The server logs the operation with that counter one up
+   * (`increment(vectorClock, clientId)`) and says so in the ack's `log`.
+   */
   vectorClock?: VectorClock;
+  /**
+   * The operation's idempotency key (UUID v4, lower case): the same on every
+   * try, so the server applies it at most once and answers a resend with the
+   * outcome it gave (`duplicate: true`).
+   */
+  opId: string;
 }
 
 export interface FileCreatePayload extends BaseEnvelope {
@@ -209,6 +363,15 @@ export interface YjsEmitPayload {
 export type AckOk<T = unknown> = { ok: true } & T;
 export type AckErr = { ok: false; error: string };
 export type Ack<T = unknown> = AckOk<T> | AckErr;
+
+/**
+ * Ack of a file operation (`file:*`): what the server made of it and its log
+ * row — the clock it logged the operation with. `duplicate`: the `opId` had
+ * been applied already, and this is the answer it got then; nothing was
+ * applied again. Fields come off the wire: `outcome` and `log` are read
+ * defensively.
+ */
+export type FileAck = AckOk<{ outcome?: unknown; log?: ServerLogEntry; duplicate?: true }> | AckErr;
 
 // -- DI seam for tests --------------------------------------------------------
 
@@ -291,6 +454,8 @@ export class SocketClient {
   private readonly pendingAcks = new Set<PendingAck>();
   /** `yjs:fetch` requests waiting for their answer — see {@link fetchYjsDoc}. */
   private readonly pendingFetches = new Set<(result: YjsFetchResult) => void>();
+  /** `ops:status` requests waiting for their answer — see {@link opsStatus}. */
+  private readonly pendingStatuses = new Set<(result: OpsStatusResult) => void>();
 
   constructor(options: SocketClientOptions) {
     this.factory = options.factory ?? defaultFactory;
@@ -342,6 +507,8 @@ export class SocketClient {
       const r = typeof reason === 'string' ? reason : 'unknown';
       for (const cb of this.disconnectCbs) cb(r);
       this.failPendingAcks((pending) => pending.sent);
+      // Asked on the connection that dropped: its answer never comes.
+      this.settleStatuses({ ok: false, error: 'disconnected' });
     });
     socket.on('connect_error', (err: unknown) => {
       // socket.io hands over an Error; anything else keeps a readable message
@@ -359,6 +526,7 @@ export class SocketClient {
         type: 'created',
         result: data.result,
         log: data.log,
+        ...createdPlacement(data),
         ...originOf(data),
       });
     });
@@ -455,6 +623,7 @@ export class SocketClient {
     for (const settle of [...this.pendingFetches]) {
       settle({ ok: false, error: 'disconnected' });
     }
+    this.settleStatuses({ ok: false, error: 'disconnected' });
   }
 
   // -- Subscriptions --------------------------------------------------------
@@ -503,27 +672,63 @@ export class SocketClient {
     return this.emitWithAck<{ ok: true }>('project:leave', { projectId });
   }
 
-  emitFileCreate(payload: FileCreatePayload): Promise<Ack> {
-    return this.emitWithAck<Ack>('file:create', this.envelopeFor(payload, { data: payload.data }));
+  emitFileCreate(payload: FileCreatePayload): Promise<FileAck> {
+    return this.emitWithAck<FileAck>(
+      'file:create',
+      this.envelopeFor(payload, { data: payload.data }),
+    );
   }
 
-  emitFileUpdateBinary(payload: FileUpdateBinaryPayload): Promise<Ack> {
-    return this.emitWithAck<Ack>(
+  emitFileUpdateBinary(payload: FileUpdateBinaryPayload): Promise<FileAck> {
+    return this.emitWithAck<FileAck>(
       'file:update-binary',
       this.envelopeFor(payload, { data: payload.data }),
     );
   }
 
-  emitFileDelete(payload: FileDeletePayload): Promise<Ack> {
-    return this.emitWithAck<Ack>('file:delete', this.envelopeFor(payload, {}));
+  emitFileDelete(payload: FileDeletePayload): Promise<FileAck> {
+    return this.emitWithAck<FileAck>('file:delete', this.envelopeFor(payload, {}));
   }
 
-  emitFileRename(payload: FileMovePayload): Promise<Ack> {
-    return this.emitWithAck<Ack>('file:rename', this.envelopeFor(payload, {}));
+  emitFileRename(payload: FileMovePayload): Promise<FileAck> {
+    return this.emitWithAck<FileAck>('file:rename', this.envelopeFor(payload, {}));
   }
 
-  emitFileMove(payload: FileMovePayload): Promise<Ack> {
-    return this.emitWithAck<Ack>('file:move', this.envelopeFor(payload, {}));
+  emitFileMove(payload: FileMovePayload): Promise<FileAck> {
+    return this.emitWithAck<FileAck>('file:move', this.envelopeFor(payload, {}));
+  }
+
+  /**
+   * Ask the server what became of operations sent from here whose answers
+   * never came (`ops:status`, at most {@link OPS_STATUS_MAX} at a time): the
+   * ones it applied, and the ones it voids now — it never applies those, and
+   * the client sends them again under new ids. The server answers once every
+   * operation it received before the question is applied. Never rejects: no
+   * socket, a server error, a lost connection (`disconnected`) and a missing
+   * ack (`timeout`) all resolve to `ok: false`.
+   */
+  opsStatus(
+    projectId: string,
+    opIds: readonly string[],
+    timeoutMs = OPS_STATUS_TIMEOUT_MS,
+  ): Promise<OpsStatusResult> {
+    return new Promise<OpsStatusResult>((resolve) => {
+      if (!this.socket) {
+        resolve({ ok: false, error: 'socket_not_connected' });
+        return;
+      }
+      let timer: number | undefined;
+      const settle = (result: OpsStatusResult): void => {
+        if (!this.pendingStatuses.delete(settle)) return;
+        window.clearTimeout(timer);
+        resolve(result);
+      };
+      this.pendingStatuses.add(settle);
+      timer = window.setTimeout(() => settle({ ok: false, error: 'timeout' }), timeoutMs);
+      this.socket.emit('ops:status', { projectId, opIds: [...opIds] }, (ack: unknown) =>
+        settle(toOpsStatusResult(ack)),
+      );
+    });
   }
 
   emitYjsUpdate(payload: YjsEmitPayload): Promise<Ack<{ changed: boolean }>> {
@@ -606,6 +811,11 @@ export class SocketClient {
     });
   }
 
+  /** Answer every `ops:status` still waiting with `result`. */
+  private settleStatuses(result: OpsStatusResult): void {
+    for (const settle of [...this.pendingStatuses]) settle(result);
+  }
+
   /** Reject the acks {@link emitWithAck} waits for that `which` picks. */
   private failPendingAcks(which: (pending: PendingAck) => boolean): void {
     for (const pending of [...this.pendingAcks]) {
@@ -626,4 +836,23 @@ export class SocketClient {
       }
     }
   }
+}
+
+/** The `ops:status` ack as {@link OpsStatusResult}; a malformed one is an error. */
+function toOpsStatusResult(ack: unknown): OpsStatusResult {
+  if (typeof ack !== 'object' || ack === null) return { ok: false, error: 'invalid_ack' };
+  const raw = ack as { ok?: unknown; error?: unknown; applied?: unknown; voided?: unknown };
+  if (raw.ok !== true) {
+    return { ok: false, error: typeof raw.error === 'string' ? raw.error : 'invalid_ack' };
+  }
+  if (!Array.isArray(raw.applied) || !Array.isArray(raw.voided)) {
+    return { ok: false, error: 'invalid_ack' };
+  }
+  const applied: AppliedOperation[] = [];
+  for (const row of raw.applied as unknown[]) {
+    const parsed = toAppliedOperation(row);
+    if (parsed) applied.push(parsed);
+  }
+  const voided = (raw.voided as unknown[]).filter((id): id is string => typeof id === 'string');
+  return { ok: true, applied, voided };
 }

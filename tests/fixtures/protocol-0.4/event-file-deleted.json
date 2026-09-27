@@ -1,0 +1,12 @@
+{
+  "fileId": "f4",
+  "clientId": "c-B",
+  "opId": "77aa5b6c-7d8e-4f90-a1b2-c3d4e5f60718",
+  "log": {
+    "id": "cl_4",
+    "vectorClock": {
+      "c-B": 5
+    },
+    "createdAt": "2026-10-01T10:00:01.000Z"
+  }
+}

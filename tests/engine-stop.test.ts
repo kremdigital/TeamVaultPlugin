@@ -524,6 +524,8 @@ function createOp(fileId: string, filePath: string): ServerOperation {
     filePath,
     newPath: null,
     authorId: 'u2',
+    clientId: 'device-2',
+    opId: null,
     vectorClock: { 'device-2': 1 },
     payload: { fileId, fileType: 'BINARY' },
     createdAt: '2026-01-01',

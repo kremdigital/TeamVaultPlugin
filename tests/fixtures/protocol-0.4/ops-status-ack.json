@@ -1,0 +1,23 @@
+{
+  "ok": true,
+  "applied": [
+    {
+      "opId": "3f1c2e4a-9b7d-4c1e-8f2a-0d5b6c7e8f90",
+      "opType": "RENAME",
+      "logId": "cl_9",
+      "filePath": "x.md",
+      "newPath": "y.md",
+      "outcome": {
+        "kind": "renamed",
+        "fileId": "f1",
+        "from": "x.md",
+        "to": "y.md"
+      },
+      "vectorClock": {
+        "c-A": 12
+      },
+      "createdAt": "2026-10-01T10:00:00.000Z"
+    }
+  ],
+  "voided": ["9a0b1c2d-3e4f-4a5b-8c6d-7e8f9a0b1c2d"]
+}

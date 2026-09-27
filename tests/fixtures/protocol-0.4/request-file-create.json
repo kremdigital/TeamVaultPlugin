@@ -1,0 +1,13 @@
+{
+  "projectId": "p1",
+  "clientId": "c-A",
+  "vectorClock": {
+    "c-A": 7
+  },
+  "opId": "3f1c2e4a-9b7d-4c1e-8f2a-0d5b6c7e8f90",
+  "filePath": "notes/a.md",
+  "fileType": "TEXT",
+  "contentHash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "size": 12,
+  "data": [104, 101, 108, 108, 111, 32, 119, 111, 114, 108, 100, 10]
+}
