@@ -1037,6 +1037,19 @@ describe('OperationLog — persistNow and unwritten changes', () => {
     await log.close();
   });
 
+  // Obsidian's quit shows "Saving..." while the plugin's task runs (see
+  // `main.ts`): a delay left running after the change was written is nothing
+  // to wait for.
+  it('reports nothing unwritten once a flush wrote a change still waiting out its delay', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    log.setFileMeta(makeMeta());
+    await log.flush();
+    expect(files.has(PATH)).toBe(true);
+    expect(log.hasUnwrittenChanges()).toBe(false);
+    await log.close();
+  });
+
   it('counts a write under way as unwritten', async () => {
     const { storage } = makeStorage();
     let release!: () => void;

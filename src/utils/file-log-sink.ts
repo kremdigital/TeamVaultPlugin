@@ -55,6 +55,8 @@ export class FileLogSink implements LogSink {
   private chain: Promise<unknown> = Promise.resolve();
   /** Cached file size; we read it once from `stat()`, then track increments. */
   private knownSize = -1;
+  /** Lines written and not on disk yet — see {@link hasPendingWrites}. */
+  private pending = 0;
 
   constructor(options: FileLogSinkOptions) {
     this.storage = options.storage;
@@ -65,9 +67,30 @@ export class FileLogSink implements LogSink {
 
   write(entry: LogEntry): Promise<void> {
     const line = formatLogEntry(entry) + '\n';
-    const next = this.chain.then(() => this.appendLine(line));
+    this.pending += 1;
+    const next = this.chain
+      .then(() => this.appendLine(line))
+      .finally(() => {
+        this.pending -= 1;
+      });
     this.chain = next.catch(() => undefined);
     return next;
+  }
+
+  /** Whether a line written has not reached the file yet. */
+  hasPendingWrites(): boolean {
+    return this.pending > 0;
+  }
+
+  /**
+   * Resolves once every line written so far is in the file, or has failed to
+   * get there. Never rejects: Obsidian's quit waits for it (see `main.ts`).
+   */
+  settled(): Promise<void> {
+    return this.chain.then(
+      () => undefined,
+      () => undefined,
+    );
   }
 
   /** Read the current `.log` file (without archives). */

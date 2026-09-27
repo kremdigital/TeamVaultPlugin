@@ -157,3 +157,31 @@ describe('FileLogSink — readLog / clear', () => {
     expect(storage.files.has('sync.log.1')).toBe(true);
   });
 });
+
+// Obsidian's quit waits for what `sync.log` has not written yet (see `main.ts`).
+describe('FileLogSink — lines still on their way', () => {
+  it('says a line is on its way until it is in the file, and settles then', async () => {
+    const storage = new MemoryStorage();
+    const sink = new FileLogSink({ storage, filePath: 'sync.log' });
+    expect(sink.hasPendingWrites()).toBe(false);
+
+    void sink.write(entry('warn', 'last words'));
+    expect(sink.hasPendingWrites()).toBe(true);
+    await sink.settled();
+
+    expect(sink.hasPendingWrites()).toBe(false);
+    expect(storage.files.get('sync.log')).toContain('last words');
+  });
+
+  it('settles without rejecting when the write fails', async () => {
+    const storage = new MemoryStorage();
+    storage.append = (): Promise<void> => Promise.reject(new Error('EIO'));
+    storage.write = (): Promise<void> => Promise.reject(new Error('EIO'));
+    const sink = new FileLogSink({ storage, filePath: 'sync.log' });
+
+    sink.write(entry('warn', 'lost')).catch(() => undefined);
+
+    await expect(sink.settled()).resolves.toBeUndefined();
+    expect(sink.hasPendingWrites()).toBe(false);
+  });
+});

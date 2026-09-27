@@ -87,7 +87,7 @@ function fakeApp(
   };
   const app = {
     vault: { configDir: '.obsidian', adapter, getFiles: () => [] },
-    workspace: { onLayoutReady: layoutReady },
+    workspace: { onLayoutReady: layoutReady, on: jest.fn(() => ({})) },
     layoutReady,
     listed,
     files,

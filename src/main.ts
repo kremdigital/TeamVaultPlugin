@@ -1,4 +1,4 @@
-import { Notice, Plugin, WorkspaceLeaf } from 'obsidian';
+import { Notice, Plugin, WorkspaceLeaf, type Tasks } from 'obsidian';
 import { IndexeddbPersistence } from 'y-indexeddb';
 import {
   defaultSettings,
@@ -43,6 +43,12 @@ import { StatusBar } from '@/ui/status-bar';
 import { registerCommands } from '@/ui/commands';
 import { HISTORY_VIEW_TYPE, HistoryView } from '@/ui/views/history-view';
 import { uuid } from '@/utils/id';
+
+/**
+ * How long Obsidian's quit waits at most for what the plugin has not written
+ * to disk yet (see `ObsidianSyncPlugin.flushOnQuit`).
+ */
+const QUIT_FLUSH_TIMEOUT_MS = 2_000;
 
 /**
  * Team Vault — plugin entry point.
@@ -156,6 +162,8 @@ export default class ObsidianSyncPlugin extends Plugin {
       sweepTmp = true;
     }
     if (this.unloaded) return;
+    // Obsidian quits without unloading the plugin (see `flushOnQuit`).
+    this.registerEvent(this.app.workspace.on('quit', (tasks) => this.flushOnQuit(tasks)));
     this.bootstrapManager();
     // Watchers attach only after the workspace layout is ready: while the
     // vault index loads, Obsidian fires `vault.on('create')` for EVERY
@@ -205,6 +213,36 @@ export default class ObsidianSyncPlugin extends Plugin {
       logger: this.logger,
     });
     handOffTeardown(window, this.manifest.id, done);
+  }
+
+  /**
+   * Obsidian's quit (`workspace.on('quit')`). Obsidian does not unload the
+   * plugin when it quits, and the operation log writes `state.json` a moment
+   * after a change (see `OperationLog`): the record of a teammate's note
+   * written to disk in that moment was lost, and the next start took the note
+   * for a file of the user's — uploaded as a conflict copy for the whole team,
+   * or back for everyone after the teammate had deleted it. The quit waits for
+   * what `state.json` and `sync.log` have not written yet, at most
+   * {@link QUIT_FLUSH_TIMEOUT_MS}.
+   *
+   * No task when nothing waits: Obsidian shows "Saving..." while one runs. And
+   * the task never rejects: Obsidian closes the window once every task has
+   * resolved (app.js 1.13.7, `registerQuitHook`), and one that rejects leaves
+   * the window open for good.
+   */
+  private flushOnQuit(tasks: Tasks): void {
+    try {
+      const writes: Array<Promise<unknown>> = [];
+      if (this.operationLog?.hasUnwrittenChanges() === true) {
+        writes.push(this.operationLog.flush());
+      }
+      if (this.fileLogSink?.hasPendingWrites() === true) writes.push(this.fileLogSink.settled());
+      if (writes.length === 0) return;
+      tasks.addPromise(settleWithin(Promise.allSettled(writes), QUIT_FLUSH_TIMEOUT_MS));
+    } catch (err) {
+      // Nothing to wait for then: the window closes as it would.
+      this.logger?.warn('could not write the plugin state at quit', { err });
+    }
   }
 
   /**
@@ -666,6 +704,21 @@ export default class ObsidianSyncPlugin extends Plugin {
     // A Promise since 1.7.2 (deferred views) — the manifest's minAppVersion.
     await this.app.workspace.revealLeaf(leaf);
   }
+}
+
+/**
+ * Resolves once `work` has settled, whatever its outcome, or after `ms`,
+ * whichever comes first. Never rejects.
+ */
+function settleWithin(work: Promise<unknown>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = window.setTimeout(resolve, ms);
+    const done = (): void => {
+      window.clearTimeout(timer);
+      resolve();
+    };
+    work.then(done, done);
+  });
 }
 
 /**

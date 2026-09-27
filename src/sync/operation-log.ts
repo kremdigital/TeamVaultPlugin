@@ -793,9 +793,11 @@ export class OperationLog {
   /**
    * Whether a change has not reached the disk yet: waiting out the debounce,
    * or on its way. Obsidian's quit waits for such a change (see `main.ts`).
+   * A debounce timer left after {@link flush} wrote the change is none: the
+   * quit would show "Saving..." for nothing.
    */
   hasUnwrittenChanges(): boolean {
-    return this.persistent && (this.dirty || this.timer !== null || this.writing > 0);
+    return this.persistent && (this.dirty || this.writing > 0);
   }
 
   /** Mark the document dirty and schedule (or force) a write. */
