@@ -111,10 +111,11 @@ server, a passing **Test** also checks that the server lists their projects,
 and a notice names any it doesn't.
 
 The server keeps its bindings. On **Save**, the vaults bound to it reconnect
-to the new address at once, with their unsent offline changes and offline
-documents: nothing syncs from scratch. Change the URL only when the same
-server has moved to a new address. Another server has projects of its own,
-and a vault bound here would stop syncing there with "project not found".
+to the new address at once — or on **Resume sync**, if sync is paused — with
+their unsent offline changes and offline documents: nothing syncs from
+scratch. Change the URL only when the same server has moved to a new address.
+Another server has projects of its own, and a vault bound here would stop
+syncing there with "project not found".
 
 ### 3. Bind the vault to a project
 
