@@ -849,13 +849,16 @@ sync) останавливала движки, и всё сделанное на
    примерно через полторы минуты: плагин четыре раза спрашивает
    `ops:status` (старый сервер не отвечает), затем шлёт `project:join` с
    `skipOperations` и `skipYjsCatchup` и читает ответ; в `sync.log` перед
-   ошибкой —
-   `could not ask the server about operations whose answers were lost`.
+   ошибкой — `could not check the queued operations with the server`.
 2. Цепочка переименований и пауза. В `test-vault` переименовать `r1.md` в
    `r2.md`, `r3.md`, `r4.md`, не дожидаясь синхронизации, и сразу
    «Приостановить». В `test-vault-2` переименовать эту заметку в `r5.md`.
    В `test-vault` «Возобновить». В `sync.log` —
-   `operations whose answers were lost, settled` с `asked`, `applied` и
+   `queued operations checked with the server` с `asked`, `applied` и
+   `voided`: `applied` — операции, которые сервер уже применил, а ответ
+   на них потерялся; `voided` — операции, которые до сервера не дошли
+   (очередь на паузе или офлайн, либо потерялись в пути), они уходят заново
+   с новым `opId`. Операции, которые только ждали в очереди, попадают в
    `voided`. Итоговое имя у всех — последнее переименование в порядке
    сервера: `r5.md`, если переименования `test-vault` дошли до сервера до
    переименования в `test-vault-2`. Ни одно переименование `test-vault` не

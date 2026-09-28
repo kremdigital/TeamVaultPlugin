@@ -533,8 +533,15 @@ describe('SyncEngine — an operation whose answer was lost, settled at the next
       payload: { fileId: 'f1' },
     });
     let asked = 0;
+    const entries: LogEntry[] = [];
+    const logger = new Logger('debug', {
+      write: (e) => {
+        entries.push(e);
+      },
+    });
     const h = buildHarness({
       log,
+      logger,
       opsStatusRetryMs: [0, 0, 0],
       statusResponder: (e) => {
         asked += 1;
@@ -549,6 +556,11 @@ describe('SyncEngine — an operation whose answer was lost, settled at the next
     expect(h.engine.getStatus()).toBe('error');
     expect(h.statuses.at(-1)).toBe('error');
     expect(details.at(-1)).toBe('ops_status_failed');
+    // The entry may only have waited in the queue: no answer is said lost.
+    expect(
+      entries.filter((e) => e.message === 'could not check the queued operations with the server'),
+    ).toHaveLength(1);
+    expect(entries.filter((e) => e.message.includes('answers were lost'))).toEqual([]);
     // A server that answers is one that has the question: no join asks it.
     expect(joinsOf(h)).toBe(0);
     await h.engine.stop();

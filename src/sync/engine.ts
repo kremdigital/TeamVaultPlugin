@@ -795,9 +795,9 @@ export class SyncEngine {
   private readonly sending = new Set<string>();
 
   /**
-   * Whether this connect has settled the operations whose answers were lost
-   * (see {@link settleUnanswered}); cleared on each connect. Until then a
-   * live change is queued, not sent.
+   * Whether this connect has checked the queued operations with the server
+   * — some of them may have lost their answers (see {@link settleUnanswered});
+   * cleared on each connect. Until then a live change is queued, not sent.
    */
   private opsSettled = false;
 
@@ -1207,10 +1207,10 @@ export class SyncEngine {
       // first connect, `state.json` lost), the catch-up brings this device's
       // own old operations back as ones it does not know (see `ownRows`).
       const hadState = this.operationLog.getBindingState(this.binding.id) !== null;
-      // What became of the operations whose answers were lost — the server
-      // is asked before anything else (see `settleUnanswered`). Live changes
-      // are queued meanwhile. Nothing is asked when nothing waits: the join
-      // goes out at once.
+      // What became of the queued operations, some of which may have lost
+      // their answers — the server is asked before anything else (see
+      // `settleUnanswered`). Live changes are queued meanwhile. Nothing is
+      // asked when nothing waits: the join goes out at once.
       this.opsSettled = false;
       this.ownKnown.clear();
       const unanswered = this.operationLog.dequeueOperations(this.binding.id);
@@ -1220,7 +1220,7 @@ export class SyncEngine {
         } catch (err) {
           if (!(err instanceof OpsStatusError)) throw err;
           online.throwIfAborted();
-          this.log.warn('could not ask the server about operations whose answers were lost', {
+          this.log.warn('could not check the queued operations with the server', {
             error: err.reason,
           });
           this.setStatus('error', await this.opsStatusFailure(err, online));
@@ -1404,7 +1404,7 @@ export class SyncEngine {
     }
   }
 
-  // -- Operations whose answers were lost ------------------------------------
+  // -- Queued operations, some of which may have lost their answers ---------
 
   /**
    * Ask the server (`ops:status`) what became of the operations in the queue
@@ -1456,7 +1456,13 @@ export class SyncEngine {
         else this.operationLog.rotateOpId(this.binding.id, entry.id);
       }
     }
-    this.log.info('operations whose answers were lost, settled', {
+    // `applied`: the server applied them and their answers were lost; what
+    // each would have brought is taken in now (and logged one by one, see
+    // `settleLanded`). `voided`: the server never got them — queued while
+    // offline or paused, or lost on their way — and they go out again under
+    // new `opId`s. The line said `operations whose answers were lost,
+    // settled` before, for changes that had only waited in the queue too.
+    this.log.info('queued operations checked with the server', {
       asked: entries.length,
       applied,
       voided,

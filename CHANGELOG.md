@@ -6,6 +6,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **`sync.log` no longer says answers were lost when changes only waited in
+  the queue.** On connecting, Team Vault checks the changes waiting in its
+  queue with the server; the summary line now reads
+  `queued operations checked with the server` (with the same `asked`,
+  `applied` and `voided`), and the warning when the server can't answer reads
+  `could not check the queued operations with the server`. Before, they said
+  `operations whose answers were lost, settled` and
+  `could not ask the server about operations whose answers were lost` even for
+  changes made while sync was paused or the device was offline, which had
+  never been sent. `applied` counts changes the server had applied while their
+  answer was lost (each is still logged on its own line); `voided` counts
+  changes the server never got, which go out again.
+
 ### Fixed
 
 - **Deleting a folder deletes each file in it once.** When you deleted a

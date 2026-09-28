@@ -419,6 +419,44 @@ describe('Pause sync — the work of the connection it closes', () => {
     await h.engine.stop();
   });
 
+  it('logs the changes that waited in the queue as checked with the server, not as lost answers', async () => {
+    // `sync.log` said `operations whose answers were lost, settled` for
+    // changes that had only waited while paused: nothing had been sent, and
+    // no answer was lost (2026-09-28, `{"asked":2,"applied":0,"voided":2}`).
+    const entries: LogEntry[] = [];
+    const logger = new Logger('debug', {
+      write: (e) => {
+        entries.push(e);
+      },
+    });
+    const { h, server, docs } = await seeded(
+      [
+        ['a.md', 'f1', 'A\n'],
+        ['b.md', 'f2', 'B\n'],
+      ],
+      [],
+      { logger },
+    );
+    h.engine.pause();
+    await h.engine.start();
+    await userRename(h, 'a.md', 'a2.md');
+    h.vault.files.delete('b.md');
+    await h.engine.handleVaultEvent(vaultEvent('delete', 'b.md'));
+    expect(queue(h)).toEqual(['RENAME a.md -> a2.md', 'DELETE b.md']);
+
+    await h.engine.resume();
+    await answerJoin(h, server, docs);
+    expect(server.applied).toEqual(['f1 a.md -> a2.md', 'delete f2']);
+
+    const checked = entries.filter(
+      (e) => e.message === 'queued operations checked with the server',
+    );
+    expect(checked).toHaveLength(1);
+    expect(checked[0]?.args[0]).toEqual({ asked: 2, applied: 0, voided: 2 });
+    expect(entries.filter((e) => e.message.includes('answers were lost'))).toEqual([]);
+    await h.engine.stop();
+  });
+
   it('cancels an upload on its way and queues its change, sent once on resume', async () => {
     const { h, server, docs } = await seeded([]);
     await h.engine.start();
