@@ -327,6 +327,8 @@ export class FakeIndexedDb {
   ]);
   /** Every database deleted, in order. */
   readonly deleted: string[] = [];
+  /** Every database a store was opened on, in order — a new one included. */
+  readonly opened: string[] = [];
   readonly registry: IdbRegistry = {
     list: () => Promise.resolve([...this.dbs.keys()]),
     delete: (name) => {
@@ -353,6 +355,7 @@ export class FakeIndexedDb {
   }
 
   private open(name: string, doc: Y.Doc): DocPersistence {
+    this.opened.push(name);
     let db = this.dbs.get(name);
     if (!db) {
       db = { updates: [], custom: new Map() };
@@ -398,6 +401,11 @@ export class FakeIndexedDb {
         store.custom.set(key, value);
         return Promise.resolve();
       },
+      // Updates are stored as they come here, so ordering after them is `set`.
+      setOrdered: (key, value) => {
+        store.custom.set(key, value);
+        return Promise.resolve();
+      },
     };
     doc.on('update', onUpdate);
     return persistence;
@@ -407,6 +415,43 @@ export class FakeIndexedDb {
 /** The database name `DocManager` gives the doc of `path` in binding `b1`. */
 export function dbNameOf(path: string): string {
   return `team-vault-b1-${encodeURIComponent(path)}`;
+}
+
+/**
+ * A teammate types on in note `id`: a Yjs edit only, the file row's hash waits
+ * for the snapshot. Sent to the engine's room live when it is connected.
+ */
+export function typeOn(docs: ServerDocs, h: Harness, id: string, more: string): void {
+  const doc = docs.docs.get(id);
+  if (!doc) throw new Error(`no doc ${id}`);
+  const seen = Y.encodeStateVector(doc);
+  const text = doc.getText('content');
+  text.insert(text.length, more);
+  const socket = h.socketIfBuilt();
+  if (socket?.connected) {
+    socket.fire('yjs:update', {
+      fileId: id,
+      update: Array.from(Y.encodeStateAsUpdate(doc, seen)),
+    });
+  }
+}
+
+/** The server's snapshot of note `id` catches up with its doc: the listing's hash moves. */
+export async function snapshotCatchesUp(
+  server: FakeServer,
+  docs: ServerDocs,
+  id: string,
+): Promise<void> {
+  const file = server.files.get(id);
+  if (!file) throw new Error(`no file ${id}`);
+  file.contentHash = await sha256Hex(docs.text(id) ?? '');
+  // The listing the engine reads follows the server's files.
+  server.add({ ...file });
+}
+
+/** Every file on the engine's disk as `path=content`, sorted. */
+export function disk(h: Harness): string[] {
+  return [...h.vault.files.keys()].sort().map((p) => `${p}=${h.vault.text(p) ?? ''}`);
 }
 
 export interface Emit {

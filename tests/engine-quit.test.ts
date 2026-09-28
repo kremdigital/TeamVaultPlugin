@@ -14,9 +14,7 @@
  * listing's hash lagging the note's text).
  */
 import type { App, PluginManifest } from 'obsidian';
-import * as Y from 'yjs';
 import TeamVaultPlugin from '@/main';
-import { sha256Hex } from '@/sync/hash';
 import type { OperationLog } from '@/sync/operation-log';
 import type { Logger } from '@/utils/logger';
 import {
@@ -25,10 +23,13 @@ import {
   ServerDocs,
   buildHarness,
   connect,
+  disk,
   encode,
   joinToAnswer,
   logOn,
   restartFromDisk,
+  snapshotCatchesUp,
+  typeOn,
   type Harness,
 } from './engine-test-kit';
 
@@ -255,35 +256,6 @@ describe('quit — main.ts waits for what state.json has not written', () => {
 });
 
 // -- V3: a teammate's note written here, the listing's hash lagging ----------------
-
-/** A teammate types on in note `id`: a Yjs edit only, the file row's hash waits for the snapshot. */
-function typeOn(docs: ServerDocs, h: Harness, id: string, more: string): void {
-  const doc = docs.docs.get(id);
-  if (!doc) throw new Error(`no doc ${id}`);
-  const seen = Y.encodeStateVector(doc);
-  const text = doc.getText('content');
-  text.insert(text.length, more);
-  const socket = h.socketIfBuilt();
-  if (socket?.connected) {
-    socket.fire('yjs:update', {
-      fileId: id,
-      update: Array.from(Y.encodeStateAsUpdate(doc, seen)),
-    });
-  }
-}
-
-/** The server's snapshot of note `id` catches up with its doc: the listing's hash moves. */
-async function snapshotCatchesUp(server: FakeServer, docs: ServerDocs, id: string): Promise<void> {
-  const file = server.files.get(id);
-  if (!file) throw new Error(`no file ${id}`);
-  file.contentHash = await sha256Hex(docs.text(id) ?? '');
-  // The listing the engine reads follows the server's files.
-  server.add({ ...file });
-}
-
-function disk(h: Harness): string[] {
-  return [...h.vault.files.keys()].sort().map((p) => `${p}=${h.vault.text(p) ?? ''}`);
-}
 
 describe('quit — a teammate’s note written here just before it', () => {
   // The log's own delay never runs out in these tests: only the quit writes.

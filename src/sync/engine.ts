@@ -816,6 +816,15 @@ export class SyncEngine {
    */
   private freedHere = new Set<string>();
 
+  /**
+   * The checks at start of records of files never written here whose file
+   * is on disk (see {@link startWrittenCheck}), by path, while they run.
+   */
+  private readonly writtenChecks = new Map<string, Promise<void>>();
+
+  /** All of {@link writtenChecks}: resolves once they are done, never rejects. */
+  private writtenCheck: Promise<void> = Promise.resolve();
+
   /** Subscriber tear-down list. */
   private cleanups: Array<() => void> = [];
 
@@ -2828,6 +2837,46 @@ export class SyncEngine {
       byId.set(id, meta);
     }
     this.fileIndex = { byPath, byId };
+    this.startWrittenCheck();
+  }
+
+  /**
+   * Settle the records of files never written here whose file is on disk
+   * (see {@link settleWrittenHere}) as the engine starts, against what they
+   * are known by without the listing: the disk, `state.json` and the note's
+   * offline history. Checked only at connect, such a file was taken for
+   * another one at its first save before then — and a crash, or a "Reload
+   * app without saving", brings the user back to the note they were at. The
+   * save went up as a new file, a conflict copy for the whole team, and the
+   * note's offline history, the one proof that the text on disk was the
+   * teammate's, was deleted with it (see `yieldNameNotWritten`). Offline, or
+   * before a slow listing, that is the first thing to happen.
+   *
+   * A save of such a file waits for its check (see {@link createLocal}); the
+   * connect waits for all of them before it checks what is left against the
+   * listing (see {@link recordWrittenAfterAll}).
+   */
+  private startWrittenCheck(): void {
+    const signal = this.lifetime.signal;
+    const checks: Array<Promise<void>> = [];
+    for (const record of this.operationLog.listFileMeta(this.binding.id)) {
+      const path = record.relativePath;
+      if (record.notOnDisk !== true) continue;
+      if (this.fileIndex.byPath.get(path)?.fileId !== record.serverFileId) continue;
+      const done = this.settleWrittenHere(record, [record.contentHash], signal).catch(
+        (err: unknown) => {
+          // Stopped meanwhile: nothing failed.
+          if (this.hasStopped) return;
+          this.log.debug('check of a file not written here failed', path, err);
+        },
+      );
+      this.writtenChecks.set(path, done);
+      void done.then(() => {
+        if (this.writtenChecks.get(path) === done) this.writtenChecks.delete(path);
+      });
+      checks.push(done);
+    }
+    if (checks.length > 0) this.writtenCheck = Promise.all(checks).then(() => undefined);
   }
 
   /** `online`: the connection the refresh is for (see `online`). */
@@ -2840,6 +2889,9 @@ export class SyncEngine {
     // recording local changes in.
     online.throwIfAborted();
     this.lastListing = new Map(listed.map((f) => [f.id, f]));
+    // What the check at start settles is settled first (see `startWrittenCheck`).
+    await this.writtenCheck;
+    online.throwIfAborted();
     await this.recordWrittenAfterAll(online);
     // Records of files never written here (see `FileMeta.notOnDisk`) hold no
     // copy to settle: a file under such a name is another one. Taken for a
@@ -3031,70 +3083,139 @@ export class SyncEngine {
   /**
    * Records of files never written here (see `FileMeta.notOnDisk`) whose
    * content is under their name after all: the engine wrote it, and the
-   * record of the write was lost. `state.json` takes a change of a record
-   * after a moment's delay, and Obsidian quits without unloading the plugin:
-   * a teammate's file written in the last moment before a quit or a crash
-   * stayed recorded as never come. Taken for a file saved under the name at
-   * the next connect, it went up as a new file — once the teammate had
-   * edited theirs, a conflict copy with the old content for the whole team;
-   * once they had deleted it, the file back for everyone.
-   *
-   * The file under the name is the teammate's when it has the content the
-   * record has, which the listing gave when it was recorded, or the content
-   * the server has now (the catch-up can bring a newer one than the
-   * listing). A file of the user's with that very content is the same file.
-   * Recorded then as a copy, synced at that content. `online`: see
-   * `refreshFileIndex`.
+   * record of the write was lost. Each is settled by {@link settleWrittenHere},
+   * against the content the listing gives it now as well (the catch-up can
+   * bring a newer one than the listing did when it was recorded). After the
+   * check at start (see {@link startWrittenCheck}), which settles what it can
+   * without the listing. `online`: see `refreshFileIndex`.
    */
   private async recordWrittenAfterAll(online: AbortSignal): Promise<void> {
     for (const record of this.operationLog.listFileMeta(this.binding.id)) {
       if (record.notOnDisk !== true) continue;
-      const path = record.relativePath;
-      let hash: string;
-      let size: number;
-      try {
-        if (!(await this.vault.exists(path))) continue;
-        if (record.fileType === 'TEXT') {
-          const text = await this.vault.readText(path);
-          hash = await sha256Hex(text);
-          size = new TextEncoder().encode(text).byteLength;
-        } else {
-          const data = await this.vault.readBinary(path);
-          hash = await sha256Hex(data);
-          size = data.byteLength;
-        }
-      } catch {
-        // Unreadable now: left as it is, for the index to go by the record.
-        online.throwIfAborted();
-        continue;
+      const listed = this.lastListing.get(record.serverFileId)?.contentHash;
+      await this.settleWrittenHere(record, [record.contentHash, listed], online);
+    }
+  }
+
+  /**
+   * A record of a file never written here (see `FileMeta.notOnDisk`) whose
+   * content is under its name after all: the engine wrote it, and the record
+   * of the write was lost. `state.json` takes a change of a record after a
+   * moment's delay, and neither a crash nor Obsidian's "Reload app without
+   * saving" (a reload of the window: no `quit`, no unload) waits for it. A
+   * teammate's file written in that moment stayed recorded as never come.
+   * Taken for a file saved under the name, it went up as a new file — once
+   * the teammate had edited theirs, a conflict copy with the old content for
+   * the whole team; once they had deleted it, the file back for everyone.
+   *
+   * The file under the name is the teammate's when its content is one it is
+   * known by (`known`: the content the listing gave when it was recorded, the
+   * content the listing gives now); a file of the user's with that very
+   * content is the same file. A teammate typing on in the moment after the
+   * listing leaves the content on disk known by nothing but this device's
+   * own proof: the note's offline history (see
+   * {@link writtenByThisDevice}). An attachment has none; the listing's hash
+   * of it moves with its bytes.
+   *
+   * Recorded then as a copy, synced at that content, and the content kept as
+   * the note's fold base: a save of the note before its catch-up is folded
+   * against it (see `resolveFoldBase`) — without one, the save replaced the
+   * teammate's text the offline history holds beyond the disk, for everyone.
+   * `signal`: the connection the check is for, or the engine's lifetime.
+   */
+  private async settleWrittenHere(
+    record: FileMeta,
+    known: ReadonlyArray<string | undefined>,
+    signal: AbortSignal,
+  ): Promise<void> {
+    const path = record.relativePath;
+    let hash: string;
+    let size: number;
+    let text: string | null = null;
+    try {
+      if (!(await this.vault.exists(path))) return;
+      if (record.fileType === 'TEXT') {
+        text = await this.vault.readText(path);
+        hash = await sha256Hex(text);
+        size = new TextEncoder().encode(text).byteLength;
+      } else {
+        const data = await this.vault.readBinary(path);
+        hash = await sha256Hex(data);
+        size = data.byteLength;
       }
-      online.throwIfAborted();
-      const known = [record.contentHash, this.lastListing.get(record.serverFileId)?.contentHash];
-      if (!known.includes(hash)) continue;
-      // Changed while the file was read: that change stands.
-      const now = this.operationLog.getFileMeta(this.binding.id, path);
-      if (
-        now?.notOnDisk !== true ||
-        now.serverFileId !== record.serverFileId ||
-        now.contentHash !== record.contentHash
-      ) {
-        continue;
-      }
+    } catch {
+      // Unreadable now: left as it is, for the index to go by the record.
+      signal.throwIfAborted();
+      return;
+    }
+    signal.throwIfAborted();
+    let by: 'listing' | 'text' | 'mark' | null = known.includes(hash) ? 'listing' : null;
+    if (by === null && text !== null) {
+      by = await this.writtenByThisDevice(record, text, hash);
+      signal.throwIfAborted();
+    }
+    if (by === null) return;
+    // Changed while the file was read: that change stands.
+    const now = this.operationLog.getFileMeta(this.binding.id, path);
+    if (
+      now?.notOnDisk !== true ||
+      now.serverFileId !== record.serverFileId ||
+      now.contentHash !== record.contentHash
+    ) {
+      return;
+    }
+    if (by === 'listing') {
       this.log.info('a file recorded as not written here is on disk; taken for its copy', {
         path,
         fileId: record.serverFileId,
       });
-      // The text is in the note's history here, or comes with the server's.
-      const folded = record.fileType === 'TEXT' ? { foldedHash: hash } : {};
-      const copy: FileMeta = { ...now, contentHash: hash, size, ...folded };
-      delete copy.notOnDisk;
-      this.operationLog.setFileMeta(copy);
-      const indexed = this.fileIndex.byPath.get(path);
-      if (indexed?.fileId === record.serverFileId && indexed.notOnDisk === true) {
-        delete indexed.notOnDisk;
-        Object.assign(indexed, { contentHash: hash, size, ...folded });
-      }
+    } else {
+      this.log.info(
+        'a file recorded as not written here matches its offline history; taken for its copy',
+        { path, fileId: record.serverFileId, by },
+      );
     }
+    // The text is in the note's history here, or comes with the server's.
+    const folded = record.fileType === 'TEXT' ? { foldedHash: hash } : {};
+    const copy: FileMeta = { ...now, contentHash: hash, size, ...folded };
+    delete copy.notOnDisk;
+    this.operationLog.setFileMeta(copy);
+    const indexed = this.fileIndex.byPath.get(path);
+    if (indexed?.fileId === record.serverFileId && indexed.notOnDisk === true) {
+      delete indexed.notOnDisk;
+      Object.assign(indexed, { contentHash: hash, size, ...folded });
+    }
+    if (text !== null) this.foldBases.set(record.serverFileId, { text, hash });
+  }
+
+  /**
+   * Whether the note on disk under the name of `record`, `text` (hashed to
+   * `hash`), is what this device wrote there from the note's offline history
+   * (y-indexeddb): the history under that very name is stamped for the note
+   * (see `DocManager.open`) and holds that text byte for byte — or holds the
+   * mark the engine put there right before it wrote this very text (see
+   * `DocManager.noteWritten`), when the teammate typed on after the write.
+   * The history reaches IndexedDB with each edit, the disk half a second
+   * after the last one at the earliest, and `state.json` a moment after
+   * that: after a crash, the history has the text on disk, and more.
+   *
+   * Byte for byte: the engine writes the doc's text as it is, line ends and
+   * all, and a file whose line ends were changed since is the user's.
+   * `null` when it is not, or when there is no history to tell — no store
+   * under the name, or none that loaded in time.
+   */
+  private async writtenByThisDevice(
+    record: FileMeta,
+    text: string,
+    hash: string,
+  ): Promise<'text' | 'mark' | null> {
+    const stored = await this.docManager.peek(this.binding.id, record.relativePath);
+    if (stored === null || stored.owner !== record.serverFileId) return null;
+    if (stored.text === text) return 'text';
+    const mark = stored.written;
+    return mark !== null && mark.fileId === record.serverFileId && mark.hash === hash
+      ? 'mark'
+      : null;
   }
 
   /**
@@ -3849,6 +3970,15 @@ export class SyncEngine {
 
   /** {@link handleLocalCreate} past its checks: send the create, or the save of a known file. */
   private async createLocal(path: string, from: LocalSource): Promise<void> {
+    // A file never written here waits for its check at start: it may be the
+    // one the engine wrote, the record of the write lost (see
+    // `startWrittenCheck`). Taken for another first, it went up as a new file,
+    // and its note's offline history — the proof — went with the name.
+    const checking =
+      this.fileIndex.byPath.get(path)?.notOnDisk === true
+        ? this.writtenChecks.get(path)
+        : undefined;
+    if (checking !== undefined) await checking;
     const known = this.fileIndex.byPath.get(path);
     // No file here after all: a stray event, nothing to send.
     if (known?.notOnDisk === true && (await this.yieldNameNotWritten(known)) === 'none') return;
@@ -7791,6 +7921,16 @@ export class SyncEngine {
           await this.markFolded(meta, text, hash);
         }
         return;
+      }
+      // In the note's offline history before the write, where a crash leaves
+      // it: the record of the write reaches `state.json` a moment after it
+      // (see `settleWrittenHere`). Not waited for.
+      if (meta && this.docPathOf(meta) === path) {
+        this.docManager.noteWritten(this.binding.id, path, {
+          fileId: meta.fileId,
+          hash,
+          over: meta.foldedHash ?? '',
+        });
       }
       // The fold and the hashing yield, and the disk may change meanwhile. A
       // save landing now is on disk but not in `text`: the write would roll it

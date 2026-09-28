@@ -47,10 +47,44 @@ export interface DocPersistence {
    */
   get?(key: string): Promise<unknown>;
   set?(key: string, value: string): Promise<unknown>;
+  /**
+   * `set`, in a transaction ordered after every update of the doc handed to
+   * the store before it: IndexedDB runs read-write transactions whose scopes
+   * overlap in the order they were created, so one over the updates and the
+   * key/value area lands after them. The mark of a write to disk (see
+   * {@link DocManager.noteWritten}) goes through it: found after a crash, the
+   * updates the written text was made of are in the store too. A backend
+   * without it takes `set`.
+   */
+  setOrdered?(key: string, value: string): Promise<unknown>;
 }
 
 /** Key of the owner stamp in {@link DocPersistence.get} / `set`. */
 const OWNER_KEY = 'team-vault-file-id';
+
+/** Key of the mark of the last write to disk (see {@link DocManager.noteWritten}). */
+const WRITTEN_KEY = 'team-vault-written';
+
+/**
+ * The note's text the engine was about to write to disk, from this doc: the
+ * file whose history it is, the hash of the text, and the fold marker of the
+ * file's record right before the write (`''` when it had none).
+ */
+export interface WrittenMark {
+  fileId: string;
+  hash: string;
+  over: string;
+}
+
+/** What {@link DocManager.peek} found under a name. */
+export interface StoredDoc {
+  /** Whose history it is, by its stamp; `null` when it has none. */
+  owner: string | null;
+  /** The text the history holds. */
+  text: string;
+  /** The mark of the last write to disk from it; `null` when there is none. */
+  written: WrittenMark | null;
+}
 
 /**
  * How long a listing of database names is reused (see
@@ -136,6 +170,8 @@ interface ManagedEntry {
   waiting: boolean;
   /** Dropped from the cache: a deferred persistence is not created any more. */
   dead: boolean;
+  /** The last mark handed to the store (see {@link DocManager.noteWritten}), as stored. */
+  written: string | null;
 }
 
 /** What {@link DocManager.open} found under the name. */
@@ -254,6 +290,11 @@ export class DocManager {
   private readonly opening = new Map<string, Promise<unknown>>();
   /** Database names this manager opened; see {@link mayHaveStore}. */
   private readonly opened = new Set<string>();
+  /**
+   * {@link peek} runs looking for a store, by cache key: a {@link clear} of
+   * the name meanwhile marks it, and the peek opens nothing.
+   */
+  private readonly peeks = new Map<string, { cleared: boolean }>();
   /** A recent listing of database names; see {@link DB_LIST_TTL_MS}. */
   private dbList: { at: number; names: Promise<Set<string> | null> } | null = null;
 
@@ -497,12 +538,87 @@ export class DocManager {
   }
 
   /**
+   * Mark the doc at `filePath` as the source of the text about to be written
+   * to disk, in its own store — the key/value area of the database under this
+   * exact name, next to its history (see {@link DocPersistence.setOrdered}).
+   * The engine's record of the write goes to `state.json` a moment later: a
+   * crash, or Obsidian's "Reload app without saving", in that moment loses
+   * it, and the next start finds a teammate's note on disk that its records
+   * say never reached it (see `SyncEngine.settleWrittenHere`).
+   *
+   * Only for the doc of file `mark.fileId`, by its stamp: a doc without one,
+   * or another file's, is left unmarked. Not waited for — each note of a first
+   * sync is written this way, and nothing about the write depends on it; a
+   * mark that never lands leaves the check at the next start as it was. A
+   * mark handed to the store already is not handed again. It goes with the
+   * store when the doc is deleted ({@link clear}), and stays behind when its
+   * history is carried to another name ({@link move}).
+   */
+  noteWritten(bindingId: string, filePath: string, mark: WrittenMark): void {
+    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
+    if (!entry || entry.dead || entry.owner !== mark.fileId) return;
+    const value = JSON.stringify({ fileId: mark.fileId, hash: mark.hash, over: mark.over });
+    if (entry.written === value) return;
+    entry.written = value;
+    const write = (): void => {
+      const persistence = entry.persistence;
+      if (entry.dead || !persistence) return;
+      try {
+        const stored = persistence.setOrdered
+          ? persistence.setOrdered(WRITTEN_KEY, value)
+          : persistence.set?.(WRITTEN_KEY, value);
+        void Promise.resolve(stored).catch(() => undefined);
+      } catch {
+        // Unwritable: the store keeps its last mark, if any.
+      }
+    };
+    if (entry.waiting && entry.ready) void entry.ready.then(write, () => undefined);
+    else write();
+  }
+
+  /**
+   * What the store under `filePath` holds — its stamp, its text and the mark
+   * of its last write to disk (see {@link noteWritten}) — without opening a
+   * doc for the name. `null` when there is no store under the name, it did
+   * not load in time, or it could not be read.
+   *
+   * By the exact name only. IndexedDB is one store for every vault on the
+   * machine: the list of its databases only tells whether this one exists,
+   * taken fresh (one from a moment ago may still show a store deleted since).
+   * A name that is not there is not opened — opening it would create it — and
+   * nothing is ever deleted. A store that is there is opened on a doc of its
+   * own, outside the cache, and closed again; y-indexeddb stores the state of
+   * that doc as it opens — an empty update, which changes nothing. A doc open
+   * under the name is read as it is.
+   */
+  peek(bindingId: string, filePath: string): Promise<StoredDoc | null> {
+    const key = this.cacheKey(bindingId, filePath);
+    return this.serially([key], async (): Promise<StoredDoc | null> => {
+      try {
+        const cached = this.cache.get(key);
+        if (cached) {
+          if (!(await this.settle(cached)) || cached.dead) return null;
+          const written =
+            cached.written !== null
+              ? parseMark(cached.written)
+              : await readMark(cached.persistence);
+          return { owner: cached.owner, text: cached.ytext.toJSON(), written };
+        }
+        return await this.peekStore(bindingId, filePath);
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  /**
    * Delete the doc at `filePath` and its store: no file's history is under
    * this name any more. Only this one database, by its exact name — never an
    * enumeration: IndexedDB is one store for every vault on the machine. A doc
    * acquired for the name meanwhile starts from nothing: its store is opened
    * once the old one is gone. Local-update subscribers go too, unless
-   * `keepSubscribers`.
+   * `keepSubscribers`. The mark of the last write to disk (see
+   * {@link noteWritten}) is in the store, and goes with it.
    */
   async clear(
     bindingId: string,
@@ -510,6 +626,9 @@ export class DocManager {
     opts: { keepSubscribers?: boolean } = {},
   ): Promise<void> {
     const key = this.cacheKey(bindingId, filePath);
+    // A peek of the name that has not opened its store yet opens none now.
+    const peeking = this.peeks.get(key);
+    if (peeking) peeking.cleared = true;
     if (!opts.keepSubscribers) this.localSubs.delete(key);
     const name = this.dbName(bindingId, filePath);
     // One delete at a time per name: a store reopened while an earlier delete
@@ -558,6 +677,10 @@ export class DocManager {
    *
    * Deleting a store is best effort: a database IndexedDB refuses to delete
    * does not stop the move, nor the rename it is part of.
+   *
+   * Only the history is carried, and the stamp set anew: the mark of the last
+   * write to disk (see {@link noteWritten}) stays with the store under `from`,
+   * and goes with it — it names a text written under that name.
    */
   move(
     bindingId: string,
@@ -844,34 +967,60 @@ export class DocManager {
     if (entry.ready) await entry.ready;
     const persistence = entry.persistence;
     if (!persistence) return true;
-    let timer: number | undefined;
-    let synced = false;
-    try {
-      await Promise.race([
-        persistence.whenSynced.then(() => {
-          synced = true;
-        }),
-        new Promise<void>((resolve) => {
-          timer = window.setTimeout(resolve, WHEN_SYNCED_TIMEOUT_MS);
-        }),
-      ]);
-    } finally {
-      if (timer !== undefined) window.clearTimeout(timer);
-    }
-    if (!synced) return false;
+    if (!(await waitSynced(persistence))) return false;
     entry.ownerRead ??= this.readOwner(entry, persistence);
     await entry.ownerRead;
     return true;
   }
 
   private async readOwner(entry: ManagedEntry, persistence: DocPersistence): Promise<void> {
-    if (!persistence.get) return;
+    const stamp = await readStamp(persistence);
+    // A stamp set while this one was being read is newer.
+    if (entry.owner === null && stamp !== null) entry.owner = stamp;
+  }
+
+  /**
+   * {@link peek} of a name no doc is open under: the store, if the renderer
+   * lists one under that very name, read on a doc of its own and closed.
+   */
+  private async peekStore(bindingId: string, filePath: string): Promise<StoredDoc | null> {
+    const key = this.cacheKey(bindingId, filePath);
+    const name = this.dbName(bindingId, filePath);
+    // A delete of the name under way: the store is going, and a store opened
+    // meanwhile would be created anew.
+    const clearing = this.clearing.get(key);
+    if (clearing) await clearing;
+    const watch = { cleared: false };
+    this.peeks.set(key, watch);
     try {
-      const stamp = await persistence.get(OWNER_KEY);
-      // A stamp set while this one was being read is newer.
-      if (entry.owner === null && typeof stamp === 'string' && stamp !== '') entry.owner = stamp;
-    } catch {
-      // Unreadable: the owner stays unknown.
+      if (!this.opened.has(name)) {
+        const names = await this.listDbs();
+        if (!names.includes(name)) return null;
+      }
+      // Deleted since it was listed, or opened again by the engine: read
+      // another time, or as the doc it is.
+      if (watch.cleared || this.cache.has(key)) return null;
+      const doc = new Y.Doc();
+      let persistence: DocPersistence | null = null;
+      try {
+        persistence = this.persistenceFactory(name, doc);
+        if (persistence === null || !(await waitSynced(persistence))) return null;
+        const owner = await readStamp(persistence);
+        const written = await readMark(persistence);
+        return { owner, text: doc.getText('content').toJSON(), written };
+      } finally {
+        // Closed without waiting: y-indexeddb closes once its database has
+        // opened, which a wedged IndexedDB never does, and the check this
+        // peek is for would wait with it — and every save it holds back.
+        try {
+          void Promise.resolve(persistence?.destroy()).catch(() => undefined);
+        } catch {
+          // Closed or not, nothing of it is used any more.
+        }
+        doc.destroy();
+      }
+    } finally {
+      if (this.peeks.get(key) === watch) this.peeks.delete(key);
     }
   }
 
@@ -964,6 +1113,7 @@ export class DocManager {
       ready: null,
       waiting: false,
       dead: false,
+      written: null,
     };
     entry.updateHandler = (update: Uint8Array, origin: unknown): void => {
       if (SILENT_ORIGINS.has(origin)) return;
@@ -1086,6 +1236,65 @@ export class DocManager {
     } catch {
       return false;
     }
+  }
+}
+
+/**
+ * Wait for a persistence backend to load, up to {@link WHEN_SYNCED_TIMEOUT_MS};
+ * `false` when it did not load in time.
+ */
+async function waitSynced(persistence: DocPersistence): Promise<boolean> {
+  let timer: number | undefined;
+  let synced = false;
+  try {
+    await Promise.race([
+      persistence.whenSynced.then(() => {
+        synced = true;
+      }),
+      new Promise<void>((resolve) => {
+        timer = window.setTimeout(resolve, WHEN_SYNCED_TIMEOUT_MS);
+      }),
+    ]);
+  } finally {
+    if (timer !== undefined) window.clearTimeout(timer);
+  }
+  return synced;
+}
+
+/** The owner stamp in a store; `null` when it has none, or it cannot be read. */
+async function readStamp(persistence: DocPersistence): Promise<string | null> {
+  if (!persistence.get) return null;
+  try {
+    const stamp = await persistence.get(OWNER_KEY);
+    return typeof stamp === 'string' && stamp !== '' ? stamp : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The mark of the last write to disk in a store (see `noteWritten`); `null` without one. */
+async function readMark(persistence: DocPersistence | null): Promise<WrittenMark | null> {
+  if (!persistence?.get) return null;
+  try {
+    return parseMark(await persistence.get(WRITTEN_KEY));
+  } catch {
+    return null;
+  }
+}
+
+/** A stored mark, read back; `null` for anything else. */
+function parseMark(raw: unknown): WrittenMark | null {
+  if (typeof raw !== 'string') return null;
+  try {
+    const value: unknown = JSON.parse(raw);
+    if (typeof value !== 'object' || value === null) return null;
+    const { fileId, hash, over } = value as Record<string, unknown>;
+    if (typeof fileId !== 'string' || typeof hash !== 'string' || typeof over !== 'string') {
+      return null;
+    }
+    return { fileId, hash, over };
+  } catch {
+    return null;
   }
 }
 

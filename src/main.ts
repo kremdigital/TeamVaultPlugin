@@ -1,5 +1,4 @@
 import { Notice, Plugin, WorkspaceLeaf, type Tasks } from 'obsidian';
-import { IndexeddbPersistence } from 'y-indexeddb';
 import {
   defaultSettings,
   describeSkipped,
@@ -15,6 +14,7 @@ import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
 import { SyncSettingsTab } from '@/settings/tab';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager, type IdbRegistry, type PersistenceFactory } from '@/crdt/doc-manager';
+import { TeamVaultIdbPersistence } from '@/crdt/idb-persistence';
 import { EngineManager } from '@/sync/engine-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import { ObsidianWatcher, type VaultEvent } from '@/watcher/obsidian-events';
@@ -413,8 +413,10 @@ export default class ObsidianSyncPlugin extends Plugin {
     });
     await this.operationLog.load();
 
+    // With `setOrdered`: the mark of a note written to disk lands after the
+    // edits the written text holds (see `DocManager.noteWritten`).
     const persistenceFactory: PersistenceFactory = (name, doc) =>
-      new IndexeddbPersistence(name, doc);
+      new TeamVaultIdbPersistence(name, doc);
     this.docManager = new DocManager({ persistenceFactory, idb: browserIdbRegistry() });
     this.recentlyApplied = new RecentlyApplied();
   }

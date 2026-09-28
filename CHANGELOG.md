@@ -23,6 +23,25 @@ uses [Semantic Versioning](https://semver.org/).
 
 ### Fixed
 
+- **A teammate's note written here right before Obsidian crashed is no
+  longer sent back as your own.** Team Vault records that it wrote a
+  teammate's note to disk about half a second after the write. When Obsidian
+  crashed, was killed, or was reloaded with "Reload app without saving" (which
+  does not let plugins finish their work) in that moment, the next start took
+  the note for a file you had saved under its name: once the teammate had
+  edited it since, everyone got a conflict copy with its old text; once they
+  had deleted it, it came back for everyone. Now, as soon as it starts and
+  before it connects, Team Vault checks such a note against its offline
+  history on this device — only the note's own store in this vault, found by
+  its exact name — and takes it for the teammate's note when the history
+  holds that very text, byte for byte, or the mark Team Vault leaves there
+  right before each write. A save of the note made meanwhile waits for the
+  check, and text the teammate typed after the write that had not reached the
+  disk yet is kept when you edit the note before it syncs. Attachments work
+  as before: their hash on the server follows their bytes, so the check at
+  connect already recognises them. What remains: a crash of the whole system
+  or a power loss, which can lose the offline history too, and a note you
+  edit before the check has read it.
 - **Deleting a folder deletes each file in it once.** When you deleted a
   folder in Obsidian, the first file in it and every file in its subfolders
   could be sent to the server as two deletes (three for a file two subfolders
