@@ -6,6 +6,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Deleting a folder deletes each file in it once.** When you deleted a
+  folder in Obsidian, the first file in it and every file in its subfolders
+  could be sent to the server as two deletes (three for a file two subfolders
+  down), and offline both were queued. The server recorded the second delete
+  too, and had a teammate created a file under the same name in between, the
+  second delete removed the teammate's new file. The same happened when a
+  file's deletion was reported both by Obsidian and by the file system. A
+  folder delete also no longer looks up each file whose delete is already on
+  its way in the server's list of all project files.
+
 ## [0.4.0] — 2026-09-28
 
 ### Changed

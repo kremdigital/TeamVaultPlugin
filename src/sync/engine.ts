@@ -240,6 +240,25 @@ type HeldChange = Required<Omit<PendingOperationInput, 'opId' | 'settleOnly'>> &
 };
 
 /**
+ * What became of a delete claimed in {@link SyncEngine.deleteClaims}: `gone`
+ * — sent, queued, refused by the server for good, or nothing to delete;
+ * `kept` — nothing went out for it: the file was still on disk when its
+ * handler looked, or the handler gave up before sending. A handler that
+ * joined the claim looks again itself only after `kept`.
+ */
+type DeleteOutcome = 'gone' | 'kept';
+
+/** The delete of one file under way on this device — see {@link SyncEngine.deleteClaims}. */
+interface DeleteClaim {
+  readonly fileId: string;
+  /** The `opId` of the change whose handler sends the delete. */
+  readonly opId: string;
+  readonly done: Promise<DeleteOutcome>;
+  /** Resolve {@link done} (the first call counts) and drop the claim, if it is still the file's. */
+  end(outcome: DeleteOutcome): void;
+}
+
+/**
  * Where a local change comes from. A `queue` replay is held by the offline
  * queue itself — its entry stays until the drain marks it sent — so the
  * handler must not hold it a second time.
@@ -679,6 +698,30 @@ export class SyncEngine {
   private readonly ownDeletes = new Map<string, number>();
 
   /**
+   * Deletes of files under way on this device, by file id. The handler that
+   * sends one claims it before its first `await`, and the claim ends as soon
+   * as the file is out of the index — the delete acknowledged or queued — or
+   * the handler has found nothing to send. Another handler of the same file
+   * joins the claim instead of sending a delete of its own (see
+   * {@link joinDelete}).
+   *
+   * One file's delete comes to the engine several times. Obsidian 1.13.7
+   * reports a folder deleted with what is in it as a `delete` of every file
+   * and subfolder in it, in the order they were listed — a subfolder before
+   * its files — and of the folder last (`reconcileDeletion` in `app.js`), and
+   * the engine expands each folder into its files' deletes (see
+   * {@link handleLocalFolderDelete}); chokidar reports each file's `unlink`
+   * besides, before Obsidian's or after. Each of these sent a delete of its
+   * own, under an `opId` of its own: the first file of the folder and the
+   * files of each subfolder went to the server twice (2026-09-28, a folder of
+   * a note, two attachments and a subfolder), and so did `state.json`'s queue
+   * when offline. The server logs a delete of a tombstone like any other, and
+   * one that came late deleted the file a teammate had created again under
+   * the name meanwhile: the server gives it the deleted file's id.
+   */
+  private readonly deleteClaims = new Map<string, DeleteClaim>();
+
+  /**
    * Whether an operation under this device's client id that it did not send
    * was logged (see {@link reportTwin}).
    */
@@ -977,6 +1020,9 @@ export class SyncEngine {
     if (!this.hasStopped) {
       this.handOverHeldChanges();
       this.lifetime.abort(new EngineStoppedError());
+      // What was under way is queued now: a delete that joined one waits for
+      // nothing more (see `joinDelete`).
+      for (const claim of [...this.deleteClaims.values()]) claim.end('gone');
     }
     for (const cb of this.cleanups) cb();
     this.cleanups = [];
@@ -4066,13 +4112,22 @@ export class SyncEngine {
   }
 
   /**
-   * A whole folder was deleted in Obsidian. Obsidian emits a delete for each
-   * file in it and then one for the folder, but a child's can be missed — the
-   * watcher swallows it as the echo of this plugin's own write a moment
-   * before — and the chokidar `unlink` events for the children are unreliable
-   * under a burst of hundreds. So enumerate every indexed path under the
-   * folder and delete each one explicitly — that is what makes a folder
-   * delete propagate durably to the server.
+   * A whole folder was deleted in Obsidian. Obsidian 1.13.7 reports a
+   * `delete` of every file and subfolder in it, in the order they were
+   * listed — a subfolder before its files, a file renamed since after the
+   * rest — and then one of the folder (`reconcileDeletion` in `app.js`). A
+   * file's own event can still be missed — the watcher swallows it as the
+   * echo of this plugin's own write a moment before — and the chokidar
+   * `unlink` events for the children are unreliable under a burst of
+   * hundreds. So enumerate every indexed path under the folder and delete
+   * each one explicitly — that is what makes a folder delete propagate
+   * durably to the server.
+   *
+   * A file's own event may come before the folder's or after it, and so may
+   * its chokidar `unlink`; a subfolder's expansion takes its files before the
+   * folder's does. Each file's delete goes out once (see {@link deleteClaims}):
+   * a child whose delete is under way already is left to it, and an event of
+   * a child that comes after this one joins this one's.
    */
   private async handleLocalFolderDelete(folderPath: string): Promise<void> {
     if (!isInBinding(folderPath, this.binding.localFolder)) return;
@@ -4089,24 +4144,69 @@ export class SyncEngine {
       }
     }
     if (children.length === 0) return;
-    this.log.debug('folder delete → expanding', folderPath, `(${children.length} files)`);
     // Hold every child's delete up front. They go out one ack at a time, and
     // a `stop()` halfway through must queue the ones not sent yet — the next
     // catch-up would otherwise write them back to disk. Checked already: the
     // folder is gone, so none of them can still be on disk.
-    const held = children.map((path) => this.holdLocalDelete(path, { checked: true }));
+    //
+    // Claimed up front too, before the first `await`: an event of a child
+    // that comes after this one joins its delete. A child whose delete is
+    // claimed already — its own event came first, or its subfolder's — is
+    // neither held nor recorded here: held twice, `stop()` queued it twice,
+    // and it went out twice.
+    const held: HeldChange[] = [];
+    const claimed = new Map<HeldChange, DeleteClaim>();
+    const underWay: Array<{ path: string; claim: DeleteClaim }> = [];
+    for (const path of children) {
+      const fileId = this.fileIndex.byPath.get(path)?.fileId ?? '';
+      const claim = fileId === '' ? undefined : this.deleteClaims.get(fileId);
+      if (claim !== undefined) {
+        underWay.push({ path, claim });
+        continue;
+      }
+      const change = this.holdLocalDelete(path, { checked: true });
+      held.push(change);
+      if (fileId !== '') claimed.set(change, this.claimDelete(fileId, change.opId));
+    }
+    this.log.debug(
+      'folder delete → expanding',
+      folderPath,
+      `(${children.length} files, ${underWay.length} on their way already)`,
+    );
     const ahead = await this.recordDeletesAhead(held);
     try {
       for (const change of held) {
-        // Obsidian's delete of each child came before the folder's; a chokidar
-        // `unlink` of a child can still follow. Pre-mark each child so that
-        // echo is swallowed instead of dispatching a second, racing
-        // handleLocalDelete.
+        // Out of the index since: deleted or moved by a teammate meanwhile.
+        // Nothing to send, and nothing to look up — looked up in the
+        // server's listing, each such file cost a listing of the whole
+        // project.
+        if (this.fileIndex.byPath.get(change.filePath)?.fileId !== queuedFileId(change.payload)) {
+          this.releaseDelete(change);
+          claimed.get(change)?.end('gone');
+          continue;
+        }
+        // A chokidar `unlink` of a child can still follow. Pre-mark each
+        // child so that echo is swallowed instead of dispatching a second
+        // handleLocalDelete. Marked as its turn comes: a mark made ahead
+        // would take Obsidian's own event of a subfolder's file, which comes
+        // after the subfolder's, instead of the `unlink`.
         this.recentlyApplied.mark(change.filePath);
         await this.handleLocalDelete(change.filePath, change);
       }
+      for (const { path, claim } of underWay) {
+        if ((await claim.done) === 'gone') continue;
+        // Its handler found it still on disk, or gave up before sending: the
+        // folder is gone, so it is deleted from here.
+        if (!this.fileIndex.byPath.has(path)) continue;
+        this.recentlyApplied.mark(path);
+        await this.handleLocalDelete(path, this.holdLocalDelete(path, { checked: true }));
+      }
     } finally {
-      for (const change of held) this.settle(change);
+      for (const change of held) {
+        this.settle(change);
+        // Not reached: nothing went out for it, unless `stop()` has queued it.
+        claimed.get(change)?.end(this.hasStopped ? 'gone' : 'kept');
+      }
       // Recorded ahead and never sent: nothing went out for them.
       if (!this.hasStopped) {
         for (const opId of ahead) {
@@ -4211,107 +4311,216 @@ export class SyncEngine {
     );
   }
 
+  /**
+   * `change`: held by the caller (`null` for a queue replay). The delete is
+   * claimed before the first `await` (see {@link deleteClaims}): when another
+   * handler has claimed this file's already, this one joins it.
+   */
   private async sendLocalDelete(path: string, change: HeldChange | null): Promise<void> {
-    // Stale-delete guard: if the file is still on disk, the watcher
-    // event is almost certainly a stray chokidar `unlink` from an
-    // atomic-rename overwrite (the matching `add` lands a beat later).
-    // Without this check the engine emits `file:delete`, the server
-    // applies it, broadcasts `file:deleted` back, our applyServerDelete
-    // strips the path out of `fileIndex` — and the next watcher event
-    // then finds an empty index and dispatches a phantom `file:create`.
-    if (await this.vault.exists(path)) return;
-    const meta = this.fileIndex.byPath.get(path);
-    let fileId = meta?.fileId ?? '';
-    // Checked: from here on `stop()` hands it over as a plain DELETE.
-    if (change) change.payload = deletePayload(fileId, meta);
-    // The path may be absent from the local index (a folder-delete child, or
-    // a stale index). Resolve the id from the server's live file list before
-    // giving up — otherwise the DELETE is queued with an empty fileId and is
-    // later dropped as `no_file_id`, so the deletion never propagates.
-    // Not a name a file of the server's waits for (see `waitForName`): the
-    // file deleted here was another one, and the server's was never here.
-    if (!fileId && this.socket.isConnected() && this.waitingFor(path) === undefined) {
-      fileId = await this.resolveServerFileId(path);
-      this.throwIfStopped();
-    }
-    if (change) change.payload = deletePayload(fileId, meta);
-    if (fileId) this.deletedIds.add(fileId);
     const opId = change?.opId ?? newOpId();
-    if (this.canSendLive() && fileId) {
-      const sent = await this.sendOp(
-        {
-          opType: 'DELETE',
-          filePath: path,
-          newPath: null,
-          payload: deletePayload(fileId, meta),
-          opId,
-        },
-        (id) =>
-          this.emitDelete({
-            projectId: this.binding.projectId,
-            clientId: this.clientId,
-            opId: id,
-            vectorClock: this.bumpClock(),
-            fileId,
-            filePath: path,
-          }),
-        async (_ack, settle) => {
-          // Only what is still this file's: a note renamed onto the name here
-          // while the delete was on its way is recorded there at once (see
-          // `handleLocalRename`). Wiped unconditionally, its record went, its
-          // next save was uploaded as a new file, and its history was deleted.
-          if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
-            this.fileIndex.byId.delete(fileId);
-          }
-          this.forgetPath(this.operationLog, fileId, path);
-          settle();
-          // A concurrent remote yjs:update may have scheduled a debounced disk
-          // snapshot for this path: cancelled, or it would recreate the
-          // just-deleted file. The doc and its store go too: left in place,
-          // they were the history of the next note created under this name —
-          // the same teardown applyServerDelete does.
-          await this.dropDoc(this.docManager, fileId, path);
-          this.forgetWaiting(fileId);
-          await this.releaseName(path);
-        },
-      );
-      if (sent.kind === 'acked') return;
-      if (sent.kind === 'queued' && sent.entry !== null) {
-        // Back in the queue, as a delete made offline is queued.
-        const docState = await this.noteStateVector(meta);
-        if (docState !== null) {
-          this.operationLog.amendOperation(sent.entry.id, {
-            payload: { ...sent.entry.payload, [DOC_STATE]: docState },
-          });
-        }
+    const indexed = this.fileIndex.byPath.get(path)?.fileId ?? '';
+    const underWay = this.deleteClaimedByOther(indexed, opId);
+    if (underWay !== undefined) {
+      await this.joinDelete(path, change, underWay);
+      return;
+    }
+    let claim = indexed === '' ? null : this.claimDelete(indexed, opId);
+    let outcome: DeleteOutcome = 'kept';
+    try {
+      // Stale-delete guard: if the file is still on disk, the watcher
+      // event is almost certainly a stray chokidar `unlink` from an
+      // atomic-rename overwrite (the matching `add` lands a beat later).
+      // Without this check the engine emits `file:delete`, the server
+      // applies it, broadcasts `file:deleted` back, our applyServerDelete
+      // strips the path out of `fileIndex` — and the next watcher event
+      // then finds an empty index and dispatches a phantom `file:create`.
+      if (await this.vault.exists(path)) return;
+      const meta = this.fileIndex.byPath.get(path);
+      let fileId = meta?.fileId ?? '';
+      // Checked: from here on `stop()` hands it over as a plain DELETE.
+      if (change) change.payload = deletePayload(fileId, meta);
+      // The path may be absent from the local index (a folder-delete child, or
+      // a stale index). Resolve the id from the server's live file list before
+      // giving up — otherwise the DELETE is queued with an empty fileId and is
+      // later dropped as `no_file_id`, so the deletion never propagates.
+      // Not a name a file of the server's waits for (see `waitForName`): the
+      // file deleted here was another one, and the server's was never here.
+      if (!fileId && this.socket.isConnected() && this.waitingFor(path) === undefined) {
+        fileId = await this.resolveServerFileId(path);
+        this.throwIfStopped();
       }
-      // Queued, or refused for good (the server has no such file): gone here.
-      await this.forgetDeletedHere(fileId, path);
+      // Looked up in the listing, or another file's under the name since the
+      // claim: claimed now, before the next `await`.
+      if (fileId !== '' && claim?.fileId !== fileId) {
+        claim?.end('kept');
+        claim = null;
+        const taken = this.deleteClaimedByOther(fileId, opId);
+        if (taken !== undefined) {
+          await this.joinDelete(path, change, taken);
+          return;
+        }
+        claim = this.claimDelete(fileId, opId);
+      }
+      // From here on the delete is sent, queued, or there is none to make.
+      outcome = 'gone';
+      if (change) change.payload = deletePayload(fileId, meta);
+      if (fileId) this.deletedIds.add(fileId);
+      const sending = claim;
+      if (this.canSendLive() && fileId) {
+        const sent = await this.sendOp(
+          {
+            opType: 'DELETE',
+            filePath: path,
+            newPath: null,
+            payload: deletePayload(fileId, meta),
+            opId,
+          },
+          (id) =>
+            this.emitDelete({
+              projectId: this.binding.projectId,
+              clientId: this.clientId,
+              opId: id,
+              vectorClock: this.bumpClock(),
+              fileId,
+              filePath: path,
+            }),
+          async (_ack, settle) => {
+            // Only what is still this file's: a note renamed onto the name here
+            // while the delete was on its way is recorded there at once (see
+            // `handleLocalRename`). Wiped unconditionally, its record went, its
+            // next save was uploaded as a new file, and its history was deleted.
+            if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
+              this.fileIndex.byId.delete(fileId);
+            }
+            this.forgetPath(this.operationLog, fileId, path);
+            settle();
+            // Out of the index: a delete of the file from now on is another
+            // one — the server gives a file created under the name again the
+            // deleted one's id.
+            sending?.end('gone');
+            // A concurrent remote yjs:update may have scheduled a debounced disk
+            // snapshot for this path: cancelled, or it would recreate the
+            // just-deleted file. The doc and its store go too: left in place,
+            // they were the history of the next note created under this name —
+            // the same teardown applyServerDelete does.
+            await this.dropDoc(this.docManager, fileId, path);
+            this.forgetWaiting(fileId);
+            await this.releaseName(path);
+          },
+        );
+        if (sent.kind === 'acked') return;
+        if (sent.kind === 'queued' && sent.entry !== null) {
+          // Back in the queue, as a delete made offline is queued.
+          const docState = await this.noteStateVector(meta);
+          if (docState !== null) {
+            this.operationLog.amendOperation(sent.entry.id, {
+              payload: { ...sent.entry.payload, [DOC_STATE]: docState },
+            });
+          }
+        }
+        // Queued, or refused for good (the server has no such file): gone here.
+        await this.forgetDeletedHere(fileId, path, sending);
+        this.forgetWaiting(fileId);
+        await this.releaseName(path);
+        return;
+      }
+      if (!fileId) {
+        // No live server file at this path (already deleted, or never synced).
+        // Nothing to propagate — but log it rather than silently swallowing a
+        // delete that couldn't be resolved.
+        this.log.debug('local delete: no server fileId, nothing to propagate', path);
+        return;
+      }
+      const docState = await this.noteStateVector(meta);
+      this.queue(
+        'DELETE',
+        path,
+        null,
+        {
+          ...deletePayload(fileId, meta),
+          ...(docState !== null ? { [DOC_STATE]: docState } : {}),
+        },
+        opId,
+      );
+      await this.forgetDeletedHere(fileId, path, sending);
       this.forgetWaiting(fileId);
       await this.releaseName(path);
-      return;
+    } finally {
+      claim?.end(outcome);
     }
-    if (!fileId) {
-      // No live server file at this path (already deleted, or never synced).
-      // Nothing to propagate — but log it rather than silently swallowing a
-      // delete that couldn't be resolved.
-      this.log.debug('local delete: no server fileId, nothing to propagate', path);
-      return;
+  }
+
+  /**
+   * Another handler is deleting the file at `path` (see {@link deleteClaims}):
+   * this delete is that one, and waits for it. Only when nothing went out for
+   * it — the file was still on disk when that handler looked — does this one
+   * look again, as a delete of its own.
+   */
+  private async joinDelete(
+    path: string,
+    change: HeldChange | null,
+    claim: DeleteClaim,
+  ): Promise<void> {
+    // Let go at once: held by both, `stop()` queued both, and both went out.
+    this.releaseDelete(change);
+    this.log.debug('local delete: already on its way', path);
+    if ((await claim.done) === 'gone') return;
+    const again =
+      change === null
+        ? null
+        : this.holdLocalDelete(path, { checked: change.payload[RECHECK_DELETE] !== true });
+    try {
+      await this.sendLocalDelete(path, again);
+    } finally {
+      this.settle(again);
     }
-    const docState = await this.noteStateVector(meta);
-    this.queue(
-      'DELETE',
-      path,
-      null,
-      {
-        ...deletePayload(fileId, meta),
-        ...(docState !== null ? { [DOC_STATE]: docState } : {}),
-      },
+  }
+
+  /**
+   * Let go of the held delete `change`: nothing goes out for it, not even
+   * from the queue after `stop()` — nor for the record of it in flight a
+   * folder delete made ahead (see {@link recordDeletesAhead}). Left there,
+   * `stop()` put it in the queue, and the next connect sent it under a new
+   * `opId`.
+   */
+  private releaseDelete(change: HeldChange | null): void {
+    if (change === null) return;
+    this.settle(change);
+    if (this.sending.has(change.opId)) return;
+    if (this.operationLog.clearInFlight(this.binding.id, change.opId)) {
+      this.inflightHere.delete(change.opId);
+    }
+  }
+
+  /**
+   * Claim the delete of `fileId` for the change `opId` (see
+   * {@link deleteClaims}): the claim it has already, if any.
+   */
+  private claimDelete(fileId: string, opId: string): DeleteClaim {
+    const known = this.deleteClaims.get(fileId);
+    if (known !== undefined && known.opId === opId) return known;
+    let resolve!: (outcome: DeleteOutcome) => void;
+    const done = new Promise<DeleteOutcome>((r) => {
+      resolve = r;
+    });
+    const claim: DeleteClaim = {
+      fileId,
       opId,
-    );
-    await this.forgetDeletedHere(fileId, path);
-    this.forgetWaiting(fileId);
-    await this.releaseName(path);
+      done,
+      end: (outcome) => {
+        if (this.deleteClaims.get(fileId) === claim) this.deleteClaims.delete(fileId);
+        resolve(outcome);
+      },
+    };
+    this.deleteClaims.set(fileId, claim);
+    return claim;
+  }
+
+  /** The claim on the delete of `fileId` held for another change than `opId`, if any. */
+  private deleteClaimedByOther(fileId: string, opId: string): DeleteClaim | undefined {
+    if (fileId === '') return undefined;
+    const claim = this.deleteClaims.get(fileId);
+    return claim !== undefined && claim.opId !== opId ? claim : undefined;
   }
 
   /**
@@ -4326,13 +4535,21 @@ export class SyncEngine {
    * the name meanwhile (Obsidian reuses "Untitled") was folded into the
    * deleted one's doc — its text went to the server as the deleted note's,
    * and the new note itself was never uploaded.
+   *
+   * `claim`, the delete's (see {@link deleteClaims}), ends as the file leaves
+   * the index.
    */
-  private async forgetDeletedHere(fileId: string, path: string): Promise<void> {
+  private async forgetDeletedHere(
+    fileId: string,
+    path: string,
+    claim: DeleteClaim | null,
+  ): Promise<void> {
     await this.commitLocal(async (io) => {
       if (this.fileIndex.byId.get(fileId)?.relativePath === path) {
         this.fileIndex.byId.delete(fileId);
       }
       this.forgetPath(io.log, fileId, path);
+      claim?.end('gone');
       await this.dropDoc(io.docs, fileId, path);
     });
   }
@@ -5469,11 +5686,12 @@ export class SyncEngine {
   /**
    * Whether the user has deleted file `fileId` at `path` here and the delete
    * is under way: held (a folder delete holds every file of the folder, and
-   * sends one at a time), or sent and not acknowledged yet. Once acknowledged
-   * or queued, the file is out of the index.
+   * sends one at a time), claimed (see {@link deleteClaims}), or sent and not
+   * acknowledged yet. Once acknowledged or queued, the file is out of the
+   * index.
    */
   private deletingHere(fileId: string, path: string): boolean {
-    if (this.ownDeletes.has(fileId)) return true;
+    if (this.ownDeletes.has(fileId) || this.deleteClaims.has(fileId)) return true;
     for (const change of this.held) {
       if (change.opType === 'DELETE' && change.filePath === path) return true;
     }
