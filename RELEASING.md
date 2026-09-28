@@ -78,12 +78,25 @@ the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
 `project:join` answer). For such a release:
 
 - Deploy the server first: tag the plugin only once production runs it.
-  0.4.0 connected to an older server sends nothing and reports
-  `server_outdated`.
-- Then release the plugin without delay. The server of 0.4.0 refuses the
-  file operations of older plugins (`invalid_op_id`, an error they retry):
-  their new files, renames, moves, deletes and attachment uploads wait in
-  their offline queue until they update. Edits of notes' text still sync.
+  0.4.0 connected to an older server reports `server_outdated` and stops
+  sending: with nothing queued, from the answer to its join; with changes
+  queued, after about a minute and a half — it asks `ops:status` first,
+  which an older server never answers, then joins without catch-up
+  (`skipOperations`, `skipYjsCatchup`) to read `opIdempotency`. A change
+  made while that first join is on its way (well under a second) can still
+  reach the older server, which applies it once.
+- Then release the plugin without delay, and have every device updated
+  right after. The server of 0.4.0 refuses the file operations of older
+  plugins (`invalid_op_id`, an error they retry): their new files, renames,
+  moves, deletes and attachment uploads wait in their offline queue until
+  they update. Edits of notes' text still sync.
+- Until every device runs 0.4.0, tell the team not to answer the "Content
+  conflict" prompt of an attachment or canvas with **Keep local** on a
+  device still on 0.3.9 — **Keep both** instead. 0.3.9 doesn't read the
+  answer to that one upload: refused, it is not queued, the version is
+  recorded as synced anyway, and the teammate's next version replaces it
+  without a prompt. The chosen version is then lost for good, updating the
+  device doesn't bring it back.
 - Say so at the top of the version's `CHANGELOG.md` section, under
   **Changed**, and in the README's **Server version** note.
 - A change 0.3.9 queued has no operation id; 0.4.0 gives it one when it
@@ -91,7 +104,7 @@ the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
   0.3.9 had sent). One the old server applied while its answer was lost can
   therefore reach the server once more — the risk 0.3.9 had anyway. What
   0.3.9 queued after the server update was refused, never applied, and is
-  safe.
+  safe; its **Keep local** above never reached the queue.
 
 Going back from 0.4.0 to 0.3.9 is safe only in the same state: 0.3.9 drops
 the operations 0.4.0 keeps in flight in `state.json` (`inflight`) and knows

@@ -11,16 +11,23 @@ uses [Semantic Versioning](https://semver.org/).
 - **This version needs the Team Vault server updated first.** Every change to
   a file — a new note or attachment, an attachment saved again, a rename, a
   move, a delete — now goes to the server under an operation id, and the
-  server applies each id once. A server without operation ids gets nothing
-  from this version: the status bar shows an error, the notice and `sync.log`
-  say `server_outdated`, and your changes wait in the offline queue until the
-  server is updated. The updated server, in turn, keeps the file changes of
-  older versions — new files, renames, moves, deletes, attachment uploads —
-  waiting in their offline queue until they update (edits of a note's text
-  still sync), so update every device soon after the server; what they
-  queued goes out then. Going back to 0.3.9 is safe only while nothing waits
-  to go out (the status bar says **Synced**): 0.3.9 doesn't know the changes
-  this version has on their way.
+  server applies each id once. This version stops sending to a server
+  without operation ids: the status bar shows an error, the notice and
+  `sync.log` say `server_outdated` (with changes waiting in the queue, after
+  about a minute and a half: this version first asks the server about them,
+  and an older server never answers), and your changes wait in the offline
+  queue until the server is updated. The updated server, in turn, refuses the file
+  changes of older versions — new files, renames, moves, deletes, attachment
+  uploads — and they wait in their offline queue until they update (edits of
+  a note's text still sync), so update every device soon after the server;
+  what they queued goes out then. One answer is lost instead: **Keep local**
+  in the "Content conflict" prompt of an attachment or canvas, chosen in
+  0.3.9 once the server is updated. 0.3.9 records your version as synced
+  though the server refused it, and doesn't queue it; the teammate's next
+  version then replaces yours without a prompt. Until a device runs 0.4.0,
+  answer that prompt there with **Keep both**. Going back to 0.3.9 is safe
+  only while nothing waits to go out (the status bar says **Synced**): 0.3.9
+  doesn't know the changes this version has on their way.
 - **Two empty notes created under one name at the same moment are two
   notes.** When you and a teammate both made an `Untitled.md` (Obsidian's new
   note) within a moment of each other, the server took the second for the

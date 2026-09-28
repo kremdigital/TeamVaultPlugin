@@ -265,8 +265,20 @@ export class OperationLog {
   private generation = 0;
   /** The {@link generation} the last successful write put on disk. */
   private writtenGeneration = 0;
-  /** Operations in flight by `opId`: the {@link generation} that recorded them. */
-  private readonly inflightGeneration = new Map<string, number>();
+  /**
+   * Operations queued or in flight by `opId`: the {@link generation} that
+   * gave the entry its `opId` — 0 for one loaded with it from the disk. See
+   * {@link queuedWritten}; an `opId` missing here is taken for one not on
+   * disk.
+   */
+  private readonly opIdGeneration = new Map<string, number>();
+  /**
+   * The {@link generation} of the `opId`s {@link hydrate} gave a queue of an
+   * older build; 0 when it gave none. Written by the next write, or by the
+   * first {@link persistNow} — the file is not rewritten only because it was
+   * read.
+   */
+  private givenGeneration = 0;
   private closed = false;
 
   constructor(options: OperationLogOptions = {}) {
@@ -351,6 +363,7 @@ export class OperationLog {
     // The queue is the one part of the log that can't be reconstructed from
     // the server, so it doesn't wait out the debounce.
     this.touch({ immediate: true });
+    this.opIdGeneration.set(entry.opId, this.generation);
     return copyOf(entry);
   }
 
@@ -366,7 +379,7 @@ export class OperationLog {
     const entry = this.entryOf(bindingId, op);
     this.bucket(bindingId).inflight.push(entry);
     this.touch({ immediate: true });
-    this.inflightGeneration.set(entry.opId, this.generation);
+    this.opIdGeneration.set(entry.opId, this.generation);
     return copyOf(entry);
   }
 
@@ -379,7 +392,24 @@ export class OperationLog {
   inFlightWritten(bindingId: string, opId: string): boolean {
     if (!this.isInFlight(bindingId, opId)) return false;
     if (!this.persistent) return true;
-    const recorded = this.inflightGeneration.get(opId);
+    const recorded = this.opIdGeneration.get(opId);
+    return recorded !== undefined && recorded <= this.writtenGeneration;
+  }
+
+  /**
+   * Whether queued operation `opId` is on disk under this `opId` already:
+   * loaded so, or a write that began after it got the id went through. The
+   * drain sends such an entry without a write of its own — before, each one
+   * waited for a whole `state.json` write, one after another. `false` when a
+   * newer instance of the plugin has the file: {@link persistNow} says so.
+   */
+  queuedWritten(bindingId: string, opId: string): boolean {
+    if (!(this.bindings.get(bindingId)?.pending.some((op) => op.opId === opId) ?? false)) {
+      return false;
+    }
+    if (!this.persistent) return true;
+    if (!this.ownsFile()) return false;
+    const recorded = this.opIdGeneration.get(opId);
     return recorded !== undefined && recorded <= this.writtenGeneration;
   }
 
@@ -393,7 +423,7 @@ export class OperationLog {
     const at = bucket?.inflight.findIndex((op) => op.opId === opId) ?? -1;
     if (!bucket || at < 0) return false;
     bucket.inflight.splice(at, 1);
-    this.inflightGeneration.delete(opId);
+    this.opIdGeneration.delete(opId);
     this.touch();
     return true;
   }
@@ -414,10 +444,15 @@ export class OperationLog {
     if (!bucket || at < 0) return null;
     const [entry] = bucket.inflight.splice(at, 1);
     if (!entry) return null;
-    this.inflightGeneration.delete(opId);
-    if (opts.rotate === true) entry.opId = newOpId();
+    // Not rotated, it is on disk as soon as its record in flight is: a load
+    // puts what was in flight back in the queue.
+    if (opts.rotate === true) {
+      this.opIdGeneration.delete(opId);
+      entry.opId = newOpId();
+    }
     insertById(bucket.pending, entry);
     this.touch({ immediate: true });
+    if (opts.rotate === true) this.opIdGeneration.set(entry.opId, this.generation);
     return copyOf(entry);
   }
 
@@ -448,8 +483,10 @@ export class OperationLog {
   rotateOpId(bindingId: string, entryId: number): string {
     const entry = this.bindings.get(bindingId)?.pending.find((op) => op.id === entryId);
     if (!entry) return '';
+    this.opIdGeneration.delete(entry.opId);
     entry.opId = newOpId();
     this.touch({ immediate: true });
+    this.opIdGeneration.set(entry.opId, this.generation);
     return entry.opId;
   }
 
@@ -480,6 +517,10 @@ export class OperationLog {
     };
     bucket.pending[at] = entry;
     this.touch({ immediate: true });
+    if (entry.opId !== old.opId) {
+      this.opIdGeneration.delete(old.opId);
+      this.opIdGeneration.set(entry.opId, this.generation);
+    }
     return copyOf(entry);
   }
 
@@ -556,9 +597,13 @@ export class OperationLog {
     const drop = new Set(entryIds);
     let removed = false;
     for (const bucket of this.bindings.values()) {
-      const before = bucket.pending.length;
-      bucket.pending = bucket.pending.filter((op) => !drop.has(op.id));
-      if (bucket.pending.length !== before) removed = true;
+      const kept: PendingOperation[] = [];
+      for (const op of bucket.pending) {
+        if (!drop.has(op.id)) kept.push(op);
+        else this.opIdGeneration.delete(op.opId);
+      }
+      if (kept.length !== bucket.pending.length) removed = true;
+      bucket.pending = kept;
     }
     if (removed) this.touch({ immediate: true });
   }
@@ -727,6 +772,7 @@ export class OperationLog {
       fileMeta: bucket.files.size,
       bindingsState: bucket.state ? 1 : 0,
     };
+    for (const op of [...bucket.pending, ...bucket.inflight]) this.opIdGeneration.delete(op.opId);
     this.bindings.delete(bindingId);
     this.touch({ immediate: true });
     return result;
@@ -784,6 +830,8 @@ export class OperationLog {
       window.clearTimeout(this.timer);
       this.timer = null;
     }
+    // Ids given at load, not on disk yet: one of them may be about to go out.
+    if (this.givenGeneration > this.writtenGeneration) this.dirty = true;
     if (this.dirty) this.chain = this.chain.then(() => this.writeOnce());
     const written = await this.chain;
     if (!this.ownsFile()) throw new StateNotWrittenError('taken_over');
@@ -958,6 +1006,8 @@ export class OperationLog {
     /** Queue entries of a 0.3.x build that had gone out, answered or not. */
     let legacySent = 0;
     const opIds = new Set<string>();
+    /** The `opId`s given here: not on disk until the next write. */
+    const given: string[] = [];
     for (const [bindingId, rawBucket] of Object.entries(bindings)) {
       if (!isRecord(rawBucket)) continue;
       const bucket = this.bucket(bindingId);
@@ -975,7 +1025,12 @@ export class OperationLog {
         // A queue written before operation ids, or an id seen twice: a new
         // one. The server has never seen it, so the operation is sent again
         // as the 0.3.x build would have sent it.
-        if (!isOpId(op.opId) || opIds.has(op.opId)) op.opId = newOpId();
+        if (!isOpId(op.opId) || opIds.has(op.opId)) {
+          op.opId = newOpId();
+          given.push(op.opId);
+        } else {
+          this.opIdGeneration.set(op.opId, 0);
+        }
         opIds.add(op.opId);
         if (stripLegacySentFields(op.payload)) legacySent += 1;
         bucket.pending.push(op);
@@ -1022,6 +1077,14 @@ export class OperationLog {
     }
 
     this.nextOpId = Math.max(toNumber(doc.nextOpId, 1), maxId + 1);
+    if (given.length > 0) {
+      // Written with the next write, or by the `persistNow` before one of
+      // them goes out: an id sent before it reached the disk would be a new
+      // one again after a restart, and the server would apply it twice.
+      this.generation += 1;
+      this.givenGeneration = this.generation;
+      for (const opId of given) this.opIdGeneration.set(opId, this.generation);
+    }
     if (legacySent > 0) {
       // Their answers were lost to a 0.3.x build: the server may have applied
       // them, and they go out once more under new ids (the risk 0.3.x had).

@@ -213,6 +213,29 @@ function askedAboutCopy(h: Harness): number {
 }
 
 /**
+ * The server answers what the engine sends, and the docs it asks for, until
+ * `done()` holds (a bounded number of rounds).
+ */
+async function serveUntil(b: Bench, done: () => boolean): Promise<void> {
+  for (let round = 0; round < 30 && !done(); round++) {
+    await b.server.pump(100);
+    await b.h.settle();
+    b.docs.absorb();
+    b.docs.answerFetches();
+    await flushAsync(10);
+  }
+}
+
+/** Wait, in real time, until `done()` holds; fails after `ms`. */
+async function until(done: () => boolean, ms = 5_000): Promise<void> {
+  const end = Date.now() + ms;
+  while (!done()) {
+    if (Date.now() > end) throw new Error('timed out waiting');
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  }
+}
+
+/**
  * The user renames `from` in Obsidian; resolves once its rename is out, not
  * answered yet (unlike `userRename`, whose settling lets the server answer).
  */
@@ -340,6 +363,73 @@ describe('SyncEngine — an operation is on disk before it goes out', () => {
     appliedOnce(b.server);
     await b.h.engine.stop();
   });
+
+  it('drains a queue on disk already without waiting for a write before each entry', async () => {
+    const N = 20;
+    const seed: Array<[string, string, string]> = [];
+    for (let i = 0; i < N; i++) seed.push([`n${i}.md`, `f${i}`, `n${i}\n`]);
+    const b = await online(seed);
+    b.h.socket().disconnect();
+    await flushAsync();
+    for (let i = 0; i < N; i++) await userRename(b.h, `n${i}.md`, `m${i}.md`);
+    expect(queue(b.h)).toHaveLength(N);
+    const joins = joinsOf(b.h);
+    b.h.socket().connect();
+    // Asked about and voided: under their new ids on disk before the join.
+    const join = await nextJoin(b.h, joins);
+    const onDisk = stateOpIds(b.storage.state());
+    expect(onDisk).toHaveLength(N);
+
+    // The disk is slow from here on: no write lands until released.
+    const release = b.storage.holdWrites();
+    join.ack(b.server.joinAnswer('whole journal', { yjsDocs: b.docs.snapshots() }));
+    const renames = (): Emit[] => b.h.socket().emits.filter((e) => e.event === 'file:rename');
+    await serveUntil(b, () => renames().length === N && b.server.applied.length === N);
+    expect(renames().map(opIdOf).sort()).toEqual([...onDisk].sort());
+    expect(b.server.applied).toHaveLength(N);
+    release();
+    await b.h.log.persistNow();
+    expect(queue(b.h)).toEqual([]);
+    expect(stateOpIds(b.storage.state())).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  }, 120_000);
+
+  it('does not send a queued operation before its opId is on disk', async () => {
+    const b = await online();
+    b.h.socket().disconnect();
+    await flushAsync();
+    const joins = joinsOf(b.h);
+    b.h.socket().connect();
+    const join = await nextJoin(b.h, joins);
+    // Created while the join is on its way — queued: the index can't tell a
+    // new file yet — and the disk is slow.
+    const release = b.storage.holdWrites();
+    b.h.vault.files.set('N.md', encode('n\n'));
+    await b.h.engine.handleVaultEvent(event('create', 'N.md'));
+    expect(queue(b.h)).toEqual(['CREATE N.md']);
+    const onDiskAtEmit: boolean[] = [];
+    const socket = b.h.socket();
+    const emit = socket.emit.bind(socket);
+    socket.emit = (name: string, ...args: unknown[]) => {
+      if (name.startsWith('file:')) {
+        const opId = String((args[0] as { opId?: unknown }).opId);
+        onDiskAtEmit.push(stateOpIds(b.storage.state()).includes(opId));
+      }
+      return emit(name, ...args);
+    };
+
+    join.ack(b.server.joinAnswer('whole journal', { yjsDocs: b.docs.snapshots() }));
+    await flushAsync(40);
+    expect(sent(b.h)).toEqual([]);
+    release();
+    await b.docs.drive();
+    expect(onDiskAtEmit).toEqual([true]);
+    expect(b.server.applied).toEqual(['create N.md']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
 });
 
 // -- Answers lost: the next connect asks -----------------------------------------
@@ -434,11 +524,15 @@ describe('SyncEngine — an operation whose answer was lost, settled at the next
         e.ack({ ok: false, error: 'busy' });
       },
     });
+    const details: Array<string | undefined> = [];
+    h.engine.onStatus((_status, detail) => details.push(detail));
     await h.engine.start();
     await flushAsync(40);
     expect(asked).toBe(4);
     expect(h.engine.getStatus()).toBe('error');
     expect(h.statuses.at(-1)).toBe('error');
+    expect(details.at(-1)).toBe('ops_status_failed');
+    // A server that answers is one that has the question: no join asks it.
     expect(joinsOf(h)).toBe(0);
     await h.engine.stop();
   });
@@ -545,6 +639,54 @@ describe('SyncEngine — an operation whose answer was lost, settled at the next
     expect(disk(b.h)).toEqual(['b.md=a\n', 'y.md=x\n']);
     appliedOnce(b.server);
     await b.h.engine.stop();
+  });
+
+  it('has its counter moved up in every state.json that no longer holds the entry it settled', async () => {
+    const b = await online([['x.md', 'f1', 'x\n']]);
+    loseAck(await renameOut(b, 'x.md', 'y.md'));
+    b.h.socket().disconnect();
+    expect(b.server.serveNext()).toBe(true);
+    await flushAsync(20);
+    const counter =
+      b.server.journal.find((row) => row.clientId === 'device-1')?.vectorClock['device-1'] ?? 0;
+    expect(counter).toBeGreaterThan(0);
+
+    // Each state.json the settle writes; the first one without the entry is
+    // what the process leaves when it ends right then.
+    const written: Array<{ entries: number; own: number }> = [];
+    let ended: FakeStorage | null = null;
+    b.storage.onState = (state): void => {
+      const entries = stateOpIds(state).length;
+      written.push({ entries, own: state.bindings['b1']?.state?.lastVectorClock['device-1'] ?? 0 });
+      if (entries === 0 && ended === null) ended = b.storage.snapshot();
+    };
+    const joins = joinsOf(b.h);
+    b.h.socket().connect();
+    await nextJoin(b.h, joins);
+    b.storage.onState = null;
+    expect(written.filter((s) => s.entries === 0)).not.toEqual([]);
+    for (const state of written.filter((s) => s.entries === 0)) {
+      expect(state.own).toBeGreaterThanOrEqual(counter);
+    }
+
+    // Started from that disk: the catch-up does not bring the rename back as
+    // one of another device under this device's id.
+    const { next } = await restartFromDisk(b.h, ended ?? b.storage, {
+      server: b.server,
+      docs: b.docs,
+    });
+    const before = joinsOf(next);
+    await next.engine.start();
+    const join = await nextJoin(next, before);
+    const clock = joinClockOf(next);
+    expect(clock['device-1']).toBeGreaterThanOrEqual(counter);
+    expect(b.server.catchupFor(clock).filter((row) => row.clientId === 'device-1')).toEqual([]);
+    join.ack(b.server.joinAnswer('whole journal', { clock, yjsDocs: b.docs.snapshots() }));
+    await b.docs.drive();
+    expect(disk(next)).toEqual(['y.md=x\n']);
+    expect(queue(next)).toEqual([]);
+    appliedOnce(b.server);
+    await next.engine.stop();
   });
 });
 
@@ -982,25 +1124,106 @@ describe('SyncEngine — answers to questions whose sending was cut short', () =
 // -- A server that does not keep operations idempotent --------------------------------
 
 describe('SyncEngine — a server without opIdempotency', () => {
-  it('reports server_outdated and sends nothing; changes wait in the queue', async () => {
-    const storage = new FakeStorage();
-    const log = await logOn(storage);
+  /**
+   * An engine whose queue holds a delete of `a.md`, against a server that
+   * `answer`s each `ops:status` — one older than the question never does: it
+   * has no handler for it.
+   */
+  async function queuedAgainst(answer: (e: Emit) => void = () => undefined): Promise<{
+    h: Harness;
+    details: Array<string | undefined>;
+    asked: () => number;
+  }> {
+    const log = await logOn(new FakeStorage());
     log.enqueueOperation('b1', { opType: 'DELETE', filePath: 'a.md', payload: { fileId: 'f1' } });
-    const h = buildHarness({ log });
+    let asked = 0;
+    const h = buildHarness({
+      log,
+      opsStatusRetryMs: [0, 0, 0],
+      opsStatusTimeoutMs: 5,
+      statusResponder: (e) => {
+        asked += 1;
+        answer(e);
+      },
+    });
     const details: Array<string | undefined> = [];
     h.engine.onStatus((_status, detail) => details.push(detail));
+    return { h, details, asked: () => asked };
+  }
+
+  function isProbe(e: Emit): boolean {
+    const p = e.payload as { skipOperations?: unknown; skipYjsCatchup?: unknown };
+    return e.event === 'project:join' && p.skipOperations === true && p.skipYjsCatchup === true;
+  }
+
+  it('with changes queued: asks ops:status, then tells by a join without catch-up; sends nothing', async () => {
+    const { h, details, asked } = await queuedAgainst();
     await h.engine.start();
-    (await nextJoin(h, 0)).ack({ ok: true, operations: [], yjsDocs: [], opIdempotency: undefined });
+    await until(() => joinsOf(h) === 1);
+    expect(asked()).toBe(4);
+    const probe = await nextJoin(h, 0);
+    expect(isProbe(probe)).toBe(true);
+    probe.ack({ ok: true, operations: [], yjsSkipped: true, opIdempotency: undefined });
     await flushAsync(20);
     expect(h.engine.getStatus()).toBe('error');
-    expect(h.statuses.at(-1)).toBe('error');
     expect(details.at(-1)).toBe('server_outdated');
+
+    // A change made now waits too.
     h.vault.files.set('n.md', encode('n\n'));
     await h.engine.handleVaultEvent(event('create', 'n.md'));
     await flushAsync(20);
     expect(h.socket().emits.map((e) => e.event)).toEqual(['project:join']);
     expect(queue(h)).toEqual(['DELETE a.md', 'CREATE n.md']);
     await h.engine.stop();
+  });
+
+  it('leaves the room of a server that has ops:status and answered no try: ops_status_failed', async () => {
+    const { h, details } = await queuedAgainst();
+    await h.engine.start();
+    await until(() => joinsOf(h) === 1);
+    (await nextJoin(h, 0)).ack({ ok: true, operations: [], yjsSkipped: true });
+    await flushAsync(20);
+    expect(details.at(-1)).toBe('ops_status_failed');
+    expect(h.socket().emits.map((e) => e.event)).toEqual(['project:join', 'project:leave']);
+    expect(h.socket().inRoom).toBe(false);
+    expect(queue(h)).toEqual(['DELETE a.md']);
+    await h.engine.stop();
+  });
+
+  it('reports the refusal of ops:status as the join would: project_not_found, no join', async () => {
+    const { h, details, asked } = await queuedAgainst((e) =>
+      e.ack({ ok: false, error: 'project_not_found' }),
+    );
+    await h.engine.start();
+    await until(() => h.engine.getStatus() === 'error');
+    expect(asked()).toBe(1);
+    expect(details.at(-1)).toBe('project_not_found');
+    expect(joinsOf(h)).toBe(0);
+    expect(queue(h)).toEqual(['DELETE a.md']);
+    await h.engine.stop();
+  });
+
+  it('with nothing queued: tells by the join, and sends nothing after its answer', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    b.h.socket().disconnect();
+    await flushAsync();
+    const joins = joinsOf(b.h);
+    b.h.socket().connect();
+    const join = await nextJoin(b.h, joins);
+    const details: Array<string | undefined> = [];
+    b.h.engine.onStatus((_status, detail) => details.push(detail));
+    join.ack({ ...b.server.joinAnswer('whole journal'), opIdempotency: undefined });
+    await flushAsync(40);
+    expect(details.at(-1)).toBe('server_outdated');
+    // Nothing asked with nothing queued: an older server never answers.
+    expect(b.h.socket().statusQueries).toEqual([]);
+    const out = sent(b.h).length;
+    await userRename(b.h, 'a.md', 'b.md');
+    await flushAsync(20);
+    expect(sent(b.h).slice(out)).toEqual([]);
+    expect(queue(b.h)).toEqual(['RENAME a.md -> b.md']);
+    expect(b.server.applied).toEqual([]);
+    await b.h.engine.stop();
   });
 });
 

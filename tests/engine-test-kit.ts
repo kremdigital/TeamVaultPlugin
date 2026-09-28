@@ -490,6 +490,11 @@ export class FakeSocket implements SocketLike {
         answer(response);
       };
       this.emits.push(join);
+    } else if (event === 'project:leave') {
+      // Out of the room: the server's broadcasts no longer reach the socket.
+      this.inRoom = false;
+      this.emits.push({ event, payload: args[0], ack, seq });
+      ack({ ok: true });
     } else {
       this.emits.push({ event, payload: args[0], ack, seq });
     }
@@ -684,6 +689,8 @@ export interface HarnessOptions {
   statusResponder?: (e: Emit) => void;
   /** The engine's pauses before it asks `ops:status` again (`SyncEngineDeps.opsStatusRetryMs`). */
   opsStatusRetryMs?: readonly number[];
+  /** How long each `ops:status` waits for its answer (`SyncEngineDeps.opsStatusTimeoutMs`). */
+  opsStatusTimeoutMs?: number;
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -805,6 +812,9 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     diskSnapshotDebounceMs: opts.diskSnapshotDebounceMs ?? 0,
     ...(opts.logger ? { logger: opts.logger } : {}),
     ...(opts.opsStatusRetryMs ? { opsStatusRetryMs: opts.opsStatusRetryMs } : {}),
+    ...(opts.opsStatusTimeoutMs !== undefined
+      ? { opsStatusTimeoutMs: opts.opsStatusTimeoutMs }
+      : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));
 
@@ -2162,7 +2172,8 @@ export const STATE_PATH = '.obsidian/plugins/team-vault/state.json';
  * `LogStorage` of an in-memory disk: a file holds what the last completed
  * write left there. {@link snapshot} is the disk as it is now — what the next
  * start of Obsidian would find, whatever the process still holds in memory.
- * `failWrites` makes every write fail (a full disk).
+ * `failWrites` makes every write fail (a full disk); {@link holdWrites} keeps
+ * every write on its way until released (a slow disk).
  */
 export class FakeStorage implements LogStorage {
   readonly files = new Map<string, string>();
@@ -2171,6 +2182,24 @@ export class FakeStorage implements LogStorage {
   failWrites = false;
   /** Called with each `state.json` as it lands on the disk (see {@link states}). */
   onState: ((state: StoredState) => void) | null = null;
+  /** While set, a write waits for it (see {@link holdWrites}). */
+  private held: Promise<void> | null = null;
+
+  /**
+   * From now on each write stays on its way — started, not landed — until the
+   * function returned is called; then they land in the order they began.
+   */
+  holdWrites(): () => void {
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    this.held = held;
+    return () => {
+      if (this.held === held) this.held = null;
+      release();
+    };
+  }
 
   exists(path: string): Promise<boolean> {
     return Promise.resolve(this.files.has(path));
@@ -2186,8 +2215,12 @@ export class FakeStorage implements LogStorage {
   }
   write(path: string, data: string): Promise<void> {
     if (this.failWrites) return Promise.reject(new Error('ENOSPC'));
-    this.files.set(path, data);
-    this.noteState(path);
+    const land = (): void => {
+      this.files.set(path, data);
+      this.noteState(path);
+    };
+    if (this.held !== null) return this.held.then(land);
+    land();
     return Promise.resolve();
   }
   rename(from: string, to: string): Promise<void> {

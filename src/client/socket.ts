@@ -668,6 +668,22 @@ export class SocketClient {
     });
   }
 
+  /**
+   * A `project:join` that brings no catch-up (`skipOperations`,
+   * `skipYjsCatchup`, as the web editor joins): only its answer — whether the
+   * project is there for this user, and whether the server keeps operations
+   * idempotent (`opIdempotency`). The socket is in the project's room after
+   * it, as after any join: {@link leaveProject} takes it out.
+   */
+  probeProject(projectId: string): Promise<JoinResult> {
+    return this.emitWithAck<JoinResult>('project:join', {
+      projectId,
+      sinceVectorClock: null,
+      skipOperations: true,
+      skipYjsCatchup: true,
+    });
+  }
+
   leaveProject(projectId: string): Promise<{ ok: true }> {
     return this.emitWithAck<{ ok: true }>('project:leave', { projectId });
   }

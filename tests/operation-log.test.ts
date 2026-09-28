@@ -917,7 +917,9 @@ function opIdOf(n: number): string {
 }
 
 interface StoredDoc {
-  bindings: { b1: { inflight?: Array<{ opId: string }>; files: unknown[] } };
+  bindings: {
+    b1: { pending: Array<{ opId: string }>; inflight?: Array<{ opId: string }>; files: unknown[] };
+  };
 }
 
 describe('OperationLog — operations in flight on disk', () => {
@@ -1146,6 +1148,104 @@ describe('OperationLog — persistNow and unwritten changes', () => {
     const memory = makeLog();
     const d = memory.recordInFlight('b1', { opType: 'DELETE', filePath: 'd.md', opId: opIdOf(4) });
     expect(memory.inFlightWritten('b1', d.opId)).toBe(true);
+    await log.close();
+  });
+
+  it('tells whether a queued operation is on disk under its opId: loaded, or written since it got it', async () => {
+    const { storage } = makeStorage();
+    let failing = false;
+    const write = storage.write.bind(storage);
+    storage.write = (p, data): Promise<void> =>
+      failing ? Promise.reject(new Error('disk full')) : write(p, data);
+    let owns = true;
+    const options = {
+      storage,
+      filePath: PATH,
+      now,
+      flushDelayMs: 60_000,
+      onError: (): void => undefined,
+      ownsFile: (): boolean => owns,
+    };
+    const log = new OperationLog(options);
+    failing = true;
+    const a = log.enqueueOperation('b1', { opType: 'DELETE', filePath: 'a.md' });
+    const b = log.enqueueOperation('b1', { opType: 'DELETE', filePath: 'b.md' });
+    // The immediate write failed: neither is on disk.
+    await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+    expect(log.queuedWritten('b1', a.opId)).toBe(false);
+    failing = false;
+    await log.persistNow();
+    expect(log.queuedWritten('b1', a.opId)).toBe(true);
+    expect(log.queuedWritten('b1', b.opId)).toBe(true);
+    // Another change since does not take them off the disk.
+    log.setFileMeta(makeMeta());
+    expect(log.queuedWritten('b1', a.opId)).toBe(true);
+
+    // A new id is on disk only once a write after it went through.
+    failing = true;
+    const rotated = log.rotateOpId('b1', a.id);
+    const replaced = log.replaceOperation('b1', b.id, { opType: 'DELETE', filePath: 'c.md' });
+    await expect(log.persistNow()).rejects.toBeInstanceOf(StateNotWrittenError);
+    expect(log.queuedWritten('b1', rotated)).toBe(false);
+    expect(log.queuedWritten('b1', replaced?.opId ?? '')).toBe(false);
+    // Not queued any more (the id before the rotation, too).
+    expect(log.queuedWritten('b1', a.opId)).toBe(false);
+    failing = false;
+    await log.persistNow();
+    expect(log.queuedWritten('b1', rotated)).toBe(true);
+    expect(log.queuedWritten('b1', replaced?.opId ?? '')).toBe(true);
+
+    // Put back from flight: on disk as its record in flight was; rotated, not.
+    const out = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'd.md', opId: opIdOf(9) });
+    await log.persistNow();
+    expect(log.requeueInFlight('b1', out.opId)?.opId).toBe(out.opId);
+    expect(log.queuedWritten('b1', out.opId)).toBe(true);
+    const e = log.recordInFlight('b1', { opType: 'DELETE', filePath: 'e.md', opId: opIdOf(10) });
+    await log.persistNow();
+    const back = log.requeueInFlight('b1', e.opId, { rotate: true });
+    expect(log.queuedWritten('b1', back?.opId ?? '')).toBe(false);
+    await log.persistNow();
+    expect(log.queuedWritten('b1', back?.opId ?? '')).toBe(true);
+
+    // Loaded from the disk: there already.
+    await log.close();
+    const loaded = new OperationLog(options);
+    await loaded.load();
+    for (const op of loaded.dequeueOperations('b1')) {
+      expect(loaded.queuedWritten('b1', op.opId)).toBe(true);
+    }
+    // A newer instance has the file: the caller writes, and hears so.
+    owns = false;
+    expect(loaded.queuedWritten('b1', rotated)).toBe(false);
+    owns = true;
+    // Sent: not queued.
+    loaded.markSent([a.id]);
+    expect(loaded.queuedWritten('b1', rotated)).toBe(false);
+    // A log without storage has nothing to wait for.
+    const memory = makeLog();
+    const m = memory.enqueueOperation('b1', { opType: 'DELETE', filePath: 'm.md' });
+    expect(memory.queuedWritten('b1', m.opId)).toBe(true);
+    await loaded.close();
+  });
+
+  it('puts the ids it gives a 0.3.9 queue on disk before one of them can go out', async () => {
+    const raw = readFileSync(join(__dirname, 'fixtures', 'state-0.3.9.json'), 'utf8');
+    const { storage, files } = makeStorage({ [PATH]: raw });
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    await log.load();
+    const [first] = log.dequeueOperations('b1');
+    expect(first).toBeDefined();
+    expect(log.queuedWritten('b1', first?.opId ?? '')).toBe(false);
+    // Not written only because it was read.
+    expect(log.hasUnwrittenChanges()).toBe(false);
+    await log.flush();
+    expect(files.get(PATH)).toBe(raw);
+    await log.persistNow();
+    expect(log.queuedWritten('b1', first?.opId ?? '')).toBe(true);
+    const onDisk = JSON.parse(files.get(PATH) ?? '{}') as StoredDoc;
+    expect(onDisk.bindings.b1.pending.map((op) => op.opId)).toEqual(
+      log.dequeueOperations('b1').map((op) => op.opId),
+    );
     await log.close();
   });
 

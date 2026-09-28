@@ -86,13 +86,19 @@ dependencies, so there is no `node_modules` to install next to it.
 **Server version.** Team Vault 0.4.0 and later need a Team Vault server that
 keeps operation ids (it says so when a vault joins a project: `opIdempotency`
 in the answer). Update the server first. With an older server the plugin
-sends nothing: the status bar shows an error, the notice and `sync.log` say
-`server_outdated`, and your changes wait in the offline queue until the
-server is updated. The updated server keeps the file changes of older plugin
-versions (new files, renames, moves, deletes, attachment uploads) in their
-offline queue until they update; edits of a note's text still sync. Go back
-to an older version only while nothing waits to go out (the status bar says
-**Synced**): it doesn't know the changes 0.4.0 has on their way.
+stops sending: the status bar shows an error, the notice and `sync.log` say
+`server_outdated` (with changes waiting in the queue, after about a minute
+and a half), and your changes wait in the offline queue until the server is
+updated. The updated server refuses the file changes of older plugin
+versions (new files, renames, moves, deletes, attachment uploads), which
+wait in their offline queue until they update; edits of a note's text still
+sync. Update every device soon after the server. Until then, don't answer
+the "Content conflict" prompt of an attachment or canvas with **Keep local**
+on a device with an older version: it records your version as synced though
+the server refused it, and the teammate's next version replaces yours
+without a prompt. **Keep both** keeps both. Go back to an older version only
+while nothing waits to go out (the status bar says **Synced**): it doesn't
+know the changes 0.4.0 has on their way.
 
 ## Configuration
 
@@ -353,13 +359,16 @@ binding. Nor is there any need to edit `data.json` by hand any more.
 **"Error: server_outdated"** — the server is older than the plugin and
 doesn't keep operation ids (see [Installation](#installation)). Nothing is
 sent until the server is updated; your changes wait in the offline queue and
-go out at the next connect after the update.
+go out at the next connect after the update. With changes waiting, the error
+comes after about a minute and a half: the plugin first asks the server
+about them, an older server never answers, and the plugin then checks the
+server's version.
 
-**"Error: ops_status_failed"** — the server didn't answer the question the
-plugin asks at each connect about changes whose answers were lost, after
-four tries. Nothing is lost or sent twice: the plugin asks again at the next
-connect (**Pause sync** and **Resume sync** make one). If it keeps failing,
-check that the server is up to date and running.
+**"Error: ops_status_failed"** — the server is up to date but didn't answer
+the question the plugin asks at each connect about changes whose answers
+were lost, after four tries. Nothing is lost or sent twice: the plugin asks
+again at the next connect (**Pause sync** and **Resume sync** make one). If
+it keeps failing, check the server's logs and that it is running.
 
 **Status stays at `connecting…`** — the plugin handles the WebSocket
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`

@@ -163,10 +163,21 @@ export interface SyncEngineDeps {
    * 5 and 15 s.
    */
   opsStatusRetryMs?: readonly number[];
+  /**
+   * How long one `ops:status` waits for its answer (see
+   * `SocketClient.opsStatus`). Default: `OPS_STATUS_TIMEOUT_MS`, 15 s.
+   */
+  opsStatusTimeoutMs?: number;
 }
 
 /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
 const OPS_STATUS_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000];
+
+/**
+ * What the server says when it refuses `ops:status` for good: the status
+ * shows it as the join would (see {@link SyncEngine.opsStatusFailure}).
+ */
+const OPS_STATUS_REFUSALS: ReadonlySet<string> = new Set(['project_not_found', 'forbidden']);
 
 /**
  * A file operation about to go out through {@link SyncEngine.sendOp}: what
@@ -196,9 +207,15 @@ type SendResult<T> =
 /**
  * `ops:status` could not be answered in this connect: the connect flow ends
  * with the status `error` (see {@link SyncEngine.settleUnanswered}).
+ * `reason`: the last try's error; `answered`: whether the server answered any
+ * try at all (`busy`, a refusal) — a server older than the question never
+ * does.
  */
 class OpsStatusError extends Error {
-  constructor(readonly reason: string) {
+  constructor(
+    readonly reason: string,
+    readonly answered: boolean,
+  ) {
     super('ops_status_failed');
     this.name = 'OpsStatusError';
   }
@@ -757,6 +774,9 @@ export class SyncEngine {
   /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
   private readonly opsStatusRetryMs: readonly number[];
 
+  /** See {@link SyncEngineDeps.opsStatusTimeoutMs}. */
+  private readonly opsStatusTimeoutMs: number | undefined;
+
   constructor(deps: SyncEngineDeps) {
     this.binding = deps.binding;
     this.server = deps.server;
@@ -786,6 +806,7 @@ export class SyncEngine {
     this.configDir = deps.configDir ?? DEFAULT_CONFIG_DIR;
     this.reportedRefusals = deps.reportedRefusals ?? new Set();
     this.opsStatusRetryMs = deps.opsStatusRetryMs ?? OPS_STATUS_RETRY_MS;
+    this.opsStatusTimeoutMs = deps.opsStatusTimeoutMs;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -1148,7 +1169,17 @@ export class SyncEngine {
       this.ownKnown.clear();
       const unanswered = this.operationLog.dequeueOperations(this.binding.id);
       if (unanswered.length > 0) {
-        await this.settleUnanswered(unanswered, online);
+        try {
+          await this.settleUnanswered(unanswered, online);
+        } catch (err) {
+          if (!(err instanceof OpsStatusError)) throw err;
+          online.throwIfAborted();
+          this.log.warn('could not ask the server about operations whose answers were lost', {
+            error: err.reason,
+          });
+          this.setStatus('error', await this.opsStatusFailure(err, online));
+          return;
+        }
         online.throwIfAborted();
       }
       this.opsSettled = true;
@@ -1314,11 +1345,6 @@ export class SyncEngine {
       // Cut short by the connection dropping: the status says so already, and
       // the next connect starts over.
       if (!this.socketLink.isConnected()) return;
-      if (err instanceof OpsStatusError) {
-        this.log.warn('could not ask the server about operations whose answers were lost', {
-          error: err.reason,
-        });
-      }
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
   }
@@ -1356,7 +1382,12 @@ export class SyncEngine {
       for (const row of answer.applied) {
         const entry = this.operationLog.findByOpId(this.binding.id, row.opId);
         this.ownKnown.add(row.opId);
+        // Recorded before the entry leaves the queue (its first write takes
+        // the counter along): a `state.json` without the entry and with the
+        // old counter made the next start's catch-up return the operation as
+        // one of another device under this device's id.
         this.adoptOwnCounter(row.vectorClock);
+        this.persistVectorClock();
         if (entry === null || this.operationLog.isInFlight(this.binding.id, row.opId)) continue;
         applied += 1;
         await this.settleLanded(entry, row);
@@ -1370,7 +1401,6 @@ export class SyncEngine {
         else this.operationLog.rotateOpId(this.binding.id, entry.id);
       }
     }
-    this.persistVectorClock();
     this.log.info('operations whose answers were lost, settled', {
       asked: entries.length,
       applied,
@@ -1390,17 +1420,47 @@ export class SyncEngine {
     opIds: readonly string[],
     online: AbortSignal,
   ): Promise<Extract<OpsStatusResult, { ok: true }>> {
+    /** Whether the server answered a try: `timeout` is the client's own. */
+    let answered = false;
     for (let attempt = 0; ; attempt++) {
-      const answer = await this.socket.opsStatus(this.binding.projectId, opIds);
+      const answer = await this.socket.opsStatus(
+        this.binding.projectId,
+        opIds,
+        this.opsStatusTimeoutMs,
+      );
       online.throwIfAborted();
       if (answer.ok) return answer;
       if (answer.error === 'disconnected') throw new Error('disconnected');
+      if (answer.error !== 'timeout') answered = true;
       const pause = this.opsStatusRetryMs[attempt];
       const again = answer.error === 'busy' || answer.error === 'timeout';
-      if (!again || pause === undefined) throw new OpsStatusError(answer.error);
+      if (!again || pause === undefined) throw new OpsStatusError(answer.error, answered);
       this.log.debug('ops:status not answered; asking again', { error: answer.error, pause });
       await waitFor(pause, online);
     }
+  }
+
+  /**
+   * The status detail for an `ops:status` that failed ({@link OpsStatusError}).
+   * The server's own refusal (`project_not_found`, `forbidden`) as the join
+   * would give it. A server that answered no try at all may be one older than
+   * the question — it has no handler for it, and says nothing: a join without
+   * catch-up (`skipOperations`, `skipYjsCatchup`, as the web editor's) tells.
+   * Without `opIdempotency` in its answer it is `server_outdated`, as when the
+   * queue is empty, and nothing goes out to it. With it, the server is one
+   * that could not answer: out of its room again, since its broadcasts would
+   * be read against a queue not settled, and `ops_status_failed` — the next
+   * connect asks again.
+   */
+  private async opsStatusFailure(err: OpsStatusError, online: AbortSignal): Promise<string> {
+    if (OPS_STATUS_REFUSALS.has(err.reason)) return err.reason;
+    if (err.answered) return 'ops_status_failed';
+    const probe = await this.socket.probeProject(this.binding.projectId);
+    online.throwIfAborted();
+    if (!probe.ok) return probe.error;
+    if (probe.opIdempotency === undefined) return 'server_outdated';
+    void this.socket.leaveProject(this.binding.projectId).catch(() => undefined);
+    return 'ops_status_failed';
   }
 
   /**
@@ -7786,13 +7846,18 @@ export class SyncEngine {
   /**
    * Emit queued operation `op` for the drain: written ahead — its `opId` is
    * on disk before it goes out (a write that fails halts the drain on it) —
-   * and known in {@link sending} until answered.
+   * and known in {@link sending} until answered. An entry on disk under its
+   * `opId` already goes out without a write: waited for before each entry,
+   * the write the previous entry's answer asked for made the drain of a large
+   * queue take a write per entry, one after another.
    */
   private async emitQueued(
     op: PendingOperation,
     emit: (opId: string) => Promise<FileAck>,
   ): Promise<FileAck> {
-    await this.operationLog.persistNow();
+    if (!this.operationLog.queuedWritten(this.binding.id, op.opId)) {
+      await this.operationLog.persistNow();
+    }
     this.throwIfStopped();
     this.sending.add(op.opId);
     try {
