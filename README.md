@@ -96,7 +96,8 @@ sync. Update every device soon after the server. Until then, don't answer
 the "Content conflict" prompt of an attachment or canvas with **Keep local**
 on a device with an older version: it records your version as synced though
 the server refused it, and the teammate's next version replaces yours
-without a prompt. **Keep both** keeps both. Go back to an older version only
+without a prompt (the server keeps the refused version, and its admin can
+put it back). **Keep both** keeps both. Go back to an older version only
 while nothing waits to go out (the status bar says **Synced**): it doesn't
 know the changes 0.4.0 has on their way.
 

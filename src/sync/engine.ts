@@ -1199,7 +1199,16 @@ export class SyncEngine {
       // after each of them (see `forgetAppliedLive` below).
       const liveBeforeJoin = this.operationLog.appliedLiveIds(this.binding.id);
       this.startedSinceJoin.clear();
-      const joinPromise = this.socket.joinProject(this.binding.projectId, this.vectorClock, true);
+      // A server that does not keep operations idempotent (see below): live
+      // changes are queued from its answer on, not from the end of the
+      // listing — on a large vault seconds later, and a rename or a delete
+      // made meanwhile went to it.
+      const joinPromise = this.socket
+        .joinProject(this.binding.projectId, this.vectorClock, true)
+        .then((joined) => {
+          if (joined.ok && joined.opIdempotency === undefined) this.opsSettled = false;
+          return joined;
+        });
       const filesPromise = this.refreshFileIndex(online);
       // Known to `resume()` on its own: a join failed by a pause ends this
       // flow at once, while the listing is still on its way.

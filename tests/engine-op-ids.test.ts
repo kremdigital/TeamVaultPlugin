@@ -197,6 +197,19 @@ async function emitted(h: Harness, event: string, count = 1): Promise<Emit> {
   throw new Error(`no ${event} sent`);
 }
 
+/** Hold the connect's listing until the returned function is called. */
+function holdListing(h: Harness): () => void {
+  const gate = deferred<void>();
+  const route = h.routes.get('GET /api/projects/p1/files');
+  if (!route) throw new Error('no listing route');
+  h.routes.set('GET /api/projects/p1/files', async () => {
+    const asked = await route();
+    await gate.promise;
+    return asked;
+  });
+  return () => gate.resolve();
+}
+
 /** Lose the ack of `e`: the server applies it, the answer never comes. */
 function loseAck(e: Emit): void {
   e.ack = (): void => undefined;
@@ -1222,6 +1235,42 @@ describe('SyncEngine — a server without opIdempotency', () => {
     await flushAsync(20);
     expect(sent(b.h).slice(out)).toEqual([]);
     expect(queue(b.h)).toEqual(['RENAME a.md -> b.md']);
+    expect(b.server.applied).toEqual([]);
+    await b.h.engine.stop();
+  });
+
+  // The join's answer told the server, but the check waited for the listing
+  // too: a rename or a delete made in between went to the older server.
+  it('with nothing queued: sends nothing from the answer to its join on, while the listing is on its way', async () => {
+    const b = await online([
+      ['a.md', 'f1', 'a\n'],
+      ['c.md', 'f2', 'c\n'],
+    ]);
+    b.h.socket().disconnect();
+    await flushAsync();
+    const joins = joinsOf(b.h);
+    const release = holdListing(b.h);
+    b.h.socket().connect();
+    const join = await nextJoin(b.h, joins);
+    const details: Array<string | undefined> = [];
+    b.h.engine.onStatus((_status, detail) => details.push(detail));
+    join.ack({ ...b.server.joinAnswer('whole journal'), opIdempotency: undefined });
+    await flushAsync(20);
+    const out = sent(b.h).length;
+
+    await userRename(b.h, 'a.md', 'b.md');
+    b.h.vault.files.delete('c.md');
+    const deleted = b.h.engine.handleVaultEvent(event('delete', 'c.md'));
+    await b.server.pump();
+    await deleted;
+    expect(sent(b.h).slice(out)).toEqual([]);
+    expect(b.server.applied).toEqual([]);
+
+    release();
+    await flushAsync(40);
+    expect(details.at(-1)).toBe('server_outdated');
+    expect(sent(b.h).slice(out)).toEqual([]);
+    expect(queue(b.h)).toEqual(['RENAME a.md -> b.md', 'DELETE c.md']);
     expect(b.server.applied).toEqual([]);
     await b.h.engine.stop();
   });

@@ -20,14 +20,17 @@ uses [Semantic Versioning](https://semver.org/).
   changes of older versions — new files, renames, moves, deletes, attachment
   uploads — and they wait in their offline queue until they update (edits of
   a note's text still sync), so update every device soon after the server;
-  what they queued goes out then. One answer is lost instead: **Keep local**
-  in the "Content conflict" prompt of an attachment or canvas, chosen in
-  0.3.9 once the server is updated. 0.3.9 records your version as synced
-  though the server refused it, and doesn't queue it; the teammate's next
-  version then replaces yours without a prompt. Until a device runs 0.4.0,
-  answer that prompt there with **Keep both**. Going back to 0.3.9 is safe
-  only while nothing waits to go out (the status bar says **Synced**): 0.3.9
-  doesn't know the changes this version has on their way.
+  what they queued goes out then. One answer doesn't get through instead:
+  **Keep local** in the "Content conflict" prompt of an attachment or canvas,
+  chosen in 0.3.9 once the server is updated. 0.3.9 records your version as
+  synced though the server refused it, and doesn't queue it — an edit of
+  that attachment already in its queue is dropped too; the teammate's next
+  version then replaces yours without a prompt, and the device never sends
+  yours again. The server keeps the version it refused, so its admin can put
+  it back. Until a device runs 0.4.0, answer that prompt there with
+  **Keep both**. Going back to 0.3.9 is safe only while nothing waits to go
+  out (the status bar says **Synced**): 0.3.9 doesn't know the changes this
+  version has on their way.
 - **Two empty notes created under one name at the same moment are two
   notes.** When you and a teammate both made an `Untitled.md` (Obsidian's new
   note) within a moment of each other, the server took the second for the

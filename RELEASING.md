@@ -82,9 +82,11 @@ the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
   sending: with nothing queued, from the answer to its join; with changes
   queued, after about a minute and a half — it asks `ops:status` first,
   which an older server never answers, then joins without catch-up
-  (`skipOperations`, `skipYjsCatchup`) to read `opIdempotency`. A change
-  made while that first join is on its way (well under a second) can still
-  reach the older server, which applies it once.
+  (`skipOperations`, `skipYjsCatchup`) to read `opIdempotency`. With
+  nothing queued, a change made while that join is on its way (one round
+  trip to the server) can still reach the older server, which applies it
+  once; a change made after its answer waits in the queue, even while the
+  file listing of the connect is still loading.
 - Then release the plugin without delay, and have every device updated
   right after. The server of 0.4.0 refuses the file operations of older
   plugins (`invalid_op_id`, an error they retry): their new files, renames,
@@ -92,19 +94,29 @@ the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
   they update. Edits of notes' text still sync.
 - Until every device runs 0.4.0, tell the team not to answer the "Content
   conflict" prompt of an attachment or canvas with **Keep local** on a
-  device still on 0.3.9 — **Keep both** instead. 0.3.9 doesn't read the
-  answer to that one upload: refused, it is not queued, the version is
-  recorded as synced anyway, and the teammate's next version replaces it
-  without a prompt. The chosen version is then lost for good, updating the
-  device doesn't bring it back.
+  device still on 0.3.9 — **Keep both** instead. 0.3.9 uploads its version
+  and doesn't read the server's answer: the server refuses it
+  (`invalid_op_id`), yet 0.3.9 records the version as synced and queues
+  nothing — an edit of the same attachment already waiting in its queue is
+  dropped too — and the teammate's next version replaces it on that device
+  without a prompt. The device never sends that version again, not even
+  once updated. The server keeps what it refused: the socket process logs a
+  `warn` "file op: refused without a valid opId" with the `fileId` and
+  `contentHash`, and the bytes stay in `<projectRoot>/.staging/<contentHash>`.
+- Once every device runs 0.4.0, look through the socket process's log for
+  refused `file:update-binary` with `staged: true` (see "Клиенты без
+  `opId`" in the server's `docs/sync-protocol.md`). Put such a version back
+  — for instance as a separate file next to the original — only when the
+  owner of that device confirms it is the one they chose to keep.
 - Say so at the top of the version's `CHANGELOG.md` section, under
   **Changed**, and in the README's **Server version** note.
 - A change 0.3.9 queued has no operation id; 0.4.0 gives it one when it
   loads `state.json` (`sync.log` warns `legacy in-flight entries` for those
   0.3.9 had sent). One the old server applied while its answer was lost can
   therefore reach the server once more — the risk 0.3.9 had anyway. What
-  0.3.9 queued after the server update was refused, never applied, and is
-  safe; its **Keep local** above never reached the queue.
+  0.3.9 queued after the server update was refused, never applied, and goes
+  out once the device is updated — except an attachment edit dropped by a
+  **Keep local** of the same attachment (above).
 
 Going back from 0.4.0 to 0.3.9 is safe only in the same state: 0.3.9 drops
 the operations 0.4.0 keeps in flight in `state.json` (`inflight`) and knows
