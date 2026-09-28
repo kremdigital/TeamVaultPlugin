@@ -286,12 +286,16 @@ describe('SyncEngine — an operation is on disk before it goes out', () => {
     await b.docs.drive();
     await deleted;
 
-    expect(onDisk).toEqual([
-      ['file:rename', true],
-      ['file:update-binary', true],
-      ['file:create', true],
-      ['file:delete', true],
-    ]);
+    // The modify and the create are handled at once: either may go out first.
+    expect(onDisk).toHaveLength(4);
+    expect(onDisk[0]).toEqual(['file:rename', true]);
+    expect(onDisk.slice(1, 3)).toEqual(
+      expect.arrayContaining([
+        ['file:update-binary', true],
+        ['file:create', true],
+      ]),
+    );
+    expect(onDisk[3]).toEqual(['file:delete', true]);
     for (const e of b.h.socket().emits.filter((x) => x.event.startsWith('file:'))) {
       expect(isOpId(opIdOf(e))).toBe(true);
     }
