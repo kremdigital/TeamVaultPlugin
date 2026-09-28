@@ -103,9 +103,12 @@ the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
   once updated. The server keeps what it refused: the socket process logs a
   `warn` "file op: refused without a valid opId" with the `fileId` and
   `contentHash`, and the bytes stay in `<projectRoot>/.staging/<contentHash>`.
-- Once every device runs 0.4.0, look through the socket process's log for
-  refused `file:update-binary` with `staged: true` (see "Клиенты без
-  `opId`" in the server's `docs/sync-protocol.md`). Put such a version back
+- Once every device runs 0.4.0 — and no later than two weeks after the
+  server deploy, even if some devices still lag, because the socket log
+  keeps 14 files rotated daily or at 100 MB — look through the socket
+  process's log for refused `file:update-binary` with `staged: true` (see
+  "Клиенты без `opId`" in the server's `docs/sync-protocol.md`). Only those
+  whose blob is still in `.staging` are candidates. Put such a version back
   — for instance as a separate file next to the original — only when the
   owner of that device confirms it is the one they chose to keep.
 - Say so at the top of the version's `CHANGELOG.md` section, under
