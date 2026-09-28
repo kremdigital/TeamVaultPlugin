@@ -6,6 +6,7 @@ import {
   OperationLog,
   StateNotWrittenError,
   isOpId,
+  newOpId,
   type FileMeta,
 } from '@/sync/operation-log';
 import type { LogStorage } from '@/utils/file-log-sink';
@@ -130,6 +131,17 @@ describe('OperationLog — pending operations', () => {
     expect(log.pendingCount('b1')).toBe(2);
     expect(log.pendingCount('b2')).toBe(1);
     expect(log.pendingCount()).toBe(3);
+  });
+
+  it('counts the operations the drain replays: not the answers to questions, not those in flight', () => {
+    const log = makeLog();
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'b.md', settleOnly: true });
+    log.recordInFlight('b1', { opType: 'DELETE', filePath: 'c.md', opId: newOpId() });
+    log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'd.md' });
+    expect(log.pendingCount('b1')).toBe(2);
+    expect(log.replayableCount('b1')).toBe(1);
+    expect(log.replayableCount('b3')).toBe(0);
   });
 
   it('uses the injected clock for createdAt', () => {

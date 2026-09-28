@@ -691,6 +691,11 @@ export interface HarnessOptions {
   opsStatusRetryMs?: readonly number[];
   /** How long each `ops:status` waits for its answer (`SyncEngineDeps.opsStatusTimeoutMs`). */
   opsStatusTimeoutMs?: number;
+  /**
+   * The engine's pauses before it tries the queue again after `busy`
+   * (`SyncEngineDeps.queueRetryMs`).
+   */
+  queueRetryMs?: readonly number[];
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -815,6 +820,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     ...(opts.opsStatusTimeoutMs !== undefined
       ? { opsStatusTimeoutMs: opts.opsStatusTimeoutMs }
       : {}),
+    ...(opts.queueRetryMs ? { queueRetryMs: opts.queueRetryMs } : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));
 
@@ -1199,6 +1205,10 @@ export class FakeServer {
    * emits — an operation received before it still being applied.
    */
   holdStatus = false;
+  /** The `opId` of every file operation refused `busy` (see {@link bar}), in order. */
+  readonly refusedBusy: string[] = [];
+  /** How many more file operations the server refuses `busy` (see {@link bar}). */
+  private barred = 0;
   private readonly byOpId = new Map<string, AppliedOp>();
   private readonly voided = new Set<string>();
   private readonly served = new WeakSet<Emit>();
@@ -1208,6 +1218,23 @@ export class FakeServer {
 
   constructor(private harness: Harness) {
     harness.route.server = this;
+  }
+
+  /**
+   * The server's project queue is stuck: each file operation it is sent
+   * from now on is refused `busy`, without being applied — the next `times`
+   * ones, or all of them until {@link lift}. The barrier of one connection
+   * in `Project/server` (`files.ts`, `barLane`): after an operation that
+   * did not get its turn in time, every later one of the connection is
+   * refused, until the queue has passed them. `ops:status` is not refused.
+   */
+  bar(times = Number.POSITIVE_INFINITY): void {
+    this.barred = times;
+  }
+
+  /** The server's queue is moving again: see {@link bar}. */
+  lift(): void {
+    this.barred = 0;
   }
 
   /** Serve the engine built after this one instead (see `buildHarness`). */
@@ -1418,6 +1445,13 @@ export class FakeServer {
     };
     const opType = OP_TYPE_OF[e.event];
     if (opType === undefined) return;
+    // Refused before the handler looks at it (see `bar`).
+    if (this.barred > 0) {
+      this.barred -= 1;
+      this.refusedBusy.push(typeof p.opId === 'string' ? p.opId : '');
+      e.ack({ ok: false, error: 'busy' });
+      return;
+    }
     if (!isOpId(p.opId)) {
       e.ack({ ok: false, error: 'invalid_op_id' });
       return;

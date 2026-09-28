@@ -334,10 +334,14 @@ export class EngineManager {
     this.engines.set(binding.id, engine);
     this.connections.set(binding.id, { url: server.url, apiKey: server.apiKey });
     const off = engine.onStatus((status, detail) => {
+      const was = this.statuses.get(binding.id);
       this.statuses.set(binding.id, status);
       // `connected` is the catch-up-complete transition: the binding has
       // synced with the server. Let the host stamp lastSyncedAt + persist.
-      if (status === 'connected') {
+      // Only on the transition: a connected engine reports `connected` again
+      // when only its detail changes (changes waiting behind ones the server
+      // refused as busy), and each report saved the settings.
+      if (status === 'connected' && was !== 'connected') {
         this.deps.onBindingSynced?.(binding.id, Date.now());
       }
       // Stash the latest detail so `getAggregateStatus()` keeps reporting

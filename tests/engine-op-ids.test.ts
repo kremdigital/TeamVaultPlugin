@@ -1499,6 +1499,7 @@ describe('SyncEngine — an operation the server refuses', () => {
         ['c.md', 'f2', 'c\n'],
         ['e.md', 'f3', 'e\n'],
         ['g.md', 'f4', 'g\n'],
+        ['i.md', 'f5', 'i\n'],
       ],
       [],
       { logger },
@@ -1514,20 +1515,30 @@ describe('SyncEngine — an operation the server refuses', () => {
 
     await refused('a.md', 'b.md', 'op_id_conflict');
     expect(queue(b.h)).toEqual([]);
-    const busy = await refused('c.md', 'd.md', 'busy');
-    expect(b.h.log.dequeueOperations('b1').map((entry) => entry.opId)).toEqual([opIdOf(busy)]);
     const voided = await refused('e.md', 'f.md', 'op_voided');
-    const rotated = b.h.log.dequeueOperations('b1')[1];
+    const rotated = b.h.log.dequeueOperations('b1')[0];
     expect(rotated?.filePath).toBe('e.md');
     expect(isOpId(rotated?.opId)).toBe(true);
     expect(rotated?.opId).not.toBe(opIdOf(voided));
+    // Neither holds up the changes made after it: they go out at once.
     const invalid = await refused('g.md', 'h.md', 'invalid_op_id');
+    const busy = await refused('c.md', 'd.md', 'busy');
+    expect(b.h.log.dequeueOperations('b1').map((entry) => entry.opId)).toEqual([
+      rotated?.opId,
+      opIdOf(invalid),
+      opIdOf(busy),
+    ]);
+    // `busy` does: the next change waits behind the refused ones (see
+    // `engine-busy-order.test.ts`).
+    await b.h.vault.rename('i.md', 'j.md');
+    await until(() => queue(b.h).includes('RENAME i.md -> j.md'));
+    expect(sent(b.h)).not.toContain('file:rename i.md -> j.md');
     expect(queue(b.h)).toEqual([
-      'RENAME c.md -> d.md',
       'RENAME e.md -> f.md',
       'RENAME g.md -> h.md',
+      'RENAME c.md -> d.md',
+      'RENAME i.md -> j.md',
     ]);
-    expect(b.h.log.dequeueOperations('b1')[2]?.opId).toBe(opIdOf(invalid));
     expect(b.h.log.inFlightOperations('b1')).toEqual([]);
     expect(entries.filter((e) => e.message === 'the server refused an operation id')).toHaveLength(
       1,

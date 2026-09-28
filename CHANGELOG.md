@@ -32,6 +32,25 @@ uses [Semantic Versioning](https://semver.org/).
   file's deletion was reported both by Obsidian and by the file system. A
   folder delete also no longer looks up each file whose delete is already on
   its way in the server's list of all project files.
+- **Changes the server turns away as busy go out again within seconds, in
+  their order.** When the server can't get to a change in time (its queue is
+  jammed, say by a teammate adding hundreds of files at once), it answers
+  "busy" for that change and every later one from this device until it has
+  caught up. Team Vault used to keep such a change until the next connection
+  — hours, perhaps — while newer changes went out at once and overtook it: a
+  note renamed to the name of one whose delete was turned away, or a new
+  "Untitled" note made right after the rename of the last one was turned
+  away, reached the team under a conflict name, and an old rename could undo
+  a teammate's later one. Now new file changes wait behind the ones turned
+  away, and Team Vault sends them again after 2, 5, 15 and then every 30
+  seconds, without reconnecting; the status bar shows `server_busy` while
+  they wait. If the retry keeps failing for another reason, new changes go
+  out again after three tries and the rest waits for the next connection, as
+  before. Edits to a note's text are not affected.
+- **A folder deleted while the connection dropped, sync was paused or the
+  server was busy is deleted on the server in full.** Files of the folder not
+  yet sent at that moment were removed from this device but never from the
+  server, and came back with the next connection.
 
 ## [0.4.0] — 2026-09-28
 

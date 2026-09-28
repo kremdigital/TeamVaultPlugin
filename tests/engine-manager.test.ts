@@ -469,6 +469,23 @@ describe('EngineManager — onBindingSynced', () => {
     await m.stop();
   });
 
+  it('does not fire again when a connected engine only changes its detail', async () => {
+    const calls: number[] = [];
+    const deps = makeDeps([server], [makeBinding({ id: 'a' })]);
+    deps.onBindingSynced = (_id, at) => calls.push(at);
+    const m = new EngineManager(deps);
+    await m.start();
+
+    FakeEngine.lastFor('a')?.setStatus('connected');
+    FakeEngine.lastFor('a')?.setStatus('connected', 'server_busy');
+    expect(m.getAggregateStatus()).toMatchObject({ state: 'connected', detail: 'server_busy' });
+    FakeEngine.lastFor('a')?.setStatus('connected');
+
+    expect(calls).toHaveLength(1);
+    expect(m.getAggregateStatus().detail).toBeUndefined();
+    await m.stop();
+  });
+
   it('fires again on every reconnect (re-sync)', async () => {
     const calls: number[] = [];
     const deps = makeDeps([server], [makeBinding({ id: 'a' })]);

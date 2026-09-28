@@ -36,6 +36,7 @@ import {
   computeDeepSyncDiff,
   flushPendingQueue,
   type DeepSyncDiff,
+  type FlushResult,
   type PendingEmitter,
   type ReplayOutcome,
 } from './reconnect';
@@ -168,10 +169,53 @@ export interface SyncEngineDeps {
    * `SocketClient.opsStatus`). Default: `OPS_STATUS_TIMEOUT_MS`, 15 s.
    */
   opsStatusTimeoutMs?: number;
+  /**
+   * The pauses (ms) before each new try of the offline queue after the server
+   * refused a file operation with `busy` (see `SyncEngine.queueFirst`); the
+   * last one repeats. Default: 2, 5, 15 and 30 s.
+   */
+  queueRetryMs?: readonly number[];
 }
 
 /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
 const OPS_STATUS_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000];
+
+/** See {@link SyncEngineDeps.queueRetryMs}. */
+const QUEUE_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000];
+
+/**
+ * How many tries of the queue in a row, after `busy`, may halt on another
+ * error before new changes go out again without waiting for the queue (see
+ * `SyncEngine.afterDrain`).
+ */
+const QUEUE_FAILURES_MAX = 3;
+
+/**
+ * How many passes one drain makes over a queue that keeps filling up while
+ * it runs before new changes go out again without waiting for it (see
+ * `SyncEngine.drainQueue`).
+ */
+const DRAIN_PASSES_MAX = 50;
+
+/**
+ * The status detail while new changes wait in the queue behind ones the
+ * server refused with `busy` (see `SyncEngine.queueFirst`).
+ */
+const QUEUE_FIRST_DETAIL = 'server_busy';
+
+/**
+ * How one drain of the queue ended (see `SyncEngine.drainQueue`): the queue
+ * sent (`empty`); halted on an operation that failed for now, with its error;
+ * a pass that sent nothing and halted on nothing (`stalled`); still filling
+ * up after {@link DRAIN_PASSES_MAX} passes (`capped`); or the connection gone
+ * (`offline`).
+ */
+type DrainOutcome =
+  | { kind: 'empty' }
+  | { kind: 'halted'; error: string }
+  | { kind: 'stalled' }
+  | { kind: 'capped' }
+  | { kind: 'offline' };
 
 /**
  * What the server says when it refuses `ops:status` for good: the status
@@ -191,6 +235,12 @@ interface OutgoingOp {
   opId: string;
   /** An answer to a question: see `PendingOperationInput.settleOnly`. */
   settleOnly?: true;
+  /**
+   * Sent by the drain's replay of a queue entry (see `replayPending`): the
+   * head of the queue, it goes out while new changes wait behind the ones
+   * the server refused (see `SyncEngine.queueFirst`).
+   */
+  fromQueue?: true;
 }
 
 /**
@@ -820,6 +870,77 @@ export class SyncEngine {
   /** See {@link SyncEngineDeps.opsStatusTimeoutMs}. */
   private readonly opsStatusTimeoutMs: number | undefined;
 
+  /** Wakes each flow waiting in {@link liveOpsSettled} when {@link inflightHere} shrinks. */
+  private readonly flightWaiters = new Set<() => void>();
+
+  /**
+   * Whether new file changes wait in the offline queue behind the ones the
+   * server refused with `busy`, instead of going out at once: from the
+   * refusal (see {@link closeGate}) until the queue has gone out (see
+   * {@link afterDrain}), or until the next connect.
+   *
+   * A server whose project queue did not reach an operation in time refuses
+   * it and every later file operation of the connection with `busy`, until
+   * its queue has passed them (`sync-protocol.md`, «Порядок операций одного
+   * соединения»), and expects them again in their order, before anything new.
+   * A change sent at once meanwhile overtook them: a note renamed onto the
+   * name of one whose delete was refused, or a new "Untitled" made right after
+   * a refused rename of the last one, found the name taken on the server and
+   * went to everyone under a conflict name. And the refused ones waited for
+   * the next connect — hours, maybe — the queue being sent only then.
+   */
+  private queueFirst = false;
+
+  /** The timer of the next try of the queue after `busy` (see {@link schedulePump}). */
+  private pumpTimer: number | null = null;
+
+  /** Which pause of {@link queueRetryMs} the next try waits (see {@link schedulePump}). */
+  private pumpStep = 0;
+
+  /** Tries of the queue in a row, after `busy`, that halted on another error. */
+  private pumpFailures = 0;
+
+  /**
+   * The drain of the queue running now, the connect's or a try after `busy`
+   * (see {@link runDrain}), as a promise that never rejects: one at a time.
+   */
+  private draining: Promise<void> | null = null;
+
+  /** A try of the queue came while a drain ran: another follows it (see {@link runDrain}). */
+  private drainAgain = false;
+
+  /**
+   * The signal of the drain running now (see {@link runDrain}): aborted, it
+   * sends nothing more (see {@link emitQueued}).
+   */
+  private drainSignal: AbortSignal | null = null;
+
+  /**
+   * Whether this connect has handed the queue to its drain (see
+   * {@link onSocketConnect}). Until it has, a `busy` only puts new changes
+   * behind the queue: the drain sends the queue once the catch-up is done.
+   * Sent earlier, in the middle of the catch-up, a queued create of a file the
+   * listing has just shown the server to have went out as a create — a
+   * conflict copy — and a queued delete missed the checks the connect runs
+   * before the drain (see `settleOvertakenQueue`).
+   */
+  private drainHandedOver = false;
+
+  /**
+   * The connection open now: aborted when it drops, and with {@link online}
+   * by Pause sync and `stop()`; a new one on each connect. The drains end
+   * with it (see {@link runDrain}): one of a connection gone, still running
+   * when the next connects, would send the queue beside that one's drain and
+   * undo what that connect settled.
+   */
+  private link: AbortController | null = null;
+
+  /** See {@link SyncEngineDeps.queueRetryMs}. */
+  private readonly queueRetryMs: readonly number[];
+
+  /** The detail of the last status reported (see {@link setStatus}). */
+  private statusDetail: string | undefined = undefined;
+
   constructor(deps: SyncEngineDeps) {
     this.binding = deps.binding;
     this.server = deps.server;
@@ -850,6 +971,7 @@ export class SyncEngine {
     this.reportedRefusals = deps.reportedRefusals ?? new Set();
     this.opsStatusRetryMs = deps.opsStatusRetryMs ?? OPS_STATUS_RETRY_MS;
     this.opsStatusTimeoutMs = deps.opsStatusTimeoutMs;
+    this.queueRetryMs = deps.queueRetryMs ?? QUEUE_RETRY_MS;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -881,6 +1003,10 @@ export class SyncEngine {
     this.cleanups.push(this.socket.onConnect(() => this.trackConnectFlow(this.onSocketConnect())));
     this.cleanups.push(
       this.socket.onDisconnect((reason) => {
+        // What was tied to the connection ends with it (see `link`); the next
+        // connect sends the queue.
+        this.link?.abort(new Error('disconnected'));
+        this.clearPumpTimer();
         this.setStatus('offline', reason);
       }),
     );
@@ -925,6 +1051,7 @@ export class SyncEngine {
   pause(): void {
     if (this.hasStopped || this.paused) return;
     this.paused = true;
+    this.clearPumpTimer();
     this.online.abort(new SyncPausedError());
     this.socketLink.disconnect();
     // Never started: `start()` finds the engine paused.
@@ -1018,6 +1145,7 @@ export class SyncEngine {
    */
   async stop(): Promise<void> {
     if (!this.hasStopped) {
+      this.clearPumpTimer();
       this.handOverHeldChanges();
       this.lifetime.abort(new EngineStoppedError());
       // What was under way is queued now: a delete that joined one waits for
@@ -1183,6 +1311,18 @@ export class SyncEngine {
     // The connection this flow works for: Pause sync ends it (see `online`),
     // and the flow then unwinds at its next step.
     const online = this.online.signal;
+    // A connection of its own for this connect's drains (see `link`). The
+    // queue goes out anew from this connect: what the server refused with
+    // `busy` on the connection gone, it has forgotten, and `ops:status`
+    // below voids; the drain sends it first.
+    this.link?.abort(new Error('disconnected'));
+    const link = childController(online);
+    this.link = link;
+    this.drainHandedOver = false;
+    this.clearPumpTimer();
+    this.queueFirst = false;
+    this.pumpStep = 0;
+    this.pumpFailures = 0;
     /** This connect's catch-up completion signal, while it is the armed one. */
     let armed: (() => void) | null = null;
     try {
@@ -1387,12 +1527,16 @@ export class SyncEngine {
       this.operationLog.forgetAppliedLive(this.binding.id, seen);
       // Taken for new files by this connect: under the id is the new one now.
       this.operationLog.forgetDeleteAsked(this.binding.id, askedBack);
-      this.setStatus('connected');
+      // A change of this connect's refused `busy` meanwhile has put the new
+      // ones behind the queue (see `queueFirst`).
+      this.setStatus('connected', this.queueFirst ? QUEUE_FIRST_DETAIL : undefined);
 
       // Reconnect catch-up tail, kicked off in the background so the
       // `connected` status doesn't wait on every queued upload. Ordering
-      // inside is load-bearing — see `drainThenInitialPush`.
-      this.trackConnectFlow(this.drainThenInitialPush(online));
+      // inside is load-bearing — see `drainThenInitialPush`. From here on a
+      // `busy` has the queue tried again (see `schedulePump`).
+      this.drainHandedOver = true;
+      this.trackConnectFlow(this.drainThenInitialPush(online, link));
     } catch (err) {
       if (this.catchupResolve === armed) this.catchupResolve = null;
       // Cut short by `stop()` or by Pause sync — not a sync failure.
@@ -1815,6 +1959,28 @@ export class SyncEngine {
   }
 
   /**
+   * Whether a local change can go out now: {@link canSendLive}, and no
+   * change the server refused with `busy` waits in the queue ahead of it
+   * (see {@link queueFirst}) — it is queued behind them then. A change the
+   * drain replays from the queue (`from` `queue`) is the head of the queue,
+   * and goes out.
+   */
+  private mayEmitLive(from: LocalSource): boolean {
+    return this.canSendLive() && (from === 'queue' || !this.queueFirst);
+  }
+
+  /**
+   * Whether operation `op` can go out now (see {@link mayEmitLive}). An
+   * answer to a question (`settleOnly`) is never queued to be replayed: it
+   * goes out whatever waits in the queue, and one the server refuses is
+   * asked again at the next connect.
+   */
+  private mayEmitOp(op: OutgoingOp): boolean {
+    if (op.settleOnly === true) return this.canSendLive();
+    return this.mayEmitLive(op.fromQueue === true ? 'queue' : 'watcher');
+  }
+
+  /**
    * Send one live file operation, written ahead to `state.json`:
    *
    *   1. recorded in flight (`opId`, payload) and the log written to disk —
@@ -1845,13 +2011,9 @@ export class SyncEngine {
     ) => Promise<T> | T,
   ): Promise<SendResult<T | undefined>> {
     const bindingId = this.binding.id;
-    if (!this.canSendLive()) {
-      // Recorded ahead with others (see `handleLocalFolderDelete`): queued.
-      if (this.operationLog.isInFlight(bindingId, op.opId)) {
-        return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
-      }
-      return { kind: 'queued', entry: this.queueOp(op) };
-    }
+    // Recorded ahead with others (see `handleLocalFolderDelete`), it goes
+    // back to its place in the queue (see `queueOp`).
+    if (!this.mayEmitOp(op)) return { kind: 'queued', entry: this.queueOp(op) };
     if (!this.operationLog.isInFlight(bindingId, op.opId)) {
       this.operationLog.recordInFlight(bindingId, op);
     }
@@ -1871,7 +2033,9 @@ export class SyncEngine {
       return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
     }
     this.throwIfStopped();
-    if (!this.canSendLive()) return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
+    // Offline meanwhile, or another change was refused `busy`: this one goes
+    // behind it, in its place.
+    if (!this.mayEmitOp(op)) return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
     let ack: FileAck;
     this.sending.add(op.opId);
     try {
@@ -1896,7 +2060,7 @@ export class SyncEngine {
       this.adoptOwnCounter(ack.log?.vectorClock);
       this.persistVectorClock();
       this.operationLog.clearInFlight(bindingId, op.opId);
-      this.inflightHere.delete(op.opId);
+      this.leftFlight(op.opId);
       this.ownKnown.add(op.opId);
     };
     try {
@@ -1920,22 +2084,55 @@ export class SyncEngine {
     // an operation refused for good.
     if (op.settleOnly === true || (!outcome.ok && !outcome.retryable)) {
       this.operationLog.clearInFlight(this.binding.id, op.opId);
-      this.inflightHere.delete(op.opId);
+      this.leftFlight(op.opId);
       this.log.debug('operation refused by the server', { opType: op.opType, error });
       return { kind: 'refused', error };
     }
     const entry = this.requeueInFlight(op.opId, { rotate: error === 'op_voided' });
+    if (error === 'busy') {
+      // The server refuses every later file operation of this connection
+      // until its queue has passed this one: later changes wait behind it,
+      // and the queue goes out again shortly (see `queueFirst`).
+      this.closeGate();
+      this.schedulePump();
+    }
     return { kind: 'queued', entry };
   }
 
   /** Put operation `opId`, recorded in flight here, back in the queue. */
   private requeueInFlight(opId: string, opts: { rotate?: boolean } = {}): PendingOperation | null {
-    this.inflightHere.delete(opId);
+    // Waiters look again once this call has returned: the entry is queued by then.
+    this.leftFlight(opId);
     return this.operationLog.requeueInFlight(this.binding.id, opId, opts);
   }
 
-  /** Queue `op` under its `opId`, unless the queue has it already. */
+  /**
+   * `opId` is not in flight here any more (see {@link inflightHere}): a
+   * drain waiting for that (see {@link liveOpsSettled}) looks again.
+   */
+  private leftFlight(opId: string): void {
+    if (!this.inflightHere.delete(opId)) return;
+    for (const wake of [...this.flightWaiters]) wake();
+  }
+
+  /**
+   * Queue `op` under its `opId`, unless the queue has it already. One recorded
+   * in flight ahead and not sent — a folder's delete (see
+   * `recordDeletesAhead`) — goes back to its place in the queue. Taken for
+   * queued already, it stayed in flight, and the folder's delete took it off
+   * as never sent: the files of a folder whose delete met a dropped
+   * connection, Pause sync or a `busy` halfway through were deleted here and
+   * never on the server, and came back with the next connect.
+   */
   private queueOp(op: OutgoingOp): PendingOperation | null {
+    if (this.operationLog.isInFlight(this.binding.id, op.opId)) {
+      const entry = this.requeueInFlight(op.opId);
+      if (entry === null) return null;
+      // With what the caller has learnt of it since it was recorded: a
+      // note's state when it was deleted (see `DOC_STATE`).
+      this.operationLog.amendOperation(entry.id, { payload: op.payload });
+      return { ...entry, payload: { ...op.payload } };
+    }
     const known = this.operationLog.findByOpId(this.binding.id, op.opId);
     if (known !== null) return known;
     this.throwIfStopped();
@@ -2349,10 +2546,14 @@ export class SyncEngine {
    * order) win, and `replayPending` keeps `fileIndex` authoritative as it
    * goes — so the `initialPush` that follows recognises every file the
    * queue already synced and skips it.
+   *
+   * A drain still running from before — a try of the queue after `busy`
+   * (see {@link runDrain}) — is waited for, not skipped: skipped, the upload
+   * pass went ahead of the queue.
    */
-  private async drainThenInitialPush(online: AbortSignal): Promise<void> {
+  private async drainThenInitialPush(online: AbortSignal, link: AbortController): Promise<void> {
     try {
-      await this.flushPendingOperations(online);
+      await this.runDrain(link, 'connect');
     } catch {
       // A drain stopped with the engine or by Pause sync ends the tail here:
       // the first upload of a paused connection would queue every new file.
@@ -3753,6 +3954,8 @@ export class SyncEngine {
     const payload = { fileType, contentHash: hash, size: buffer.byteLength };
     if (change) change.payload = payload;
     const opId = change?.opId ?? newOpId();
+    // A replay of the queue's (see `hold`): the head of the queue.
+    const from: LocalSource = change === null ? 'queue' : 'watcher';
 
     // Join-window guard: between socket connect and the fileIndex refresh
     // the index can't tell a NEW file from a server-known one — emitting
@@ -3761,7 +3964,7 @@ export class SyncEngine {
     // this window and minted 120 `<name>.conflict-<clientId>.md` copies in
     // two seconds). Queue instead — the post-connect drain consults the
     // refreshed index and routes server-known paths through modify.
-    if (this.canSendLive() && this.indexReady) {
+    if (this.mayEmitLive(from) && this.indexReady) {
       let data: ArrayBuffer | undefined;
       try {
         // Binary bytes are staged over REST; text rides inline (small).
@@ -3775,7 +3978,14 @@ export class SyncEngine {
       }
       this.throwIfStopped();
       const sent = await this.sendOp(
-        { opType: 'CREATE', filePath: path, newPath: null, payload, opId },
+        {
+          opType: 'CREATE',
+          filePath: path,
+          newPath: null,
+          payload,
+          opId,
+          ...(from === 'queue' ? { fromQueue: true as const } : {}),
+        },
         (id) =>
           this.emitCreate({
             projectId: this.binding.projectId,
@@ -4081,8 +4291,10 @@ export class SyncEngine {
     };
     if (change) change.payload = payload;
     const opId = change?.opId ?? newOpId();
+    // A replay of the queue's (see `hold`): the head of the queue.
+    const from: LocalSource = change === null ? 'queue' : 'watcher';
 
-    if (this.canSendLive()) {
+    if (this.mayEmitLive(from)) {
       try {
         // Binary bytes go to the REST staging area; the socket op is metadata-only.
         await this.uploadBlob(hash, buffer);
@@ -4094,7 +4306,14 @@ export class SyncEngine {
       }
       this.throwIfStopped();
       await this.sendOp(
-        { opType: 'UPDATE', filePath: path, newPath: null, payload, opId },
+        {
+          opType: 'UPDATE',
+          filePath: path,
+          newPath: null,
+          payload,
+          opId,
+          ...(from === 'queue' ? { fromQueue: true as const } : {}),
+        },
         (id) =>
           this.socket.emitFileUpdateBinary({
             projectId: this.binding.projectId,
@@ -4217,8 +4436,7 @@ export class SyncEngine {
       if (!this.hasStopped) {
         for (const opId of ahead) {
           if (this.sending.has(opId)) continue;
-          if (this.operationLog.clearInFlight(this.binding.id, opId))
-            this.inflightHere.delete(opId);
+          if (this.operationLog.clearInFlight(this.binding.id, opId)) this.leftFlight(opId);
         }
       }
     }
@@ -4232,7 +4450,7 @@ export class SyncEngine {
    * when nothing can go out now.
    */
   private async recordDeletesAhead(held: readonly HeldChange[]): Promise<string[]> {
-    if (!this.canSendLive()) return [];
+    if (!this.mayEmitLive('watcher')) return [];
     const bindingId = this.binding.id;
     const ahead: string[] = [];
     for (const change of held) {
@@ -4372,7 +4590,9 @@ export class SyncEngine {
       if (change) change.payload = deletePayload(fileId, meta);
       if (fileId) this.deletedIds.add(fileId);
       const sending = claim;
-      if (this.canSendLive() && fileId) {
+      // A replay of the queue's (see `hold`): the head of the queue.
+      const from: LocalSource = change === null ? 'queue' : 'watcher';
+      if (this.mayEmitLive(from) && fileId) {
         const sent = await this.sendOp(
           {
             opType: 'DELETE',
@@ -4380,6 +4600,7 @@ export class SyncEngine {
             newPath: null,
             payload: deletePayload(fileId, meta),
             opId,
+            ...(from === 'queue' ? { fromQueue: true as const } : {}),
           },
           (id) =>
             this.emitDelete({
@@ -4494,7 +4715,7 @@ export class SyncEngine {
     this.settle(change);
     if (this.sending.has(change.opId)) return;
     if (this.operationLog.clearInFlight(this.binding.id, change.opId)) {
-      this.inflightHere.delete(change.opId);
+      this.leftFlight(change.opId);
     }
   }
 
@@ -4730,7 +4951,7 @@ export class SyncEngine {
       docMoved = this.moveRenamedDoc(target, oldPath, newPath);
       /** Sent, and whatever became of it is settled or queued already. */
       let sent = false;
-      if (this.canSendLive() && this.supersedeQueuedMoves(fileId, newPath)) {
+      if (this.mayEmitLive('watcher') && this.supersedeQueuedMoves(fileId, newPath)) {
         sent = true;
         const result = await this.sendOp(
           {
@@ -6069,7 +6290,7 @@ export class SyncEngine {
       [KEEP_OVER]: serverHash,
     };
     const opId = newOpId();
-    if (!this.canSendLive()) {
+    if (!this.mayEmitLive('watcher')) {
       this.queue('UPDATE', meta.relativePath, null, payload, opId);
       return;
     }
@@ -6281,6 +6502,8 @@ export class SyncEngine {
       // un-deletes it. The recipient broadcast will reset our state. An
       // answer to the question: never replayed. Its answer lost, the next
       // connect closes it if the server applied it, and asks again if not.
+      // Nor queued behind changes the server refused with `busy` (see
+      // `mayEmitOp`): refused itself meanwhile, it is asked again then too.
       if (this.canSendLive()) {
         let data: ArrayBuffer | undefined;
         try {
@@ -6798,6 +7021,8 @@ export class SyncEngine {
    */
   private async restoreMovedAway(meta: IndexedMeta, movedTo: string): Promise<void> {
     const path = meta.relativePath;
+    // An answer to the question: not queued behind changes the server refused
+    // with `busy` either (see `mayEmitOp`).
     if (!this.canSendLive()) return;
     let result: SendResult<void>;
     // On its way from here: its broadcast is this device's own.
@@ -7681,20 +7906,250 @@ export class SyncEngine {
   }
 
   /**
+   * Send the queue, one drain at a time: the connect's (see
+   * {@link drainThenInitialPush}), or a try after `busy` (see
+   * {@link pumpQueue}). `link`: the connection the drain works for — it ends
+   * with it, and what it came to is acted on only while that connection is
+   * the one open (see {@link afterDrain}). The connect's drain waits for one
+   * still running; a try that comes while one runs is made after it.
+   */
+  private async runDrain(link: AbortController, kind: 'connect' | 'pump'): Promise<void> {
+    if (this.draining !== null && kind === 'pump') {
+      this.drainAgain = true;
+      return;
+    }
+    while (this.draining !== null) {
+      await this.draining;
+      link.signal.throwIfAborted();
+    }
+    let finished!: () => void;
+    this.draining = new Promise<void>((resolve) => {
+      finished = resolve;
+    });
+    this.drainSignal = link.signal;
+    try {
+      this.afterDrain(await this.drainQueue(link.signal), link);
+    } finally {
+      this.drainSignal = null;
+      this.draining = null;
+      finished();
+      if (this.drainAgain) {
+        this.drainAgain = false;
+        if (
+          link === this.link &&
+          !link.signal.aborted &&
+          this.operationLog.replayableCount(this.binding.id) > 0
+        ) {
+          this.schedulePump();
+        }
+      }
+    }
+  }
+
+  /**
+   * Replay the queue until it is empty, pass after pass (see
+   * {@link flushPendingOperations}): changes queued while a pass runs — new
+   * ones behind those the server refused with `busy` (see {@link queueFirst}),
+   * or a live one put back — go out with the next. Before a pass while new
+   * changes wait behind the queue, the ones this engine has on their way are
+   * waited for (see {@link liveOpsSettled}).
+   */
+  private async drainQueue(signal: AbortSignal): Promise<DrainOutcome> {
+    for (let pass = 0; this.operationLog.replayableCount(this.binding.id) > 0; pass++) {
+      if (pass >= DRAIN_PASSES_MAX) return { kind: 'capped' };
+      if (this.queueFirst) await this.liveOpsSettled(signal);
+      if (!this.canSendLive()) return { kind: 'offline' };
+      const result = await this.flushPendingOperations(signal);
+      if (result.haltedOn !== null) {
+        return { kind: 'halted', error: result.haltedError ?? 'unknown' };
+      }
+      if (result.sent + result.droppedCount === 0) return { kind: 'stalled' };
+    }
+    return { kind: 'empty' };
+  }
+
+  /**
+   * What a drain of the queue (see {@link runDrain}) came to, acted on while
+   * the connection it worked for is the one open — the next connect starts
+   * over (see {@link onSocketConnect}):
+   *
+   *   - the queue sent: new changes go out at once again;
+   *   - halted on `busy`: new changes wait behind the queue, which is tried
+   *     again after a pause (see {@link schedulePump});
+   *   - halted on another error while new changes wait behind the queue:
+   *     tried again, and after {@link QUEUE_FAILURES_MAX} such tries in a row
+   *     new changes go out at once again, the rest of the queue waiting for
+   *     the next connect as it does after any drain halted so;
+   *   - a pass that sent nothing, the queue not empty: tried again;
+   *   - still filling up after {@link DRAIN_PASSES_MAX} passes: new changes go
+   *     out at once again, and the rest of the queue is tried after a pause.
+   */
+  private afterDrain(outcome: DrainOutcome, link: AbortController): void {
+    if (link !== this.link || link.signal.aborted) return;
+    switch (outcome.kind) {
+      case 'empty':
+        this.openGate('sent');
+        return;
+      case 'halted':
+        if (outcome.error === 'busy') {
+          this.closeGate();
+          this.pumpFailures = 0;
+          this.schedulePump();
+          return;
+        }
+        // Halted so with nothing waiting behind the queue: it waits for the
+        // next connect, as it always has.
+        if (!this.queueFirst) return;
+        this.pumpFailures += 1;
+        if (this.pumpFailures < QUEUE_FAILURES_MAX) {
+          this.schedulePump();
+          return;
+        }
+        this.log.warn(
+          'queue drain halted after busy; new changes go out again, the rest waits for the next connect',
+          { error: outcome.error, waiting: this.operationLog.replayableCount(this.binding.id) },
+        );
+        this.openGate('given up');
+        return;
+      case 'stalled':
+        if (this.queueFirst) this.schedulePump();
+        return;
+      case 'capped':
+        this.log.warn(
+          'changes keep coming faster than the queue goes out; new changes go out again',
+          {
+            waiting: this.operationLog.replayableCount(this.binding.id),
+          },
+        );
+        this.openGate('given up');
+        this.schedulePump();
+        return;
+      case 'offline':
+        return;
+    }
+  }
+
+  /**
+   * The server refused a file operation of this device with `busy`: new
+   * changes wait in the queue behind it (see {@link queueFirst}), and the
+   * status says so.
+   */
+  private closeGate(): void {
+    if (this.queueFirst) return;
+    this.queueFirst = true;
+    this.log.info('server busy: new file changes wait in the queue behind the refused ones', {
+      waiting: this.operationLog.replayableCount(this.binding.id),
+    });
+    if (this.status === 'connected') this.setStatus('connected', QUEUE_FIRST_DETAIL);
+  }
+
+  /**
+   * New changes go out at once again (see {@link queueFirst}): the queue has
+   * gone out (`sent`), or the engine has stopped waiting for it (`given up`).
+   */
+  private openGate(how: 'sent' | 'given up'): void {
+    this.pumpStep = 0;
+    this.pumpFailures = 0;
+    if (!this.queueFirst) return;
+    this.queueFirst = false;
+    if (how === 'sent')
+      this.log.info('changes the server refused as busy sent; new ones go out again');
+    if (this.status === 'connected' && this.statusDetail === QUEUE_FIRST_DETAIL) {
+      this.setStatus('connected');
+    }
+  }
+
+  /**
+   * Try the queue again after the next pause of {@link queueRetryMs} (see
+   * {@link pumpQueue}), on the connection open now. Not before this connect
+   * has handed the queue to its drain (see {@link drainHandedOver}); nor
+   * offline, on Pause sync or once stopped — the next connect sends it.
+   */
+  private schedulePump(): void {
+    if (this.pumpTimer !== null || this.hasStopped || this.paused || !this.started) return;
+    if (!this.drainHandedOver) return;
+    const link = this.link;
+    if (link === null || link.signal.aborted) return;
+    const pauses = this.queueRetryMs;
+    const delay = pauses[Math.min(this.pumpStep, pauses.length - 1)] ?? 0;
+    this.pumpStep += 1;
+    this.pumpTimer = window.setTimeout(() => {
+      this.pumpTimer = null;
+      this.trackConnectFlow(this.pumpQueue(link));
+    }, delay);
+  }
+
+  /** Call off the try of the queue {@link schedulePump} set up, if any. */
+  private clearPumpTimer(): void {
+    if (this.pumpTimer === null) return;
+    window.clearTimeout(this.pumpTimer);
+    this.pumpTimer = null;
+  }
+
+  /**
+   * A try of the queue after `busy` (see {@link schedulePump}): a drain on
+   * the connection `link`, while it is the one open. Cut short with it, by
+   * Pause sync or by `stop()`, it ends silently: the next connect sends the
+   * queue.
+   */
+  private async pumpQueue(link: AbortController): Promise<void> {
+    if (link !== this.link || link.signal.aborted || this.hasStopped) return;
+    try {
+      await this.runDrain(link, 'pump');
+    } catch (err) {
+      if (link.signal.aborted || this.hasStopped) return;
+      this.log.warn('could not send the queue again', {
+        error: describeError(err, 'drain_failed'),
+      });
+    }
+  }
+
+  /**
+   * Resolves once none of the changes this engine sent live is on its way —
+   * recorded in flight and neither answered nor queued yet (answers to
+   * questions aside). A try of the queue after `busy` goes after them: the
+   * server may still refuse one of them `busy` after the pause, and it goes
+   * back to the queue in its place, ahead of the changes queued since. The
+   * pause alone was no guarantee: an answer late by more than it, and the
+   * refused change went out after the ones made after it.
+   */
+  private async liveOpsSettled(signal: AbortSignal): Promise<void> {
+    while (this.liveInFlight()) {
+      signal.throwIfAborted();
+      await new Promise<void>((resolve) => {
+        const wake = (): void => {
+          this.flightWaiters.delete(wake);
+          signal.removeEventListener('abort', wake);
+          resolve();
+        };
+        this.flightWaiters.add(wake);
+        signal.addEventListener('abort', wake, { once: true });
+      });
+    }
+    signal.throwIfAborted();
+  }
+
+  /** Whether a change of this engine's is on its way (see {@link liveOpsSettled}). */
+  private liveInFlight(): boolean {
+    if (this.inflightHere.size === 0) return false;
+    return this.operationLog
+      .inFlightOperations(this.binding.id)
+      .some((op) => op.settleOnly !== true && this.inflightHere.has(op.opId));
+  }
+
+  /**
    * Replay every pending operation for this binding via the shared
    * `flushPendingQueue` helper from `reconnect.ts`. Splitting the loop
    * out of the engine lets us reuse the same drain machinery from a
    * future "Sync now" command.
    */
-  private async flushPendingOperations(online: AbortSignal): Promise<void> {
+  private async flushPendingOperations(signal: AbortSignal): Promise<FlushResult> {
     this.collapseQueuedRenames();
     const emit: PendingEmitter = (op) => this.replayPending(op);
     // Pause sync ends the drain like `stop()`: the operation in flight stays
     // queued and goes out once on resume, and the drain is not reported as
-    // halted on it.
-    const result = await flushPendingQueue(this.binding.id, this.operationLog, emit, {
-      signal: online,
-    });
+    // halted on it. So does a connection lost (see `link`).
+    const result = await flushPendingQueue(this.binding.id, this.operationLog, emit, { signal });
     // A halted drain used to be invisible: the queue simply stopped moving and
     // nothing said so. Surface it — one stuck operation holds back every edit
     // queued behind it.
@@ -7706,12 +8161,19 @@ export class SyncEngine {
       });
     }
     if (result.haltedOn) {
-      this.log.warn('offline queue drain halted', {
+      // `busy` is said once, when changes start waiting behind the queue (see
+      // `closeGate`), and the queue is tried again: a line for each try, every
+      // half a minute of a long stall, only buried the rest of `sync.log`.
+      const detail = {
         opType: result.haltedOn.opType,
         path: result.haltedOn.filePath,
+        error: result.haltedError,
         remaining: result.remaining,
-      });
+      };
+      if (result.haltedError === 'busy') this.log.debug('offline queue drain halted', detail);
+      else this.log.warn('offline queue drain halted', detail);
     }
+    return result;
   }
 
   /**
@@ -7758,8 +8220,13 @@ export class SyncEngine {
       }
       if (chain.length === 0) continue;
       for (const id of chain) absorbed.add(id);
-      // None of them has reached the server: the connect asked about each
-      // before this (see `settleUnanswered`). The chain goes out as `first`,
+      // None of them has reached the server. The connect asked about each one
+      // queued before it (see `settleUnanswered`), and in the same connection
+      // an operation comes back to the queue only without having been
+      // applied: refused (`busy` among others), queued behind the ones the
+      // server refused (see `queueFirst`), or not sent at all. A live rename
+      // the server answered is settled before anything can throw (see
+      // `renameRecorded`), so never goes back. The chain goes out as `first`,
       // under its `opId`.
       if (target === first.filePath) absorbed.add(first.id);
       else this.operationLog.retargetOperation(first.id, target);
@@ -8092,6 +8559,9 @@ export class SyncEngine {
       await this.operationLog.persistNow();
     }
     this.throwIfStopped();
+    // The drain's connection is gone (see `link`): the next connect's drain
+    // sends it.
+    this.drainSignal?.throwIfAborted();
     this.sending.add(op.opId);
     try {
       return await emit(op.opId);
@@ -8120,6 +8590,9 @@ export class SyncEngine {
    */
   private drainRefusal(op: PendingOperation, error: string): ReplayOutcome {
     if (error === 'op_voided') this.operationLog.rotateOpId(this.binding.id, op.id);
+    // New changes wait behind it; the end of the drain has the queue tried
+    // again (see `afterDrain`).
+    if (error === 'busy') this.closeGate();
     return ackToOutcome({ ok: false, error });
   }
 
@@ -8293,6 +8766,7 @@ export class SyncEngine {
     // engine stays `stopped`.
     if (this.hasStopped && status !== 'stopped') return;
     this.status = status;
+    this.statusDetail = detail;
     // Observability: surface every transition through the logger so a sync
     // failure is diagnosable from sync.log / DevTools, not just the status
     // bar. `error` logs at error level (always written to the file sink);

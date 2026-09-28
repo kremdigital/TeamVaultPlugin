@@ -35,6 +35,7 @@ describe('flushPendingQueue', () => {
     const result = await flushPendingQueue('b1', log, emit);
     expect(result.sent).toBe(2);
     expect(result.haltedOn).toBeNull();
+    expect(result.haltedError).toBeNull();
     expect(result.dropped).toBeNull();
     expect(result.remaining).toBe(0);
   });
@@ -54,6 +55,8 @@ describe('flushPendingQueue', () => {
     const result = await flushPendingQueue('b1', log, emit);
     expect(result.sent).toBe(1);
     expect(result.haltedOn?.filePath).toBe('b.md');
+    // What it halted on: the engine tries the queue again after `busy`.
+    expect(result.haltedError).toBe('boom');
     expect(result.remaining).toBe(2); // b.md and c.md still queued
   });
 
@@ -105,6 +108,7 @@ describe('flushPendingQueue', () => {
     const result = await flushPendingQueue('b1', log, emit);
     expect(result.sent).toBe(0);
     expect(result.haltedOn).not.toBeNull();
+    expect(result.haltedError).toBe('network down');
     expect(result.remaining).toBe(1);
   });
 
@@ -117,6 +121,7 @@ describe('flushPendingQueue', () => {
       dropped: null,
       droppedCount: 0,
       haltedOn: null,
+      haltedError: null,
       remaining: 0,
     });
   });

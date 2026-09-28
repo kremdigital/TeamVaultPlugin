@@ -38,6 +38,8 @@ export interface FlushResult {
   droppedCount: number;
   /** First op that failed retryably (we stop and leave the rest queued). */
   haltedOn: PendingOperation | null;
+  /** The error {@link haltedOn} failed with (`busy`, `blob_staging_failed`, …); `null` when not halted. */
+  haltedError: string | null;
   /** Total ops still in the queue after this drain. */
   remaining: number;
 }
@@ -75,6 +77,7 @@ export async function flushPendingQueue(
   let dropped: PendingOperation | null = null;
   let droppedCount = 0;
   let haltedOn: PendingOperation | null = null;
+  let haltedError: string | null = null;
 
   for (const op of pending) {
     signal?.throwIfAborted();
@@ -91,6 +94,7 @@ export async function flushPendingQueue(
     }
     if (outcome.retryable) {
       haltedOn = op;
+      haltedError = outcome.error;
       break;
     }
     // Non-retryable: drop it and keep going.
@@ -104,6 +108,7 @@ export async function flushPendingQueue(
     dropped,
     droppedCount,
     haltedOn,
+    haltedError,
     remaining: log.pendingCount(bindingId),
   };
 }

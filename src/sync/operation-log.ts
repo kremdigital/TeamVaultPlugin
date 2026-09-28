@@ -554,6 +554,15 @@ export class OperationLog {
   }
 
   /**
+   * Number of queued operations of a binding the drain replays: every one but
+   * the answers to questions (`settleOnly`), which wait for the next connect.
+   */
+  replayableCount(bindingId: string): number {
+    return (this.bindings.get(bindingId)?.pending ?? []).filter((op) => op.settleOnly !== true)
+      .length;
+  }
+
+  /**
    * Point a queued RENAME or MOVE at another destination, keeping its place in
    * the queue and its `opId`: a chain of renames of one file is sent as one
    * (see `SyncEngine.collapseQueuedRenames`). `false` when no such operation
