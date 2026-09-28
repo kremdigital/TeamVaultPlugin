@@ -1,0 +1,17 @@
+{
+  "id": "cl_5",
+  "opType": "DELETE",
+  "filePath": "archive/2025/old.md",
+  "newPath": null,
+  "authorId": "u2",
+  "clientId": "c-B",
+  "opId": "77aa5b6c-7d8e-4f90-a1b2-c3d4e5f60718",
+  "vectorClock": {
+    "c-B": 6
+  },
+  "payload": {
+    "fileId": "f4",
+    "folder": "archive"
+  },
+  "createdAt": "2026-10-01T10:00:02.000Z"
+}

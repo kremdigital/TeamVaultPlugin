@@ -174,8 +174,8 @@ export type FileEvent = FileEventOrigin &
         fileType?: 'TEXT' | 'BINARY';
       }
     | { type: 'updated-binary'; fileId: string; contentHash: string; log: ServerLogEntry }
-    | { type: 'deleted'; fileId: string; log: ServerLogEntry }
-    | {
+    | ({ type: 'deleted'; fileId: string; log: ServerLogEntry } & VanishedFolder)
+    | ({
         type: 'renamed';
         fileId: string;
         /**
@@ -186,15 +186,28 @@ export type FileEvent = FileEventOrigin &
         newPath: string;
         outcome: unknown;
         log: ServerLogEntry;
-      }
-    | {
+      } & VanishedFolder)
+    | ({
         type: 'moved';
         fileId: string;
         newPath: string;
         outcome: unknown;
         log: ServerLogEntry;
-      }
+      } & VanishedFolder)
   );
+
+/**
+ * `folder` of a delete, rename or move (`sync-protocol.md`, «Папки»): the
+ * topmost folder that vanished on the author's device together with the
+ * operation — the folder deleted or renamed there. Folders are not synced as
+ * such, the server knows files only: without it, a folder a teammate deleted
+ * or renamed stayed behind, empty, on every other device. A receiver removes
+ * it only if nothing is left in it. Absent when the author deleted or moved
+ * only the file, and from a server that does not keep it.
+ */
+export interface VanishedFolder {
+  folder?: string;
+}
 
 export interface YjsUpdateMessage {
   fileId: string;
@@ -250,6 +263,12 @@ function originOf(data: object): FileEventOrigin {
     ...(typeof clientId === 'string' && clientId !== '' ? { clientId } : {}),
     ...(typeof opId === 'string' && opId !== '' ? { opId } : {}),
   };
+}
+
+/** `folder` of a file event (see {@link VanishedFolder}), when it is a non-empty string. */
+function folderOf(data: object): VanishedFolder {
+  const { folder } = data as { folder?: unknown };
+  return typeof folder === 'string' && folder !== '' ? { folder } : {};
 }
 
 /** The top-level fields of `file:created` that say where the file went. */
@@ -343,12 +362,17 @@ export interface FileUpdateBinaryPayload extends BaseEnvelope {
   data?: ArrayBuffer;
 }
 
-export interface FileDeletePayload extends BaseEnvelope {
+/** `folder`: see {@link VanishedFolder} — a strict ancestor of `filePath`. */
+export interface FileDeletePayload extends BaseEnvelope, VanishedFolder {
   fileId: string;
   filePath: string;
 }
 
-export interface FileMovePayload extends BaseEnvelope {
+/**
+ * `folder`: see {@link VanishedFolder} — a strict ancestor of `filePath`, and
+ * never `newPath` nor one of its folders: the folder the file went to is there.
+ */
+export interface FileMovePayload extends BaseEnvelope, VanishedFolder {
   fileId: string;
   filePath: string;
   newPath: string;
@@ -548,6 +572,7 @@ export class SocketClient {
         type: 'deleted',
         fileId: data.fileId,
         log: data.log,
+        ...folderOf(data),
         ...originOf(data),
       });
     });
@@ -562,6 +587,7 @@ export class SocketClient {
         newPath: data.newPath,
         outcome: data.outcome,
         log: data.log,
+        ...folderOf(data),
         ...originOf(data),
       });
     });
@@ -576,6 +602,7 @@ export class SocketClient {
         newPath: data.newPath,
         outcome: data.outcome,
         log: data.log,
+        ...folderOf(data),
         ...originOf(data),
       });
     });

@@ -1,10 +1,20 @@
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
 import {
   SocketClient,
+  type FileEvent,
   type SocketFactory,
   type SocketFactoryOptions,
   type SocketLike,
 } from '@/client/socket';
 import { stubWindow } from './window-stub';
+
+/** One example of `tests/fixtures/protocol-0.4/` (`sync-protocol.md` §4), parsed. */
+function protocolFixture(name: string): unknown {
+  return JSON.parse(
+    readFileSync(join(__dirname, 'fixtures', 'protocol-0.4', `${name}.json`), 'utf8'),
+  ) as unknown;
+}
 
 /**
  * Minimal socket.io-client stand-in. Just enough surface to drive the plugin
@@ -443,6 +453,39 @@ describe('SocketClient — incoming events', () => {
       outcome: 'moved',
       log,
     });
+  });
+
+  it('passes on the folder a delete, rename or move says vanished with it, as the examples carry it', () => {
+    const { client, socket } = captureSocket();
+    const fileCb = jest.fn<void, [FileEvent]>();
+    client.onFileEvent(fileCb);
+    client.connect();
+    socket().fire('file:deleted', protocolFixture('event-file-deleted-folder'));
+    socket().fire('file:renamed', protocolFixture('event-file-renamed-folder'));
+    socket().fire('file:moved', protocolFixture('event-file-moved-folder'));
+    expect(fileCb.mock.calls.map(([e]) => [e.type, 'folder' in e ? e.folder : null])).toEqual([
+      ['deleted', 'archive'],
+      ['renamed', 'drafts'],
+      ['moved', 'inbox'],
+    ]);
+  });
+
+  it('drops a folder that is not a non-empty string', () => {
+    const { client, socket } = captureSocket();
+    const fileCb = jest.fn<void, [FileEvent]>();
+    client.onFileEvent(fileCb);
+    client.connect();
+    const log = { id: 'l4', vectorClock: {}, createdAt: '2026-01-04' };
+    socket().fire('file:deleted', { fileId: 'f1', folder: 42, log });
+    socket().fire('file:renamed', { fileId: 'f1', newPath: 'b.md', folder: '', outcome: {}, log });
+    socket().fire('file:moved', {
+      fileId: 'f1',
+      newPath: 'c/b.md',
+      folder: null,
+      outcome: {},
+      log,
+    });
+    expect(fileCb.mock.calls.map(([e]) => 'folder' in e)).toEqual([false, false, false]);
   });
 
   it('decodes yjs:update payload back to a Uint8Array', () => {

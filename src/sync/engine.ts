@@ -57,6 +57,7 @@ import {
   pathKey,
   type PathRejection,
 } from '@/watcher/path-utils';
+import { normalizeFolderPath } from '@/settings/folder-utils';
 import { debounce, type DebouncedFunction } from '@/utils/debounce';
 import { Logger, type LogSink } from '@/utils/logger';
 import { EngineStoppedError, SyncPausedError, childController, fence } from './stop-fence';
@@ -381,6 +382,8 @@ interface Catchup {
   renamedFrom: ReadonlyMap<string, ReadonlySet<string>>;
   /** Operations this device applied from their live broadcasts. */
   appliedLive: ReadonlySet<string>;
+  /** Cut short to its newest operations (`operationsTruncated`). */
+  truncated: boolean;
 }
 
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
@@ -459,6 +462,19 @@ const DOC_STATE = 'docState';
  * {@link RECHECK_DELETE}.
  */
 const KEEP_OVER = 'keepOver';
+
+/**
+ * Payload of a queued DELETE, RENAME or MOVE: the folder that vanished with
+ * it here (see `SyncEngine.vanishedFolderOf`). Sent as the operation's
+ * `folder` when the queue replays it.
+ */
+const FOLDER = 'folder';
+
+/**
+ * How many folders {@link SyncEngine.prunedHere} keeps whose `delete` Obsidian
+ * has not reported, before it starts over.
+ */
+const PRUNED_MAX = 1000;
 
 /** How many paths {@link SyncEngine.caseKey} remembers the key of before it starts over. */
 const CASE_KEYS_MAX = 50_000;
@@ -790,6 +806,39 @@ export class SyncEngine {
    * the name meanwhile: the server gives it the deleted file's id.
    */
   private readonly deleteClaims = new Map<string, DeleteClaim>();
+
+  /**
+   * The checks of {@link vanishedFolderOf}, chained: one at a time, in the
+   * order the local deletes and renames that wait for them came. Each such
+   * operation goes out after its check; without the chain, a check that took
+   * longer on disk let a later rename of the same note go out first.
+   */
+  private folderChecks: Promise<unknown> = Promise.resolve();
+
+  /**
+   * Folders this engine removed from disk as ones a teammate deleted or
+   * renamed (see {@link pruneVanishedFolder}), by {@link folderKey}, whose
+   * `delete` Obsidian has not reported yet. Its watcher reports the removal a
+   * moment later, as it reports a folder the user deleted, and the engine
+   * expands a folder's delete into its files' deletes (see
+   * {@link handleLocalFolderDelete}). Nothing was indexed under the folder
+   * when it was removed; a file indexed under its name since — a teammate's
+   * new one, still downloading — would have gone out as deleted by the user.
+   * Kept until the report comes: its time is Obsidian's.
+   */
+  private readonly prunedHere = new Set<string>();
+
+  /**
+   * Folders the catch-up's deletes, renames and moves say vanished at their
+   * authors' (see {@link pruneVanishedFolder}): folder → the path of the file
+   * of the first of them. Removed only at the end of the connect's tail (see
+   * {@link drainThenInitialPush}): the copies of files deleted while this
+   * device was away are still on disk during the catch-up, and go only then
+   * (see {@link initialPush}). Kept for the next connect's tail when this
+   * one's is cut short (Pause sync, the connection lost): the catch-up does
+   * not bring those operations again.
+   */
+  private readonly catchupFolders = new Map<string, string>();
 
   /**
    * Whether an operation under this device's client id that it did not send
@@ -1488,6 +1537,7 @@ export class SyncEngine {
         superseded: supersededOps(result.operations),
         renamedFrom: renameSources(result.operations),
         appliedLive,
+        truncated: result.operationsTruncated === true,
       };
       for (const op of result.operations) {
         if (own.has(op)) this.mergeClock(op);
@@ -2621,6 +2671,8 @@ export class SyncEngine {
     }
     try {
       await this.initialPush(online);
+      // The copies of files deleted while away are gone by now.
+      await this.pruneCatchupFolders();
     } finally {
       await this.askAboutRetiredWhileAway(online);
     }
@@ -4530,9 +4582,19 @@ export class SyncEngine {
    * folder's does. Each file's delete goes out once (see {@link deleteClaims}):
    * a child whose delete is under way already is left to it, and an event of
    * a child that comes after this one joins this one's.
+   *
+   * Each delete says which folder went with it (see {@link vanishedFolderOf}).
+   * Not for a folder this engine removed itself, as one a teammate removed
+   * (see {@link prunedHere}): Obsidian reports it all the same.
    */
   private async handleLocalFolderDelete(folderPath: string): Promise<void> {
     if (!isInBinding(folderPath, this.binding.localFolder)) return;
+    if (this.prunedHere.delete(this.folderKey(folderPath))) {
+      this.log.debug('folder delete: a folder removed here as a teammate’s, nothing to send', {
+        folder: folderPath,
+      });
+      return;
+    }
     const children: string[] = [];
     // The folder on disk may be spelled in another case than the notes in it
     // are recorded by (see `spelledHere`).
@@ -4575,6 +4637,12 @@ export class SyncEngine {
       folderPath,
       `(${children.length} files, ${underWay.length} on their way already)`,
     );
+    // The folder that went — this one, or one above it that went with it —
+    // in the records made ahead too: from them, the queue sends it.
+    if (held.length > 0) {
+      const folder = await this.vanishedFolderOf(folderPath);
+      for (const change of held) change.payload = withFolder(change.payload, folder);
+    }
     const ahead = await this.recordDeletesAhead(held);
     try {
       for (const change of held) {
@@ -4736,10 +4804,13 @@ export class SyncEngine {
       // strips the path out of `fileIndex` — and the next watcher event
       // then finds an empty index and dispatches a phantom `file:create`.
       if (await this.vault.exists(path)) return;
+      // The folder that went with the file, if it did: its teammates remove
+      // it too (see `vanishedFolderOf`).
+      const folder = await this.vanishedFolderOf(parentFolder(path));
       const meta = this.fileIndex.byPath.get(path);
       let fileId = meta?.fileId ?? '';
       // Checked: from here on `stop()` hands it over as a plain DELETE.
-      if (change) change.payload = deletePayload(fileId, meta);
+      if (change) change.payload = withFolder(deletePayload(fileId, meta), folder);
       // The path may be absent from the local index (a folder-delete child, or
       // a stale index). Resolve the id from the server's live file list before
       // giving up — otherwise the DELETE is queued with an empty fileId and is
@@ -4764,7 +4835,8 @@ export class SyncEngine {
       }
       // From here on the delete is sent, queued, or there is none to make.
       outcome = 'gone';
-      if (change) change.payload = deletePayload(fileId, meta);
+      const payload = withFolder(deletePayload(fileId, meta), folder);
+      if (change) change.payload = payload;
       if (fileId) this.deletedIds.add(fileId);
       const sending = claim;
       // A replay of the queue's (see `hold`): the head of the queue.
@@ -4775,7 +4847,7 @@ export class SyncEngine {
             opType: 'DELETE',
             filePath: path,
             newPath: null,
-            payload: deletePayload(fileId, meta),
+            payload,
             opId,
             ...(from === 'queue' ? { fromQueue: true as const } : {}),
           },
@@ -4787,6 +4859,7 @@ export class SyncEngine {
               vectorClock: this.bumpClock(),
               fileId,
               filePath: path,
+              ...folderField(folder),
             }),
           async (_ack, settle) => {
             // Only what is still this file's: a note renamed onto the name here
@@ -4841,7 +4914,7 @@ export class SyncEngine {
         path,
         null,
         {
-          ...deletePayload(fileId, meta),
+          ...payload,
           ...(docState !== null ? { [DOC_STATE]: docState } : {}),
         },
         opId,
@@ -4956,6 +5029,178 @@ export class SyncEngine {
       claim?.end('gone');
       await this.dropDoc(io.docs, fileId, path);
     });
+  }
+
+  /**
+   * The topmost folder that vanished from disk with a file of `folder`, the
+   * folder the file was in, for its delete, rename or move (`folder` in
+   * `sync-protocol.md`, «Папки»): the folder the user deleted, renamed or
+   * moved — in Obsidian, to its trash or out of the binding — or the one above
+   * it that went with it. `null` when `folder` is still there: only the file
+   * went, and its folder stays for every teammate too. Never the binding's own
+   * folder; for a rename, never where the file went (`newPath`).
+   *
+   * Obsidian removes a folder on disk before it reports anything about it, a
+   * folder deleted and one renamed alike (`reconcileDeletion`, `rename` in
+   * `app.js` 1.13.7), so the disk tells when a file's event comes. Checked one
+   * at a time, in the order they are asked for (see {@link folderChecks}).
+   */
+  private vanishedFolderOf(folder: string, newPath: string | null = null): Promise<string | null> {
+    const check = this.folderChecks.then(() => this.vanishedFolderNow(folder, newPath));
+    this.folderChecks = check.catch(() => undefined);
+    return check;
+  }
+
+  /** {@link vanishedFolderOf}, looked up now. */
+  private async vanishedFolderNow(folder: string, newPath: string | null): Promise<string | null> {
+    const root = normalizeFolderPath(this.binding.localFolder);
+    let gone: string | null = null;
+    for (
+      let dir = folder;
+      dir !== '' && dir !== root && isInBinding(dir, root);
+      dir = parentFolder(dir)
+    ) {
+      let there: boolean;
+      try {
+        there = await this.vault.exists(dir);
+      } catch {
+        this.throwIfStopped();
+        return null;
+      }
+      if (there) break;
+      gone = dir;
+    }
+    // The folder the file went to has not vanished, nor has one it is in.
+    if (gone !== null && newPath !== null && isInBinding(newPath, gone)) return null;
+    return gone;
+  }
+
+  /**
+   * `folder`, which vanished at its author's with a teammate's delete, rename
+   * or move of a file that was at `from` (`null` when this device did not have
+   * it): removed from disk here with the folders under it, if nothing is left
+   * in any of them (`sync-protocol.md`, «Папки»). The teammate removed the
+   * folder; a folder only emptied by a teammate's delete or move carries no
+   * `folder`, and stays, as it stayed at theirs.
+   *
+   * Never a folder that holds anything on disk but empty folders — a file this
+   * client does not sync included — nor one under which this device has a
+   * file recorded, a teammate's new one on its way to the disk included (see
+   * {@link holdsFiles}): looked at again right before each folder goes. The
+   * path is checked as any path from the server is, and a folder outside the
+   * binding, or the binding's own, is left alone.
+   *
+   * Obsidian reports the folder gone a moment later, as a `delete` of the
+   * folder: nothing the user did, and nothing goes to the server for it (see
+   * {@link prunedHere}).
+   */
+  private async pruneVanishedFolder(
+    folder: string | undefined,
+    from: string | null,
+  ): Promise<void> {
+    if (folder === undefined || folder === '') return;
+    if (this.local.vault.removeEmptyFolders === undefined) return;
+    // Another binding's folder, or none of this client's.
+    if (!isInBinding(folder, this.binding.localFolder)) return;
+    if (this.refuseServerPath(folder, 'vanished folder') !== null) return;
+    if (folder === normalizeFolderPath(this.binding.localFolder)) return;
+    // The server keeps only a folder of where the file was: anything else is
+    // not this operation's.
+    if (from !== null && !from.startsWith(`${folder}/`)) return;
+    if (this.holdsFiles(folder)) {
+      this.log.debug('a folder a teammate removed holds files here; kept', { folder });
+      return;
+    }
+    /** The folders this call is about to remove, as it goes: see `prunedHere`. */
+    const tried: string[] = [];
+    let removed: string[];
+    try {
+      removed = await this.commitLocal(
+        async (io) =>
+          (await io.vault.removeEmptyFolders?.(folder, (dir) => {
+            if (this.holdsFiles(folder)) return false;
+            // Before the folder goes: Obsidian's report may come before the
+            // rest have gone.
+            this.notePruned(dir);
+            tried.push(dir);
+            return true;
+          })) ?? [],
+      );
+    } catch (err) {
+      this.throwIfStopped();
+      this.log.debug('could not remove a folder a teammate removed', { folder, err });
+      removed = [];
+    }
+    // Not removed after all: nothing will report it.
+    for (const dir of tried) {
+      if (!removed.includes(dir)) this.prunedHere.delete(this.folderKey(dir));
+    }
+    if (removed.length === 0) {
+      this.log.debug('a folder a teammate removed is not empty here; kept', { folder });
+      return;
+    }
+    this.log.info('removed a folder a teammate deleted or renamed', {
+      folder,
+      folders: removed.length,
+    });
+  }
+
+  /**
+   * The folders of the catch-up (see {@link catchupFolders}), each removed
+   * if nothing is left in it.
+   */
+  private async pruneCatchupFolders(): Promise<void> {
+    const folders = [...this.catchupFolders];
+    this.catchupFolders.clear();
+    for (const [folder, from] of folders) await this.pruneVanishedFolder(folder, from);
+  }
+
+  /**
+   * A catch-up delete, rename or move whose folder vanished at its author's
+   * (`payload.folder`, see {@link pruneVanishedFolder}): noted for the end of
+   * the connect's tail. Whether this device had the file or not — one deleted
+   * while it was away is not in the listing, and its copy goes in
+   * `initialPush`. From a catch-up cut short, only for a file this device has.
+   */
+  private noteCatchupFolder(op: ServerOperation, catchup: Catchup): void {
+    if (op.opType !== 'DELETE' && op.opType !== 'RENAME' && op.opType !== 'MOVE') return;
+    const payload = (op.payload ?? {}) as { fileId?: unknown; folder?: unknown };
+    const folder = stringOf(payload.folder);
+    if (folder === '' || this.catchupFolders.has(folder)) return;
+    if (catchup.truncated && !this.fileIndex.byId.has(stringOf(payload.fileId))) return;
+    this.catchupFolders.set(folder, op.filePath);
+  }
+
+  /**
+   * Whether this device has a file under `folder`: indexed — one never
+   * written here yet included — being created, or a copy asked about. Under
+   * the folder in any case, on a disk that takes names in any case.
+   */
+  private holdsFiles(folder: string): boolean {
+    const insensitive = this.caseInsensitive();
+    const prefix = `${insensitive ? pathKey(folder) : folder}/`;
+    const under = (path: string): boolean =>
+      (insensitive ? this.caseKey(path) : path).startsWith(prefix);
+    for (const paths of [
+      this.fileIndex.byPath.keys(),
+      this.creating.keys(),
+      this.awayCopies.keys(),
+      this.askedCopies.keys(),
+    ]) {
+      for (const path of paths) if (under(path)) return true;
+    }
+    return false;
+  }
+
+  /** Folder `path` is being removed here: see {@link prunedHere}. */
+  private notePruned(path: string): void {
+    if (this.prunedHere.size >= PRUNED_MAX) this.prunedHere.clear();
+    this.prunedHere.add(this.folderKey(path));
+  }
+
+  /** How {@link prunedHere} knows folder `path`: in any case, on a disk that takes any. */
+  private folderKey(path: string): string {
+    return this.caseInsensitive() ? pathKey(path) : path;
   }
 
   private async handleLocalRename(oldPath: string, newPath: string): Promise<void> {
@@ -5100,6 +5345,11 @@ export class SyncEngine {
     newPath: string,
   ): Promise<void> {
     const { fileId } = target;
+    // Asked for at once: renames go out in the order they came (see
+    // `folderChecks`).
+    const vanished = this.vanishedFolderOf(parentFolder(oldPath), newPath);
+    // Awaited below; a throw before that is the one reported.
+    vanished.catch(() => undefined);
     // Renamed here after the server's rename it waited to apply: this one
     // reaches the server after it, and wins there.
     this.forgetWaiting(fileId);
@@ -5126,6 +5376,10 @@ export class SyncEngine {
       this.switchRecords(target, oldPath, newPath);
       // The history follows, under both names' locks.
       docMoved = this.moveRenamedDoc(target, oldPath, newPath);
+      // The folder the file left, if it went too: a folder renamed or moved.
+      const folder = await vanished;
+      const payload = withFolder({ fileId }, folder);
+      change.payload = payload;
       /** Sent, and whatever became of it is settled or queued already. */
       let sent = false;
       if (this.mayEmitLive('watcher') && this.supersedeQueuedMoves(fileId, newPath)) {
@@ -5135,7 +5389,7 @@ export class SyncEngine {
             opType: 'RENAME',
             filePath: oldPath,
             newPath,
-            payload: { fileId },
+            payload,
             opId: change.opId,
           },
           (id) =>
@@ -5147,6 +5401,7 @@ export class SyncEngine {
               fileId,
               filePath: oldPath,
               newPath,
+              ...folderField(folder),
             }),
           (ack, settle) => {
             // The records moved already (see `switchRecords`).
@@ -5160,7 +5415,7 @@ export class SyncEngine {
           this.log.debug('rename emit failed; queued', { oldPath, newPath });
         }
       }
-      if (!sent) this.queue('RENAME', oldPath, newPath, { fileId }, change.opId);
+      if (!sent) this.queue('RENAME', oldPath, newPath, payload, change.opId);
     } finally {
       this.settle(change);
       // Acknowledged: a teammate's rename broadcast from here on was applied
@@ -5666,13 +5921,21 @@ export class SyncEngine {
       case 'updated-binary':
         await this.applyServerUpdateBinary(event.fileId, event.contentHash);
         break;
-      case 'deleted':
+      case 'deleted': {
+        const from = this.fileIndex.byId.get(event.fileId)?.relativePath ?? null;
         await this.applyServerDelete(event.fileId);
+        // The folder, if the teammate deleted it (see `pruneVanishedFolder`).
+        await this.pruneVanishedFolder(event.folder, from);
         break;
+      }
       case 'renamed':
-      case 'moved':
+      case 'moved': {
+        const from = this.fileIndex.byId.get(event.fileId)?.relativePath ?? null;
         await this.handleServerRename(event.fileId, event.newPath, event.outcome, own);
+        // This device's own: the folder went here already.
+        if (!own) await this.pruneVanishedFolder(event.folder, from);
         break;
+      }
     }
   }
 
@@ -5908,6 +6171,7 @@ export class SyncEngine {
    */
   private async applyServerOperation(op: ServerOperation, catchup: Catchup): Promise<void> {
     const live = catchup.appliedLive.has(op.id);
+    this.noteCatchupFolder(op, catchup);
     switch (op.opType) {
       case 'CREATE': {
         const payload = (op.payload ?? {}) as { fileType?: FileType; fileId?: string };
@@ -8473,6 +8737,8 @@ export class SyncEngine {
       /** Names other files' queued operations involve, since `first`. */
       const involved = new Set<string>();
       const chain: number[] = [];
+      /** The folders the steps left that went with them (see `vanishedFolderOf`). */
+      const folders: string[] = [];
       for (let j = i + 1; j < ops.length; j++) {
         const op = ops[j];
         if (op === undefined || absorbed.has(op.id)) continue;
@@ -8489,6 +8755,8 @@ export class SyncEngine {
         if (op.filePath !== target || op.newPath === null) break;
         if (involved.has(pathKey(target)) || involved.has(pathKey(op.newPath))) break;
         chain.push(op.id);
+        const folder = queuedFolder(op.payload);
+        if (folder !== null) folders.push(folder);
         target = op.newPath;
       }
       if (chain.length === 0) continue;
@@ -8502,7 +8770,22 @@ export class SyncEngine {
       // `renameRecorded`), so never goes back. The chain goes out as `first`,
       // under its `opId`.
       if (target === first.filePath) absorbed.add(first.id);
-      else this.operationLog.retargetOperation(first.id, target);
+      else {
+        this.operationLog.retargetOperation(first.id, target);
+        // The folder the note left that went with one of the steps — the
+        // folder renamed after the note was: the topmost that is still a
+        // folder of where the chain starts, and not one of where it ends.
+        const own = queuedFolder(first.payload);
+        const left =
+          [...(own === null ? [] : [own]), ...folders]
+            .filter((f) => first.filePath.startsWith(`${f}/`) && !isInBinding(target, f))
+            .sort((a, b) => a.length - b.length)[0] ?? null;
+        if (left !== own) {
+          this.operationLog.amendOperation(first.id, {
+            payload: withFolder(first.payload, left),
+          });
+        }
+      }
       this.log.debug('offline renames of one file sent as one', {
         from: first.filePath,
         to: target,
@@ -8740,6 +9023,7 @@ export class SyncEngine {
               vectorClock: this.bumpClock(),
               fileId: deleted,
               filePath: op.filePath,
+              ...folderField(queuedFolder(op.payload)),
             }),
           );
           this.throwIfStopped();
@@ -8775,6 +9059,7 @@ export class SyncEngine {
               fileId,
               filePath: op.filePath,
               newPath,
+              ...folderField(queuedFolder(op.payload)),
             };
             return op.opType === 'RENAME'
               ? this.socket.emitFileRename(payload)
@@ -9158,6 +9443,36 @@ function lastSyncedHashes(payload: Record<string, unknown>): string[] | null {
 function queuedFileId(payload: Record<string, unknown>): string {
   const value = payload['fileId'];
   return typeof value === 'string' ? value : '';
+}
+
+/**
+ * The folder a queued DELETE, RENAME or MOVE says vanished with it (see
+ * {@link FOLDER}); `null` for none, or one parsed back from `state.json`
+ * malformed.
+ */
+function queuedFolder(payload: Record<string, unknown>): string | null {
+  const value = payload[FOLDER];
+  return typeof value === 'string' && value !== '' ? value : null;
+}
+
+/** `payload` with {@link FOLDER} set to `folder`, or without it for `null`. */
+function withFolder(
+  payload: Record<string, unknown>,
+  folder: string | null,
+): Record<string, unknown> {
+  const { [FOLDER]: _dropped, ...rest } = payload;
+  return folder === null ? rest : { ...rest, [FOLDER]: folder };
+}
+
+/** `folder` of a `file:delete`, `file:rename` or `file:move`, when there is one. */
+function folderField(folder: string | null): { folder?: string } {
+  return folder === null ? {} : { folder };
+}
+
+/** The folder vault path `path` is in; `''` for the vault's root. */
+function parentFolder(path: string): string {
+  const at = path.lastIndexOf('/');
+  return at < 0 ? '' : path.slice(0, at);
 }
 
 /** `value` when it is a string, else `''`: for fields that come off the wire. */

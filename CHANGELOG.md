@@ -6,6 +6,21 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **A folder a teammate deletes, renames or moves goes from your vault too.**
+  Team Vault syncs files, not folders, so such a folder used to stay behind,
+  empty, on every other device. Now the device where it happened says which
+  folder went with each file, and the other devices remove that folder, with
+  the empty folders in it, once nothing is left in it. Anything still there
+  keeps the folder: a file Team Vault doesn't sync (a `.gitkeep`, say), or a
+  teammate's new file on its way to your disk. A folder emptied by deleting
+  or moving its last file stays, as it stays for whoever did it. A device
+  that was offline removes the folder when it reconnects, unless it was away
+  so long that the server sent it only the newest changes. Needs the Team
+  Vault server that keeps this; with an older one, folders stay behind as
+  before. A queue written by 0.4.0 goes out as it is.
+
 ### Changed
 
 - **`sync.log` no longer says answers were lost when changes only waited in

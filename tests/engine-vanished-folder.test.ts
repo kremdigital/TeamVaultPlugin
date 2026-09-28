@@ -1,0 +1,670 @@
+/**
+ * A folder a teammate deleted or renamed goes from this disk too; a folder a
+ * teammate only emptied stays (`sync-protocol.md`, «Папки»).
+ *
+ * Folders are not synced as such: the server knows files only, and this
+ * client makes a file's folders when it writes the file. Before, a folder a
+ * teammate deleted, renamed or moved stayed behind, empty, on every other
+ * device — after each reorganization of a shared vault, a skeleton of empty
+ * folders. A receiver cannot tell by itself a folder deleted from a folder
+ * whose last file was deleted or moved: removing the second, it took folders
+ * such as "Inbox" or the attachments folder from the whole team, and with
+ * the folder for new notes gone, Obsidian puts new notes at the vault's root.
+ *
+ * So the author says so. Its delete, rename or move of a file carries
+ * `folder` — the topmost folder that vanished from its disk with the file —
+ * and a receiver removes that folder and the folders under it only if
+ * nothing is left in them, on disk or in its index: never a file, not even
+ * one it does not sync, nor a teammate's file on its way to the disk. Obsidian
+ * reports a folder removed so as it reports one the user deleted, and nothing
+ * goes to the server for it.
+ */
+import { sha256Hex } from '@/sync/hash';
+import { Logger, type LogEntry } from '@/utils/logger';
+import type { VaultEvent } from '@/watcher/obsidian-events';
+import {
+  FakeServer,
+  ServerDocs,
+  buildHarness,
+  deferred,
+  encode,
+  flushAsync,
+  joinToAnswer,
+  joinsOf,
+  nextJoin,
+  userRename,
+  type Harness,
+} from './engine-test-kit';
+
+jest.setTimeout(60_000);
+
+interface Bench {
+  h: Harness;
+  server: FakeServer;
+  docs: ServerDocs | null;
+  entries: LogEntry[];
+}
+
+/**
+ * `paths` synced — notes (`.md`) with their docs when `notes` is set, the rest
+ * attachments — and the engine connected, its catch-up and first upload done.
+ * Without `notes`, no doc of the server's reaches the engine: a note a
+ * teammate creates is recorded here and never written (it waits for its doc).
+ */
+async function seeded(
+  paths: readonly string[],
+  opts: { notes?: boolean; localFolder?: string } = {},
+): Promise<Bench> {
+  const entries: LogEntry[] = [];
+  const logger = new Logger('debug', {
+    write: (e) => {
+      entries.push(e);
+    },
+  });
+  const h = buildHarness({
+    logger,
+    ...(opts.localFolder !== undefined ? { localFolder: opts.localFolder } : {}),
+  });
+  const server = new FakeServer(h);
+  const docs = opts.notes === true ? new ServerDocs(server, h) : null;
+  for (const [i, path] of paths.entries()) {
+    const id = `f${i + 1}`;
+    const text = `${path}\n`;
+    const content = encode(text);
+    const hash = await sha256Hex(content);
+    const note = docs !== null && path.endsWith('.md');
+    h.vault.files.set(path, content);
+    h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: path,
+      serverFileId: id,
+      contentHash: hash,
+      size: content.byteLength,
+      fileType: note ? 'TEXT' : 'BINARY',
+      lastSyncedAt: 1,
+      ...(note ? { foldedHash: hash } : {}),
+    });
+    if (note) await docs.add(id, path, text);
+    else server.add({ id, path, fileType: 'BINARY', contentHash: hash, size: content.byteLength });
+  }
+  const lookups = tombstoneLookups(h);
+  await h.engine.start();
+  (await joinToAnswer(h)).ack(
+    server.joinAnswer('whole journal', { yjsDocs: docs?.snapshots() ?? [] }),
+  );
+  if (docs !== null) await docs.drive();
+  const b = { h, server, docs, entries };
+  await tailDone(b, lookups);
+  return b;
+}
+
+/** The listing with the server's deleted files, which the first upload of each connect reads. */
+const TOMBSTONES = 'GET /api/projects/p1/files?includeDeleted=true';
+
+/** How many times the engine has asked for {@link TOMBSTONES}. */
+function tombstoneLookups(h: Harness): number {
+  return h.requests.filter((r) => `${r.method} ${r.path}` === TOMBSTONES).length;
+}
+
+/**
+ * Until the tail of the connect made after `before` lookups of
+ * {@link TOMBSTONES} — the queue, the first upload, the folders of the
+ * catch-up — is under way, the server answering on the way: the tombstones
+ * asked for again, and the engine quiet.
+ */
+async function tailDone(b: Bench, before: number): Promise<void> {
+  for (let round = 0; round < 200 && tombstoneLookups(b.h) <= before; round++) {
+    b.server.serveNext();
+    await flushAsync(5);
+  }
+  if (tombstoneLookups(b.h) <= before)
+    throw new Error('the first upload of the connect never came');
+  await b.server.pump();
+  await b.h.settle();
+}
+
+/** Wait, as long as it takes the engine and within a bound, until `done()`. */
+async function until(what: string, done: () => boolean): Promise<void> {
+  for (let round = 0; round < 200; round++) {
+    if (done()) return;
+    await flushAsync(5);
+  }
+  throw new Error(`still waiting for ${what}`);
+}
+
+/** Whether the engine logged `message` since entry `from`. */
+function said(b: Bench, message: string, from = 0): boolean {
+  return b.entries.slice(from).some((e) => e.message === message);
+}
+
+const KEPT_HOLDS = 'a folder a teammate removed holds files here; kept';
+const KEPT_NOT_EMPTY = 'a folder a teammate removed is not empty here; kept';
+const REMOVED = 'removed a folder a teammate deleted or renamed';
+
+function fileEvent(path: string): VaultEvent {
+  return { bindingId: 'b1', type: 'delete', path, source: 'obsidian' };
+}
+
+function folderEvent(path: string): VaultEvent {
+  return { bindingId: 'b1', type: 'delete', path, source: 'obsidian', isFolder: true };
+}
+
+/** Dispatch `events` as `main.ts` does — one after another, none awaited. */
+function dispatch(h: Harness, events: readonly VaultEvent[]): Array<Promise<void>> {
+  return events.map((event) => h.engine.handleVaultEvent(event));
+}
+
+/** Let the handlers of `runs` finish, the server answering on the way. */
+async function finish(b: Bench, runs: ReadonlyArray<Promise<void>>): Promise<void> {
+  let done = false;
+  const all = Promise.allSettled(runs).then((results) => {
+    done = true;
+    return results;
+  });
+  for (let round = 0; round < 40 && !done; round++) {
+    await b.server.pump(500);
+    await flushAsync(5);
+  }
+  if (!done) throw new Error('vault event handlers still waiting');
+  expect((await all).filter((r) => r.status === 'rejected')).toEqual([]);
+  await b.server.pump(500);
+  await b.h.settle();
+}
+
+/** The `file:*` requests sent from emit `from` on: `event path [-> newPath] [folder]`. */
+function sent(b: Bench, from = 0): string[] {
+  return b.h
+    .socket()
+    .emits.slice(from)
+    .filter((e) => e.event.startsWith('file:'))
+    .map((e) => {
+      const p = e.payload as { filePath: string; newPath?: string; folder?: string };
+      const to = p.newPath !== undefined ? ` -> ${p.newPath}` : '';
+      return `${e.event} ${p.filePath}${to}${'folder' in p ? ` [${String(p.folder)}]` : ''}`;
+    });
+}
+
+/** The server's journal rows from `from` on: `OP path [-> newPath] [folder]`. */
+function journal(server: FakeServer, from = 0): string[] {
+  return server.journal.slice(from).map((row) => {
+    const folder = (row.payload as { folder?: string }).folder;
+    const to = row.newPath !== null ? ` -> ${row.newPath}` : '';
+    return `${row.opType} ${row.filePath}${to}${folder !== undefined ? ` [${folder}]` : ''}`;
+  });
+}
+
+function live(server: FakeServer): string[] {
+  return [...server.files.values()]
+    .filter((f) => !f.deleted)
+    .map((f) => f.path)
+    .sort();
+}
+
+async function reconnect(b: Bench, rows?: number): Promise<void> {
+  const before = joinsOf(b.h);
+  const lookups = tombstoneLookups(b.h);
+  b.h.socket().connect();
+  (await nextJoin(b.h, before)).ack(
+    rows === undefined
+      ? b.server.joinAnswer('whole journal')
+      : b.server.joinAnswer('cut short', { rows }),
+  );
+  await tailDone(b, lookups);
+}
+
+// -- The author ---------------------------------------------------------------------
+
+describe('SyncEngine — a folder deleted or renamed here: its operations say which folder went', () => {
+  it('a folder deleted in Obsidian: each file’s delete carries the folder', async () => {
+    const b = await seeded(['dir/a.png', 'dir/n.md', 'dir/sub/b.png', 'keep.md'], { notes: true });
+    const emits = b.h.socket().emits.length;
+    const rows = b.server.journal.length;
+
+    b.h.vault.removeFolder('dir');
+    await finish(
+      b,
+      dispatch(b.h, [
+        fileEvent('dir/a.png'),
+        fileEvent('dir/n.md'),
+        folderEvent('dir/sub'),
+        fileEvent('dir/sub/b.png'),
+        folderEvent('dir'),
+      ]),
+    );
+
+    expect(sent(b, emits).sort()).toEqual([
+      'file:delete dir/a.png [dir]',
+      'file:delete dir/n.md [dir]',
+      'file:delete dir/sub/b.png [dir]',
+    ]);
+    // The server keeps it, and its teammates get it.
+    expect(journal(b.server, rows).sort()).toEqual([
+      'DELETE dir/a.png [dir]',
+      'DELETE dir/n.md [dir]',
+      'DELETE dir/sub/b.png [dir]',
+    ]);
+    expect(live(b.server)).toEqual(['keep.md']);
+    await b.h.engine.stop();
+  });
+
+  it('a subfolder deleted: that folder, not the one it was in', async () => {
+    const b = await seeded(['dir/sub/a.png', 'dir/b.png']);
+    const emits = b.h.socket().emits.length;
+
+    b.h.vault.removeFolder('dir/sub');
+    await finish(b, dispatch(b.h, [fileEvent('dir/sub/a.png'), folderEvent('dir/sub')]));
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/sub/a.png [dir/sub]']);
+    await b.h.engine.stop();
+  });
+
+  it('the last file of a folder deleted: no folder — it stays here, and at every teammate’s', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+
+    b.h.vault.files.delete('dir/a.png');
+    await finish(b, dispatch(b.h, [fileEvent('dir/a.png')]));
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/a.png']);
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a folder renamed in Obsidian: each file’s rename carries the old folder', async () => {
+    const b = await seeded(['old/a.png', 'old/sub/b.md', 'keep.md'], { notes: true });
+    const emits = b.h.socket().emits.length;
+    const rows = b.server.journal.length;
+
+    b.h.vault.renameFolder('old', 'new');
+    await b.h.settle();
+    await b.docs?.drive();
+
+    expect(sent(b, emits).sort()).toEqual([
+      'file:rename old/a.png -> new/a.png [old]',
+      'file:rename old/sub/b.md -> new/sub/b.md [old]',
+    ]);
+    expect(journal(b.server, rows).sort()).toEqual([
+      'RENAME old/a.png -> new/a.png [old]',
+      'RENAME old/sub/b.md -> new/sub/b.md [old]',
+    ]);
+    expect(live(b.server)).toEqual(['keep.md', 'new/a.png', 'new/sub/b.md']);
+    await b.h.engine.stop();
+  });
+
+  it('a folder moved into another: the folder it left, not the one it went to', async () => {
+    const b = await seeded(['A/x.png', 'B/y.png']);
+    const emits = b.h.socket().emits.length;
+
+    b.h.vault.renameFolder('A', 'B/A');
+    await b.h.settle();
+
+    expect(sent(b, emits)).toEqual(['file:rename A/x.png -> B/A/x.png [A]']);
+    await b.h.engine.stop();
+  });
+
+  it('a file moved out of a folder, the last one included: no folder', async () => {
+    const b = await seeded(['dir/a.png', 'dir/b.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+
+    await userRename(b.h, 'dir/a.png', 'other/a.png');
+    await userRename(b.h, 'dir/b.png', 'other/b.png');
+
+    expect(sent(b, emits)).toEqual([
+      'file:rename dir/a.png -> other/a.png',
+      'file:rename dir/b.png -> other/b.png',
+    ]);
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('offline: the queue keeps the folder, and sends it when the connection is back', async () => {
+    const b = await seeded(['dir/a.png', 'old/b.png', 'keep.png']);
+    b.h.socket().disconnect();
+
+    b.h.vault.removeFolder('dir');
+    await Promise.all(dispatch(b.h, [fileEvent('dir/a.png'), folderEvent('dir')]));
+    b.h.vault.renameFolder('old', 'new');
+    await b.h.settle();
+    expect(
+      b.h.log
+        .dequeueOperations('b1')
+        .map((op) => `${op.opType} ${op.filePath} ${String(op.payload['folder'])}`),
+    ).toEqual(['DELETE dir/a.png dir', 'RENAME old/b.png old']);
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual([
+      'file:delete dir/a.png [dir]',
+      'file:rename old/b.png -> new/b.png [old]',
+    ]);
+    expect(live(b.server)).toEqual(['keep.png', 'new/b.png']);
+    expect(b.h.log.dequeueOperations('b1')).toEqual([]);
+    await b.h.engine.stop();
+  });
+
+  it('a folder’s deletes cut off by a lost connection go out again with the folder', async () => {
+    const b = await seeded(['dir/a.png', 'dir/b.png', 'keep.png']);
+    b.h.vault.removeFolder('dir');
+    // Only the folder's own event: its files' were missed.
+    const run = b.h.engine.handleVaultEvent(folderEvent('dir'));
+    await until('the first delete sent', () =>
+      b.h.socket().emits.some((e) => e.event === 'file:delete'),
+    );
+    // Its packet never reaches the server, and the connection drops.
+    b.server.delay(b.h.socket().pending('file:delete'));
+    b.h.socket().disconnect();
+    await run;
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits).sort()).toEqual([
+      'file:delete dir/a.png [dir]',
+      'file:delete dir/b.png [dir]',
+    ]);
+    expect(live(b.server)).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('a queue written by 0.4.0, without folders, goes out as it is', async () => {
+    const b = await seeded(['a/x.png', 'b/y.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.h.vault.files.delete('a/x.png');
+    b.h.vault.move('b/y.png', 'b/z.png');
+    // What 0.4.0 wrote to `state.json` for a delete and a rename.
+    b.h.log.enqueueOperation('b1', {
+      opType: 'DELETE',
+      filePath: 'a/x.png',
+      payload: { fileId: 'f1', lastSynced: [] },
+    });
+    b.h.log.enqueueOperation('b1', {
+      opType: 'RENAME',
+      filePath: 'b/y.png',
+      newPath: 'b/z.png',
+      payload: { fileId: 'f2' },
+    });
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual(['file:delete a/x.png', 'file:rename b/y.png -> b/z.png']);
+    expect(live(b.server)).toEqual(['b/z.png', 'keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('renames made offline one after another go as one, with the folder the note left', async () => {
+    const b = await seeded(['A/x.png', 'keep.png']);
+    b.h.socket().disconnect();
+    // Renamed in its folder (the folder stays), then the folder renamed.
+    await userRename(b.h, 'A/x.png', 'A/y.png');
+    b.h.vault.renameFolder('A', 'Z');
+    await b.h.settle();
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual(['file:rename A/x.png -> Z/y.png [A]']);
+    expect(journal(b.server).at(-1)).toBe('RENAME A/x.png -> Z/y.png [A]');
+    await b.h.engine.stop();
+  });
+
+  it('renames go out in the order they came, however long the look at the disk takes', async () => {
+    const b = await seeded(['a/x.png', 'a/keep.png', 'b/keep.png']);
+    const emits = b.h.socket().emits.length;
+
+    // The first rename's look at its folder takes long; the second's would not.
+    const slow = b.h.vault.gate('exists');
+    const first = b.h.vault.rename('a/x.png', 'b/x.png');
+    await slow.reached;
+    const second = b.h.vault.rename('b/x.png', 'b/y.png');
+    await flushAsync(20);
+    slow.release();
+    await Promise.all([first, second]);
+    await b.h.settle();
+    await b.server.pump();
+
+    expect(sent(b, emits)).toEqual([
+      'file:rename a/x.png -> b/x.png',
+      'file:rename b/x.png -> b/y.png',
+    ]);
+    expect(b.server.pathOf('f1')).toBe('b/y.png');
+    await b.h.engine.stop();
+  });
+
+  it('a rename within a folder renamed before the rename is looked at: that folder goes with the next one', async () => {
+    const b = await seeded(['A/x.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+
+    const slow = b.h.vault.gate('exists');
+    const first = b.h.vault.rename('A/x.png', 'A/y.png');
+    await slow.reached;
+    // The folder renamed right after: the first rename's look finds it gone,
+    // though the note did not leave it.
+    b.h.vault.renameFolder('A', 'Z');
+    await flushAsync(20);
+    slow.release();
+    await first;
+    await b.h.settle();
+    await b.server.pump();
+
+    expect(sent(b, emits)).toEqual([
+      'file:rename A/x.png -> A/y.png',
+      'file:rename A/y.png -> Z/y.png [A]',
+    ]);
+    expect(b.server.pathOf('f1')).toBe('Z/y.png');
+    await b.h.engine.stop();
+  });
+});
+
+// -- A teammate's device --------------------------------------------------------------
+
+describe('SyncEngine — a folder a teammate deleted or renamed: removed here once empty', () => {
+  it('a teammate deletes a folder: it goes here with its last file, its empty subfolders too', async () => {
+    const b = await seeded(['dir/a.png', 'dir/sub/b.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+    let mark = b.entries.length;
+
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the first file’s delete', () => said(b, KEPT_HOLDS, mark));
+    // `dir/sub/b.png` is still here.
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    expect(b.h.vault.files.has('dir/a.png')).toBe(false);
+
+    mark = b.entries.length;
+    b.server.teammateDelete('f2', { folder: 'dir' });
+    await until('the folder removed', () => said(b, REMOVED, mark));
+
+    expect(b.h.vault.folders.has('dir')).toBe(false);
+    expect(b.h.vault.folders.has('dir/sub')).toBe(false);
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    expect(sent(b, emits)).toEqual([]);
+    await b.h.engine.stop();
+  });
+
+  it('a teammate deletes the last file of a folder, not the folder: it stays', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+
+    b.server.teammateDelete('f1');
+    await until('the delete applied', () => !b.h.vault.files.has('dir/a.png'));
+    await b.h.settle();
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a file this client does not sync keeps the folder, and itself', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    b.h.vault.files.set('dir/.gitkeep', encode(''));
+    const mark = b.entries.length;
+
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the folder looked at', () => said(b, KEPT_NOT_EMPTY, mark));
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    expect(b.h.vault.files.has('dir/.gitkeep')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a teammate’s new file on its way to this disk keeps the folder', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    // Recorded here, waiting for its doc: not on disk yet.
+    await b.server.teammateCreate('dir/new.md', 'new\n');
+    await until('the new note recorded', () => b.h.engine.getFileIdForPath('dir/new.md') !== null);
+    const mark = b.entries.length;
+
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the folder looked at', () => said(b, KEPT_HOLDS, mark));
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a teammate’s file recorded under the folder while it is being removed stops the removal', async () => {
+    const b = await seeded(['dir/a.png', 'dir/sub/b.png', 'keep.png']);
+    const first = b.entries.length;
+    b.server.teammateDelete('f2', { folder: 'dir' });
+    await until('the first delete applied', () => said(b, KEPT_HOLDS, first));
+
+    const removing = b.h.vault.gate('removeEmptyFolders');
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await removing.reached;
+    // Between the look at the index and the removal of each folder.
+    await b.server.teammateCreate('dir/new.md', 'new\n');
+    await until('the new note recorded', () => b.h.engine.getFileIdForPath('dir/new.md') !== null);
+    const mark = b.entries.length;
+    removing.release();
+    await until('the removal given up', () => said(b, KEPT_NOT_EMPTY, mark));
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('Obsidian’s report of the folder removed sends nothing — not the teammate’s file recorded under it since', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const mark = b.entries.length;
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the folder removed', () => said(b, REMOVED, mark));
+    // A teammate creates a file in the folder again; not written here yet.
+    await b.server.teammateCreate('dir/new.md', 'new\n');
+    await until('the new note recorded', () => b.h.engine.getFileIdForPath('dir/new.md') !== null);
+    const emits = b.h.socket().emits.length;
+
+    // Obsidian's watcher reports the folder removed a moment later.
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+
+    expect(sent(b, emits)).toEqual([]);
+    expect(live(b.server)).toEqual(['dir/new.md', 'keep.png']);
+    expect(b.h.engine.getFileIdForPath('dir/new.md')).not.toBeNull();
+    await b.h.engine.stop();
+  });
+
+  it('a teammate renames a folder: the old one goes with the last file moved out of it', async () => {
+    const b = await seeded(['old/a.png', 'old/b.png', 'keep.png']);
+    let mark = b.entries.length;
+
+    b.server.teammateRename('f1', 'new/a.png', { folder: 'old' });
+    await until('the first file moved', () => said(b, KEPT_HOLDS, mark));
+    expect(b.h.vault.folders.has('old')).toBe(true);
+
+    mark = b.entries.length;
+    b.server.teammateRename('f2', 'new/b.png', { folder: 'old' });
+    await until('the folder removed', () => said(b, REMOVED, mark));
+
+    expect(b.h.vault.folders.has('old')).toBe(false);
+    expect([...b.h.vault.files.keys()].sort()).toEqual(['keep.png', 'new/a.png', 'new/b.png']);
+    await b.h.engine.stop();
+  });
+
+  it('the binding’s own folder is never removed', async () => {
+    const b = await seeded(['notes/a.png'], { localFolder: 'notes' });
+
+    b.server.teammateDelete('f1', { folder: 'notes' });
+    await until('the delete applied', () => !b.h.vault.files.has('notes/a.png'));
+    await b.h.settle();
+
+    expect(b.h.vault.folders.has('notes')).toBe(true);
+    await b.h.engine.stop();
+  });
+});
+
+describe('SyncEngine — a folder a teammate deleted or renamed while this device was away', () => {
+  it('deleted: removed once the connect has removed the copies of its files', async () => {
+    const b = await seeded(['dir/a.png', 'dir/sub/b.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    b.server.teammateDelete('f2', { folder: 'dir' });
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect(b.h.vault.folders.has('dir/sub')).toBe(false);
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    expect(sent(b, emits)).toEqual([]);
+    await b.h.engine.stop();
+  });
+
+  it('renamed: the old folder goes, the files are under the new one', async () => {
+    const b = await seeded(['old/a.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateRename('f1', 'new/a.png', { folder: 'old' });
+
+    await reconnect(b);
+    await until('the folder removed', () => !b.h.vault.folders.has('old'));
+
+    expect([...b.h.vault.files.keys()].sort()).toEqual(['keep.png', 'new/a.png']);
+    await b.h.engine.stop();
+  });
+
+  it('the connect cut short by Pause sync before the copies went: the next one removes the folder', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    // The first upload looks up the server's deleted files; sync is paused then.
+    const served = b.h.routes.get(TOMBSTONES);
+    if (served === undefined) throw new Error('no route for the deleted files');
+    const lookedUp = deferred<void>();
+    b.h.routes.set(TOMBSTONES, () => lookedUp.promise.then(served));
+    const asked = tombstoneLookups(b.h);
+    const before = joinsOf(b.h);
+    b.h.socket().connect();
+    (await nextJoin(b.h, before)).ack(b.server.joinAnswer('whole journal'));
+    await until('the first upload started', () => tombstoneLookups(b.h) > asked);
+    b.h.engine.pause();
+    lookedUp.resolve();
+    await flushAsync(20);
+    expect(b.h.vault.files.has('dir/a.png')).toBe(true);
+    b.h.routes.set(TOMBSTONES, served);
+
+    const resumed = b.h.engine.resume();
+    // A new connection, a join of its own. Nothing new in the catch-up: the
+    // connect paused took the operation in.
+    await until('the join after Resume sync', () =>
+      (b.h.socketIfBuilt()?.emits ?? []).some(
+        (e) => e.event === 'project:join' && e.answered !== true,
+      ),
+    );
+    (await joinToAnswer(b.h)).ack(b.server.joinAnswer('whole journal'));
+    await resumed;
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('a catch-up cut short: a deleted file’s folder is left as it is', async () => {
+    const b = await seeded(['dir/a.png', 'x.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f2');
+    b.server.teammateDelete('f1', { folder: 'dir' });
+
+    // The newest operation only: the listing tells the rest.
+    await reconnect(b, 1);
+    await until('the copy removed', () => !b.h.vault.files.has('dir/a.png'));
+    await b.h.settle();
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+});

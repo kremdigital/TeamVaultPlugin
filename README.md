@@ -31,6 +31,12 @@ reconnect, and every file keeps its version history. Companion to the
   the next connect asks the server what it applied and sends only the rest.
 - **External edits** — chokidar watches the filesystem, so changes from CLI
   scripts and AI agents propagate the same way as in-app edits.
+- **Folders follow their files** — the server keeps files, not folders: a
+  folder reaches a teammate with its first file. A folder you delete, rename
+  or move goes from your teammates' vaults once nothing is left in it there
+  (a file Team Vault doesn't sync keeps it). A folder you empty by deleting
+  or moving its last file stays, for you and for them, and an empty folder
+  you create stays on your device.
 - **Version history** — right-pane view shows every server-side version of
   the active file, with author and timestamp.
 
@@ -497,6 +503,9 @@ edits in `…conflict-<ts>.<ext>`.
   deleted one. So rename, move and delete files in Obsidian, and to keep
   working without syncing, use **Pause sync** rather than closing Obsidian,
   turning the plugin off or switching the binding off.
+- A folder a teammate deleted or renamed stays behind, empty, on a device
+  that was away so long that the server sent it only the newest changes, and
+  on one whose Team Vault or server predates this; delete it by hand.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.

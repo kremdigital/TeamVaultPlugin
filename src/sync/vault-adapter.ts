@@ -53,4 +53,18 @@ export interface VaultAdapter {
    * such names are two files.
    */
   isCaseInsensitive?(): boolean;
+
+  /**
+   * Remove the folder `vaultPath` and the folders under it, deepest first —
+   * only if nothing but empty folders is under it on disk. Anything else there
+   * (a file, one Obsidian does not list, a link) keeps the whole folder as it
+   * is. `mayGo` is asked right before each removal, with the folder about to
+   * go: `false` stops them, and the ones left stay. Each removal is itself the
+   * disk's: a folder that is not empty by then stays, and so do the ones above
+   * it.
+   *
+   * Resolves with the folders removed, deepest first; none when the folder is
+   * not there or holds anything. Never rejects. Absent: no folder is removed.
+   */
+  removeEmptyFolders?(vaultPath: string, mayGo?: (folder: string) => boolean): Promise<string[]>;
 }

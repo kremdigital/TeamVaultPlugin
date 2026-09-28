@@ -1594,4 +1594,37 @@ describe('SyncEngine — its requests have the keys of the contract’s examples
     appliedOnce(b.server);
     await b.h.engine.stop();
   });
+
+  it('sends a delete and a rename that took their folder along as request-*-folder spell them', async () => {
+    const b = await online(
+      [],
+      [
+        ['archive/2025/old.png', 'f1', 'old'],
+        ['drafts/a.png', 'f2', 'a'],
+      ],
+    );
+    // The folder deleted in Obsidian, then the other one renamed.
+    b.h.vault.removeFolder('archive');
+    const deleted = b.h.engine.handleVaultEvent(event('delete', 'archive/2025/old.png'));
+    b.h.vault.renameFolder('drafts', 'final');
+    await b.server.pump();
+    await deleted;
+    await b.h.settle();
+
+    for (const [event, example] of [
+      ['file:delete', 'request-file-delete-folder'],
+      ['file:rename', 'request-file-rename-folder'],
+    ] as const) {
+      expect([event, shapeOf(payloadOf(b.h, event))]).toEqual([
+        event,
+        shapeOf(protocolFixture(example)),
+      ]);
+    }
+    expect((payloadOf(b.h, 'file:delete') as { folder?: string }).folder).toBe('archive');
+    expect((payloadOf(b.h, 'file:rename') as { folder?: string }).folder).toBe('drafts');
+    expect(b.server.pathOf('f1')).toBeNull();
+    expect(b.server.pathOf('f2')).toBe('final/a.png');
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
 });

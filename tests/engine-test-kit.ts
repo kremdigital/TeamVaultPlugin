@@ -117,8 +117,35 @@ export interface Gate {
 
 type RenameListener = (file: WatchableFile, oldPath: string) => void;
 
+/** Every folder `path` is in, the deepest first: `a/b/c.md` → `a/b`, `a`. */
+function foldersOf(path: string): string[] {
+  const out: string[] = [];
+  for (let at = path.lastIndexOf('/'); at > 0; at = path.lastIndexOf('/', at - 1)) {
+    out.push(path.slice(0, at));
+  }
+  return out;
+}
+
+/** The files of a {@link MemoryVault}: a file written makes its folders, as on a disk. */
+class DiskFiles extends Map<string, ArrayBuffer> {
+  constructor(private readonly folders: Set<string>) {
+    super();
+  }
+  override set(path: string, content: ArrayBuffer): this {
+    for (const folder of foldersOf(path)) this.folders.add(folder);
+    return super.set(path, content);
+  }
+}
+
 export class MemoryVault implements VaultAdapter {
-  files = new Map<string, ArrayBuffer>();
+  /**
+   * The folders on disk. Writing a file makes its folders, as Obsidian's
+   * adapter does; deleting or moving the last file of a folder leaves the
+   * folder, as a disk does. The user deletes or renames a folder with what is
+   * in it through {@link removeFolder} and {@link renameFolder}.
+   */
+  readonly folders = new Set<string>();
+  files: Map<string, ArrayBuffer> = new DiskFiles(this.folders);
   /** `true` once {@link caseInsensitiveDisk} made it so. */
   isCaseInsensitive = (): boolean => false;
   private readonly renameListeners = new Set<RenameListener>();
@@ -175,7 +202,7 @@ export class MemoryVault implements VaultAdapter {
   }
   async exists(path: string): Promise<boolean> {
     await this.pass('exists');
-    return this.files.has(path);
+    return this.files.has(path) || this.folders.has(path);
   }
   async readText(path: string): Promise<string> {
     await this.pass('readText');
@@ -222,9 +249,61 @@ export class MemoryVault implements VaultAdapter {
     this.files.delete(oldPath);
     this.files.set(newPath, buf);
   }
-  async ensureParentFolder(): Promise<void> {
-    // No folders in memory.
+  async ensureParentFolder(path: string): Promise<void> {
     await this.pass('ensureParentFolder');
+    for (const folder of foldersOf(path)) this.folders.add(folder);
+  }
+  /**
+   * The user deletes folder `path` in Obsidian: everything in it goes from
+   * disk, before Obsidian reports anything (`reconcileDeletion` in `app.js`
+   * 1.13.7). The test dispatches the reports.
+   */
+  removeFolder(path: string): void {
+    for (const file of [...this.files.keys()]) {
+      if (file.startsWith(`${path}/`)) this.files.delete(file);
+    }
+    for (const folder of [...this.folders]) {
+      if (folder === path || folder.startsWith(`${path}/`)) this.folders.delete(folder);
+    }
+  }
+  /**
+   * The user renames or moves folder `from` to `to` in Obsidian: everything in
+   * it moves on disk, then the vault `rename` of each file in it fires — the
+   * folder's own is not the engine's business (the watcher drops it).
+   */
+  renameFolder(from: string, to: string): void {
+    const moved = [...this.files.keys()].filter((file) => file.startsWith(`${from}/`));
+    for (const folder of [...this.folders]) {
+      if (folder !== from && !folder.startsWith(`${from}/`)) continue;
+      this.folders.delete(folder);
+      this.folders.add(to + folder.slice(from.length));
+    }
+    for (const file of moved) this.move(file, to + file.slice(from.length));
+    for (const file of moved) {
+      for (const cb of [...this.renameListeners]) {
+        cb({ path: to + file.slice(from.length), kind: 'file' }, file);
+      }
+    }
+  }
+  /** See `VaultAdapter.removeEmptyFolders`. */
+  async removeEmptyFolders(path: string, mayGo?: (folder: string) => boolean): Promise<string[]> {
+    await this.pass('removeEmptyFolders');
+    const holds = (folder: string): boolean =>
+      [...this.files.keys()].some((file) => file.startsWith(`${folder}/`));
+    if (!this.folders.has(path) || holds(path)) return [];
+    const depth = (folder: string): number => folder.split('/').length;
+    const under = [...this.folders]
+      .filter((folder) => folder === path || folder.startsWith(`${path}/`))
+      .sort((a, b) => depth(b) - depth(a));
+    const removed: string[] = [];
+    for (const folder of under) {
+      if (mayGo !== undefined && !mayGo(folder)) break;
+      // The disk's own check, at the moment of removal.
+      if (holds(folder)) break;
+      this.folders.delete(folder);
+      removed.push(folder);
+    }
+    return removed;
   }
   async list(folderPath: string): Promise<string[]> {
     const folder = folderPath.replace(/^\/+/, '').replace(/\/+$/, '');
@@ -262,7 +341,10 @@ export function caseInsensitiveDisk(vault: MemoryVault): void {
   };
   const listeners = (vault as unknown as { renameListeners: Set<RenameListener> }).renameListeners;
   vault.isCaseInsensitive = (): boolean => true;
-  vault.exists = (p) => Promise.resolve(find(p) !== undefined);
+  vault.exists = (p) =>
+    Promise.resolve(
+      find(p) !== undefined || [...vault.folders].some((folder) => key(folder) === key(p)),
+    );
   vault.readBinary = (p) => Promise.resolve(at(p));
   vault.readText = (p) => Promise.resolve(new TextDecoder().decode(at(p)));
   vault.writeText = (p, c) => {
@@ -1192,6 +1274,20 @@ function sameOpKind(a: ServerOperation['opType'], b: ServerOperation['opType']):
   return kind(a) === kind(b);
 }
 
+/**
+ * `{ folder }` of a DELETE, RENAME or MOVE as the server keeps it
+ * (`vanishedFolder` in `Project/server`, `sync-protocol.md`, «Папки»): a
+ * string that is a strict ancestor of where the file was on the server
+ * (`from`) and, for a move, neither where it went (`to`) nor a folder of that.
+ * Anything else is dropped: `{}`. (The server's path normalization is left
+ * out: the engine sends paths as it records them.)
+ */
+function keptFolder(raw: unknown, from: string, to?: string): { folder?: string } {
+  if (typeof raw !== 'string' || raw === '' || !from.startsWith(`${raw}/`)) return {};
+  if (to !== undefined && (to === raw || to.startsWith(`${raw}/`))) return {};
+  return { folder: raw };
+}
+
 /** A log entry as acks and broadcasts carry it. */
 interface LogEntry {
   id: string;
@@ -1229,7 +1325,9 @@ function authorOf(clientId: string): string {
  * path the file was stored at — right before the ack. CREATE, DELETE and a binary
  * UPDATE are applied the same way, without file contents. A CREATE on a name
  * taken by a live file with the same non-empty content is that file (`merged`);
- * one on a tombstone brings its id back.
+ * one on a tombstone brings its id back. The `folder` of a DELETE, RENAME or
+ * MOVE is kept in the journal row and broadcast when it is valid (see
+ * {@link keptFolder}).
  *
  * Operations are keyed by `opId` (`sync-protocol.md` §4): one without a valid
  * one is refused (`invalid_op_id`), one applied already is answered with its
@@ -1489,9 +1587,13 @@ export class FakeServer {
     });
   }
 
-  /** A teammate (`device-2`) renames file `id`; the broadcast reaches the engine. */
-  teammateRename(id: string, newPath: string): void {
-    const result = this.move(id, newPath, 'device-2', 'RENAME', newOpId());
+  /**
+   * A teammate (`device-2`) renames file `id`; the broadcast reaches the
+   * engine. `folder`: the folder that vanished at theirs with it — they
+   * renamed or moved the folder.
+   */
+  teammateRename(id: string, newPath: string, opts: { folder?: string } = {}): void {
+    const result = this.move(id, newPath, 'device-2', 'RENAME', newOpId(), undefined, opts.folder);
     if ('error' in result) throw new Error(result.error);
   }
 
@@ -1506,6 +1608,7 @@ export class FakeServer {
       fileType?: 'TEXT' | 'BINARY';
       contentHash?: string;
       size?: number;
+      folder?: unknown;
     };
     const opType = OP_TYPE_OF[e.event];
     if (opType === undefined) return;
@@ -1546,6 +1649,7 @@ export class FakeServer {
           e.event === 'file:rename' ? 'RENAME' : 'MOVE',
           opId,
           p.vectorClock,
+          p.folder,
         );
         e.ack(
           'error' in result
@@ -1642,19 +1746,20 @@ export class FakeServer {
         }
         const log = this.log(p.clientId, p.vectorClock);
         const outcome = { kind: 'deleted', fileId: file.id };
+        const folder = keptFolder(p.folder, file.path);
         this.record(
           log,
           'DELETE',
           file.path,
           null,
-          { fileId: file.id },
+          { fileId: file.id, ...folder },
           {
             clientId: p.clientId,
             opId,
             outcome,
           },
         );
-        this.broadcast('file:deleted', { fileId: file.id, log }, p.clientId, opId);
+        this.broadcast('file:deleted', { fileId: file.id, ...folder, log }, p.clientId, opId);
         e.ack({ ok: true, outcome, log });
         return;
       }
@@ -1668,6 +1773,7 @@ export class FakeServer {
     opType: 'RENAME' | 'MOVE',
     opId: string,
     sentClock?: Record<string, number>,
+    sentFolder?: unknown,
   ): { outcome: unknown; log: LogEntry } | { error: string } {
     const file = this.files.get(id);
     if (!file || file.deleted) return { error: 'file_not_found' };
@@ -1700,13 +1806,15 @@ export class FakeServer {
       this.publish();
     }
     const log = this.log(clientId, sentClock);
-    this.record(log, opType, from, stored, { fileId: id }, { clientId, opId, outcome });
+    const folder = keptFolder(sentFolder, from, stored);
+    this.record(log, opType, from, stored, { fileId: id, ...folder }, { clientId, opId, outcome });
     this.broadcast(
       opType === 'RENAME' ? 'file:renamed' : 'file:moved',
       {
         fileId: id,
         newPath: stored,
         requestedPath: requested,
+        ...folder,
         outcome,
         log,
       },
@@ -1749,8 +1857,12 @@ export class FakeServer {
     return (outcome as { fileId: string }).fileId;
   }
 
-  /** A teammate (`device-2`) deletes file `id`; the broadcast reaches the engine. */
-  teammateDelete(id: string): void {
+  /**
+   * A teammate (`device-2`) deletes file `id`; the broadcast reaches the
+   * engine. `folder`: the folder that vanished at theirs with it — they
+   * deleted the folder.
+   */
+  teammateDelete(id: string, opts: { folder?: string } = {}): void {
     const file = this.files.get(id);
     if (!file || file.deleted) throw new Error(`no file ${id}`);
     file.deleted = true;
@@ -1759,19 +1871,20 @@ export class FakeServer {
     const log = this.log('device-2');
     const opId = newOpId();
     const outcome = { kind: 'deleted', fileId: id };
+    const folder = keptFolder(opts.folder, file.path);
     this.record(
       log,
       'DELETE',
       file.path,
       null,
-      { fileId: id },
+      { fileId: id, ...folder },
       {
         clientId: 'device-2',
         opId,
         outcome,
       },
     );
-    this.broadcast('file:deleted', { fileId: id, log }, 'device-2', opId);
+    this.broadcast('file:deleted', { fileId: id, ...folder, log }, 'device-2', opId);
   }
 
   /**

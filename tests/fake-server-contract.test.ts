@@ -325,6 +325,88 @@ describe('FakeServer — the shapes of the contract’s examples', () => {
     );
   });
 
+  it('keeps the folder that vanished with a delete, rename or move, as the examples carry it', () => {
+    const { server, socket, heard } = room();
+    server.add({
+      id: 'f4',
+      path: 'archive/2025/old.md',
+      fileType: 'TEXT',
+      contentHash: 'h',
+      size: 1,
+    });
+    server.add({ id: 'f5', path: 'drafts/a.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    server.add({ id: 'f6', path: 'inbox/x.png', fileType: 'BINARY', contentHash: 'h', size: 1 });
+    send(server, socket, 'file:delete', {
+      opId: newOpId(),
+      fileId: 'f4',
+      filePath: 'archive/2025/old.md',
+      folder: 'archive',
+    });
+    expect(shapeOf(heard.at(-1)?.[1])).toEqual(
+      shapeOf(protocolFixture('event-file-deleted-folder')),
+    );
+    expect(shapeOf(server.journal.at(-1))).toEqual(
+      shapeOf(protocolFixture('catchup-row-delete-folder')),
+    );
+    send(server, socket, 'file:rename', {
+      opId: newOpId(),
+      fileId: 'f5',
+      filePath: 'drafts/a.md',
+      newPath: 'final/a.md',
+      folder: 'drafts',
+    });
+    expect(shapeOf(heard.at(-1)?.[1])).toEqual(
+      shapeOf(protocolFixture('event-file-renamed-folder')),
+    );
+    send(server, socket, 'file:move', {
+      opId: newOpId(),
+      fileId: 'f6',
+      filePath: 'inbox/x.png',
+      newPath: 'assets/x.png',
+      folder: 'inbox',
+    });
+    expect(shapeOf(heard.at(-1)?.[1])).toEqual(shapeOf(protocolFixture('event-file-moved-folder')));
+    expect(heard.map(([, e]) => (e as { folder?: string }).folder)).toEqual([
+      'archive',
+      'drafts',
+      'inbox',
+    ]);
+  });
+
+  it('drops a folder that is not one the file was in, or that the file went to', () => {
+    const { server, socket, heard } = room();
+    server.add({ id: 'f1', path: 'a/b/x.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    server.add({ id: 'f2', path: 'c/y.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    server.add({ id: 'f3', path: 'd/z.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    // Not a folder of the file, nor one at all.
+    send(server, socket, 'file:delete', {
+      opId: newOpId(),
+      fileId: 'f1',
+      filePath: 'a/b/x.md',
+      folder: 'a/b/x.md',
+    });
+    send(server, socket, 'file:delete', {
+      opId: newOpId(),
+      fileId: 'f2',
+      filePath: 'c/y.md',
+      folder: 42,
+    });
+    // The folder the file went into.
+    send(server, socket, 'file:rename', {
+      opId: newOpId(),
+      fileId: 'f3',
+      filePath: 'd/z.md',
+      newPath: 'd/e/z.md',
+      folder: 'd',
+    });
+    expect(heard.map(([, e]) => 'folder' in (e as object))).toEqual([false, false, false]);
+    expect(server.journal.map((row) => 'folder' in (row.payload as object))).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
   it('merges a create of the same content only when it is not empty', () => {
     const { server, socket } = room();
     const empty = { fileType: 'TEXT', contentHash: 'e'.repeat(64), size: 0 };
