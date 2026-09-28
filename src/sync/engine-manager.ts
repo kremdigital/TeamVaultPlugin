@@ -53,8 +53,12 @@ export interface EngineManagerDeps {
   operationLog: OperationLog;
   docManager: DocManager;
   recentlyApplied: RecentlyApplied;
-  /** Same value used as the vector-clock key everywhere. Stable per device. */
+  /** Same value used as the vector-clock key everywhere. One per copy of the vault. */
   clientId: string;
+  /** Forwarded to every engine: see `SyncEngineDeps.previousClientIds`. */
+  previousClientIds?: readonly string[] | undefined;
+  /** Forwarded to every engine: see `SyncEngineDeps.onTwinDetected`. */
+  onTwinDetected?: ((clientId: string) => void) | undefined;
   /** Optional UI hook for binary / delete conflicts. */
   conflictResolver?: ConflictResolver | undefined;
   /**
@@ -316,6 +320,8 @@ export class EngineManager {
       binding,
       server,
       clientId: this.deps.clientId,
+      ...(this.deps.previousClientIds ? { previousClientIds: this.deps.previousClientIds } : {}),
+      ...(this.deps.onTwinDetected ? { onTwinDetected: this.deps.onTwinDetected } : {}),
       vault: this.deps.vault,
       operationLog: this.deps.operationLog,
       docManager: this.deps.docManager,

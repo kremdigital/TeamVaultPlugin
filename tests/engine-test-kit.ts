@@ -741,6 +741,16 @@ export interface HarnessOptions {
    * (`SyncEngineDeps.queueRetryMs`).
    */
   queueRetryMs?: readonly number[];
+  /**
+   * The client id the engine syncs under; `device-1` by default. The
+   * {@link FakeServer} takes each of {@link THIS_USERS_CLIENTS} for this
+   * device's user.
+   */
+  clientId?: string;
+  /** `SyncEngineDeps.previousClientIds`. */
+  previousClientIds?: readonly string[];
+  /** `SyncEngineDeps.onTwinDetected`. */
+  onTwinDetected?: (clientId: string) => void;
 }
 
 export function json(body: unknown, status = 200): RequestUrlResponse {
@@ -840,7 +850,8 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
     own = built;
     return built;
   };
-  const socket = new SocketClient({ server, clientId: 'device-1', factory });
+  const clientId = opts.clientId ?? 'device-1';
+  const socket = new SocketClient({ server, clientId, factory });
   const resolver: ConflictResolver = {
     resolveBinaryConflict: () => h.modal.binary.promise,
     resolveDeleteConflict: () => h.modal.del.promise,
@@ -851,7 +862,9 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
   const engine = new SyncEngine({
     binding: engineBinding,
     server,
-    clientId: 'device-1',
+    clientId,
+    ...(opts.previousClientIds ? { previousClientIds: opts.previousClientIds } : {}),
+    ...(opts.onTwinDetected ? { onTwinDetected: opts.onTwinDetected } : {}),
     vault: track(vault, 'vault', calls),
     operationLog: track(log, 'log', calls),
     docManager: track(doc, 'doc', calls),
@@ -1195,9 +1208,15 @@ interface AppliedOp {
   row: ServerOperation;
 }
 
-/** The user a client of the {@link FakeServer} works as: `device-1` is this device's. */
+/**
+ * The client ids of this device's user: `device-1`, and `device-1b` — the id
+ * a harness takes as this vault's new one (see `HarnessOptions.clientId`).
+ */
+export const THIS_USERS_CLIENTS: ReadonlySet<string> = new Set(['device-1', 'device-1b']);
+
+/** The user a client of the {@link FakeServer} works as: see {@link THIS_USERS_CLIENTS}. */
 function authorOf(clientId: string): string {
-  return clientId === 'device-1' ? 'u1' : 'u2';
+  return THIS_USERS_CLIENTS.has(clientId) ? 'u1' : 'u2';
 }
 
 /**
@@ -2381,7 +2400,14 @@ export async function logOn(storage: FakeStorage, flushDelayMs = 500): Promise<O
 export async function restartFromDisk(
   h: Harness,
   storage: FakeStorage,
-  opts: { server?: FakeServer; docs?: ServerDocs; manager?: DocManager; offline?: boolean } = {},
+  opts: {
+    server?: FakeServer;
+    docs?: ServerDocs;
+    manager?: DocManager;
+    offline?: boolean;
+    /** What the next start's engine syncs under (see {@link HarnessOptions}). */
+    identity?: Pick<HarnessOptions, 'clientId' | 'previousClientIds' | 'onTwinDetected' | 'logger'>;
+  } = {},
 ): Promise<{ next: Harness; storage: FakeStorage }> {
   const disk = storage.snapshot();
   h.socketIfBuilt()?.kill();
@@ -2392,6 +2418,7 @@ export async function restartFromDisk(
     log,
     ...(opts.manager ? { docs: opts.manager } : {}),
     ...(opts.offline ? { offline: true } : {}),
+    ...opts.identity,
   });
   opts.server?.attach(next);
   opts.docs?.attach(next);

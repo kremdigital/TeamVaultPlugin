@@ -9,6 +9,7 @@ import { SocketClient } from '@/client/socket';
 import { OperationLog } from '@/sync/operation-log';
 import { DocManager } from '@/crdt/doc-manager';
 import type { EngineManager } from '@/sync/engine-manager';
+import { CLIENT_ID_KEY } from '@/settings/client-identity';
 
 /**
  * `main.ts` itself, for the one thing only it decides: what `onload` still
@@ -32,6 +33,43 @@ async function settle(): Promise<void> {
 }
 
 type FakeApp = App & { layoutReady: jest.Mock; listed: jest.Mock; files: Map<string, string> };
+
+/**
+ * Obsidian's `localStorage`, one for every vault of the machine (the
+ * renderer's origin), with a write that fails while `full` is set.
+ */
+interface FakeLocalStorage {
+  items: Map<string, string>;
+  full: boolean;
+}
+
+function localStorageOf(): FakeLocalStorage {
+  return { items: new Map(), full: false };
+}
+
+/**
+ * Give `app` Obsidian's vault-scoped local storage (app.js 1.13.7): JSON under
+ * `<appId>-<key>`, `appId` being the vault's id in Obsidian's vault list; a
+ * falsy value removes the key; a write that fails is dropped without a word.
+ */
+function withLocalStorage(app: FakeApp, appId: string, storage: FakeLocalStorage): FakeApp {
+  Object.assign(app, {
+    appId,
+    loadLocalStorage: (key: string): unknown => {
+      const raw = storage.items.get(`${appId}-${key}`);
+      return raw ? (JSON.parse(raw) as unknown) : null;
+    },
+    saveLocalStorage: (key: string, data: unknown): void => {
+      if (!data) {
+        storage.items.delete(`${appId}-${key}`);
+        return;
+      }
+      if (storage.full) return;
+      storage.items.set(`${appId}-${key}`, JSON.stringify(data));
+    },
+  });
+  return app;
+}
 
 /** An in-memory vault with just the adapter calls `onload` reaches. */
 function fakeApp(
@@ -104,6 +142,17 @@ function anyEl(): HTMLElement {
   return el;
 }
 
+/** Stub the calls into Obsidian's UI that `onload` makes once it gets that far. */
+function stubUi(plugin: TeamVaultPlugin): void {
+  Object.assign(plugin, {
+    addSettingTab: jest.fn(),
+    registerView: jest.fn(),
+    addStatusBarItem: anyEl,
+    addCommand: jest.fn(),
+    registerEvent: jest.fn(),
+  });
+}
+
 /** The plugin's private parts the tests look at. */
 function internals(plugin: TeamVaultPlugin): { operationLog: unknown; engineManager: unknown } {
   return plugin as unknown as { operationLog: unknown; engineManager: unknown };
@@ -155,8 +204,10 @@ describe('plugin lifecycle — unloaded while still loading', () => {
     expect(internals(plugin).operationLog).toBeNull();
     expect(registered).not.toHaveBeenCalled();
     expect(app.layoutReady).not.toHaveBeenCalled();
-    // Settings were loaded (and the client id minted) before the unload.
-    expect(plugin.settings.clientId).not.toBe('');
+    // The client id is settled only right before the engines: none minted,
+    // nothing saved.
+    expect(plugin.settings.clientId).toBe('');
+    expect(app.files.get(`.obsidian/plugins/${id}/data.json`)).toBe('{}');
   });
 
   it('stops after reading the state file: no sweeps, engines, views or watchers', async () => {
@@ -321,22 +372,19 @@ describe('plugin lifecycle — a data.json it cannot read', () => {
     // bindings whose data.json a sync client is replacing right now.
     const id = `team-vault-first-${++seq}`;
     const dir = `.obsidian/plugins/${id}`;
-    const scan = deferred();
-    const app = fakeApp({ seed: { [`${dir}/state.json`]: queuedState }, listGate: scan.promise });
+    const app = fakeApp({ seed: { [`${dir}/state.json`]: queuedState } });
     const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    // No bindings yet: loaded to the end, nothing connects.
+    stubUi(plugin);
 
-    const loading = plugin.onload();
-    await jest.advanceTimersByTimeAsync(5000);
-    expect(app.listed).toHaveBeenCalled();
-    plugin.onunload();
-    scan.resolve();
-    await jest.advanceTimersByTimeAsync(100);
-    await loading;
+    await load(plugin);
 
     expect(plugin.settings.clientId).not.toBe('');
     expect(app.files.get(`${dir}/data.json`)).toContain(plugin.settings.clientId);
     expect(app.files.get(`${dir}/state.json`)).toContain('"note.md"');
     expect(Notice.shown).toEqual([]);
+    plugin.onunload();
+    await jest.advanceTimersByTimeAsync(100);
   });
 
   it('never saves over the file, even when asked to', async () => {
@@ -513,7 +561,9 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
   });
 
   it('keeps such an entry in data.json when it saves, in its place', async () => {
-    // No client id yet: the plugin mints one and saves at once.
+    // No client id yet: the plugin mints one and saves before it starts the
+    // engines — which connect nowhere here.
+    const connect = jest.spyOn(SocketClient.prototype, 'connect').mockImplementation(() => {});
     const id = `team-vault-skipped-${++seq}`;
     const dir = `.obsidian/plugins/${id}`;
     const brokenServer = { id: 's2', name: 'Home', url: 'https://home.example.com' };
@@ -522,12 +572,15 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
       bindings: [binding('binding-0'), withoutProject('binding-1'), binding('binding-2')],
     });
     const state = queued('binding-1');
-
-    const { app, plugin } = await loadThroughSweeps(
-      { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state },
-      dir,
-      id,
-    );
+    const app = fakeApp({ seed: { [`${dir}/data.json`]: data, [`${dir}/state.json`]: state } });
+    const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    stubUi(plugin);
+    const loading = plugin.onload();
+    await jest.advanceTimersByTimeAsync(5000);
+    await loading;
+    plugin.onunload();
+    await jest.advanceTimersByTimeAsync(100);
+    connect.mockRestore();
 
     const saved = JSON.parse(app.files.get(`${dir}/data.json`) ?? '{}') as Record<string, unknown>;
     expect(saved.clientId).toBe(plugin.settings.clientId);
@@ -650,6 +703,218 @@ describe('plugin lifecycle — a data.json with entries it cannot read', () => {
     const { setting, button } = addBindingSetting(app, plugin);
     expect(button.disabled).toBe(false);
     expect(setting.desc).toBe('');
+  });
+});
+
+describe('plugin lifecycle — the client id of a copied vault', () => {
+  const server = {
+    id: 's1',
+    name: 'Work',
+    url: 'https://sync.example.com',
+    apiKey: 'osk_1',
+    addedAt: 1,
+  };
+  const binding = {
+    id: 'binding-1',
+    serverId: 's1',
+    projectId: 'p1',
+    projectName: 'Notes',
+    localFolder: '/',
+    enabled: true,
+    lastSyncedAt: 1,
+    lastVectorClock: {},
+  };
+  /** A data.json as 0.4.0 wrote it, with `extra` fields. */
+  const dataJson = (extra: Record<string, unknown> = {}): string =>
+    JSON.stringify({
+      settingsVersion: 2,
+      servers: [server],
+      bindings: [binding],
+      clientId: 'client-1',
+      ...extra,
+    });
+
+  let connect: jest.SpyInstance;
+  beforeEach(() => {
+    jest.useFakeTimers();
+    jest.setSystemTime(Date.UTC(2026, 8, 28, 12));
+    Notice.shown = [];
+    // The binding's engine starts; its socket connects nowhere.
+    connect = jest.spyOn(SocketClient.prototype, 'connect').mockImplementation(() => {});
+  });
+  afterEach(() => {
+    connect.mockRestore();
+    jest.useRealTimers();
+  });
+
+  interface Started {
+    plugin: TeamVaultPlugin;
+    saved: () => Record<string, unknown>;
+    log: () => string;
+    /** The client id the binding's engine syncs under. */
+    engineClientId: () => string | undefined;
+    stop: () => Promise<void>;
+  }
+
+  /** Start the plugin to the end on `app` (its files and local storage as they are). */
+  async function start(app: FakeApp, id: string): Promise<Started> {
+    const dir = `.obsidian/plugins/${id}`;
+    const plugin = new TeamVaultPlugin(app, { id, dir } as PluginManifest);
+    stubUi(plugin);
+    const loading = plugin.onload();
+    await jest.advanceTimersByTimeAsync(5000);
+    await loading;
+    return {
+      plugin,
+      saved: () => JSON.parse(app.files.get(`${dir}/data.json`) ?? '{}') as Record<string, unknown>,
+      log: () => app.files.get(`${dir}/sync.log`) ?? '',
+      engineClientId: () => {
+        const manager = internals(plugin).engineManager as EngineManager | null;
+        const engine = manager?.getEngine('binding-1') as unknown as { clientId?: string };
+        return engine?.clientId;
+      },
+      stop: async () => {
+        plugin.onunload();
+        await jest.advanceTimersByTimeAsync(100);
+      },
+    };
+  }
+
+  /** A vault whose plugin folder holds `data`, registered in Obsidian as `appId`. */
+  function vault(
+    id: string,
+    data: string,
+    appId: string,
+    storage: FakeLocalStorage | null,
+  ): FakeApp {
+    const app = fakeApp({ seed: { [`.obsidian/plugins/${id}/data.json`]: data } });
+    return storage ? withLocalStorage(app, appId, storage) : app;
+  }
+
+  it('binds the id of a data.json from before to the vault, without changing it', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const app = vault(id, dataJson(), 'vault-a', storage);
+
+    const run = await start(app, id);
+
+    expect(run.plugin.settings.clientId).toBe('client-1');
+    expect(run.saved()).toMatchObject({ clientId: 'client-1', clientIdClaimed: true });
+    expect(storage.items.get(`vault-a-${CLIENT_ID_KEY}`)).toBe('"client-1"');
+    expect(run.engineClientId()).toBe('client-1');
+    expect(Notice.shown).toEqual([]);
+    await run.stop();
+  });
+
+  // The regression: a vault copied along with its data.json kept the id, and
+  // its changes and the original's shared one counter in the vector clocks.
+  it('gives a copy of the vault a new id before any engine starts, and leaves the original’s', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const original = vault(id, dataJson(), 'vault-a', storage);
+    const first = await start(original, id);
+    await first.stop();
+    const copiedData = original.files.get(`.obsidian/plugins/${id}/data.json`) ?? '';
+
+    // The folder copied and opened as a vault of its own: another entry of
+    // Obsidian's vault list, the same local storage of the machine.
+    const copyId = `team-vault-identity-${++seq}`;
+    const copy = vault(copyId, copiedData, 'vault-b', storage);
+    const startedAt = Date.now();
+    const run = await start(copy, copyId);
+
+    const clientId = run.plugin.settings.clientId;
+    expect(clientId).not.toBe('client-1');
+    expect(clientId).not.toBe('');
+    expect(run.engineClientId()).toBe(clientId);
+    expect(run.saved()).toMatchObject({
+      clientId,
+      clientIdClaimed: true,
+      twinClientId: '',
+      previousClientIds: ['client-1'],
+    });
+    expect(run.saved().clientIdRotatedAt).toBeGreaterThanOrEqual(startedAt);
+    expect(run.saved().clientIdRotatedAt).toBeLessThanOrEqual(Date.now());
+    expect(storage.items.get(`vault-b-${CLIENT_ID_KEY}`)).toBe(JSON.stringify(clientId));
+    expect(storage.items.get(`vault-a-${CLIENT_ID_KEY}`)).toBe('"client-1"');
+    expect(Notice.shown.map((n) => n.message)).toEqual([t('notice.clientIdReplaced')]);
+    expect(run.log()).toContain('client id replaced');
+    expect(run.log()).toContain('"reason":"vault-copied"');
+    await run.stop();
+
+    // The original starts as it did.
+    Notice.shown = [];
+    const again = await start(original, id);
+    expect(again.plugin.settings.clientId).toBe('client-1');
+    expect(Notice.shown).toEqual([]);
+    await again.stop();
+  });
+
+  it('gives the vault a new id at the start after an engine saw another device under it', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const app = vault(id, dataJson(), 'vault-a', storage);
+    const first = await start(app, id);
+    const manager = internals(first.plugin).engineManager as {
+      deps: { onTwinDetected?: (clientId: string) => void };
+    };
+    manager.deps.onTwinDetected?.('client-1');
+    manager.deps.onTwinDetected?.('client-1');
+    // An id the vault no longer has: nothing.
+    manager.deps.onTwinDetected?.('someone-else');
+    await jest.advanceTimersByTimeAsync(100);
+    expect(first.saved()).toMatchObject({ clientId: 'client-1', twinClientId: 'client-1' });
+    expect(Notice.shown.map((n) => n.message)).toEqual([t('notice.clientIdTwin')]);
+    await first.stop();
+
+    Notice.shown = [];
+    const run = await start(app, id);
+    const clientId = run.plugin.settings.clientId;
+    expect(clientId).not.toBe('client-1');
+    expect(run.engineClientId()).toBe(clientId);
+    expect(run.saved()).toMatchObject({
+      clientId,
+      twinClientId: '',
+      previousClientIds: ['client-1'],
+    });
+    expect(storage.items.get(`vault-a-${CLIENT_ID_KEY}`)).toBe(JSON.stringify(clientId));
+    expect(Notice.shown.map((n) => n.message)).toEqual([t('notice.clientIdReplaced')]);
+    expect(run.log()).toContain('"reason":"twin-seen"');
+    await run.stop();
+  });
+
+  // Obsidian drops a write to a full local storage without a word. Taken for
+  // one that stuck, each start after it took the vault for a copy: a new id,
+  // and a new key in every vector clock of the project, on every start.
+  it('keeps one id start after start when the local storage drops its writes', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    storage.full = true;
+    const app = vault(id, dataJson(), 'vault-a', storage);
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const run = await start(app, id);
+      ids.push(run.plugin.settings.clientId);
+      expect(run.saved().clientIdClaimed).not.toBe(true);
+      await run.stop();
+      jest.setSystemTime(Date.now() + 2 * 24 * 60 * 60 * 1000);
+    }
+    expect(ids).toEqual(['client-1', 'client-1', 'client-1']);
+    expect(Notice.shown).toEqual([]);
+  });
+
+  it('on an Obsidian without a vault local storage, starts with data.json’s id as before', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const data = dataJson({ clientIdClaimed: true });
+    const app = vault(id, data, 'vault-a', null);
+
+    const run = await start(app, id);
+
+    expect(run.plugin.settings.clientId).toBe('client-1');
+    expect(run.engineClientId()).toBe('client-1');
+    expect(app.files.get(`.obsidian/plugins/${id}/data.json`)).toBe(data);
+    expect(Notice.shown).toEqual([]);
+    await run.stop();
   });
 });
 

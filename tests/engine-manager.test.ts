@@ -4,7 +4,7 @@ import { DocManager, type IdbRegistry } from '@/crdt/doc-manager';
 import { RecentlyApplied } from '@/watcher/recently-applied';
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
-import type { EngineStatus, SyncEngine } from '@/sync/engine';
+import type { EngineStatus, SyncEngine, SyncEngineDeps } from '@/sync/engine';
 import type { VaultEvent } from '@/watcher/obsidian-events';
 
 /**
@@ -643,6 +643,36 @@ describe('EngineManager — проводка configDir', () => {
     );
     await manager.start();
     expect(seen).toEqual(['.config-obs']);
+    await manager.stop();
+  });
+});
+
+describe('EngineManager — the client id of a copied vault', () => {
+  // The plugin gives a copied vault a new client id (`settings/client-identity`):
+  // each engine syncs under it, raises its counters under the ids the vault
+  // had before too, and tells the plugin when another device uses its id.
+  it('hands each engine the previous ids and the twin hook', async () => {
+    const seen: Array<Pick<SyncEngineDeps, 'clientId' | 'previousClientIds' | 'onTwinDetected'>> =
+      [];
+    const twins: string[] = [];
+    const manager = new EngineManager(
+      makeDeps([server], [makeBinding({ id: 'a' }), makeBinding({ id: 'b' })], {
+        clientId: 'device-1b',
+        previousClientIds: ['device-1'],
+        onTwinDetected: (clientId) => twins.push(clientId),
+        engineFactory: (deps) => {
+          seen.push(deps);
+          return new FakeEngine(deps.binding.id) as unknown as SyncEngine;
+        },
+      }),
+    );
+    await manager.start();
+    expect(seen.map((deps) => [deps.clientId, deps.previousClientIds])).toEqual([
+      ['device-1b', ['device-1']],
+      ['device-1b', ['device-1']],
+    ]);
+    seen[1]?.onTwinDetected?.('device-1b');
+    expect(twins).toEqual(['device-1b']);
     await manager.stop();
   });
 });

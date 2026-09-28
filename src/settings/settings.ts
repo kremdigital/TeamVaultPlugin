@@ -72,12 +72,40 @@ export interface PluginSettings {
   showSyncNotifications: boolean;
   logLevel: LogLevel;
   language: LanguageSetting;
-  /** Stable per-device id used as the vector clock key. Generated on first
-   *  load (see `main.ts`) and persisted; never re-rolled — would break
-   *  causality across reconnects. Empty string means "not yet generated";
-   *  the boot path replaces it with a UUID. */
+  /**
+   * The id this vault syncs under: its key in the vector clocks and the
+   * `clientId` of its operations. One per copy of the vault — a copy that
+   * came with this `data.json` gets a new one on its first start (see
+   * `settings/client-identity.ts`). Empty string means "not yet generated";
+   * the boot path replaces it with a UUID.
+   */
   clientId: string;
+  /**
+   * `clientId` is bound to a registration of this vault in Obsidian: kept in
+   * the vault's local storage too (`app.saveLocalStorage`), which a copy of
+   * the vault does not take along. A `data.json` with this set and a local
+   * storage without the id is a copy's. `false` until a start has written the
+   * id there and read it back.
+   */
+  clientIdClaimed: boolean;
+  /**
+   * A client id another device was seen sending operations under — this
+   * vault's `clientId` at the time; '' for none. The next start gives this
+   * vault a new id.
+   */
+  twinClientId: string;
+  /** Unix ms of the last automatic change of `clientId`; 0 for none. */
+  clientIdRotatedAt: number;
+  /**
+   * The ids this vault synced under before its `clientId` changed, the
+   * latest first, at most {@link PREVIOUS_CLIENT_IDS_MAX}: an operation of
+   * its queue may have gone out under one of them.
+   */
+  previousClientIds: string[];
 }
+
+/** See {@link PluginSettings.previousClientIds}. */
+export const PREVIOUS_CLIENT_IDS_MAX = 8;
 
 export const DEFAULT_SETTINGS: PluginSettings = {
   settingsVersion: SETTINGS_VERSION,
@@ -88,15 +116,19 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   logLevel: 'info',
   language: 'auto',
   clientId: '',
+  clientIdClaimed: false,
+  twinClientId: '',
+  clientIdRotatedAt: 0,
+  previousClientIds: [],
 };
 
 /**
  * A fresh copy of the defaults. `{ ...DEFAULT_SETTINGS }` alone would share
- * its `servers` and `bindings` arrays, and the first server added on a fresh
- * install would be pushed into `DEFAULT_SETTINGS` itself.
+ * its arrays, and the first server added on a fresh install would be pushed
+ * into `DEFAULT_SETTINGS` itself.
  */
 export function defaultSettings(): PluginSettings {
-  return { ...DEFAULT_SETTINGS, servers: [], bindings: [] };
+  return { ...DEFAULT_SETTINGS, servers: [], bindings: [], previousClientIds: [] };
 }
 
 const LOG_LEVELS: readonly LogLevel[] = ['error', 'warn', 'info', 'debug'];
@@ -125,6 +157,21 @@ function asEnum<T extends string>(value: unknown, allowed: readonly T[], fallbac
 /** Read a language setting — from `data.json` or the settings dropdown. */
 export function parseLanguageSetting(value: unknown): LanguageSetting {
   return asEnum(value, LANGUAGE_SETTINGS, DEFAULT_SETTINGS.language);
+}
+
+/**
+ * The non-empty strings of a list, each once, in order, at most `max` of
+ * them; `[]` for anything that is not a list.
+ */
+function asStringList(value: unknown, max: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const out: string[] = [];
+  for (const item of value) {
+    if (typeof item !== 'string' || item === '' || out.includes(item)) continue;
+    out.push(item);
+    if (out.length === max) break;
+  }
+  return out;
 }
 
 function asVectorClock(value: unknown): Record<string, number> {
@@ -257,6 +304,13 @@ export function parseSettings(raw: unknown): ParsedSettings {
     logLevel: asEnum(raw.logLevel, LOG_LEVELS, DEFAULT_SETTINGS.logLevel),
     language: legacyLanguage ? 'auto' : parseLanguageSetting(raw.language),
     clientId: asString(raw.clientId, DEFAULT_SETTINGS.clientId),
+    clientIdClaimed: asBoolean(raw.clientIdClaimed, DEFAULT_SETTINGS.clientIdClaimed),
+    twinClientId: asString(raw.twinClientId, DEFAULT_SETTINGS.twinClientId),
+    clientIdRotatedAt: Math.max(
+      0,
+      asNumber(raw.clientIdRotatedAt, DEFAULT_SETTINGS.clientIdRotatedAt),
+    ),
+    previousClientIds: asStringList(raw.previousClientIds, PREVIOUS_CLIENT_IDS_MAX),
   };
   const skipped =
     servers.skipped || bindings.skipped

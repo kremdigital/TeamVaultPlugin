@@ -432,14 +432,28 @@ fix or remove the entries, first turn the plugin off in Settings → Community
 plugins (or quit Obsidian) — a running plugin saves its settings over your
 edit — then edit `data.json` and turn the plugin back on.
 
-**`sync.log` says "another device uses the same id"** — two computers send
-changes under one client id, usually because the vault was copied to the
-second one (a USB stick, a cloud drive, git) together with
-`.obsidian/plugins/team-vault/data.json`. Team Vault applies the other
-computer's changes as a teammate's, but the id is also what keeps each
-device's changes apart on the server, so give the copy an id of its own: on
-the copied computer, quit Obsidian, set `"clientId"` in `data.json` to `""`,
-and start Obsidian again. The plugin makes a new id on start.
+**"This vault now syncs as a new device" notice** — each copy of a vault
+syncs under a client id of its own, which keeps its changes apart from other
+devices' on the server. The id is in the plugin's `data.json`, which a copy
+of the vault takes along (a USB stick, a cloud drive, git), so Team Vault
+also keeps the id in Obsidian's own storage for this vault, which a copy
+doesn't take along. A vault whose `data.json` has an id that Obsidian's
+storage for this vault doesn't hold gets a new one on its first start: a
+copy, but also a vault moved to another folder, one removed from Obsidian's
+vault list and opened again, or one whose Obsidian data was cleared. Nothing needs to be done: notes,
+bindings and unsent changes stay as they are, and the vault just counts as
+one more device on the server. `sync.log` has a `client id replaced` line
+with the reason.
+
+**`sync.log` says "another device uses the same id"** — Team Vault saw a
+change under this vault's client id that this vault didn't send, from a copy
+made before Team Vault 0.4.1 or one that came with Obsidian's own data (a
+whole user profile or disk copied, macOS Migration Assistant). It applies the
+other device's changes as a teammate's, and gives this vault a new id the
+next time Obsidian starts (see the notice above). Nothing needs to be done:
+don't edit `"clientId"` in `data.json` by hand. The id changes at most once a
+day: a vault whose id changed less than a day ago keeps it until its first
+start after that, and `sync.log` says so.
 
 **Conflict modal keeps showing** — happens for binary files when both
 sides changed since the last sync. Pick "Keep server" if you trust the
@@ -486,11 +500,29 @@ edits in `…conflict-<ts>.<ext>`.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.
-- One client id per device, generated on first run; not synced across
-  devices (that's by design — vector clock keys must be unique per
-  device). A vault copied to another computer together with the plugin's
-  `data.json` takes the id along: see "`sync.log` says another device uses
-  the same id" under Troubleshooting.
+- One client id per copy of a vault (vector clock keys must be unique per
+  device). A copy that takes the plugin's `data.json` along gets an id of
+  its own on its first start; so does a vault moved to another folder, which
+  is harmless (see "This vault now syncs as a new device" under
+  Troubleshooting). A copy made together with Obsidian's own data (a whole
+  user profile or disk) is found only once it syncs a change, and gets its id
+  at the next start after that. Each new id stays in the project's vector
+  clocks for good and makes catch-ups a little slower, so don't let the
+  plugin folder be copied back and forth.
+- Don't sync `.obsidian/plugins/team-vault/` between computers with another
+  tool (Obsidian Sync with "Installed community plugins" on, Syncthing,
+  Dropbox, a cloud drive): each computer keeps its own id and rewrites the
+  shared `data.json` on every start, and a shared `state.json` holds the
+  other computer's unsent changes, which would then be sent twice.
+- Two copies of a vault on one computer share the offline history of their
+  notes (Obsidian keeps it once per computer, by binding). Don't open both at
+  once, and don't remove the binding in the copy: that deletes the offline
+  history the original uses too. To get rid of a copy, delete its folder and
+  remove it from Obsidian's vault list.
+- Going back to Team Vault 0.4.0 drops the client-id fields from
+  `data.json`. If you then set `"clientId"` to `""` there by hand, as the
+  0.4.0 README advised, the next 0.4.1 start takes back the id this vault
+  had before, which it still keeps in Obsidian's storage.
 
 ## Development
 

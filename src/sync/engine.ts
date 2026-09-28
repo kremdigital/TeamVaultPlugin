@@ -121,8 +121,24 @@ const MAX_REPORTED_REFUSALS = 1000;
 export interface SyncEngineDeps {
   binding: VaultBinding;
   server: ServerConfig;
-  /** Stable per-device id. Same value goes into the vector clock keys. */
+  /** This vault's client id. Same value goes into the vector clock keys. */
   clientId: string;
+  /**
+   * The ids this vault synced under before `clientId` (see
+   * `settings/client-identity.ts`), the latest first. A queued operation may
+   * have gone out under one of them, its answer lost: once the server says it
+   * applied it, this device's counter under that id moves up to the one the
+   * operation was logged with, as under `clientId` (see
+   * `SyncEngine.adoptOwnCounter`). Default: none.
+   */
+  previousClientIds?: readonly string[];
+  /**
+   * Called, once per engine, when an operation under `clientId` turns up that
+   * this device did not send: another device uses the id (see
+   * `SyncEngine.reportTwin`). The plugin gives the vault a new id on its next
+   * start.
+   */
+  onTwinDetected?: (clientId: string) => void;
   vault: VaultAdapter;
   operationLog: OperationLog;
   docManager: DocManager;
@@ -460,6 +476,10 @@ export class SyncEngine {
   private readonly binding: VaultBinding;
   private readonly server: ServerConfig;
   private readonly clientId: string;
+  /** See {@link SyncEngineDeps.previousClientIds}. */
+  private readonly previousClientIds: readonly string[];
+  /** See {@link SyncEngineDeps.onTwinDetected}. */
+  private readonly onTwinDetected: ((clientId: string) => void) | undefined;
   private readonly vault: VaultAdapter;
   private readonly operationLog: OperationLog;
   private readonly docManager: DocManager;
@@ -954,6 +974,8 @@ export class SyncEngine {
     this.binding = deps.binding;
     this.server = deps.server;
     this.clientId = deps.clientId;
+    this.previousClientIds = (deps.previousClientIds ?? []).filter((id) => id !== deps.clientId);
+    this.onTwinDetected = deps.onTwinDetected;
     // Everything the engine can act on goes through the fence: the shared
     // vault, log, docs and echo set (the engine spawned after this one uses the
     // same ones), the network, and the conflict modal.
@@ -1897,35 +1919,51 @@ export class SyncEngine {
    * one past the one it went out with. A catch-up then leaves this device's
    * own operations out. The other clients' counters are not taken: the
    * catch-up brings their operations.
+   *
+   * The counters under the ids this vault synced under before
+   * ({@link previousClientIds}) too: an operation of the queue that went out
+   * under one of them is logged under it. Left behind, it came back in a
+   * catch-up after the id changed — once the connect that settled it had
+   * dropped before its catch-up, its `opId` was known no more — and was
+   * applied as a teammate's. Only the counter of an operation the server
+   * applied for this user under an `opId` of this device's queue gets here.
    */
   private adoptOwnCounter(clock: VectorClock | undefined): void {
-    const counter = clock?.[this.clientId];
-    if (typeof counter !== 'number' || !Number.isSafeInteger(counter)) return;
-    if (counter <= (this.vectorClock[this.clientId] ?? 0)) return;
-    this.vectorClock = { ...this.vectorClock, [this.clientId]: counter };
+    if (clock === undefined) return;
+    for (const id of [this.clientId, ...this.previousClientIds]) {
+      const counter = clock[id];
+      if (typeof counter !== 'number' || !Number.isSafeInteger(counter)) continue;
+      if (counter <= (this.vectorClock[id] ?? 0)) continue;
+      this.vectorClock = { ...this.vectorClock, [id]: counter };
+    }
   }
 
   /**
-   * The rows of a catch-up that are this device's own operations: under its
-   * client id, with an `opId` it knows (see {@link knowsOpId}). None is
-   * applied here again — the file is where this device put it, or has moved
-   * it since — and there should be none: this device's counter in the join's
-   * clock is the one the server logged its last known operation with (see
+   * The rows of a catch-up that are this device's own operations: those with
+   * an `opId` it knows (see {@link knowsOpId}), whatever client id they went
+   * out under — one of the queue may have gone out under an id this vault had
+   * before its id changed (see {@link previousClientIds}). None is applied
+   * here again — the file is where this device put it, or has moved it since
+   * — and there should be none: this device's counter in the join's clock is
+   * the one the server logged its last known operation with (see
    * {@link adoptOwnCounter}).
    *
    * A row under this device's client id with an `opId` it does not know is
    * another device's that uses the same id (a vault copied along with its
-   * `data.json`): applied as a teammate's, and logged once — unless the
-   * binding had no record of syncing before this connect (`hadState`), when
-   * every row of this device's own is one it does not know. A row the server
-   * logged before it recorded the client (`clientId: null`) is a teammate's.
+   * `data.json`): applied as a teammate's, and reported once (see
+   * {@link reportTwin}) — unless the binding had no record of syncing before
+   * this connect (`hadState`), when every row of this device's own is one it
+   * does not know. So is a row under an id this vault had before, and a row
+   * the server logged before it recorded the client (`clientId: null`), with
+   * nothing reported.
    */
   private ownRows(ops: readonly ServerOperation[], hadState: boolean): Set<ServerOperation> {
     const own = new Set<ServerOperation>();
     for (const op of ops) {
-      if (op.clientId !== this.clientId) continue;
       if (typeof op.opId === 'string' && this.knowsOpId(op.opId)) own.add(op);
-      else if (hadState) this.reportTwin('catch-up', { opType: op.opType, opId: op.opId });
+      else if (op.clientId === this.clientId && hadState) {
+        this.reportTwin('catch-up', { opType: op.opType, opId: op.opId });
+      }
     }
     return own;
   }
@@ -1946,15 +1984,24 @@ export class SyncEngine {
   /**
    * An operation under this device's client id that this device did not send
    * (see {@link ownRows}, {@link isOwnBroadcast}): another device uses the
-   * same id. Its operations are applied as a teammate's; this is logged once.
+   * same id. Its operations are applied as a teammate's; this is logged once,
+   * with the operation that told, and the plugin gives the vault a new id on
+   * its next start ({@link SyncEngineDeps.onTwinDetected}).
    */
   private reportTwin(where: string, detail: Record<string, unknown>): void {
     if (this.twinReported) return;
     this.twinReported = true;
     this.log.warn(
-      'an operation carries this device’s client id, but this device did not send it: another device uses the same id (a vault copied along with its data.json?)',
-      { where, ...detail },
+      'an operation carries this device’s client id, but this device did not send it: another device uses the same id (a vault copied along with its data.json?); the id changes on the next start',
+      { where, clientId: this.clientId, ...detail },
     );
+    try {
+      this.onTwinDetected?.(this.clientId);
+    } catch (err) {
+      this.log.warn('could not record that another device uses this device’s client id', {
+        err,
+      });
+    }
   }
 
   /** Take the clock of catch-up operation `op` in. */

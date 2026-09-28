@@ -3,7 +3,9 @@ import {
   defaultSettings,
   mergeWithDefaults,
   parseLanguageSetting,
+  PREVIOUS_CLIENT_IDS_MAX,
   SETTINGS_VERSION,
+  settingsToSave,
 } from '@/settings/settings';
 
 describe('mergeWithDefaults', () => {
@@ -154,8 +156,69 @@ describe('defaultSettings', () => {
       lastSyncedAt: 0,
       lastVectorClock: {},
     });
+    fresh.previousClientIds.push('c0');
     expect(DEFAULT_SETTINGS.servers).toEqual([]);
     expect(DEFAULT_SETTINGS.bindings).toEqual([]);
+    expect(DEFAULT_SETTINGS.previousClientIds).toEqual([]);
     expect(defaultSettings()).toEqual(DEFAULT_SETTINGS);
+  });
+});
+
+describe('the client id fields', () => {
+  // Written from 0.4.1 on (see `settings/client-identity.ts`); a data.json of
+  // 0.4.0 has none of them.
+  it('default to an id not bound to the vault, no twin, no change, no previous ids', () => {
+    expect(mergeWithDefaults({ clientId: 'c1' })).toMatchObject({
+      clientId: 'c1',
+      clientIdClaimed: false,
+      twinClientId: '',
+      clientIdRotatedAt: 0,
+      previousClientIds: [],
+    });
+  });
+
+  it('read back what a save wrote', () => {
+    const settings = mergeWithDefaults({
+      clientId: 'c2',
+      clientIdClaimed: true,
+      twinClientId: 'c2',
+      clientIdRotatedAt: 1_790_000_000_000,
+      previousClientIds: ['c1', 'c0'],
+    });
+    const saved = JSON.parse(JSON.stringify(settingsToSave(settings, null))) as unknown;
+    expect(mergeWithDefaults(saved)).toEqual(settings);
+    expect(settings).toMatchObject({
+      clientIdClaimed: true,
+      twinClientId: 'c2',
+      clientIdRotatedAt: 1_790_000_000_000,
+      previousClientIds: ['c1', 'c0'],
+    });
+  });
+
+  it('repair values of the wrong type', () => {
+    expect(
+      mergeWithDefaults({
+        clientIdClaimed: 'yes',
+        twinClientId: 7,
+        clientIdRotatedAt: -5,
+        previousClientIds: 'c1',
+      }),
+    ).toMatchObject({
+      clientIdClaimed: false,
+      twinClientId: '',
+      clientIdRotatedAt: 0,
+      previousClientIds: [],
+    });
+    expect(mergeWithDefaults({ clientIdRotatedAt: Number.NaN }).clientIdRotatedAt).toBe(0);
+  });
+
+  it('keep each previous id once, strings only, at most the bound', () => {
+    const many = Array.from({ length: PREVIOUS_CLIENT_IDS_MAX + 4 }, (_, i) => `c${i}`);
+    expect(
+      mergeWithDefaults({ previousClientIds: ['c1', 1, '', 'c1', null, 'c2'] }).previousClientIds,
+    ).toEqual(['c1', 'c2']);
+    expect(mergeWithDefaults({ previousClientIds: many }).previousClientIds).toEqual(
+      many.slice(0, PREVIOUS_CLIENT_IDS_MAX),
+    );
   });
 });

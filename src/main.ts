@@ -8,6 +8,12 @@ import {
   type SkippedSettings,
 } from '@/settings/settings';
 import { readSettingsFile, type SettingsFileRead } from '@/settings/settings-file';
+import {
+  settleClientIdentity,
+  type ClientIdentity,
+  type IdentityOutcome,
+  type VaultStore,
+} from '@/settings/client-identity';
 import { bindingAddBlock, type BindingAddBlock } from '@/settings/folder-utils';
 import { getLanguage, setLanguage, t } from '@/i18n';
 import { readObsidianLanguage, resolveLanguage } from '@/i18n/language';
@@ -55,7 +61,8 @@ const QUIT_FLUSH_TIMEOUT_MS = 2_000;
  *
  * The bulk of the work happens here at `onload()` time:
  *
- *   1. Load + repair settings, generate a stable `clientId` on first run.
+ *   1. Load + repair settings; settle the `clientId` this vault syncs under
+ *      (a new one on first run, or when the vault is a copy of another).
  *   2. Build shared singletons: vault adapter, log storage, logger,
  *      operation log (JSON-backed), Yjs doc manager, recently-applied set,
  *      conflict resolver, notice service.
@@ -124,13 +131,6 @@ export default class ObsidianSyncPlugin extends Plugin {
       return;
     }
 
-    // Make sure we have a stable client id; persist once on first run.
-    if (!this.settings.clientId) {
-      this.settings.clientId = uuid();
-      await this.saveSettings();
-      if (this.unloaded) return;
-    }
-
     this.bootstrapLogger();
     if (this.skippedSettings) this.reportSkippedSettings(this.skippedSettings);
     // Disabling and enabling the plugin, or an update, starts this instance
@@ -154,13 +154,17 @@ export default class ObsidianSyncPlugin extends Plugin {
     // missing a moment ago may just be one a sync client is replacing. The
     // next start cleans up whatever is really left over.
     let sweepTmp = false;
-    if (!(await this.warnOnDuplicatePluginFolders()) && !this.firstRun) {
+    const duplicates = await this.warnOnDuplicatePluginFolders();
+    if (!duplicates && !this.firstRun) {
       // A binding data.json has but the plugin could not read is not in
       // `settings`, yet it is no orphan: its unsent changes are still queued.
       // The tmp sweep stays — it only ever looks inside known bindings.
       if (!this.skippedSettings) await this.sweepOrphanedBindingState();
       sweepTmp = true;
     }
+    if (this.unloaded) return;
+    // Before any engine: they sync under it.
+    await this.ensureClientIdentity(duplicates);
     if (this.unloaded) return;
     // Obsidian quits without unloading the plugin (see `flushOnQuit`).
     this.registerEvent(this.app.workspace.on('quit', (tasks) => this.flushOnQuit(tasks)));
@@ -275,6 +279,76 @@ export default class ObsidianSyncPlugin extends Plugin {
   private settingsFilePath(): string {
     const dir = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
     return `${dir}/data.json`;
+  }
+
+  /**
+   * Settle the client id this vault syncs under (see
+   * `settings/client-identity.ts`): the one `data.json` has, bound to this
+   * vault in its local storage, or a new one when the vault is a copy of
+   * another or another device was seen using it. The local storage is written
+   * and read back before `data.json` is saved.
+   *
+   * With a duplicate plugin folder the settings may be another folder's
+   * (see {@link warnOnDuplicatePluginFolders}): they are not bound to the
+   * vault then, nor taken for a copy's.
+   */
+  private async ensureClientIdentity(duplicates: boolean): Promise<void> {
+    const current = identityOf(this.settings);
+    const outcome = settleClientIdentity({
+      current,
+      store: duplicates ? null : vaultStore(this.app),
+      now: Date.now(),
+      newId: uuid,
+    });
+    Object.assign(this.settings, outcome.next);
+    this.reportClientIdentity(outcome);
+    if (!sameIdentity(current, outcome.next)) await this.saveSettings();
+  }
+
+  /** Log what {@link ensureClientIdentity} decided; a notice when the id changed. */
+  private reportClientIdentity({ decision, next, store }: IdentityOutcome): void {
+    const context = { reason: decision.reason, clientId: next.clientId, store };
+    if (decision.rotated) {
+      this.logger?.warn('client id replaced: this vault syncs as a new device from now on', {
+        ...context,
+        previous: decision.previous,
+      });
+      new Notice(t('notice.clientIdReplaced'), 15_000);
+    } else if (decision.reason === 'deferred') {
+      this.logger?.warn(
+        'client id change put off: the id changed less than a day ago; it changes on the first start after that',
+        {
+          ...context,
+          change: decision.deferred,
+          changedAt: new Date(next.clientIdRotatedAt).toISOString(),
+        },
+      );
+    } else if (decision.reason !== 'kept' && decision.reason !== 'no-store') {
+      this.logger?.info('client id settled for this vault', {
+        ...context,
+        ...(decision.previous !== null ? { dataJson: decision.previous } : {}),
+      });
+    }
+    if (store === 'failed') {
+      // Nothing is lost: the id stays, and the next start tries again. A copy
+      // of the vault made meanwhile is only found out once it syncs.
+      this.logger?.warn('could not keep the client id in this vault’s local storage', {
+        clientId: next.clientId,
+      });
+    }
+  }
+
+  /**
+   * An engine saw an operation under this vault's client id that this device
+   * did not send (see `SyncEngine.reportTwin`): the next start gives the vault
+   * a new id. Once per id.
+   */
+  private recordTwin(clientId: string): void {
+    if (this.unloaded || this.unreadableSettings) return;
+    if (this.settings.clientId !== clientId || this.settings.twinClientId === clientId) return;
+    this.settings.twinClientId = clientId;
+    void this.saveSettings();
+    new Notice(t('notice.clientIdTwin'), 15_000);
   }
 
   /** Log why the plugin did not start, and say so where it can't be missed. */
@@ -542,6 +616,8 @@ export default class ObsidianSyncPlugin extends Plugin {
       docManager: this.docManager,
       recentlyApplied: this.recentlyApplied,
       clientId: this.settings.clientId,
+      previousClientIds: this.settings.previousClientIds,
+      onTwinDetected: (clientId) => this.recordTwin(clientId),
       conflictResolver,
       configDir: this.app.vault.configDir,
       logger: this.logger ?? undefined,
@@ -706,6 +782,48 @@ export default class ObsidianSyncPlugin extends Plugin {
     // A Promise since 1.7.2 (deferred views) — the manifest's minAppVersion.
     await this.app.workspace.revealLeaf(leaf);
   }
+}
+
+/** The settings {@link settleClientIdentity} decides, copied. */
+function identityOf(settings: PluginSettings): ClientIdentity {
+  return {
+    clientId: settings.clientId,
+    clientIdClaimed: settings.clientIdClaimed,
+    twinClientId: settings.twinClientId,
+    clientIdRotatedAt: settings.clientIdRotatedAt,
+    previousClientIds: [...settings.previousClientIds],
+  };
+}
+
+function sameIdentity(a: ClientIdentity, b: ClientIdentity): boolean {
+  return (
+    a.clientId === b.clientId &&
+    a.clientIdClaimed === b.clientIdClaimed &&
+    a.twinClientId === b.twinClientId &&
+    a.clientIdRotatedAt === b.clientIdRotatedAt &&
+    a.previousClientIds.length === b.previousClientIds.length &&
+    a.previousClientIds.every((id, i) => id === b.previousClientIds[i])
+  );
+}
+
+/**
+ * The vault's local storage in Obsidian (`App.loadLocalStorage` /
+ * `saveLocalStorage`, since 1.8.7; the manifest allows 1.7.2): `null` on an
+ * Obsidian without it.
+ */
+function vaultStore(app: unknown): VaultStore | null {
+  const host = app as {
+    loadLocalStorage?: (key: string) => unknown;
+    saveLocalStorage?: (key: string, data: unknown) => void;
+  };
+  const { loadLocalStorage, saveLocalStorage } = host;
+  if (typeof loadLocalStorage !== 'function' || typeof saveLocalStorage !== 'function') {
+    return null;
+  }
+  return {
+    load: (key) => loadLocalStorage.call(host, key),
+    save: (key, value) => saveLocalStorage.call(host, key, value),
+  };
 }
 
 /**

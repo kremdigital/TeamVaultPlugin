@@ -111,6 +111,8 @@
   "notice.settingsSkipped.servers": "servers: {count}",
   "notice.settingsSkipped.bindingList": "the binding list",
   "notice.settingsSkipped.serverList": "the server list",
+  "notice.clientIdReplaced": "Team Vault: this vault now syncs as a new device. It is a copy of another vault, was moved to another folder, or another device was using its id. Your notes and unsent changes are not affected. Details are in sync.log.",
+  "notice.clientIdTwin": "Team Vault: another device sends changes under this vault's id — most likely a copy of this vault. Its changes still reach this vault. This vault gets an id of its own the next time Obsidian starts.",
   "notice.unsyncableName": "Team Vault doesn't sync \"{name}\": {problem}.",
   "notice.unsyncableName.cannotKeep": "Windows can't keep such a name, so no device syncs it.",
   "notice.unsyncableName.alias": "On Windows such a name can open a different file, so no device syncs it.",
