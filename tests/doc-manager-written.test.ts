@@ -45,15 +45,20 @@ describe('DocManager — noteWritten', () => {
     const dm = idb.manager();
     await opened(dm, 'n.md', 'f1', 'theirs\n');
 
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
     await flushAsync();
 
-    expect(markIn(idb, dbNameOf('n.md'))).toEqual({ fileId: 'f1', hash: 'h1', over: '' });
+    expect(markIn(idb, dbNameOf('n.md'))).toEqual({
+      fileId: 'f1',
+      hash: 'h1',
+      over: '',
+      synced: '',
+    });
     // What the next start of Obsidian finds.
     await expect(idb.manager().peek('b1', 'n.md')).resolves.toEqual({
       owner: 'f1',
       text: 'theirs\n',
-      written: { fileId: 'f1', hash: 'h1', over: '' },
+      written: { fileId: 'f1', hash: 'h1', over: '', synced: '' },
     });
   });
 
@@ -64,9 +69,9 @@ describe('DocManager — noteWritten', () => {
     await opened(dm, 'n.md', 'f9', 'foreign\n');
     await dm.open('b1', 'old.md', 'f1');
 
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
-    dm.noteWritten('b1', 'old.md', { fileId: 'f1', hash: 'h1', over: '' });
-    dm.noteWritten('b1', 'none.md', { fileId: 'f1', hash: 'h1', over: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    dm.noteWritten('b1', 'old.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    dm.noteWritten('b1', 'none.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
     await flushAsync();
 
     expect(markIn(idb, dbNameOf('n.md'))).toBeUndefined();
@@ -99,14 +104,19 @@ describe('DocManager — noteWritten', () => {
     await flushAsync();
     writes.length = 0;
 
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h2', over: 'h1' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h2', over: 'h1', synced: '' });
 
     expect(writes).toEqual([`setOrdered ${WRITTEN}`, `setOrdered ${WRITTEN}`]);
     landed.resolve();
     await flushAsync();
-    expect(markIn(idb, dbNameOf('n.md'))).toEqual({ fileId: 'f1', hash: 'h2', over: 'h1' });
+    expect(markIn(idb, dbNameOf('n.md'))).toEqual({
+      fileId: 'f1',
+      hash: 'h2',
+      over: 'h1',
+      synced: '',
+    });
   });
 
   it('writes through `set` on a store without `setOrdered`', async () => {
@@ -120,10 +130,15 @@ describe('DocManager — noteWritten', () => {
     const dm = new DocManager({ persistenceFactory: factory, idb: idb.registry });
     await opened(dm, 'n.md', 'f1', 'theirs\n');
 
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
     await flushAsync();
 
-    expect(markIn(idb, dbNameOf('n.md'))).toEqual({ fileId: 'f1', hash: 'h1', over: '' });
+    expect(markIn(idb, dbNameOf('n.md'))).toEqual({
+      fileId: 'f1',
+      hash: 'h1',
+      over: '',
+      synced: '',
+    });
   });
 
   it('goes with the database when the doc is deleted, and stays behind when it moves', async () => {
@@ -131,8 +146,8 @@ describe('DocManager — noteWritten', () => {
     const dm = idb.manager();
     await opened(dm, 'n.md', 'f1', 'theirs\n');
     await opened(dm, 'm.md', 'f2', 'moved\n');
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
-    dm.noteWritten('b1', 'm.md', { fileId: 'f2', hash: 'h2', over: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    dm.noteWritten('b1', 'm.md', { fileId: 'f2', hash: 'h2', over: '', synced: '' });
     await flushAsync();
 
     await dm.clear('b1', 'n.md');
@@ -153,7 +168,7 @@ describe('DocManager — noteWritten', () => {
     const idb = new FakeIndexedDb();
     const dm = idb.manager();
     await opened(dm, 'n.md', 'f1', 'theirs\n');
-    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '' });
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
     await flushAsync();
 
     await dm.startOver('b1', 'n.md', 'f1');
@@ -201,13 +216,13 @@ describe('DocManager — peek', () => {
     seed(idb, dbNameOf('n.md'), 'theirs\r\ntyping\r\n', 'f1');
     idb.dbs
       .get(dbNameOf('n.md'))
-      ?.custom.set(WRITTEN, JSON.stringify({ fileId: 'f1', hash: 'h1', over: '' }));
+      ?.custom.set(WRITTEN, JSON.stringify({ fileId: 'f1', hash: 'h1', over: '', synced: '' }));
     const dm = idb.manager();
 
     await expect(dm.peek('b1', 'n.md')).resolves.toEqual({
       owner: 'f1',
       text: 'theirs\r\ntyping\r\n',
-      written: { fileId: 'f1', hash: 'h1', over: '' },
+      written: { fileId: 'f1', hash: 'h1', over: '', synced: '' },
     });
 
     expect(idb.opened).toEqual([dbNameOf('n.md')]);
@@ -253,7 +268,14 @@ describe('DocManager — peek', () => {
     seed(idb, dbNameOf('n.md'), 'theirs\n', 'f1');
     const dm = idb.manager();
 
-    for (const raw of ['{', JSON.stringify({ fileId: 'f1', hash: 7, over: '' }), 42]) {
+    for (const raw of [
+      '{',
+      JSON.stringify({ fileId: 'f1', hash: 7, over: '', synced: '' }),
+      // Without the record's synced content it was written over.
+      JSON.stringify({ fileId: 'f1', hash: 'h1', over: '' }),
+      '',
+      42,
+    ]) {
       idb.dbs.get(dbNameOf('n.md'))?.custom.set(WRITTEN, raw);
       await expect(dm.peek('b1', 'n.md')).resolves.toMatchObject({ written: null });
     }
@@ -311,6 +333,191 @@ describe('DocManager — peek', () => {
 
     await expect(dm.peek('b1', 'n.md')).resolves.toBeNull();
     expect(idb.dbs.has(dbNameOf('n.md'))).toBe(false);
+  });
+});
+
+describe('DocManager — the mark of a doc open under the name', () => {
+  it('is the one its store held as it loaded, and none for a store without one', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, dbNameOf('n.md'), 'theirs\n', 'f1');
+    seed(idb, dbNameOf('m.md'), 'mine\n', 'f2');
+    const mark = { fileId: 'f1', hash: 'h1', over: 'h0', synced: 'h0' };
+    idb.dbs.get(dbNameOf('n.md'))?.custom.set(WRITTEN, JSON.stringify(mark));
+    const dm = idb.manager();
+
+    expect(dm.writtenMarkOf('b1', 'n.md')).toBeNull();
+    await dm.open('b1', 'n.md', 'f1');
+    await dm.open('b1', 'm.md', 'f2');
+
+    expect(dm.writtenMarkOf('b1', 'n.md')).toEqual(mark);
+    expect(dm.writtenMarkOf('b1', 'm.md')).toBeNull();
+    expect(dm.writtenMarkOf('b1', 'none.md')).toBeNull();
+  });
+
+  it('is dropped, in its store too, unless it is of the text kept', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+    const mark = { fileId: 'f1', hash: 'h1', over: '', synced: '' };
+    dm.noteWritten('b1', 'n.md', mark);
+
+    dm.forgetWritten('b1', 'n.md', 'h1');
+    expect(dm.writtenMarkOf('b1', 'n.md')).toEqual(mark);
+    dm.forgetWritten('b1', 'n.md', 'h2');
+    await flushAsync();
+
+    expect(dm.writtenMarkOf('b1', 'n.md')).toBeNull();
+    expect(idb.dbs.get(dbNameOf('n.md'))?.custom.get(WRITTEN)).toBe('');
+    await dm.release('b1', 'n.md');
+    await expect(idb.manager().peek('b1', 'n.md')).resolves.toMatchObject({ written: null });
+  });
+
+  it('is dropped through `setOrdered`, after the edits handed to the store before', async () => {
+    const idb = new FakeIndexedDb();
+    const writes: string[] = [];
+    const factory: PersistenceFactory = (name, doc) => {
+      const inner = idb.factory(name, doc) as DocPersistence;
+      return {
+        ...inner,
+        set: (key, value) => {
+          writes.push(`set ${key}`);
+          return inner.set!(key, value);
+        },
+        setOrdered: (key, value) => {
+          writes.push(`setOrdered ${key}=${value}`);
+          return inner.setOrdered!(key, value);
+        },
+      };
+    };
+    const dm = new DocManager({ persistenceFactory: factory, idb: idb.registry });
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+    dm.noteWritten('b1', 'n.md', { fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    writes.length = 0;
+
+    dm.forgetWritten('b1', 'n.md', 'h2');
+    dm.forgetWritten('b1', 'n.md', 'h3');
+
+    expect(writes).toEqual([`setOrdered ${WRITTEN}=`]);
+  });
+
+  it('is not dropped for a doc not open under the name: its store is not opened for it', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, dbNameOf('n.md'), 'theirs\n', 'f1');
+    const raw = JSON.stringify({ fileId: 'f1', hash: 'h1', over: '', synced: '' });
+    idb.dbs.get(dbNameOf('n.md'))?.custom.set(WRITTEN, raw);
+    const dm = idb.manager();
+
+    dm.forgetWritten('b1', 'n.md', 'h2');
+    await flushAsync();
+
+    expect(idb.opened).toEqual([]);
+    expect(idb.dbs.get(dbNameOf('n.md'))?.custom.get(WRITTEN)).toBe(raw);
+  });
+});
+
+describe('DocManager — the text a doc had when its state was taken', () => {
+  it('is rebuilt without what was typed since, anywhere in the text', () => {
+    const dm = new DocManager();
+    dm.setText('b1', 'n.md', 'one\ntwo\n');
+    const state = dm.stateOf('b1', 'n.md');
+    expect(state).not.toBeNull();
+    // A teammate types on at the end and in between.
+    const { ytext } = dm.get('b1', 'n.md');
+    ytext.insert(ytext.length, 'three\n');
+    ytext.insert(4, 'one and a half\n');
+
+    expect(dm.textAt('b1', 'n.md', state!)).toBe('one\ntwo\n');
+    expect(dm.getText('b1', 'n.md')).toBe('one\none and a half\ntwo\nthree\n');
+  });
+
+  it('misses what was deleted since: a doc collects its garbage', () => {
+    const dm = new DocManager();
+    dm.setText('b1', 'n.md', 'one\ntwo\n');
+    const state = dm.stateOf('b1', 'n.md');
+    dm.get('b1', 'n.md').ytext.delete(0, 4);
+
+    expect(dm.textAt('b1', 'n.md', state!)).not.toBe('one\ntwo\n');
+    expect(dm.getText('b1', 'n.md')).toBe('two\n');
+  });
+
+  it('is rebuilt from a history loaded from the store, after a restart', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+    const state = dm.stateOf('b1', 'n.md');
+    const { ytext } = dm.get('b1', 'n.md');
+    ytext.insert(ytext.length, 'ahead\n');
+    await flushAsync();
+
+    const next = idb.manager();
+    await next.open('b1', 'n.md', 'f1');
+    expect(next.getText('b1', 'n.md')).toBe('theirs\nahead\n');
+    expect(next.textAt('b1', 'n.md', state!)).toBe('theirs\n');
+  });
+
+  it('is none for a doc not open, or a state that cannot be read', () => {
+    const dm = new DocManager();
+    dm.setText('b1', 'n.md', 'one\n');
+
+    expect(dm.stateOf('b1', 'none.md')).toBeNull();
+    expect(dm.textAt('b1', 'none.md', dm.stateOf('b1', 'n.md')!)).toBeNull();
+    expect(dm.textAt('b1', 'n.md', '!!')).toBeNull();
+  });
+});
+
+describe('DocManager — claimNew', () => {
+  it('stamps a doc started from an empty store, a teammate’s update landed in it first', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    // The engine clears the name and wires the doc; the server's doc of the
+    // new note lands before anything opens it.
+    await dm.clear('b1', 'n.md');
+    const server = new Y.Doc();
+    server.getText('content').insert(0, 'theirs\n');
+    dm.applyRemoteUpdate('b1', 'n.md', Y.encodeStateAsUpdate(server));
+
+    await dm.claimNew('b1', 'n.md', 'f1');
+    await flushAsync();
+
+    expect(dm.ownerOf('b1', 'n.md')).toBe('f1');
+    expect(idb.dbs.get(dbNameOf('n.md'))?.custom.get(OWNER)).toBe('f1');
+    // A doc opened with a history is left unstamped otherwise: see `open`.
+    const other = idb.manager();
+    other.applyRemoteUpdate('b1', 'm.md', Y.encodeStateAsUpdate(server));
+    await other.open('b1', 'm.md', 'f2');
+    expect(other.ownerOf('b1', 'm.md')).toBeNull();
+  });
+
+  it('leaves a doc unstamped when its store brought a history in: its delete did not go through', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, dbNameOf('n.md'), 'old note\n');
+    const dm = new DocManager({
+      persistenceFactory: idb.factory,
+      // IndexedDB did not delete the database.
+      idb: { list: () => idb.registry.list(), delete: () => Promise.resolve() },
+    });
+    await dm.clear('b1', 'n.md');
+    dm.get('b1', 'n.md');
+
+    await dm.claimNew('b1', 'n.md', 'f1');
+    await flushAsync();
+
+    expect(dm.getText('b1', 'n.md')).toBe('old note\n');
+    expect(dm.ownerOf('b1', 'n.md')).toBeNull();
+    expect(idb.dbs.get(dbNameOf('n.md'))?.custom.has(OWNER)).toBe(false);
+  });
+
+  it('leaves a stamp there is alone, and does nothing for a doc not open', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+
+    await dm.claimNew('b1', 'n.md', 'f2');
+    await dm.claimNew('b1', 'none.md', 'f3');
+
+    expect(dm.ownerOf('b1', 'n.md')).toBe('f1');
+    expect(dm.has('b1', 'none.md')).toBe(false);
+    expect(idb.dbs.has(dbNameOf('none.md'))).toBe(false);
   });
 });
 

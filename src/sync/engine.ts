@@ -18,7 +18,7 @@ import {
   type YjsCatchupBatch,
 } from '@/client/socket';
 import * as Y from 'yjs';
-import { DocManager, type MoveResult, type OpenResult } from '@/crdt/doc-manager';
+import { DocManager, type MoveResult, type OpenResult, type WrittenMark } from '@/crdt/doc-manager';
 import { mergeText3 } from '@/crdt/text-merge';
 import {
   OperationLog,
@@ -5313,6 +5313,12 @@ export class SyncEngine {
    * A note renamed away from the name may not have carried its history off
    * yet (see {@link moveRenamedDoc}): that goes first. Deleted here, the
    * history was lost, and the new note's subscription left with it.
+   *
+   * The new doc is stamped for the note once its store turns out empty (see
+   * `DocManager.claimNew`): the server's doc of a teammate's note lands in it
+   * right away, and a doc opened with a history is left unstamped — as was
+   * this one, all session, and the mark of its writes to disk never went to
+   * its store (see `DocManager.noteWritten`).
    */
   private async startDoc(fileId: string, path: string): Promise<void> {
     // Nothing of another history is kept: its updates need no check.
@@ -5325,6 +5331,7 @@ export class SyncEngine {
     // Deleted or moved on meanwhile.
     if (this.fileIndex.byPath.get(path)?.fileId !== fileId) return;
     this.wire(fileId, path);
+    void this.docManager.claimNew(this.binding.id, path, fileId);
   }
 
   /**
@@ -7520,6 +7527,15 @@ export class SyncEngine {
    * {@link resolveFoldBase}). With none — a log from an older plugin, or both
    * sides changed while the plugin was off — the disk content wins as it
    * always did, and that is logged: it drops the doc's unwritten remote edits.
+   *
+   * The marker is the one `state.json` gave, unless the engine's last write
+   * of the note — the teammate's text it wrote from the doc — did not reach
+   * `state.json` (see {@link lostWriteMark}): then it is the hash of that text.
+   * Folded against the older marker, the disk that write left looked like
+   * local edits made to the text before it: without a base it replaced the
+   * note's text for everyone — the teammate's text typed since, gone — and
+   * with one from the version history, the teammate's lines were merged in
+   * twice.
    */
   private async foldDiskEditsIntoDoc(path: string, diskText: string | null): Promise<void> {
     const meta = this.fileIndex.byPath.get(path);
@@ -7529,7 +7545,8 @@ export class SyncEngine {
       await this.markFolded(meta, diskText);
       return;
     }
-    const marker = meta.foldedHash;
+    const lost = this.lostWriteMark(meta, path);
+    const marker = lost?.hash ?? meta.foldedHash;
     const diskHash = await sha256Hex(diskText);
     // Logs from before 0.3.2 have no marker yet. `contentHash` still answers
     // "is the disk unchanged since the last sync", as it always did — but it
@@ -7537,11 +7554,21 @@ export class SyncEngine {
     // wrote, so it must never pick a merge base: a base the disk doesn't
     // descend from turns divergence into doubled text.
     if (diskHash === (marker ?? meta.contentHash)) {
+      if (lost !== null) {
+        // The disk is the engine's last write, the doc the one ahead: the
+        // marker `state.json` lost is recorded again.
+        this.log.info('a note on disk is this device’s last write of it; its record was lost', {
+          path,
+          fileId: meta.fileId,
+        });
+        await this.markFolded(meta, diskText, diskHash);
+        return;
+      }
       // Nothing on disk the doc hasn't seen — the doc is the one ahead.
       if (marker !== undefined) this.foldBases.set(meta.fileId, { text: diskText, hash: diskHash });
       return;
     }
-    const base = marker === undefined ? null : await this.resolveFoldBase(meta, marker);
+    const base = marker === undefined ? null : await this.resolveFoldBase(meta, marker, lost);
     this.throwIfStopped();
     // Remote updates keep landing while the awaits above yield, so the doc is
     // read only now, and everything from here to `setText` is synchronous — a
@@ -7572,8 +7599,17 @@ export class SyncEngine {
    * `null` when nothing matches — never a guess: a base missing text both
    * sides already have would re-insert it (the duplication incidents), one
    * with extra text would delete it.
+   *
+   * A marker from the mark of the engine's last write (`lost`, see
+   * {@link lostWriteMark}) names the text written: the doc gives it back,
+   * rebuilt at the state it was taken at (see `DocManager.textAt`), when the
+   * teammate typed on since — the doc is ahead of it then.
    */
-  private async resolveFoldBase(meta: IndexedMeta, marker: string): Promise<string | null> {
+  private async resolveFoldBase(
+    meta: IndexedMeta,
+    marker: string,
+    lost: WrittenMark | null = null,
+  ): Promise<string | null> {
     const cached = this.foldBases.get(meta.fileId);
     if (cached) {
       const hash = cached.hash ?? (await sha256Hex(cached.text));
@@ -7582,6 +7618,10 @@ export class SyncEngine {
     }
     const docText = this.docManager.getText(this.binding.id, meta.relativePath);
     if ((await sha256Hex(docText)) === marker) return docText;
+    if (lost?.state !== undefined && lost.hash === marker) {
+      const written = this.docManager.textAt(this.binding.id, meta.relativePath, lost.state);
+      if (written !== null && (await sha256Hex(written)) === marker) return written;
+    }
     return this.loadBaseFromHistory(meta, marker);
   }
 
@@ -7630,18 +7670,56 @@ export class SyncEngine {
    * awaits: meanwhile the file may have been deleted (writing its meta back
    * would resurrect a ghost entry in the log) or the index rebuilt on
    * reconnect (the object in hand is no longer the one folds will read).
-   * `log` is the unfenced one inside a {@link commitLocal} block.
+   * `log` and `docs` are the unfenced ones inside a {@link commitLocal} block.
+   *
+   * A marker naming another text than the engine's last write of the note
+   * drops the mark of that write (see `DocManager.forgetWritten`): the disk
+   * has moved on from it. Kept, it took that very text back on disk later —
+   * `git checkout`, a backup, File Recovery — for the write, and the doc's
+   * text went over it.
    */
   private setFoldedHash(
     meta: IndexedMeta,
     hash: string,
     log: OperationLog = this.operationLog,
+    docs: DocManager = this.docManager,
   ): void {
     const live = this.fileIndex.byId.get(meta.fileId);
     if (live !== meta) meta.foldedHash = hash;
+    if (live) docs.forgetWritten(this.binding.id, this.docPathOf(live), hash);
     if (!live || live.foldedHash === hash) return;
     live.foldedHash = hash;
     log.setFileMeta(live);
+  }
+
+  /**
+   * The mark of the engine's last write of the note at `path` to disk (see
+   * `DocManager.noteWritten`) when `state.json` did not take that write: a
+   * crash, or Obsidian's "Reload app without saving", in the moment after it.
+   * The note's fold marker still names the text the write went over then,
+   * and the fold takes the mark's text for the one folded instead (see
+   * {@link foldDiskEditsIntoDoc}). `null` otherwise.
+   *
+   * The mark says only that the engine wrote that text from this history
+   * over that record, not that the text on disk may be written over now. So
+   * it is taken only while the record is as it was right before the write —
+   * the same marker, the same synced content. A marker moved to another text
+   * since drops the mark (see {@link setFoldedHash}); a record moved on
+   * without the doc open — the catch-up takes a disk agreeing with the
+   * server as synced without it (see `catchupDocIsRedundant`) — no longer
+   * matches it. A note new here when written — no marker, no content
+   * recorded, as a teammate's note created live is until its first write —
+   * has no content to match: its record is the listing's after a crash, and
+   * without a marker.
+   */
+  private lostWriteMark(meta: IndexedMeta, path: string): WrittenMark | null {
+    const mark = this.docManager.writtenMarkOf(this.binding.id, path);
+    if (mark === null || mark.fileId !== meta.fileId) return null;
+    const marker = meta.foldedHash ?? '';
+    if (mark.hash === marker || mark.over !== marker) return null;
+    const newHere = mark.over === '' && mark.synced === '';
+    if (!newHere && mark.synced !== meta.contentHash) return null;
+    return mark;
   }
 
   /**
@@ -7908,6 +7986,12 @@ export class SyncEngine {
       }
       await this.foldDiskEditsIntoDoc(path, diskText);
       text = this.docManager.getText(this.binding.id, path);
+      // Which of the doc's operations make the text about to be written, for
+      // its mark (see below): taken with the text, before anything else lands.
+      const state =
+        meta && diskText !== text && this.docPathOf(meta) === path
+          ? this.docManager.stateOf(this.binding.id, path)
+          : null;
       if (meta) hash = await sha256Hex(text);
       // Disk already matches the doc — don't rewrite the file. The catch-up
       // used to rewrite EVERY text file on EVERY connect: a mass write storm
@@ -7924,12 +8008,14 @@ export class SyncEngine {
       }
       // In the note's offline history before the write, where a crash leaves
       // it: the record of the write reaches `state.json` a moment after it
-      // (see `settleWrittenHere`). Not waited for.
+      // (see `settleWrittenHere`, `lostWriteMark`). Not waited for.
       if (meta && this.docPathOf(meta) === path) {
         this.docManager.noteWritten(this.binding.id, path, {
           fileId: meta.fileId,
           hash,
           over: meta.foldedHash ?? '',
+          synced: meta.contentHash,
+          ...(state !== null ? { state } : {}),
         });
       }
       // The fold and the hashing yield, and the disk may change meanwhile. A
@@ -7989,7 +8075,7 @@ export class SyncEngine {
       // old disk as local deletions of everything this snapshot was bringing in.
       if (meta) {
         this.foldBases.set(meta.fileId, { text: written, hash });
-        this.setFoldedHash(meta, hash, io.log);
+        this.setFoldedHash(meta, hash, io.log, io.docs);
       }
     });
   }

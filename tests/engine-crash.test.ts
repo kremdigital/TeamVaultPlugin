@@ -135,7 +135,13 @@ async function writtenThenCrash(opts: { ahead?: boolean; eol?: string } = {}): P
   expect(h.log.getFileMeta('b1', 'n.md')?.notOnDisk).toBeUndefined();
   // The mark went into the note's own database before the write.
   const raw = idb.dbs.get(dbNameOf('n.md'))?.custom.get(WRITTEN);
-  expect(JSON.parse(String(raw))).toEqual({ fileId: id, hash: await sha256Hex(written), over: '' });
+  expect(JSON.parse(String(raw))).toMatchObject({
+    fileId: id,
+    hash: await sha256Hex(written),
+    over: '',
+    // The record the write went over: the listing's, of a note never written here.
+    synced: await sha256Hex(`theirs${eol}`),
+  });
   if (opts.ahead === true) {
     typeOn(docs, h, id, `ahead${eol}`);
     await until(() => idb.textOf(dbNameOf('n.md')) === `${written}ahead${eol}`, 'ahead stored');

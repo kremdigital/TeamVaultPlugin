@@ -42,6 +42,23 @@ uses [Semantic Versioning](https://semver.org/).
   connect already recognises them. What remains: a crash of the whole system
   or a power loss, which can lose the offline history too, and a note you
   edit before the check has read it.
+- **A teammate's typing is no longer undone or doubled after Obsidian crashes
+  right after writing their edit.** Team Vault also records, about half a
+  second after writing a teammate's edit of a note to disk, which text of the
+  note it has taken in — how it tells your edits from theirs. When Obsidian
+  crashed, was killed or was reloaded with "Reload app without saving" in
+  that moment while the teammate kept typing, the next sync took the note on
+  disk for an edit of yours made to the older text: what the teammate typed
+  since was removed for everyone, or, when the server's version history had
+  the older text, their lines were merged in twice. The same could happen to
+  a note a teammate had just created. Team Vault now takes the text it
+  wrote, from the mark it leaves in the note's offline history right before
+  each write, for the text taken in — also when you edit the note before it
+  syncs. A text Team Vault once wrote that comes back to disk after you had
+  moved on from it (git, a backup, File Recovery) is still taken as your
+  edit. What remains: two writes of one note within the same half second,
+  and text the teammate deleted right after the write when you edit the note
+  before it syncs; both behave as before.
 - **Deleting a folder deletes each file in it once.** When you deleted a
   folder in Obsidian, the first file in it and every file in its subfolders
   could be sent to the server as two deletes (three for a file two subfolders

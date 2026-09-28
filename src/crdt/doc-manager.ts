@@ -67,13 +67,18 @@ const WRITTEN_KEY = 'team-vault-written';
 
 /**
  * The note's text the engine was about to write to disk, from this doc: the
- * file whose history it is, the hash of the text, and the fold marker of the
- * file's record right before the write (`''` when it had none).
+ * file whose history it is, the hash of the text, and the file's record right
+ * before the write — its fold marker (`over`) and its synced content
+ * (`synced`), each `''` when it had none. `state`: which of the doc's
+ * operations made that text (see {@link DocManager.stateOf}), when it could
+ * be taken.
  */
 export interface WrittenMark {
   fileId: string;
   hash: string;
   over: string;
+  synced: string;
+  state?: string;
 }
 
 /** What {@link DocManager.peek} found under a name. */
@@ -170,8 +175,15 @@ interface ManagedEntry {
   waiting: boolean;
   /** Dropped from the cache: a deferred persistence is not created any more. */
   dead: boolean;
-  /** The last mark handed to the store (see {@link DocManager.noteWritten}), as stored. */
+  /**
+   * The mark of the last write to disk (see {@link DocManager.noteWritten}),
+   * as stored: the last one handed to the store, or the one read from it as
+   * it loaded; `''` for none (or one dropped, see
+   * {@link DocManager.forgetWritten}), `null` while not known yet.
+   */
   written: string | null;
+  /** The store's own history was loaded into the doc (see {@link DocManager.claimNew}). */
+  fromStore: boolean;
 }
 
 /** What {@link DocManager.open} found under the name. */
@@ -544,7 +556,9 @@ export class DocManager {
    * The engine's record of the write goes to `state.json` a moment later: a
    * crash, or Obsidian's "Reload app without saving", in that moment loses
    * it, and the next start finds a teammate's note on disk that its records
-   * say never reached it (see `SyncEngine.settleWrittenHere`).
+   * say never reached it (see `SyncEngine.settleWrittenHere`), or a note
+   * whose fold marker names the text the write went over (see
+   * `SyncEngine.lostWriteMark`).
    *
    * Only for the doc of file `mark.fileId`, by its stamp: a doc without one,
    * or another file's, is left unmarked. Not waited for — each note of a first
@@ -557,23 +571,116 @@ export class DocManager {
   noteWritten(bindingId: string, filePath: string, mark: WrittenMark): void {
     const entry = this.cache.get(this.cacheKey(bindingId, filePath));
     if (!entry || entry.dead || entry.owner !== mark.fileId) return;
-    const value = JSON.stringify({ fileId: mark.fileId, hash: mark.hash, over: mark.over });
+    const value = JSON.stringify({
+      fileId: mark.fileId,
+      hash: mark.hash,
+      over: mark.over,
+      synced: mark.synced,
+      ...(mark.state !== undefined ? { state: mark.state } : {}),
+    });
     if (entry.written === value) return;
-    entry.written = value;
-    const write = (): void => {
-      const persistence = entry.persistence;
-      if (entry.dead || !persistence) return;
-      try {
-        const stored = persistence.setOrdered
-          ? persistence.setOrdered(WRITTEN_KEY, value)
-          : persistence.set?.(WRITTEN_KEY, value);
-        void Promise.resolve(stored).catch(() => undefined);
-      } catch {
-        // Unwritable: the store keeps its last mark, if any.
+    this.storeMark(entry, value);
+  }
+
+  /**
+   * The mark of the last write of the doc at `filePath` to disk (see
+   * {@link noteWritten}): the one handed to its store, or the one the store
+   * held as it loaded. `null` when there is none, or the doc is not open or
+   * has not loaded yet.
+   */
+  writtenMarkOf(bindingId: string, filePath: string): WrittenMark | null {
+    const written = this.cache.get(this.cacheKey(bindingId, filePath))?.written;
+    return written ? parseMark(written) : null;
+  }
+
+  /**
+   * Drop the mark of the last write of the doc at `filePath` to disk (see
+   * {@link noteWritten}) — unless it is of the text hashed to `keep`: the
+   * note's fold marker moves to a text on disk that is not the engine's last
+   * write, so that write is the note's disk no more. A text the engine once
+   * wrote, brought back to disk later (git, a backup, File Recovery), is then
+   * never taken for that write: it is an edit of the user's.
+   *
+   * In the store's key/value area, after the edits handed to it before (see
+   * {@link DocPersistence.setOrdered}); not waited for. Only for a doc open
+   * under the name. One whose mark is not known yet — its store still loading
+   * — has it dropped all the same.
+   */
+  forgetWritten(bindingId: string, filePath: string, keep: string): void {
+    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
+    if (!entry || entry.dead || entry.written === '') return;
+    if (entry.written !== null && parseMark(entry.written)?.hash === keep) return;
+    this.storeMark(entry, '');
+  }
+
+  /**
+   * Which of its operations the doc at `filePath` holds now, and which of
+   * them are deleted — a Yjs snapshot, encoded. {@link textAt} gives the text
+   * it stands for later, from the operations the doc still holds then. `null`
+   * when no doc is open under the name, or it could not be taken.
+   */
+  stateOf(bindingId: string, filePath: string): string | null {
+    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
+    if (!entry || entry.dead) return null;
+    try {
+      return toBase64(Y.encodeSnapshot(Y.snapshot(entry.doc)));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * The text the doc at `filePath` had at `state` (see {@link stateOf}),
+   * rebuilt from the operations it holds now — on a copy of it: the doc
+   * itself is not touched. What was typed since is left out; what was deleted
+   * since is gone from a doc that collects its garbage, and the text rebuilt
+   * then misses it: the caller checks it against the hash of the text it
+   * needs. `null` when no doc is open under the name, or the text cannot be
+   * rebuilt.
+   */
+  textAt(bindingId: string, filePath: string, state: string): string | null {
+    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
+    if (!entry || entry.dead) return null;
+    const probe = new Y.Doc({ gc: false });
+    try {
+      Y.applyUpdate(probe, Y.encodeStateAsUpdate(entry.doc));
+      const delta = probe.getText('content').toDelta(Y.decodeSnapshot(fromBase64(state))) as Array<{
+        insert?: unknown;
+      }>;
+      let text = '';
+      for (const op of delta) {
+        if (typeof op.insert !== 'string') return null;
+        text += op.insert;
       }
-    };
-    if (entry.waiting && entry.ready) void entry.ready.then(write, () => undefined);
-    else write();
+      return text;
+    } catch {
+      return null;
+    } finally {
+      probe.destroy();
+    }
+  }
+
+  /**
+   * Stamp the doc just started for file `fileId` at `filePath` — a note new
+   * under the name, its old store deleted — once its store has loaded, and
+   * only when the store brought no history into it: then everything in the
+   * doc landed in it since, for this file (the server's doc of a note created
+   * by a teammate lands right away, before the doc is ever opened, and `open`
+   * leaves a doc with a history unstamped). A store whose delete did not go
+   * through loads the history it held, and the doc stays unstamped, as it
+   * would without this. The mark of a write to disk goes only to a stamped doc
+   * (see {@link noteWritten}). Never rejects.
+   */
+  claimNew(bindingId: string, filePath: string, fileId: string): Promise<void> {
+    const key = this.cacheKey(bindingId, filePath);
+    return this.serially([key], async () => {
+      const entry = this.cache.get(key);
+      if (!entry || entry.dead || entry.owner !== null) return;
+      if (!(await this.settle(entry))) return;
+      if (this.cache.get(key) !== entry || entry.dead) return;
+      if (entry.owner !== null || entry.fromStore) return;
+      this.claim(entry, fileId);
+    }).catch(() => undefined);
   }
 
   /**
@@ -977,6 +1084,38 @@ export class DocManager {
     const stamp = await readStamp(persistence);
     // A stamp set while this one was being read is newer.
     if (entry.owner === null && stamp !== null) entry.owner = stamp;
+    if (entry.written !== null || !persistence.get) return;
+    try {
+      const raw = await persistence.get(WRITTEN_KEY);
+      // So is a mark handed to the store, or dropped, meanwhile.
+      if (entry.written === null) entry.written = typeof raw === 'string' ? raw : '';
+    } catch {
+      // Unreadable: not known, as before the store loaded.
+    }
+  }
+
+  /**
+   * Hand `value` to the entry's store as its mark of the last write to disk
+   * (`''`: none), after the edits handed to it before (see
+   * {@link DocPersistence.setOrdered}). Not waited for; a store still being
+   * deleted gets it once it is open again.
+   */
+  private storeMark(entry: ManagedEntry, value: string): void {
+    entry.written = value;
+    const write = (): void => {
+      const persistence = entry.persistence;
+      if (entry.dead || !persistence) return;
+      try {
+        const stored = persistence.setOrdered
+          ? persistence.setOrdered(WRITTEN_KEY, value)
+          : persistence.set?.(WRITTEN_KEY, value);
+        void Promise.resolve(stored).catch(() => undefined);
+      } catch {
+        // Unwritable: the store keeps its last mark, if any.
+      }
+    };
+    if (entry.waiting && entry.ready) void entry.ready.then(write, () => undefined);
+    else write();
   }
 
   /**
@@ -1114,6 +1253,7 @@ export class DocManager {
       waiting: false,
       dead: false,
       written: null,
+      fromStore: false,
     };
     entry.updateHandler = (update: Uint8Array, origin: unknown): void => {
       if (SILENT_ORIGINS.has(origin)) return;
@@ -1123,7 +1263,10 @@ export class DocManager {
       // engine has checked whose history it is (see `open`). Fanned out here,
       // a store another file left under this name went out as this file's
       // edits the moment it loaded.
-      if (origin !== null && origin === entry.persistence) return;
+      if (origin !== null && origin === entry.persistence) {
+        entry.fromStore = true;
+        return;
+      }
       const subs = this.localSubs.get(key);
       if (!subs) return;
       for (const cb of subs) {
@@ -1288,14 +1431,36 @@ function parseMark(raw: unknown): WrittenMark | null {
   try {
     const value: unknown = JSON.parse(raw);
     if (typeof value !== 'object' || value === null) return null;
-    const { fileId, hash, over } = value as Record<string, unknown>;
-    if (typeof fileId !== 'string' || typeof hash !== 'string' || typeof over !== 'string') {
+    const { fileId, hash, over, synced, state } = value as Record<string, unknown>;
+    if (
+      typeof fileId !== 'string' ||
+      typeof hash !== 'string' ||
+      typeof over !== 'string' ||
+      typeof synced !== 'string'
+    ) {
       return null;
     }
-    return { fileId, hash, over };
+    return { fileId, hash, over, synced, ...(typeof state === 'string' ? { state } : {}) };
   } catch {
     return null;
   }
+}
+
+/** Bytes as base64 — the key/value area of a store holds strings. */
+function toBase64(bytes: Uint8Array): string {
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(i, i + 0x8000));
+  }
+  return btoa(binary);
+}
+
+/** {@link toBase64}, read back. */
+function fromBase64(text: string): Uint8Array {
+  const binary = atob(text);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return bytes;
 }
 
 /** Whether a doc holds any integrated operation. */
