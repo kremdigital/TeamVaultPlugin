@@ -455,6 +455,160 @@ describe('SyncEngine — a folder deleted or renamed here: its operations say wh
     expect(b.server.pathOf('f1')).toBe('Z/y.png');
     await b.h.engine.stop();
   });
+
+  it('a note renamed onto the name of one deleted while the folder checks wait: the delete is the deleted one’s', async () => {
+    const b = await seeded(['n/plan.png', 'n/plan2.png', 'm/x.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+
+    // A rename before them waits for its look at the disk: the checks of the
+    // delete and the rename after it wait behind it.
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/plan.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/plan.png'));
+    await flushAsync(20);
+    // Renamed onto the name meanwhile: recorded there at once.
+    const renaming = b.h.vault.rename('n/plan2.png', 'n/plan.png');
+    await flushAsync(20);
+    expect(b.h.engine.getFileIdForPath('n/plan.png')).toBe('f2');
+    slow.release();
+    await finish(b, [before, deleting, renaming]);
+
+    const deletes = b.h
+      .socket()
+      .emits.slice(emits)
+      .filter((e) => e.event === 'file:delete')
+      .map((e) => (e.payload as { fileId: string }).fileId);
+    expect(deletes).toEqual(['f1']);
+    expect(b.server.pathOf('f1')).toBeNull();
+    expect(b.server.pathOf('f2')).not.toBeNull();
+    // The renamed note keeps the name here, its record and its copy.
+    expect(b.h.engine.getFileIdForPath('n/plan.png')).toBe('f2');
+    expect(b.h.vault.files.has('n/plan.png')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a file saved under the name of one whose delete waits for the folder checks: a new file, after the delete', async () => {
+    const b = await seeded(['n/plan.png', 'm/x.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+    const rows = b.server.journal.length;
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/plan.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/plan.png'));
+    await flushAsync(20);
+    // A new file under the name, while the delete waits.
+    b.h.vault.files.set('n/plan.png', encode('new'));
+    const saving = b.h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'create',
+      path: 'n/plan.png',
+      source: 'obsidian',
+    });
+    await flushAsync(20);
+    slow.release();
+    await finish(b, [before, deleting, saving]);
+
+    expect(sent(b, emits)).toEqual([
+      'file:rename m/x.png -> m/y.png',
+      'file:delete n/plan.png',
+      'file:create n/plan.png',
+    ]);
+    // The server has the new file under the name — a create of a deleted
+    // file's name brings its id back — with the new content.
+    expect(journal(b.server, rows)).toEqual([
+      'RENAME m/x.png -> m/y.png',
+      'DELETE n/plan.png',
+      'CREATE n/plan.png',
+    ]);
+    const now = b.h.engine.getFileIdForPath('n/plan.png') ?? '';
+    expect(b.server.pathOf(now)).toBe('n/plan.png');
+    expect(b.server.files.get(now)?.contentHash).toBe(await sha256Hex(encode('new')));
+    await b.h.engine.stop();
+  });
+  it('a file never synced deleted, a note renamed onto its name meanwhile: the server listing that note there does not take the delete', async () => {
+    const b = await seeded(['n/plan2.png', 'm/x.png', 'keep.png']);
+    // Saved here and never synced: nothing is recorded under its name.
+    b.h.vault.files.set('n/u.png', encode('u'));
+    const emits = b.h.socket().emits.length;
+    const LISTING = 'GET /api/projects/p1/files';
+    const served = b.h.routes.get(LISTING);
+    if (served === undefined) throw new Error('no route for the listing');
+    const listed = deferred<void>();
+    let asked = 0;
+    b.h.routes.set(LISTING, () => {
+      asked += 1;
+      return listed.promise.then(served);
+    });
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/u.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/u.png'));
+    await flushAsync(20);
+    const renaming = b.h.vault.rename('n/plan2.png', 'n/u.png');
+    await flushAsync(20);
+    slow.release();
+    await until('the server asked for the file under the name', () => asked > 0);
+    // The rename reaches the server before the listing answers.
+    await until('the rename sent', () =>
+      b.h
+        .socket()
+        .emits.some(
+          (e) =>
+            e.event === 'file:rename' && (e.payload as { newPath?: string }).newPath === 'n/u.png',
+        ),
+    );
+    await b.server.pump();
+    expect(b.server.pathOf('f1')).toBe('n/u.png');
+    listed.resolve();
+    await finish(b, [before, deleting, renaming]);
+
+    expect(sent(b, emits).filter((e) => e.startsWith('file:delete'))).toEqual([]);
+    expect(b.server.pathOf('f1')).toBe('n/u.png');
+    expect(b.h.engine.getFileIdForPath('n/u.png')).toBe('f1');
+    await b.h.engine.stop();
+  });
+
+  it('a new file deleted before its create is answered, the answer landing while the delete waits: the delete is that file’s', async () => {
+    const b = await seeded(['m/x.png', 'keep.png']);
+    b.h.vault.files.set('n/new.png', encode('new'));
+    const creating = b.h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'create',
+      path: 'n/new.png',
+      source: 'obsidian',
+    });
+    await until('the create sent', () => b.h.socket().emits.some((e) => e.event === 'file:create'));
+    const emits = b.h.socket().emits.length;
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/new.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/new.png'));
+    await flushAsync(20);
+    // The create's answer lands while the delete waits for its checks.
+    await b.server.pump();
+    await until('the new file recorded', () => b.h.engine.getFileIdForPath('n/new.png') !== null);
+    const id = b.h.engine.getFileIdForPath('n/new.png') ?? '';
+    slow.release();
+    await finish(b, [creating, before, deleting]);
+
+    const deletes = b.h
+      .socket()
+      .emits.slice(emits)
+      .filter((e) => e.event === 'file:delete')
+      .map((e) => (e.payload as { fileId: string }).fileId);
+    expect(deletes).toEqual([id]);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(b.h.engine.getFileIdForPath('n/new.png')).toBeNull();
+    await b.h.engine.stop();
+  });
 });
 
 // -- A teammate's device --------------------------------------------------------------

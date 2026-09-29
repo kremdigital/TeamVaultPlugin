@@ -148,6 +148,14 @@ uses [Semantic Versioning](https://semver.org/).
   file's deletion was reported both by Obsidian and by the file system. A
   folder delete also no longer looks up each file whose delete is already on
   its way in the server's list of all project files.
+- **Deleting a file and right away renaming another one to its name, or
+  saving a new file under it, no longer takes the wrong file.** The delete
+  could go out as the delete of the file renamed onto the name a moment
+  later: that file was deleted for the whole team, and the one you deleted
+  stayed on the server. A new file saved under the name of one just deleted
+  went to the server as that file's new version, and the delete took it
+  along: the new file never reached the team. The delete now goes out for
+  the file you deleted, and the new file goes out as a new one after it.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the

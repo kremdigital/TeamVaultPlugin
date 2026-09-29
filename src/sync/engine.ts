@@ -4488,6 +4488,19 @@ export class SyncEngine {
   private async handleLocalModify(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     const meta = this.fileIndex.byPath.get(path);
+    // The file recorded under the name is being deleted from here (see
+    // `deleteClaims`), its delete waiting for its checks — behind every
+    // folder check before it, seconds after a folder renamed. A file saved
+    // under the name meanwhile is a new one once the delete has gone out, and
+    // the same file if the delete found it on disk after all. Taken for a save
+    // of the deleted file, it went to the server as that file's new version,
+    // the delete took it along, and the new file never reached the server.
+    const deleting = meta === undefined ? undefined : this.deleteClaims.get(meta.fileId);
+    if (deleting !== undefined) {
+      await deleting.done;
+      await this.handleLocalModify(path, from);
+      return;
+    }
     // No server record yet — promote to a CREATE. So for a file whose content
     // never reached this disk: the file here is another one (see
     // `yieldNameNotWritten`).
@@ -4841,6 +4854,16 @@ export class SyncEngine {
    * `change`: held by the caller (`null` for a queue replay). The delete is
    * claimed before the first `await` (see {@link deleteClaims}): when another
    * handler has claimed this file's already, this one joins it.
+   *
+   * The delete is of the file recorded under the name when it came, by its
+   * id, whatever is recorded under the name by the time it goes out. The
+   * checks below wait — the look at the folder waits for the checks of every
+   * delete and rename before it, hundreds after a folder renamed — and a note
+   * renamed onto the name meanwhile is recorded there at once (see
+   * {@link handleLocalRename}). Read from the name after the checks, the
+   * delete went out as that note's: the server deleted it for the whole team,
+   * its history was dropped here, and the file deleted here stayed on the
+   * server under its name, where the rename of the other one was refused.
    */
   private async sendLocalDelete(path: string, change: HeldChange | null): Promise<void> {
     const opId = change?.opId ?? newOpId();
@@ -4851,6 +4874,9 @@ export class SyncEngine {
       return;
     }
     let claim = indexed === '' ? null : this.claimDelete(indexed, opId);
+    // Nothing recorded under the name: the file a create of the name under
+    // way here records, once it has, is the one deleted (see below).
+    const created = indexed === '' ? this.createdUnder(path) : { fileId: '' };
     let outcome: DeleteOutcome = 'kept';
     try {
       // Stale-delete guard: if the file is still on disk, the watcher
@@ -4864,7 +4890,16 @@ export class SyncEngine {
       // The folder that went with the file, if it did: its teammates remove
       // it too (see `vanishedFolderOf`).
       const folder = await this.vanishedFolderOf(parentFolder(path));
-      const meta = this.fileIndex.byPath.get(path);
+      // The file claimed, if it is still recorded under the name; out of it
+      // since — deleted or renamed by a teammate — there is nothing to send
+      // for it. Any other file recorded under the name since came after the
+      // file was gone from here, and is not deleted with it.
+      const meta =
+        indexed !== ''
+          ? this.indexedAt(indexed, path)
+          : created.fileId !== ''
+            ? this.indexedAt(created.fileId, path)
+            : undefined;
       let fileId = meta?.fileId ?? '';
       // Checked: from here on `stop()` hands it over as a plain DELETE.
       if (change) change.payload = withFolder(deletePayload(fileId, meta), folder);
@@ -4874,15 +4909,29 @@ export class SyncEngine {
       // later dropped as `no_file_id`, so the deletion never propagates.
       // Not a name a file of the server's waits for (see `waitForName`): the
       // file deleted here was another one, and the server's was never here.
-      if (!fileId && this.socket.isConnected() && this.waitingFor(path) === undefined) {
+      // Only when nothing was recorded under the name when the delete came.
+      if (
+        !fileId &&
+        indexed === '' &&
+        this.socket.isConnected() &&
+        this.waitingFor(path) === undefined
+      ) {
         fileId = await this.resolveServerFileId(path);
         this.throwIfStopped();
+        // A file this device records is known here under its own name: not
+        // the one deleted here, unless its create from here landed meanwhile.
+        // The server may list a note renamed onto the name here already.
+        if (fileId !== '' && fileId !== created.fileId && this.fileIndex.byId.has(fileId)) {
+          this.log.debug('local delete: the server lists a file recorded here under the name', {
+            path,
+            fileId,
+          });
+          fileId = '';
+        }
       }
-      // Looked up in the listing, or another file's under the name since the
-      // claim: claimed now, before the next `await`.
+      // Looked up in the listing, or recorded by the create of the name:
+      // claimed now, before the next `await`.
       if (fileId !== '' && claim?.fileId !== fileId) {
-        claim?.end('kept');
-        claim = null;
         const taken = this.deleteClaimedByOther(fileId, opId);
         if (taken !== undefined) {
           await this.joinDelete(path, change, taken);
@@ -4985,6 +5034,25 @@ export class SyncEngine {
     } finally {
       claim?.end(outcome);
     }
+  }
+
+  /** File `fileId`'s record in the index, if it is under `path`. */
+  private indexedAt(fileId: string, path: string): IndexedMeta | undefined {
+    const meta = this.fileIndex.byId.get(fileId);
+    return meta?.relativePath === path ? meta : undefined;
+  }
+
+  /**
+   * The file a create of `path` under way here (see {@link creating}) records,
+   * once it has: its `fileId`, `''` until then — and for good when no create
+   * of the name is under way, or it records none (queued, refused, found gone).
+   */
+  private createdUnder(path: string): { fileId: string } {
+    const created = { fileId: '' };
+    void this.creating.get(path)?.then((done) => {
+      if (done !== null) created.fileId = done.fileId;
+    });
+    return created;
   }
 
   /**
