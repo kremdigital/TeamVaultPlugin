@@ -6,23 +6,18 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added
-
-- **A folder a teammate deletes, renames or moves goes from your vault too.**
-  Team Vault syncs files, not folders, so such a folder used to stay behind,
-  empty, on every other device. Now the device where it happened says which
-  folder went with each file, and the other devices remove that folder, with
-  the empty folders in it, once nothing is left in it. Anything still there
-  keeps the folder: a file Team Vault doesn't sync (a `.gitkeep`, say), or a
-  teammate's new file on its way to your disk. A folder emptied by deleting
-  or moving its last file stays, as it stays for whoever did it. A device
-  that was offline removes the folder when it reconnects, unless it was away
-  so long that the server sent it only the newest changes. Needs the Team
-  Vault server that keeps this; with an older one, folders stay behind as
-  before. A queue written by 0.4.0 goes out as it is.
-
 ### Changed
 
+- **This version needs the Team Vault server updated first.** Update the
+  server, then the plugin on every device. Folders follow their files (see
+  **Added**) only with the server of this release: it keeps which folder
+  went with a delete, rename or move, and passes it on. With the server of
+  0.4.0 this version syncs as 0.4.0 does, but a folder a teammate deleted or
+  renamed stays behind, empty, on the other devices. As before, nothing is
+  sent to a server without operation ids (`server_outdated`). Plugin
+  versions before 0.4.0 are no longer supported: the server of this release
+  drops what it still kept for them, so update every device. The README no
+  longer has advice for devices still on 0.3.9.
 - **`sync.log` no longer says answers were lost when changes only waited in
   the queue.** On connecting, Team Vault checks the changes waiting in its
   queue with the server; the summary line now reads
@@ -35,6 +30,33 @@ uses [Semantic Versioning](https://semver.org/).
   never been sent. `applied` counts changes the server had applied while their
   answer was lost (each is still logged on its own line); `voided` counts
   changes the server never got, which go out again.
+
+### Added
+
+- **A folder a teammate deletes, renames or moves goes from your vault too.**
+  Team Vault syncs files, not folders, so such a folder used to stay behind,
+  empty, on every other device. Now the device where it happened says which
+  folder went with each file, and the other devices remove that folder, with
+  the empty folders in it, once nothing is left in it. Anything still there
+  keeps the folder: a file Team Vault doesn't sync (a `.gitkeep`, say), or a
+  teammate's new file on its way to your disk. A folder emptied by deleting
+  or moving its last file stays, as it stays for whoever did it. A device
+  that was offline removes the folder when it reconnects, unless it was away
+  so long that the server sent it only the newest changes. It takes the
+  server of this release (see **Changed**); with the server of 0.4.0,
+  folders stay behind as before. Changes 0.4.0 left in the queue go out as
+  they are.
+
+### Removed
+
+- **What was left for plugin 0.3.x.** A queue 0.3.x left in `state.json` is
+  no longer converted when it loads, and `sync.log` no longer warns
+  `legacy in-flight entries`: each queued change still gets an operation id
+  of its own, as any change without a valid one does. Nor does Team Vault
+  look for the notes of a catch-up in the server's answer to the join, where
+  a server put them only for a plugin that did not ask for them streamed
+  (Team Vault has asked since 0.2.3): it takes them as the server streams
+  them after the answer.
 
 ### Fixed
 
@@ -93,15 +115,6 @@ uses [Semantic Versioning](https://semver.org/).
   edit. What remains: two writes of one note within the same half second,
   and text the teammate deleted right after the write when you edit the note
   before it syncs; both behave as before.
-- **Deleting a folder deletes each file in it once.** When you deleted a
-  folder in Obsidian, the first file in it and every file in its subfolders
-  could be sent to the server as two deletes (three for a file two subfolders
-  down), and offline both were queued. The server recorded the second delete
-  too, and had a teammate created a file under the same name in between, the
-  second delete removed the teammate's new file. The same happened when a
-  file's deletion was reported both by Obsidian and by the file system. A
-  folder delete also no longer looks up each file whose delete is already on
-  its way in the server's list of all project files.
 - **Changes the server turns away as busy go out again within seconds, in
   their order.** When the server can't get to a change in time (its queue is
   jammed, say by a teammate adding hundreds of files at once), it answers
@@ -117,6 +130,15 @@ uses [Semantic Versioning](https://semver.org/).
   they wait. If the retry keeps failing for another reason, new changes go
   out again after three tries and the rest waits for the next connection, as
   before. Edits to a note's text are not affected.
+- **Deleting a folder deletes each file in it once.** When you deleted a
+  folder in Obsidian, the first file in it and every file in its subfolders
+  could be sent to the server as two deletes (three for a file two subfolders
+  down), and offline both were queued. The server recorded the second delete
+  too, and had a teammate created a file under the same name in between, the
+  second delete removed the teammate's new file. The same happened when a
+  file's deletion was reported both by Obsidian and by the file system. A
+  folder delete also no longer looks up each file whose delete is already on
+  its way in the server's list of all project files.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the

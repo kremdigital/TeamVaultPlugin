@@ -89,23 +89,19 @@ Install manually until the directory listing lands:
 Those three files are all there is — since 0.3.0 the plugin has no native
 dependencies, so there is no `node_modules` to install next to it.
 
-**Server version.** Team Vault 0.4.0 and later need a Team Vault server that
-keeps operation ids (it says so when a vault joins a project: `opIdempotency`
-in the answer). Update the server first. With an older server the plugin
-stops sending: the status bar shows an error, the notice and `sync.log` say
-`server_outdated` (with changes waiting in the queue, after about a minute
-and a half), and your changes wait in the offline queue until the server is
-updated. The updated server refuses the file changes of older plugin
-versions (new files, renames, moves, deletes, attachment uploads), which
-wait in their offline queue until they update; edits of a note's text still
-sync. Update every device soon after the server. Until then, don't answer
-the "Content conflict" prompt of an attachment or canvas with **Keep local**
-on a device with an older version: it records your version as synced though
-the server refused it, and the teammate's next version replaces yours
-without a prompt (the server keeps the refused version, and its admin can
-put it back). **Keep both** keeps both. Go back to an older version only
-while nothing waits to go out (the status bar says **Synced**): it doesn't
-know the changes 0.4.0 has on their way.
+**Server version.** Update the Team Vault server first, then the plugin on
+every device. Team Vault 0.4.1 needs a server from the same release: one
+that passes on which folder went with a delete, rename or move (`folder`),
+so that a folder a teammate deleted or renamed goes from the other devices
+too. With the server of 0.4.0, 0.4.1 still syncs, but such folders stay
+behind, empty, on the other devices. To a server without operation ids (it
+says so when a vault joins a project: `opIdempotency` in the answer) the
+plugin sends nothing: the status bar shows an error, the notice and
+`sync.log` say `server_outdated` (with changes waiting in the queue, after
+about a minute and a half), and your changes wait in the offline queue until
+the server is updated. Plugin versions before 0.4.0 are not supported: the
+server refuses their new files, renames, moves, deletes and attachment
+uploads.
 
 ## Configuration
 

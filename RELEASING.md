@@ -72,60 +72,39 @@ Community directory ([community.obsidian.md](https://community.obsidian.md)).
 
 ## Releases that need the server updated
 
-Some releases change the sync protocol and work only with a server that has
-the change: 0.3.8 (`operationsCatchup`, `clientId`) and 0.4.0 (operation ids
-— the server answers `ops:status` and says `opIdempotency: 1` in its
-`project:join` answer). For such a release:
+Some releases change the sync protocol and work in full only with a server
+that has the change: 0.4.0 (operation ids — the server answers `ops:status`
+and says `opIdempotency: 1` in its `project:join` answer) and 0.4.1
+(`folder` in `file:delete`, `file:rename` and `file:move`, which the
+server keeps and passes on). For such a release:
 
 - Deploy the server first: tag the plugin only once production runs it.
-  0.4.0 connected to an older server reports `server_outdated` and stops
-  sending: with nothing queued, from the answer to its join; with changes
-  queued, after about a minute and a half — it asks `ops:status` first,
-  which an older server never answers, then joins without catch-up
-  (`skipOperations`, `skipYjsCatchup`) to read `opIdempotency`. With
-  nothing queued, a change made while that join is on its way (one round
-  trip to the server) can still reach the older server, which applies it
-  once; a change made after its answer waits in the queue, even while the
-  file listing of the connect is still loading.
+  The plugin connected to a server without operation ids reports
+  `server_outdated` and stops sending: with nothing queued, from the answer
+  to its join; with changes queued, after about a minute and a half — it
+  asks `ops:status` first, which such a server never answers, then joins
+  without catch-up (`skipOperations`, `skipYjsCatchup`) to read
+  `opIdempotency`. With nothing queued, a change made while that join is on
+  its way (one round trip to the server) can still reach the older server,
+  which applies it once; a change made after its answer waits in the queue,
+  even while the file listing of the connect is still loading. 0.4.1
+  connected to the server of 0.4.0 syncs, but that server drops `folder`:
+  a folder a teammate deleted or renamed stays behind, empty, on the other
+  devices.
 - Then release the plugin without delay, and have every device updated
-  right after. The server of 0.4.0 refuses the file operations of older
-  plugins (`invalid_op_id`, an error they retry): their new files, renames,
-  moves, deletes and attachment uploads wait in their offline queue until
-  they update. Edits of notes' text still sync.
-- Until every device runs 0.4.0, tell the team not to answer the "Content
-  conflict" prompt of an attachment or canvas with **Keep local** on a
-  device still on 0.3.9 — **Keep both** instead. 0.3.9 uploads its version
-  and doesn't read the server's answer: the server refuses it
-  (`invalid_op_id`), yet 0.3.9 records the version as synced and queues
-  nothing — an edit of the same attachment already waiting in its queue is
-  dropped too — and the teammate's next version replaces it on that device
-  without a prompt. The device never sends that version again, not even
-  once updated. The server keeps what it refused: the socket process logs a
-  `warn` "file op: refused without a valid opId" with the `fileId` and
-  `contentHash`, and the bytes stay in `<projectRoot>/.staging/<contentHash>`.
-- Once every device runs 0.4.0 — and no later than two weeks after the
-  server deploy, even if some devices still lag, because the socket log
-  keeps 14 files rotated daily or at 100 MB — look through the socket
-  process's log for refused `file:update-binary` with `staged: true` (see
-  "Клиенты без `opId`" in the server's `docs/sync-protocol.md`). Only those
-  whose blob is still in `.staging` are candidates. Put such a version back
-  — for instance as a separate file next to the original — only when the
-  owner of that device confirms it is the one they chose to keep.
+  right after. Plugin versions before 0.4.0 are not supported: the server
+  refuses their file operations (`invalid_op_id`, an error they retry), and
+  their new files, renames, moves, deletes and attachment uploads wait in
+  their offline queue.
 - Say so at the top of the version's `CHANGELOG.md` section, under
   **Changed**, and in the README's **Server version** note.
-- A change 0.3.9 queued has no operation id; 0.4.0 gives it one when it
-  loads `state.json` (`sync.log` warns `legacy in-flight entries` for those
-  0.3.9 had sent). One the old server applied while its answer was lost can
-  therefore reach the server once more — the risk 0.3.9 had anyway. What
-  0.3.9 queued after the server update was refused, never applied, and goes
-  out once the device is updated — except an attachment edit dropped by a
-  **Keep local** of the same attachment (above).
 
-Going back from 0.4.0 to 0.3.9 is safe only in the same state: 0.3.9 drops
-the operations 0.4.0 keeps in flight in `state.json` (`inflight`) and knows
-nothing of their ids. Rolling the server back to a revision without
-operation ids makes 0.4.0 stop sending — roll it back only together with the
-plugin.
+The plugin still sends `operationsCatchup: 2` and `streamYjs: true` in its
+`project:join`, which the server reads no longer: a server rolled back to
+0.4.0 reads them and answers as it answered 0.4.0 — the whole journal, the
+notes streamed after the answer. Rolling the server back to a revision
+without operation ids makes the plugin stop sending — roll it back only
+together with the plugin.
 
 ## Build verification
 
