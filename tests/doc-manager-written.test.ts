@@ -182,6 +182,82 @@ describe('DocManager — noteWritten', () => {
   });
 });
 
+describe('DocManager — confirmWritten', () => {
+  const mark = { fileId: 'f1', hash: 'h1', over: 'h0', synced: 's0', state: 'AA==' };
+
+  it('puts the mark again with the disk the write went to, through `setOrdered`', async () => {
+    const idb = new FakeIndexedDb();
+    const ordered: unknown[] = [];
+    const factory: PersistenceFactory = (name, doc) => {
+      const inner = idb.factory(name, doc) as DocPersistence;
+      return {
+        ...inner,
+        setOrdered: (key, value) => {
+          ordered.push(JSON.parse(value));
+          return inner.setOrdered!(key, value);
+        },
+      };
+    };
+    const dm = new DocManager({ persistenceFactory: factory, idb: idb.registry });
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+
+    dm.noteWritten('b1', 'n.md', mark);
+    dm.confirmWritten('b1', 'n.md', mark, '/vault');
+    await flushAsync();
+
+    expect(ordered).toEqual([mark, { ...mark, disk: '/vault' }]);
+    expect(dm.writtenMarkOf('b1', 'n.md')).toEqual({ ...mark, disk: '/vault' });
+    // What the next start of Obsidian finds.
+    await expect(idb.manager().peek('b1', 'n.md')).resolves.toEqual({
+      owner: 'f1',
+      text: 'theirs\n',
+      written: { ...mark, disk: '/vault' },
+    });
+  });
+
+  it('confirms nothing for an unknown disk, or on a doc the mark does not go to', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+    await opened(dm, 'm.md', 'f9', 'foreign\n');
+    dm.noteWritten('b1', 'n.md', mark);
+    await flushAsync();
+
+    dm.confirmWritten('b1', 'n.md', mark, '');
+    dm.confirmWritten('b1', 'm.md', mark, '/vault');
+    dm.confirmWritten('b1', 'none.md', mark, '/vault');
+    await flushAsync();
+
+    expect(markIn(idb, dbNameOf('n.md'))).toEqual(mark);
+    expect(markIn(idb, dbNameOf('m.md'))).toBeUndefined();
+    expect(idb.dbs.has(dbNameOf('none.md'))).toBe(false);
+  });
+
+  it('is not what the mark put down before the write says, whatever it carries', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+    await opened(dm, 'n.md', 'f1', 'theirs\n');
+
+    dm.noteWritten('b1', 'n.md', { ...mark, disk: '/vault' });
+    await flushAsync();
+
+    expect(markIn(idb, dbNameOf('n.md'))).toEqual(mark);
+    expect(dm.writtenMarkOf('b1', 'n.md')).toEqual(mark);
+  });
+
+  it('takes a disk it cannot read for none: the mark as put down before the write', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, dbNameOf('n.md'), 'theirs\n', 'f1');
+    seed(idb, dbNameOf('m.md'), 'theirs\n', 'f1');
+    idb.dbs.get(dbNameOf('n.md'))?.custom.set(WRITTEN, JSON.stringify({ ...mark, disk: 7 }));
+    idb.dbs.get(dbNameOf('m.md'))?.custom.set(WRITTEN, JSON.stringify({ ...mark, disk: '' }));
+    const dm = idb.manager();
+
+    expect((await dm.peek('b1', 'n.md'))?.written).toEqual(mark);
+    expect((await dm.peek('b1', 'm.md'))?.written).toEqual(mark);
+  });
+});
+
 describe('DocManager — peek', () => {
   it('opens no database for a name that has none, and creates none', async () => {
     const idb = new FakeIndexedDb();

@@ -100,12 +100,17 @@ interface Crashed {
  * process dies before `state.json` takes the write. `ahead`: the teammate typed
  * on right after the write, and the note's offline history holds more than the
  * disk (live edits reach the disk only after the snapshot's debounce, which
- * never runs out here).
+ * never runs out here). `confirmationLost`: the process dies before the note's
+ * database takes the confirmation of the write, too (see
+ * `DocManager.confirmWritten`).
  */
-async function writtenThenCrash(opts: { ahead?: boolean; eol?: string } = {}): Promise<Crashed> {
+async function writtenThenCrash(
+  opts: { ahead?: boolean; eol?: string; confirmationLost?: boolean } = {},
+): Promise<Crashed> {
   const eol = opts.eol ?? '\n';
   const storage = new FakeStorage();
   const idb = new FakeIndexedDb();
+  if (opts.confirmationLost === true) idb.loseConfirmations();
   const h = buildHarness({
     log: await logOn(storage, NEVER_FLUSHED),
     docs: idb.manager(),
@@ -142,6 +147,9 @@ async function writtenThenCrash(opts: { ahead?: boolean; eol?: string } = {}): P
     // The record the write went over: the listing's, of a note never written here.
     synced: await sha256Hex(`theirs${eol}`),
   });
+  // Confirmed once the write went through, for this vault's disk.
+  if (opts.confirmationLost === true) expect(JSON.parse(String(raw))).not.toHaveProperty('disk');
+  else expect(JSON.parse(String(raw))).toHaveProperty('disk', '/vault');
   if (opts.ahead === true) {
     typeOn(docs, h, id, `ahead${eol}`);
     await until(() => idb.textOf(dbNameOf('n.md')) === `${written}ahead${eol}`, 'ahead stored');
@@ -219,6 +227,25 @@ describe('a crash right after a teammate’s note was written here', () => {
       await next.engine.stop();
     },
   );
+
+  it('takes the note for the teammate’s when the crash came before its write was confirmed', async () => {
+    // The mark put down before the write is all the note's database has: it
+    // tells a disk holding the very text written.
+    const c = await writtenThenCrash({ ahead: true, confirmationLost: true });
+    const next = await restart(c);
+    typeOn(c.docs, next, c.id, 'more\n');
+    await snapshotCatchesUp(c.server, c.docs, c.id);
+    const before = c.server.applied.length;
+
+    await next.engine.start();
+    await connectAgain(c, next);
+
+    const text = `${c.written}ahead\nmore\n`;
+    expect(c.server.applied.slice(before)).toEqual([]);
+    expect(c.docs.live()).toEqual(['a.md=A\n', `n.md=${text}`]);
+    expect(disk(next)).toEqual(['a.md=A\n', `n.md=${text}`]);
+    await next.engine.stop();
+  });
 
   it('takes a note with CRLF line ends for the teammate’s, byte for byte', async () => {
     const c = await writtenThenCrash({ eol: '\r\n', ahead: true });

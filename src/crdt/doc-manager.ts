@@ -71,7 +71,9 @@ const WRITTEN_KEY = 'team-vault-written';
  * before the write — its fold marker (`over`) and its synced content
  * (`synced`), each `''` when it had none. `state`: which of the doc's
  * operations made that text (see {@link DocManager.stateOf}), when it could
- * be taken.
+ * be taken. `disk`: the vault whose disk took the write — its folder — once
+ * the write went through (see {@link DocManager.confirmWritten}); without it
+ * the mark says only that the write was about to happen.
  */
 export interface WrittenMark {
   fileId: string;
@@ -79,6 +81,7 @@ export interface WrittenMark {
   over: string;
   synced: string;
   state?: string;
+  disk?: string;
 }
 
 /** What {@link DocManager.peek} found under a name. */
@@ -560,6 +563,13 @@ export class DocManager {
    * whose fold marker names the text the write went over (see
    * `SyncEngine.lostWriteMark`).
    *
+   * Put down before the write, the mark says only that it was about to
+   * happen: a write that does not go through — the disk changing under it,
+   * the file gone, `stop()` — leaves it behind. It tells a disk holding the
+   * very text marked, and nothing about one that does not; the write, once
+   * through, confirms it ({@link confirmWritten}). `mark.disk` is not taken
+   * here.
+   *
    * Only for the doc of file `mark.fileId`, by its stamp: a doc without one,
    * or another file's, is left unmarked. Not waited for — each note of a first
    * sync is written this way, and nothing about the write depends on it; a
@@ -569,17 +579,23 @@ export class DocManager {
    * history is carried to another name ({@link move}).
    */
   noteWritten(bindingId: string, filePath: string, mark: WrittenMark): void {
-    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
-    if (!entry || entry.dead || entry.owner !== mark.fileId) return;
-    const value = JSON.stringify({
-      fileId: mark.fileId,
-      hash: mark.hash,
-      over: mark.over,
-      synced: mark.synced,
-      ...(mark.state !== undefined ? { state: mark.state } : {}),
-    });
-    if (entry.written === value) return;
-    this.storeMark(entry, value);
+    this.putMark(bindingId, filePath, mark);
+  }
+
+  /**
+   * The write marked by {@link noteWritten} went through: `mark` again, with
+   * the vault whose disk took it (`disk`, its folder). Only a confirmed mark
+   * tells that a disk holding another text descends from the one written —
+   * edited since, as a save of the user's is (see `SyncEngine.lostWriteMark`)
+   * — and only for that vault's disk: IndexedDB is one store for every vault
+   * on the machine, and a copy of the vault in another folder shares the
+   * note's database. In its store after the edits handed to it before, as
+   * {@link noteWritten}; not waited for. Nothing is marked for an unknown
+   * disk (`''`), or on a doc {@link noteWritten} would leave unmarked.
+   */
+  confirmWritten(bindingId: string, filePath: string, mark: WrittenMark, disk: string): void {
+    if (disk === '') return;
+    this.putMark(bindingId, filePath, mark, disk);
   }
 
   /**
@@ -1095,6 +1111,25 @@ export class DocManager {
   }
 
   /**
+   * {@link noteWritten}, confirmed for the vault whose disk took the write
+   * when `disk` is given ({@link confirmWritten}).
+   */
+  private putMark(bindingId: string, filePath: string, mark: WrittenMark, disk?: string): void {
+    const entry = this.cache.get(this.cacheKey(bindingId, filePath));
+    if (!entry || entry.dead || entry.owner !== mark.fileId) return;
+    const value = JSON.stringify({
+      fileId: mark.fileId,
+      hash: mark.hash,
+      over: mark.over,
+      synced: mark.synced,
+      ...(mark.state !== undefined ? { state: mark.state } : {}),
+      ...(disk !== undefined ? { disk } : {}),
+    });
+    if (entry.written === value) return;
+    this.storeMark(entry, value);
+  }
+
+  /**
    * Hand `value` to the entry's store as its mark of the last write to disk
    * (`''`: none), after the edits handed to it before (see
    * {@link DocPersistence.setOrdered}). Not waited for; a store still being
@@ -1431,7 +1466,7 @@ function parseMark(raw: unknown): WrittenMark | null {
   try {
     const value: unknown = JSON.parse(raw);
     if (typeof value !== 'object' || value === null) return null;
-    const { fileId, hash, over, synced, state } = value as Record<string, unknown>;
+    const { fileId, hash, over, synced, state, disk } = value as Record<string, unknown>;
     if (
       typeof fileId !== 'string' ||
       typeof hash !== 'string' ||
@@ -1440,7 +1475,16 @@ function parseMark(raw: unknown): WrittenMark | null {
     ) {
       return null;
     }
-    return { fileId, hash, over, synced, ...(typeof state === 'string' ? { state } : {}) };
+    return {
+      fileId,
+      hash,
+      over,
+      synced,
+      ...(typeof state === 'string' ? { state } : {}),
+      // A disk that cannot be read confirms nothing: the mark is taken as put
+      // down before a write.
+      ...(typeof disk === 'string' && disk !== '' ? { disk } : {}),
+    };
   } catch {
     return null;
   }

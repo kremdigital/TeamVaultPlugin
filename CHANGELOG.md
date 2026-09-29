@@ -108,13 +108,18 @@ uses [Semantic Versioning](https://semver.org/).
   since was removed for everyone, or, when the server's version history had
   the older text, their lines were merged in twice. The same could happen to
   a note a teammate had just created. Team Vault now takes the text it
-  wrote, from the mark it leaves in the note's offline history right before
-  each write, for the text taken in — also when you edit the note before it
-  syncs. A text Team Vault once wrote that comes back to disk after you had
-  moved on from it (git, a backup, File Recovery) is still taken as your
-  edit. What remains: two writes of one note within the same half second,
-  and text the teammate deleted right after the write when you edit the note
-  before it syncs; both behave as before.
+  wrote, from the mark it leaves in the note's offline history with each
+  write, for the text taken in — also when you edit the note before it
+  syncs. Only a write that went through to this vault's folder counts: one
+  that did not happen (the note kept changing on disk under it, or sync
+  stopped right then), or one a copy of the vault in another folder on this
+  computer made, is never taken for the text on disk. A text Team Vault once
+  wrote that comes back to disk after you had moved on from it (git, a
+  backup, File Recovery) is still taken as your edit. What remains: two
+  writes of one note within the same half second, text the teammate deleted
+  right after the write when you edit the note before it syncs, and a crash
+  within milliseconds of the write when you edit the note before it syncs;
+  all behave as before.
 - **Changes the server turns away as busy go out again within seconds, in
   their order.** When the server can't get to a change in time (its queue is
   jammed, say by a teammate adding hundreds of files at once), it answers

@@ -3348,6 +3348,9 @@ export class SyncEngine {
    * (see `DocManager.open`) and holds that text byte for byte — or holds the
    * mark the engine put there right before it wrote this very text (see
    * `DocManager.noteWritten`), when the teammate typed on after the write.
+   * The mark need not be confirmed by the write (see
+   * `DocManager.confirmWritten`): a crash can take the confirmation, and a
+   * disk holding the very text marked is that text either way.
    * The history reaches IndexedDB with each edit, the disk half a second
    * after the last one at the earliest, and `state.json` a moment after
    * that: after a crash, the history has the text on disk, and more.
@@ -7939,8 +7942,9 @@ export class SyncEngine {
    * always did, and that is logged: it drops the doc's unwritten remote edits.
    *
    * The marker is the one `state.json` gave, unless the engine's last write
-   * of the note — the teammate's text it wrote from the doc — did not reach
-   * `state.json` (see {@link lostWriteMark}): then it is the hash of that text.
+   * of the note — the teammate's text it wrote from the doc — went through
+   * and did not reach `state.json` (see {@link lostWriteMark}): then it is the
+   * hash of that text.
    * Folded against the older marker, the disk that write left looked like
    * local edits made to the text before it: without a base it replaced the
    * note's text for everyone — the teammate's text typed since, gone — and
@@ -7955,9 +7959,9 @@ export class SyncEngine {
       await this.markFolded(meta, diskText);
       return;
     }
-    const lost = this.lostWriteMark(meta, path);
-    const marker = lost?.hash ?? meta.foldedHash;
     const diskHash = await sha256Hex(diskText);
+    const lost = this.lostWriteMark(meta, path, diskHash);
+    const marker = lost?.hash ?? meta.foldedHash;
     // Logs from before 0.3.2 have no marker yet. `contentHash` still answers
     // "is the disk unchanged since the last sync", as it always did — but it
     // may come straight from the server listing for a file this device never
@@ -8121,15 +8125,34 @@ export class SyncEngine {
    * recorded, as a teammate's note created live is until its first write —
    * has no content to match: its record is the listing's after a crash, and
    * without a marker.
+   *
+   * Nor does it say the write took place. It goes down right before the
+   * write, and a write given up on — the disk changing under it at every
+   * look, the file gone, `stop()` — leaves it, the record as it was then: the
+   * mark of a text the disk never got. It tells a disk holding that very text
+   * (`diskHash`); a disk holding another descends from the text written — its
+   * base for the fold — only when the write went through to this vault's
+   * disk (see `DocManager.confirmWritten`). Taken for the disk's base
+   * otherwise, the fold read the disk, which never had the teammate's text
+   * the write was bringing in, as the deletion of it, for everyone; and so it
+   * did in a copy of the vault in another folder, which shares the note's
+   * database with the one that wrote.
    */
-  private lostWriteMark(meta: IndexedMeta, path: string): WrittenMark | null {
+  private lostWriteMark(meta: IndexedMeta, path: string, diskHash: string): WrittenMark | null {
     const mark = this.docManager.writtenMarkOf(this.binding.id, path);
     if (mark === null || mark.fileId !== meta.fileId) return null;
     const marker = meta.foldedHash ?? '';
     if (mark.hash === marker || mark.over !== marker) return null;
     const newHere = mark.over === '' && mark.synced === '';
     if (!newHere && mark.synced !== meta.contentHash) return null;
+    if (diskHash !== mark.hash && !this.writtenToThisDisk(mark)) return null;
     return mark;
+  }
+
+  /** Whether the write `mark` is of went through to this vault's disk (see `lostWriteMark`). */
+  private writtenToThisDisk(mark: WrittenMark): boolean {
+    const disk = this.vault.getBasePath();
+    return disk !== '' && mark.disk === disk;
   }
 
   /**
@@ -8381,6 +8404,8 @@ export class SyncEngine {
     let diskText = first;
     let text: string;
     let hash = '';
+    // The mark of the write about to happen (see below), `null` for none.
+    let mark: WrittenMark | null;
     for (let attempt = 1; ; attempt++) {
       // A note never written here, with a file under its name: that one is
       // another, which its own event sends as such (see
@@ -8418,16 +8443,20 @@ export class SyncEngine {
       }
       // In the note's offline history before the write, where a crash leaves
       // it: the record of the write reaches `state.json` a moment after it
-      // (see `settleWrittenHere`, `lostWriteMark`). Not waited for.
-      if (meta && this.docPathOf(meta) === path) {
-        this.docManager.noteWritten(this.binding.id, path, {
-          fileId: meta.fileId,
-          hash,
-          over: meta.foldedHash ?? '',
-          synced: meta.contentHash,
-          ...(state !== null ? { state } : {}),
-        });
-      }
+      // (see `settleWrittenHere`, `lostWriteMark`). Not waited for. Only a
+      // write that goes through confirms it (below): one given up on leaves
+      // the mark of a text the disk never got.
+      mark =
+        meta && this.docPathOf(meta) === path
+          ? {
+              fileId: meta.fileId,
+              hash,
+              over: meta.foldedHash ?? '',
+              synced: meta.contentHash,
+              ...(state !== null ? { state } : {}),
+            }
+          : null;
+      if (mark !== null) this.docManager.noteWritten(this.binding.id, path, mark);
       // The fold and the hashing yield, and the disk may change meanwhile. A
       // save landing now is on disk but not in `text`: the write would roll it
       // back, and the open editor, which reloads the file, with it. A delete
@@ -8461,6 +8490,7 @@ export class SyncEngine {
     // was deleted everywhere, or doubled. `stop()` waits for the phase now.
     const written = text;
     const overwrite = diskText !== null;
+    const marked = mark;
     await this.commitLocal(async (io) => {
       // Update meta BEFORE the write, same as `applyServerUpdateBinary`: the
       // watcher echo of this write must find the file already recorded.
@@ -8483,6 +8513,11 @@ export class SyncEngine {
       // Only after the write succeeded: disk and doc now agree on `text`. A
       // base recorded before a failed write would make the next fold read the
       // old disk as local deletions of everything this snapshot was bringing in.
+      // The mark of the write likewise: confirmed only now, for this vault's
+      // disk (see `lostWriteMark`).
+      if (marked !== null) {
+        io.docs.confirmWritten(this.binding.id, path, marked, io.vault.getBasePath());
+      }
       if (meta) {
         this.foldBases.set(meta.fileId, { text: written, hash });
         this.setFoldedHash(meta, hash, io.log, io.docs);

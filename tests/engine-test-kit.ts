@@ -412,6 +412,11 @@ export class FakeIndexedDb {
   readonly deleted: string[] = [];
   /** Every database a store was opened on, in order — a new one included. */
   readonly opened: string[] = [];
+  /**
+   * Writes through `setOrdered` that a crash cuts off before their transaction
+   * commits: one it answers `true` for never reaches the store.
+   */
+  lostOrdered: ((key: string, value: string) => boolean) | null = null;
   readonly registry: IdbRegistry = {
     list: () => Promise.resolve([...this.dbs.keys()]),
     delete: (name) => {
@@ -420,6 +425,18 @@ export class FakeIndexedDb {
     },
   };
   readonly factory: PersistenceFactory = (name, doc) => this.open(name, doc);
+
+  /**
+   * A crash cuts off every confirmation of a write to disk (see
+   * `DocManager.confirmWritten`) before it commits: the mark put down before
+   * the write is what the note's database keeps.
+   */
+  loseConfirmations(): void {
+    this.lostOrdered = (key, value) => {
+      if (key !== 'team-vault-written' || value === '') return false;
+      return (JSON.parse(value) as { disk?: unknown }).disk !== undefined;
+    };
+  }
 
   /** A fresh `DocManager` on these databases — what a restart of Obsidian builds. */
   manager(): DocManager {
@@ -486,6 +503,7 @@ export class FakeIndexedDb {
       },
       // Updates are stored as they come here, so ordering after them is `set`.
       setOrdered: (key, value) => {
+        if (this.lostOrdered?.(key, value) === true) return Promise.resolve();
         store.custom.set(key, value);
         return Promise.resolve();
       },

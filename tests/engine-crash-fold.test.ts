@@ -15,6 +15,11 @@
  * before it (`DocManager.noteWritten`): the fold takes the text written as its
  * base when the marker it finds is the one that mark was written over.
  *
+ * And only once the write went through to this vault's disk
+ * (`DocManager.confirmWritten`). A mark of a write given up on tells a disk
+ * holding the very text marked, and nothing else: taken for the base of a
+ * disk that never got the text, it deleted the teammate's lines in it.
+ *
  * Only then. A text the engine once wrote, brought back to disk by git, a
  * backup or File Recovery after the user had moved on from it, is the user's:
  * the mark is dropped at the first fold of a disk that is not the engine's
@@ -184,6 +189,20 @@ async function teammateAppends(b: Bench, h: Harness, id: string, line: string): 
   await b.docs.drive();
 }
 
+/** The mark of the last write of `n.md` in its database, parsed; `null` without one. */
+function markOf(b: Bench): Record<string, unknown> | null {
+  const raw = b.idb.dbs.get(dbNameOf('n.md'))?.custom.get(WRITTEN);
+  return typeof raw === 'string' && raw !== ''
+    ? (JSON.parse(raw) as Record<string, unknown>)
+    : null;
+}
+
+/** Whether the server has taken in the engine's edits, and `h`'s disk holds the note's text. */
+function agreed(b: Bench, h: Harness): boolean {
+  b.docs.absorb();
+  return h.vault.text('n.md') === b.docs.text('f2');
+}
+
 describe('a crash right after a teammate’s note created live was written here', () => {
   /**
    * Connected, a teammate creates `n.md` and the engine writes it; they type
@@ -226,10 +245,15 @@ describe('a crash right after a teammate’s edit of a synced note was written h
    * `n.md` synced at `F0\n` (its fold marker in `state.json`). A teammate
    * types `e1`, and the engine writes it; `ahead`: they type `e2` right after,
    * and the process dies before the write reaches `state.json` — the marker
-   * there is still `F0`'s.
+   * there is still `F0`'s. `confirmationLost`: it dies before the note's
+   * database takes the confirmation of the write, too.
    */
-  async function writtenThenCrash(ahead: boolean): Promise<{ b: Bench; next: Harness }> {
+  async function writtenThenCrash(
+    ahead: boolean,
+    confirmationLost = false,
+  ): Promise<{ b: Bench; next: Harness }> {
     const b = await synced('F0\n');
+    if (confirmationLost) b.idb.loseConfirmations();
     const f0 = await sha256Hex('F0\n');
     expect(storedRecord(b.storage, 'n.md')).toMatchObject({ foldedHash: f0 });
     await teammateAppends(b, b.h, 'f2', 'e1\n');
@@ -310,6 +334,172 @@ describe('a crash right after a teammate’s edit of a synced note was written h
         expect(disk(next)).toEqual(['a.md=A\n', `n.md=${text ?? ''}`]);
       },
     );
+  });
+
+  it('the catch-up keeps the teammate’s text when the crash came before the write was confirmed', async () => {
+    // The mark put down before the write is all the database has: it tells a
+    // disk holding the very text written.
+    const { b, next } = await writtenThenCrash(true, true);
+    expect(markOf(b)).toMatchObject({ hash: await sha256Hex('F0\ne1\n') });
+    expect(markOf(b)?.disk).toBeUndefined();
+    typeOn(b.docs, next, 'f2', 'e3\n');
+    await snapshotCatchesUp(b.server, b.docs, 'f2');
+    const before = b.server.applied.length;
+
+    await connectAgain(b, next);
+
+    const text = 'F0\ne1\ne2\ne3\n';
+    expect(b.server.applied.slice(before)).toEqual([]);
+    expect(b.docs.live()).toEqual(['a.md=A\n', `n.md=${text}`]);
+    expect(disk(next)).toEqual(['a.md=A\n', `n.md=${text}`]);
+  });
+});
+
+describe('a write of a teammate’s edit that did not take place', () => {
+  /**
+   * `n.md` synced at `F0`; a teammate types `e1`, and the snapshot that is to
+   * write it puts down its mark (see `DocManager.noteWritten`) — then does not
+   * write. The note's record still names `F0` for the text folded, as its
+   * mark does for the text written over: the mark is of a write the disk
+   * never got. Taken for the text on disk, it made the next fold read the
+   * disk as the deletion of `e1`, for everyone.
+   */
+  const e1 = 'F0\ne1\n';
+
+  /** Hold the first look at `n.md` made after the mark of the write of `e1`. */
+  function holdLookAfterMark(b: Bench, hash: string): { reached: Promise<void>; release(): void } {
+    let release!: () => void;
+    let reached!: () => void;
+    const open = new Promise<void>((r) => {
+      release = r;
+    });
+    const hit = new Promise<void>((r) => {
+      reached = r;
+    });
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    let armed = true;
+    b.h.vault.exists = async (path) => {
+      if (armed && path === 'n.md' && markOf(b)?.hash === hash) {
+        armed = false;
+        reached();
+        await open;
+      }
+      return exists(path);
+    };
+    return { reached: hit, release };
+  }
+
+  it('the next fold keeps it when the disk kept changing under the snapshot', async () => {
+    const b = await synced('F0\ne0\n');
+    // The user's editor saves the note while the snapshot is about to write
+    // it: each look the snapshot takes at the disk once its mark is down
+    // finds a line more, until it gives up — and once more as it tries again.
+    let saves = 4;
+    const read = b.h.vault.readText.bind(b.h.vault);
+    b.h.vault.readText = (path) => {
+      if (path === 'n.md' && saves > 0 && markOf(b) !== null) {
+        b.h.vault.files.set(path, encode(`${b.h.vault.text(path) ?? ''}u${5 - saves}\n`));
+        saves -= 1;
+      }
+      return read(path);
+    };
+
+    await teammateAppends(b, b.h, 'f2', 'e1\n');
+    await until(() => saves === 0 && agreed(b, b.h), 'disk and server agree');
+    await b.docs.drive();
+
+    // The snapshot tried again once the disk settled: folded against the
+    // mark of the write it had given up on, `e1` was gone for everyone.
+    const text = b.docs.text('f2');
+    expect(lines(text)).toEqual(lines('F0\ne0\ne1\nu1\nu2\nu3\nu4\n'));
+    expect(disk(b.h)).toEqual(['a.md=A\n', `n.md=${text ?? ''}`]);
+  });
+
+  it('the next start keeps it when the engine stopped between the mark and the write', async () => {
+    const b = await synced('F0\n');
+    const f0 = await sha256Hex('F0\n');
+    const held = holdLookAfterMark(b, await sha256Hex(e1));
+    await teammateAppends(b, b.h, 'f2', 'e1\n');
+    await held.reached;
+    // The plugin turned off, or Obsidian quitting: the write is refused.
+    await b.h.engine.stop();
+    held.release();
+    const next = await restart(b, b.h);
+    expect(storedRecord(b.storage, 'n.md')).toMatchObject({ foldedHash: f0, contentHash: f0 });
+    expect(next.vault.text('n.md')).toBe('F0\n');
+    typeOn(b.docs, next, 'f2', 'e2\n');
+
+    await connectAgain(b, next);
+
+    const text = 'F0\ne1\ne2\n';
+    expect(b.docs.live()).toEqual(['a.md=A\n', `n.md=${text}`]);
+    expect(disk(next)).toEqual(['a.md=A\n', `n.md=${text}`]);
+  });
+
+  it('a save keeps it when the note was gone at the look before the write', async () => {
+    const b = await synced('F0\n');
+    const hash = await sha256Hex(e1);
+    // Git or an editor replaces the file — unlink, then create — right as the
+    // snapshot looks at it before the write.
+    let gone = false;
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    b.h.vault.exists = (path) => {
+      if (!gone && path === 'n.md' && markOf(b)?.hash === hash) {
+        gone = true;
+        b.h.vault.files.delete(path);
+      }
+      return exists(path);
+    };
+    await teammateAppends(b, b.h, 'f2', 'e1\n');
+    await until(() => gone, 'n.md gone at the look before the write');
+    expect(b.docs.text('f2')).toBe(e1);
+
+    // Back, with the user's line: its save.
+    b.h.vault.files.set('n.md', encode('F0\nu\n'));
+    await b.h.engine.handleVaultEvent(modify('n.md'));
+    await until(() => agreed(b, b.h), 'disk and server agree');
+    await b.docs.drive();
+
+    const text = b.docs.text('f2');
+    expect(lines(text)).toEqual(lines('F0\ne1\nu\n'));
+    expect(disk(b.h)).toEqual(['a.md=A\n', `n.md=${text ?? ''}`]);
+  });
+
+  it('is not taken from another copy of the vault on this computer', async () => {
+    // One IndexedDB for every vault on the machine: a copy of the vault in
+    // another folder, `data.json` and all, shares the note's database.
+    const b = await synced('F0\n');
+    const f0 = await sha256Hex('F0\n');
+    const copyState = b.storage.snapshot();
+    const copyFiles = new Map(b.h.vault.files);
+    // The original writes `e1` over `F0`: the mark of it in the database is
+    // of a write to the original's disk.
+    await teammateAppends(b, b.h, 'f2', 'e1\n');
+    await until(() => b.h.vault.text('n.md') === e1, 'e1 written');
+    expect(markOf(b)).toMatchObject({ hash: await sha256Hex(e1), over: f0, synced: f0 });
+    expect(markOf(b)?.disk).toEqual(expect.any(String));
+    // Obsidian closes it and opens the copy, never both at once.
+    await b.h.log.persistNow();
+    b.h.socketIfBuilt()?.kill();
+    await b.h.engine.stop();
+    const copy = buildHarness({
+      log: await logOn(copyState, NEVER_FLUSHED),
+      docs: b.idb.manager(),
+    });
+    benches.push(copy);
+    copy.vault.getBasePath = (): string => '/vault copy';
+    for (const [path, data] of copyFiles) copy.vault.files.set(path, data);
+    b.server.attach(copy);
+    b.docs.attach(copy);
+    typeOn(b.docs, copy, 'f2', 'e2\n');
+
+    await connectAgain(b, copy);
+
+    // Folded against the text the original wrote, the copy's disk read as
+    // the deletion of `e1`.
+    const text = 'F0\ne1\ne2\n';
+    expect(b.docs.live()).toEqual(['a.md=A\n', `n.md=${text}`]);
+    expect(disk(copy)).toEqual(['a.md=A\n', `n.md=${text}`]);
   });
 });
 
