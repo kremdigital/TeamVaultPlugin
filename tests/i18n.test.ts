@@ -57,3 +57,20 @@ describe('command names', () => {
     expect(names.filter(([, name]) => /team\s*vault/i.test(name))).toEqual([]);
   });
 });
+
+describe('the notice of another device under this vault’s id', () => {
+  // The notice said the other device's changes still reached this vault.
+  // New ones do; one it made while this vault was offline may never have
+  // come — the catch-up leaves out an operation whose counter under the shared
+  // id this vault has reached (`SyncEngine.reportTwin`) — and the user is to
+  // check such a file against the server's versions.
+  it.each([
+    ['en', en, /offline/i, /version history/i],
+    ['ru', ru, /не было связи/i, /истори/i],
+  ])('does not promise that all its changes arrived (%s)', (_lang, catalog, offline, history) => {
+    const text = (catalog as Record<string, string>)['notice.clientIdTwin'] ?? '';
+    expect(text).not.toMatch(/still reach|всё равно доходят/i);
+    expect(text).toMatch(offline);
+    expect(text).toMatch(history);
+  });
+});
