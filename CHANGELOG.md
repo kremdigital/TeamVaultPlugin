@@ -43,9 +43,10 @@ uses [Semantic Versioning](https://semver.org/).
   or moving its last file stays, as it stays for whoever did it. A device
   that was offline removes the folder when it reconnects, unless it was away
   so long that the server sent it only the newest changes, and the folder's
-  were not among them. It takes the server of this release (see
-  **Changed**); with the server of 0.4.0, folders stay behind as before.
-  Changes 0.4.0 left in the queue go out as they are.
+  were not among them; if it could not remove everything deleted meanwhile
+  right then, the folder goes at a later connection. It takes the server of
+  this release (see **Changed**); with the server of 0.4.0, folders stay
+  behind as before. Changes 0.4.0 left in the queue go out as they are.
 
 ### Removed
 
@@ -76,15 +77,18 @@ uses [Semantic Versioning](https://semver.org/).
   never makes a vault take that computer's id. A pair made before this
   version, or copied along with Obsidian's own data, is found when one of
   them sees a change under its id that it didn't send: its id changes at the
-  next start, at most once a day. An id counts as this vault's only once
-  Obsidian's storage has kept it, so a full storage can't make it change on
-  every start. After a change, Team Vault still recognises the changes it
-  sent under the old id — by their operation keys — and keeps its place in
-  the server's log under the ids it sent changes under, so none of them comes
-  back in a catch-up as a teammate's. A copy takes none of its original's
-  ids along, so every change the original makes after the copy was taken
-  reaches the copy. The README no longer asks you to reset `"clientId"` by
-  hand.
+  next start, at most once a day. A notice says so, and that changes the
+  other one made while this vault was offline may not have reached it: a
+  file that looks out of date is worth checking against its versions in
+  Version history or the web interface. An id counts as this vault's only
+  once Obsidian's storage has kept it, so a full storage can't make it
+  change on every start. After a change, Team Vault still recognises the
+  changes it sent under the old id — by their operation keys — and keeps its
+  place in the server's log under the ids it sent changes under, so none of
+  them comes back in a catch-up as a teammate's. A copy takes none of its
+  original's ids along, so every change the original makes after the copy
+  was taken reaches the copy. The README no longer asks you to reset
+  `"clientId"` by hand.
 - **A teammate's note written here right before Obsidian crashed is no
   longer sent back as your own.** Team Vault records that it wrote a
   teammate's note to disk about half a second after the write. When Obsidian
