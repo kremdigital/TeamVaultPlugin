@@ -2922,6 +2922,11 @@ export class SyncEngine {
         online.throwIfAborted();
         try {
           await this.dropDeletedWhileAway(away.record, away.serverHash, true);
+          // **Restore on server** that did not reach the server: the copy
+          // stays the deleted file's, and the next connect asks again. Taken
+          // for settled, its folder was given up on, and stayed here, empty,
+          // once the next answer was **Delete**.
+          if (this.stillAway(away.record)) unsettled.add(away.record.relativePath);
         } catch {
           online.throwIfAborted();
           // Left as it is: the next connect finds the record again.
@@ -2934,6 +2939,18 @@ export class SyncEngine {
       }
     }
     return unsettled;
+  }
+
+  /**
+   * Whether the copy of `record`, a file deleted while this device was away,
+   * is still recorded as that file's — under its name, by the deleted id, out
+   * of the index — for the next connect to find again (see
+   * {@link deletedWhileAway}): neither removed, nor revived on the server.
+   */
+  private stillAway(record: FileMeta): boolean {
+    const id = record.serverFileId;
+    const left = this.operationLog.getFileMeta(this.binding.id, record.relativePath);
+    return left?.serverFileId === id && !this.fileIndex.byId.has(id);
   }
 
   /** The upload pass of {@link initialPush}. */
@@ -5458,30 +5475,33 @@ export class SyncEngine {
    * Obsidian reports the folder gone a moment later, as a `delete` of the
    * folder: nothing the user did, and nothing goes to the server for it (see
    * {@link prunedHere}). One removal at a time (see {@link folderPrunes}).
+   *
+   * `true` when nothing is left to do here for the folder: removed, gone
+   * already, or not one this client removes; `false` when it is kept.
    */
   private async pruneVanishedFolder(
     folder: string | undefined,
     from: string | null,
-  ): Promise<void> {
-    if (folder === undefined || folder === '') return;
-    if (this.local.vault.removeEmptyFolders === undefined) return;
+  ): Promise<boolean> {
+    if (folder === undefined || folder === '') return true;
+    if (this.local.vault.removeEmptyFolders === undefined) return true;
     // Another binding's folder, or none of this client's.
-    if (!isInBinding(folder, this.binding.localFolder)) return;
-    if (this.refuseServerPath(folder, 'vanished folder') !== null) return;
-    if (folder === normalizeFolderPath(this.binding.localFolder)) return;
+    if (!isInBinding(folder, this.binding.localFolder)) return true;
+    if (this.refuseServerPath(folder, 'vanished folder') !== null) return true;
+    if (folder === normalizeFolderPath(this.binding.localFolder)) return true;
     // The server keeps only a folder of where the file was: anything else is
     // not this operation's.
-    if (from !== null && !from.startsWith(`${folder}/`)) return;
+    if (from !== null && !from.startsWith(`${folder}/`)) return true;
     const run = this.folderPrunes.then(() => this.removeVanishedFolder(folder));
     this.folderPrunes = run.catch(() => undefined);
-    await run;
+    return run;
   }
 
   /** {@link pruneVanishedFolder} of `folder`, checked, in its turn. */
-  private async removeVanishedFolder(folder: string): Promise<void> {
+  private async removeVanishedFolder(folder: string): Promise<boolean> {
     if (this.holdsFiles(folder)) {
       this.log.debug('a folder a teammate removed holds files here; kept', { folder });
-      return;
+      return false;
     }
     /** The folders this call is about to remove, as it goes: see `prunedHere`. */
     const tried: string[] = [];
@@ -5509,24 +5529,31 @@ export class SyncEngine {
     }
     if (removed.length === 0) {
       // Gone already: removed with another file of it, or by the user.
-      let there = true;
-      try {
-        there = await this.vault.exists(folder);
-      } catch {
-        this.throwIfStopped();
-      }
+      const there = await this.folderThere(folder);
       this.log.debug(
         there
           ? 'a folder a teammate removed is not empty here; kept'
           : 'a folder a teammate removed is gone here already',
         { folder },
       );
-      return;
+      return !there;
     }
     this.log.info('removed a folder a teammate deleted or renamed', {
       folder,
       folders: removed.length,
     });
+    // Only folders under it, the rest held by what came meanwhile: kept.
+    return removed.includes(folder) || !(await this.folderThere(folder));
+  }
+
+  /** Whether folder `folder` is on disk: taken for there when the disk cannot tell. */
+  private async folderThere(folder: string): Promise<boolean> {
+    try {
+      return await this.vault.exists(folder);
+    } catch {
+      this.throwIfStopped();
+      return true;
+    }
   }
 
   /**
@@ -5537,10 +5564,20 @@ export class SyncEngine {
    * A folder that holds such a copy is kept for the next connect's tail,
    * which removes the copy: the catch-up does not bring the folder's
    * operations again. Given up on, as it used to be, the folder stayed here
-   * for good once the copy went.
+   * for good once the copy went. Kept in memory only: after a restart first,
+   * it stays, empty.
+   *
+   * With none settled, each folder goes all the same if nothing is left in
+   * it — a copy still there keeps its folder, as anything on disk does — and
+   * the folders kept wait for the next connect. Left for it without a look,
+   * a folder a teammate renamed, whose files the catch-up had moved out
+   * already, stayed until then, and for good when Obsidian restarted first.
    */
   private async pruneCatchupFolders(unsettled: ReadonlySet<string> | null): Promise<void> {
     if (unsettled === null) {
+      for (const [folder, from] of [...this.catchupFolders]) {
+        if (await this.pruneVanishedFolder(folder, from)) this.catchupFolders.delete(folder);
+      }
       if (this.catchupFolders.size > 0) {
         this.log.debug('folders a teammate removed are left for the next connect', {
           folders: this.catchupFolders.size,

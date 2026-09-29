@@ -43,8 +43,10 @@ uses [Semantic Versioning](https://semver.org/).
   or moving its last file stays, as it stays for whoever did it. A device
   that was offline removes the folder when it reconnects, unless it was away
   so long that the server sent it only the newest changes, and the folder's
-  were not among them; if it could not remove everything deleted meanwhile
-  right then, the folder goes at a later connection. It takes the server of
+  were not among them. If a file deleted meanwhile could not be removed
+  right then, its folder goes at a later connection while Obsidian stays
+  open; if Obsidian restarts first, that folder may stay behind, empty. It
+  takes the server of
   this release (see **Changed**); with the server of 0.4.0, folders stay
   behind as before. Changes 0.4.0 left in the queue go out as they are.
 

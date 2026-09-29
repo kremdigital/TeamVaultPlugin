@@ -143,6 +143,8 @@ const KEPT_HOLDS = 'a folder a teammate removed holds files here; kept';
 const KEPT_NOT_EMPTY = 'a folder a teammate removed is not empty here; kept';
 const GONE_ALREADY = 'a folder a teammate removed is gone here already';
 const REMOVED = 'removed a folder a teammate deleted or renamed';
+const LEFT_FOR_NEXT =
+  'a folder a teammate removed holds a copy not removed yet; left for the next connect';
 
 function fileEvent(path: string): VaultEvent {
   return { bindingId: 'b1', type: 'delete', path, source: 'obsidian' };
@@ -1098,6 +1100,73 @@ describe('SyncEngine — a folder a teammate deleted or renamed while this devic
     await until('the folder removed', () => !b.h.vault.folders.has('dir'));
 
     expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('the lookup of the server’s deleted files failed: a folder with nothing left in it goes at once, one with a copy at the next connect', async () => {
+    const b = await seeded(['dir/a.png', 'old/b.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    b.server.teammateRename('f2', 'new/b.png', { folder: 'old' });
+    const served = b.h.routes.get(TOMBSTONES);
+    if (served === undefined) throw new Error('no route for the deleted files');
+    b.h.routes.set(TOMBSTONES, () => json({ error: 'internal' }, 500));
+
+    await reconnect(b);
+    // The catch-up moved the file out of the renamed folder: nothing waits
+    // for the next connect there. Left for it, the folder stayed for good
+    // when Obsidian restarted first.
+    await until('the renamed folder removed', () => !b.h.vault.folders.has('old'));
+    // The first upload is put off: the copy stays, and its folder with it.
+    expect(b.h.vault.files.has('dir/a.png')).toBe(true);
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+
+    b.h.routes.set(TOMBSTONES, served);
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()].sort()).toEqual(['keep.png', 'new/b.png']);
+    await b.h.engine.stop();
+  });
+
+  it('“Restore on server” for a copy whose upload failed keeps its folder for the next connect, which removes it on “Delete”', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    b.h.socket().disconnect();
+    // Changed here while away: the user is asked before the copy goes.
+    b.h.vault.files.set('dir/a.png', encode('mine'));
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    const upload = b.h.routes.get('PUT /blobs');
+    if (upload === undefined) throw new Error('no route for the uploads');
+    b.h.routes.set('PUT /blobs', () => json({ error: 'unavailable' }, 503));
+    const questions = (): number =>
+      b.h.calls.filter((call) => call === 'modal.resolveDeleteConflict').length;
+    let mark = b.entries.length;
+
+    await reconnect(b);
+    await until('the question', () => questions() === 1);
+    b.h.modal.del.resolve('restore-server');
+    await until('the restore given up', () =>
+      said(b, 'restore-server push failed; asking again on reconnect', mark),
+    );
+    await until(
+      'the folders of the catch-up looked at',
+      () => said(b, LEFT_FOR_NEXT, mark) || said(b, KEPT_NOT_EMPTY, mark),
+    );
+    expect(b.h.vault.text('dir/a.png')).toBe('mine');
+
+    // The next connect asks again; the user deletes the copy this time.
+    b.h.routes.set('PUT /blobs', upload);
+    b.h.modal.del = deferred();
+    b.h.socket().disconnect();
+    mark = b.entries.length;
+    await reconnect(b);
+    await until('the question again', () => questions() === 2);
+    b.h.modal.del.resolve('delete-local');
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    expect(said(b, REMOVED, mark)).toBe(true);
     await b.h.engine.stop();
   });
 
