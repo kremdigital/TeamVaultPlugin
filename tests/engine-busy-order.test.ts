@@ -54,16 +54,21 @@ interface Bench {
 
 /**
  * Notes and attachments on disk, recorded and on the server; connected, the
- * catch-up done. The queue is tried again at once after `busy`.
+ * catch-up done. The queue is tried again at once after `busy`; once stuck
+ * after it, after `queueStuckRetryMs` (the engine's default when not given).
  */
-async function online(notes: Seed, attachments: Seed = []): Promise<Bench> {
+async function online(
+  notes: Seed,
+  attachments: Seed = [],
+  opts: { queueStuckRetryMs?: number } = {},
+): Promise<Bench> {
   const entries: LogEntry[] = [];
   const logger = new Logger('debug', {
     write: (e) => {
       entries.push(e);
     },
   });
-  const h = buildHarness({ logger, queueRetryMs: [0] });
+  const h = buildHarness({ logger, queueRetryMs: [0], ...opts });
   const server = new FakeServer(h);
   const docs = new ServerDocs(server, h);
   const statuses: string[] = [];
@@ -615,32 +620,99 @@ describe('SyncEngine — when the queue is tried again after busy', () => {
     await b.h.engine.stop();
   });
 
-  it('halted by another error three tries in a row: new changes go out again, the rest waits', async () => {
-    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']]);
+  it('halted by another error three tries in a row: new changes go out again, and the queue is tried again after a long pause', async () => {
+    const stuckRetryMs = 1_234_567;
+    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']], {
+      queueStuckRetryMs: stuckRetryMs,
+    });
     const mark = b.server.applied.length;
-    b.server.bar(1);
-    b.h.vault.files.set('img.png', encode('v2'));
-    const modifying = b.h.engine.handleVaultEvent(event('modify', 'img.png'));
-    await emitted(b.h, 'file:update-binary');
-    const uploads = (): number => b.h.requests.filter((r) => r.method === 'PUT').length;
-    const before = uploads();
-    b.h.routes.set('PUT /blobs', () => json({ error: 'unavailable' }, 503));
-    expect(b.server.serveNext()).toBe(true);
-    await modifying;
-    const gaveUp = (): boolean =>
-      b.entries.some(
-        (e) => e.level === 'warn' && e.message.startsWith('queue drain halted after busy'),
-      );
-    await until('the warning', gaveUp);
-    expect(uploads() - before).toBe(3);
+    const joins = joinsOf(b.h);
+    const later = holdTimers(stuckRetryMs);
+    try {
+      b.server.bar(1);
+      b.h.vault.files.set('img.png', encode('v2'));
+      const modifying = b.h.engine.handleVaultEvent(event('modify', 'img.png'));
+      await emitted(b.h, 'file:update-binary');
+      const uploads = (): number => b.h.requests.filter((r) => r.method === 'PUT').length;
+      const before = uploads();
+      b.h.routes.set('PUT /blobs', () => json({ error: 'unavailable' }, 503));
+      expect(b.server.serveNext()).toBe(true);
+      await modifying;
+      const warnings = (): string[] =>
+        b.entries.filter((e) => e.level === 'warn').map((e) => e.message);
+      const gaveUp = (): boolean =>
+        warnings().some((m) => m.startsWith('queue drain halted after busy'));
+      await until('the warning', gaveUp);
+      expect(uploads() - before).toBe(3);
 
-    await renameOut(b, 'a.md', 'b.md');
-    expect(queue(b.h)).toEqual(['UPDATE img.png']);
-    await b.server.pump();
-    await b.h.settle();
-    expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> b.md']);
-    expect(queue(b.h)).toEqual(['UPDATE img.png']);
-    await b.h.engine.stop();
+      await renameOut(b, 'a.md', 'b.md');
+      expect(queue(b.h)).toEqual(['UPDATE img.png']);
+      await b.server.pump();
+      await b.h.settle();
+      expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> b.md']);
+      expect(queue(b.h)).toEqual(['UPDATE img.png']);
+
+      // Tried again after the long pause, without a connect: still failing,
+      // and again after the next one — through by then.
+      await until('the next try set', () => later.held.length === 1);
+      const warned = warnings().length;
+      later.held[0]?.();
+      await until('the next try set again', () => later.held.length === 2);
+      expect(uploads() - before).toBe(4);
+      expect(queue(b.h)).toEqual(['UPDATE img.png']);
+      // Said once, when new changes stopped waiting.
+      expect(warnings()).toHaveLength(warned);
+      b.h.routes.set('PUT /blobs', () => json({ ok: true }));
+      later.held[1]?.();
+      await b.server.pump();
+      await b.h.settle();
+      expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> b.md', 'update f2']);
+      expect(queue(b.h)).toEqual([]);
+      expect(later.held).toHaveLength(2);
+      expect(
+        b.entries.filter((e) => e.message === 'queued changes held up after busy sent'),
+      ).toHaveLength(1);
+      expect(joinsOf(b.h)).toBe(joins);
+      appliedOnce(b.server);
+      await b.h.engine.stop();
+    } finally {
+      later.restore();
+    }
+  });
+
+  it('stuck after busy, and busy again: new changes wait behind the queue again, tried after the short pauses', async () => {
+    const stuckRetryMs = 1_234_567;
+    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']], {
+      queueStuckRetryMs: stuckRetryMs,
+    });
+    const mark = b.server.applied.length;
+    const later = holdTimers(stuckRetryMs);
+    try {
+      b.server.bar(1);
+      b.h.vault.files.set('img.png', encode('v2'));
+      const modifying = b.h.engine.handleVaultEvent(event('modify', 'img.png'));
+      await emitted(b.h, 'file:update-binary');
+      b.h.routes.set('PUT /blobs', () => json({ error: 'unavailable' }, 503));
+      expect(b.server.serveNext()).toBe(true);
+      await modifying;
+      await until('the long pause', () => later.held.length === 1);
+
+      // The server is back; a change refused busy on its way.
+      b.h.routes.set('PUT /blobs', () => json({ ok: true }));
+      b.server.bar(1);
+      await renameOut(b, 'a.md', 'b.md');
+      expect(b.server.serveNext()).toBe(true);
+      await b.server.pump();
+      await b.h.settle();
+      expect(b.server.applied.slice(mark)).toEqual(['update f2', 'f1 a.md -> b.md']);
+      expect(queue(b.h)).toEqual([]);
+      // Not after the long pause.
+      expect(later.held).toHaveLength(1);
+      appliedOnce(b.server);
+      await b.h.engine.stop();
+    } finally {
+      later.restore();
+    }
   });
 
   it('changes that keep coming faster than the queue goes out: new ones go out again, and the queue after them', async () => {

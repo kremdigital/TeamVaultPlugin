@@ -192,6 +192,12 @@ export interface SyncEngineDeps {
    * last one repeats. Default: 2, 5, 15 and 30 s.
    */
   queueRetryMs?: readonly number[];
+  /**
+   * The pause (ms) between the tries of the queue once new changes no longer
+   * wait behind it after `busy`, the queue halted on another error (see
+   * `SyncEngine.queueStuck`). Default: 5 minutes.
+   */
+  queueStuckRetryMs?: number;
 }
 
 /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
@@ -206,6 +212,9 @@ const QUEUE_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000];
  * `SyncEngine.afterDrain`).
  */
 const QUEUE_FAILURES_MAX = 3;
+
+/** See {@link SyncEngineDeps.queueStuckRetryMs}. */
+const QUEUE_STUCK_RETRY_MS = 5 * 60 * 1000;
 
 /**
  * How many passes one drain makes over a queue that keeps filling up while
@@ -979,6 +988,22 @@ export class SyncEngine {
   private pumpFailures = 0;
 
   /**
+   * Whether the tries of the queue after `busy` stopped holding new changes
+   * behind it, the queue halted on another error {@link QUEUE_FAILURES_MAX}
+   * times in a row (see {@link afterDrain}): new changes go out at once
+   * again, and the queue is tried again every {@link queueStuckRetryMs} —
+   * until it has gone out, `busy` holds new changes behind it again, or the
+   * next connect.
+   *
+   * It used to wait for the next connect, hours maybe, with the changes the
+   * server had refused `busy` in it: they did not reach the team, and every
+   * change made meanwhile overtook them. The upload of an attachment at the
+   * head of the queue fails more often just when the server is overloaded
+   * enough to refuse with `busy`, and it is back a minute later.
+   */
+  private queueStuck = false;
+
+  /**
    * The drain of the queue running now, the connect's or a try after `busy`
    * (see {@link runDrain}), as a promise that never rejects: one at a time.
    */
@@ -1016,6 +1041,9 @@ export class SyncEngine {
   /** See {@link SyncEngineDeps.queueRetryMs}. */
   private readonly queueRetryMs: readonly number[];
 
+  /** See {@link SyncEngineDeps.queueStuckRetryMs}. */
+  private readonly queueStuckRetryMs: number;
+
   /** The detail of the last status reported (see {@link setStatus}). */
   private statusDetail: string | undefined = undefined;
 
@@ -1052,6 +1080,7 @@ export class SyncEngine {
     this.opsStatusRetryMs = deps.opsStatusRetryMs ?? OPS_STATUS_RETRY_MS;
     this.opsStatusTimeoutMs = deps.opsStatusTimeoutMs;
     this.queueRetryMs = deps.queueRetryMs ?? QUEUE_RETRY_MS;
+    this.queueStuckRetryMs = deps.queueStuckRetryMs ?? QUEUE_STUCK_RETRY_MS;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -1401,6 +1430,7 @@ export class SyncEngine {
     this.drainHandedOver = false;
     this.clearPumpTimer();
     this.queueFirst = false;
+    this.queueStuck = false;
     this.pumpStep = 0;
     this.pumpFailures = 0;
     /** This connect's catch-up completion signal, while it is the armed one. */
@@ -8584,8 +8614,9 @@ export class SyncEngine {
    *     again after a pause (see {@link schedulePump});
    *   - halted on another error while new changes wait behind the queue:
    *     tried again, and after {@link QUEUE_FAILURES_MAX} such tries in a row
-   *     new changes go out at once again, the rest of the queue waiting for
-   *     the next connect as it does after any drain halted so;
+   *     new changes go out at once again, and the queue is tried again after
+   *     a long pause until it goes out (see {@link queueStuck}); a drain
+   *     halted so otherwise waits for the next connect, as it always has;
    *   - a pass that sent nothing, the queue not empty: tried again;
    *   - still filling up after {@link DRAIN_PASSES_MAX} passes: new changes go
    *     out at once again, and the rest of the queue is tried after a pause.
@@ -8594,6 +8625,8 @@ export class SyncEngine {
     if (link !== this.link || link.signal.aborted) return;
     switch (outcome.kind) {
       case 'empty':
+        if (this.queueStuck) this.log.info('queued changes held up after busy sent');
+        this.queueStuck = false;
         this.openGate('sent');
         return;
       case 'halted':
@@ -8604,18 +8637,28 @@ export class SyncEngine {
           return;
         }
         // Halted so with nothing waiting behind the queue: it waits for the
-        // next connect, as it always has.
-        if (!this.queueFirst) return;
+        // next connect, as it always has — unless it holds changes the
+        // server refused `busy` (see `queueStuck`).
+        if (!this.queueFirst) {
+          if (this.queueStuck) this.schedulePump();
+          return;
+        }
         this.pumpFailures += 1;
         if (this.pumpFailures < QUEUE_FAILURES_MAX) {
           this.schedulePump();
           return;
         }
         this.log.warn(
-          'queue drain halted after busy; new changes go out again, the rest waits for the next connect',
-          { error: outcome.error, waiting: this.operationLog.replayableCount(this.binding.id) },
+          'queue drain halted after busy; new changes go out again, and the queue is tried again later',
+          {
+            error: outcome.error,
+            waiting: this.operationLog.replayableCount(this.binding.id),
+            retryInMs: this.queueStuckRetryMs,
+          },
         );
         this.openGate('given up');
+        this.queueStuck = true;
+        this.schedulePump();
         return;
       case 'stalled':
         if (this.queueFirst) this.schedulePump();
@@ -8641,6 +8684,12 @@ export class SyncEngine {
    * status says so.
    */
   private closeGate(): void {
+    // Tried again after the long pause (see `queueStuck`): after the short
+    // ones from here on.
+    if (this.queueStuck) {
+      this.queueStuck = false;
+      this.clearPumpTimer();
+    }
     if (this.queueFirst) return;
     this.queueFirst = true;
     this.log.info('server busy: new file changes wait in the queue behind the refused ones', {
@@ -8666,8 +8715,9 @@ export class SyncEngine {
   }
 
   /**
-   * Try the queue again after the next pause of {@link queueRetryMs} (see
-   * {@link pumpQueue}), on the connection open now. Not before this connect
+   * Try the queue again after the next pause of {@link queueRetryMs}, or of
+   * {@link queueStuckRetryMs} once stuck (see {@link queueStuck}), on the
+   * connection open now (see {@link pumpQueue}). Not before this connect
    * has handed the queue to its drain (see {@link drainHandedOver}); nor
    * offline, on Pause sync or once stopped — the next connect sends it.
    */
@@ -8677,7 +8727,9 @@ export class SyncEngine {
     const link = this.link;
     if (link === null || link.signal.aborted) return;
     const pauses = this.queueRetryMs;
-    const delay = pauses[Math.min(this.pumpStep, pauses.length - 1)] ?? 0;
+    const delay = this.queueStuck
+      ? this.queueStuckRetryMs
+      : (pauses[Math.min(this.pumpStep, pauses.length - 1)] ?? 0);
     this.pumpStep += 1;
     this.pumpTimer = window.setTimeout(() => {
       this.pumpTimer = null;
@@ -8776,8 +8828,9 @@ export class SyncEngine {
         error: result.haltedError,
         remaining: result.remaining,
       };
-      if (result.haltedError === 'busy') this.log.debug('offline queue drain halted', detail);
-      else this.log.warn('offline queue drain halted', detail);
+      if (result.haltedError === 'busy' || this.queueStuck) {
+        this.log.debug('offline queue drain halted', detail);
+      } else this.log.warn('offline queue drain halted', detail);
     }
     return result;
   }

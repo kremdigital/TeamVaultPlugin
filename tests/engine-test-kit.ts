@@ -835,6 +835,11 @@ export interface HarnessOptions {
    */
   queueRetryMs?: readonly number[];
   /**
+   * The engine's pause before each try of a queue stuck after `busy`
+   * (`SyncEngineDeps.queueStuckRetryMs`).
+   */
+  queueStuckRetryMs?: number;
+  /**
    * The client id the engine syncs under; `device-1` by default. The
    * {@link FakeServer} takes each of {@link THIS_USERS_CLIENTS} for this
    * device's user.
@@ -972,6 +977,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
       ? { opsStatusTimeoutMs: opts.opsStatusTimeoutMs }
       : {}),
     ...(opts.queueRetryMs ? { queueRetryMs: opts.queueRetryMs } : {}),
+    ...(opts.queueStuckRetryMs !== undefined ? { queueStuckRetryMs: opts.queueStuckRetryMs } : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));
 

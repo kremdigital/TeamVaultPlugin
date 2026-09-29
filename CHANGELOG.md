@@ -130,9 +130,10 @@ uses [Semantic Versioning](https://semver.org/).
   they wait. A note you create meanwhile keeps its name on your device: a
   teammate's new note under the same name, or one renamed to it, waits until
   yours has gone out, as it does when you create a note offline. If the retry
-  keeps failing for another reason, new changes go out again after three
-  tries and the rest waits for the next connection, as before. Edits to a
-  note's text are not affected.
+  keeps failing for another reason (an attachment's upload, say), new
+  changes go out again after three tries, and the rest is tried again every
+  five minutes until it goes out, instead of waiting for the next
+  connection. Edits to a note's text are not affected.
 - **Deleting a folder deletes each file in it once.** When you deleted a
   folder in Obsidian, the first file in it and every file in its subfolders
   could be sent to the server as two deletes (three for a file two subfolders
