@@ -5093,12 +5093,18 @@ export class SyncEngine {
       // later dropped as `no_file_id`, so the deletion never propagates.
       // Not a name a file of the server's waits for (see `waitForName`): the
       // file deleted here was another one, and the server's was never here.
+      // Nor one a new file of this device's holds, its create queued (see
+      // `createQueuedAt`): that is the file deleted here, which the server has
+      // not heard of — what it lists under the name is another device's, its
+      // broadcast on its way or waiting for the name. Looked up, it was
+      // deleted for the whole team.
       // Only when nothing was recorded under the name when the delete came.
       if (
         !fileId &&
         indexed === '' &&
         this.socket.isConnected() &&
-        this.waitingFor(path) === undefined
+        this.waitingFor(path) === undefined &&
+        !this.createQueuedAt(path)
       ) {
         fileId = await this.resolveServerFileId(path);
         this.throwIfStopped();
@@ -5107,6 +5113,18 @@ export class SyncEngine {
         // The server may list a note renamed onto the name here already.
         if (fileId !== '' && fileId !== created.fileId && this.fileIndex.byId.has(fileId)) {
           this.log.debug('local delete: the server lists a file recorded here under the name', {
+            path,
+            fileId,
+          });
+          fileId = '';
+        }
+        // Nor a file this device keeps out of the index (see `outOfScope`):
+        // one that came under the name while the listing was on its way, and
+        // waits for it (see `waitForName`) — a create from here went back to
+        // the queue meanwhile, turned away `busy`. Never on this disk, it is
+        // not the file deleted here.
+        if (fileId !== '' && this.outOfScope.has(fileId)) {
+          this.log.debug('local delete: the server lists a file kept out of the index here', {
             path,
             fileId,
           });
@@ -7519,12 +7537,14 @@ export class SyncEngine {
   /**
    * `away`: a rename made while this device was away, applied by the index
    * refresh (see {@link applyRenamesWhileAway}), with what the listing says the
-   * server has of the file.
+   * server has of the file. `released`: the rename waited for `newPath`, and
+   * {@link releaseName} let it in.
    */
   private async applyServerRename(
     fileId: string,
     newPath: string,
     away?: { serverHash: string },
+    opts: { released?: boolean } = {},
   ): Promise<void> {
     // Hard checks first — they hold wherever the file ends up. The binding is
     // NOT one of them: a rename is the server telling us a file we already
@@ -7573,10 +7593,14 @@ export class SyncEngine {
     let holder: IndexedMeta | undefined;
     /** A new file of this device's is under the name, its create queued. */
     let createdHere = false;
-    await this.withPathLocks([oldPath, newPath], () => {
+    await this.withPathLocks([oldPath, newPath], async () => {
+      // Let in by `releaseName`: whether the new file whose create waits in
+      // the queue under the name is still gone from the disk. Read before the
+      // checks below, which hold until the next await.
+      const gone = opts.released === true && (await this.queuedCreateGone(newPath));
       // Renamed on this device while this waited: that rename reaches the
       // server after this one, and wins there.
-      if ((this.renameCount.get(fileId) ?? 0) !== renamedHere) return Promise.resolve();
+      if ((this.renameCount.get(fileId) ?? 0) !== renamedHere) return;
       // Moved by another rename from the server while this waited (or the
       // index was rebuilt): the names looked up above are stale. Taken as
       // they were, a rename back to where the note had been was dropped as
@@ -7585,17 +7609,19 @@ export class SyncEngine {
       // and deleted it.
       if (this.fileIndex.byId.get(fileId) !== meta || meta.relativePath !== oldPath) {
         movedMeanwhile = true;
-        return Promise.resolve();
+        return;
       }
-      if (oldPath === newPath) return Promise.resolve();
+      if (oldPath === newPath) return;
       holder = this.nameHolder(newPath, meta);
-      if (holder !== undefined) return Promise.resolve();
+      if (holder !== undefined) return;
       // A new file here whose create waits in the queue holds the name (see
       // `createQueuedAt`). Moved in, this file parked it aside, unsent, and
-      // its create went out as a save of this one.
-      createdHere = this.createQueuedAt(newPath);
-      if (createdHere) return Promise.resolve();
-      return this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
+      // its create went out as a save of this one. Deleted, it holds nothing:
+      // its create finds no file to send. Held for it all the same, this file
+      // waited again each time the name was let go, until the next connect.
+      createdHere = this.createQueuedAt(newPath) && !gone;
+      if (createdHere) return;
+      await this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
     });
     if (holder !== undefined || createdHere) {
       this.waitForName({ kind: 'rename', fileId, path: newPath }, holder ?? null);
@@ -7603,7 +7629,7 @@ export class SyncEngine {
     }
     // Looked up again, under the names the note has now.
     if (movedMeanwhile) {
-      await this.applyServerRename(fileId, newPath);
+      await this.applyServerRename(fileId, newPath, undefined, opts);
       return;
     }
     // The name the file left may be what another file waits for.
@@ -7698,6 +7724,26 @@ export class SyncEngine {
     return this.operationLog.queuesCreate(this.binding.id, path);
   }
 
+  /**
+   * Whether the new file under `path` whose create waits in the queue (see
+   * {@link createQueuedAt}) is gone from the disk: deleted, it holds the name
+   * no more. `false` when no create is queued under the name — the disk is
+   * not read then — and when a file came under the name again while the disk
+   * was read: a new note there, its create queued or on its way. Taken for
+   * gone, the other file moved in over it.
+   */
+  private async queuedCreateGone(path: string): Promise<boolean> {
+    const queued = this.operationLog.queuedCreates(this.binding.id, path);
+    if (queued.length === 0) return false;
+    const underWay = this.creating.get(path);
+    if (await this.vault.exists(path)) return false;
+    const creating = this.creating.get(path);
+    if (creating !== undefined && creating !== underWay) return false;
+    return this.operationLog
+      .queuedCreates(this.binding.id, path)
+      .every((entry) => queued.includes(entry));
+  }
+
   /** A file of {@link waitingForName} deleted or renamed on the server meanwhile. */
   private forgetWaiting(fileId: string): void {
     for (const [path, move] of this.waitingForName) {
@@ -7716,14 +7762,17 @@ export class SyncEngine {
     // on disk (see `createQueuedAt`). Deleted, it holds nothing: its create
     // finds no file to send (see `replayPending`).
     if (this.createQueuedAt(move.path)) {
-      if (await this.vault.exists(move.path)) return;
+      if (!(await this.queuedCreateGone(move.path))) return;
       if (this.waitingFor(path) !== move || this.nameHolder(move.path) !== undefined) return;
     }
     this.waitingForName.delete(move.path);
     if (move.kind === 'rename') {
       if (!this.fileIndex.byId.has(move.fileId)) return;
       this.log.info('a file moves into the name it waited for', move);
-      await this.applyServerRename(move.fileId, move.path);
+      // Past a create still queued under the name whose file is gone: it
+      // leaves the queue only when the drain gets to it, and a move that
+      // waited for it again was let in by nothing before the next connect.
+      await this.applyServerRename(move.fileId, move.path, undefined, { released: true });
       return;
     }
     if (this.fileIndex.byId.has(move.fileId) || !this.outOfScope.has(move.fileId)) return;

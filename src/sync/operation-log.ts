@@ -635,6 +635,14 @@ export class OperationLog {
     return pending.some((op) => op.opType === 'CREATE' && op.filePath === path);
   }
 
+  /** The entries of the creates {@link queuesCreate} looks at, by `id`, in queue order. */
+  queuedCreates(bindingId: string, path: string): number[] {
+    const pending = this.bindings.get(bindingId)?.pending ?? [];
+    return pending
+      .filter((op) => op.opType === 'CREATE' && op.filePath === path)
+      .map((op) => op.id);
+  }
+
   // -- file meta --------------------------------------------------------------
 
   getFileMeta(bindingId: string, path: string): FileMeta | null {

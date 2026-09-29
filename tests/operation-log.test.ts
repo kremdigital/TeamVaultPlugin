@@ -188,6 +188,20 @@ describe('OperationLog — pending operations', () => {
     log.markSent([created.id]);
     expect(log.queuesCreate('b1', 'f.md')).toBe(false);
   });
+
+  it('lists the entries of the creates queued under a path, in queue order', () => {
+    const log = makeLog();
+    const first = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'UPDATE', filePath: 'a.md' });
+    log.recordInFlight('b1', { opType: 'CREATE', filePath: 'a.md', opId: newOpId() });
+    log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'A.md' });
+    const second = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    expect(log.queuedCreates('b1', 'a.md')).toEqual([first.id, second.id]);
+    expect(log.queuedCreates('b3', 'a.md')).toEqual([]);
+    log.markSent([first.id]);
+    expect(log.queuedCreates('b1', 'a.md')).toEqual([second.id]);
+  });
 });
 
 describe('OperationLog — file_meta', () => {

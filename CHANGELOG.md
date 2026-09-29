@@ -144,7 +144,8 @@ uses [Semantic Versioning](https://semver.org/).
   seconds, without reconnecting; the status bar shows `server_busy` while
   they wait. A note you create meanwhile keeps its name on your device: a
   teammate's new note under the same name, or one renamed to it, waits until
-  yours has gone out, as it does when you create a note offline. If the retry
+  yours has gone out, as it does when you create a note offline. If you
+  rename or delete yours before that, theirs takes the name. If the retry
   keeps failing for another reason (an attachment's upload, say), new
   changes go out again after three tries, and the rest is tried again every
   five minutes until it goes out, instead of waiting for the next
