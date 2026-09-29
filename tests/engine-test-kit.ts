@@ -299,8 +299,12 @@ export class MemoryVault implements VaultAdapter {
     const removed: string[] = [];
     for (const folder of under) {
       if (mayGo !== undefined && !mayGo(folder)) break;
-      // The disk's own check, at the moment of removal.
-      if (holds(folder)) break;
+      // Each folder removed on its own, as the adapter's `fs.rmdir` does:
+      // another removal, or a write, may come in between.
+      await this.pass('rmdir');
+      // The disk's own check, at the moment of removal: gone (`ENOENT`) or not
+      // empty (`ENOTEMPTY`) stops it.
+      if (!this.folders.has(folder) || holds(folder)) break;
       this.folders.delete(folder);
       removed.push(folder);
     }

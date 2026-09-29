@@ -833,9 +833,23 @@ export class SyncEngine {
    * {@link handleLocalFolderDelete}). Nothing was indexed under the folder
    * when it was removed; a file indexed under its name since — a teammate's
    * new one, still downloading — would have gone out as deleted by the user.
-   * Kept until the report comes: its time is Obsidian's.
+   * Kept until the report comes: its time is Obsidian's. A report that never
+   * comes — the folder back before Obsidian looked — leaves the entry for the
+   * user's own delete of the folder later: the files written to this disk
+   * since go then all the same.
    */
   private readonly prunedHere = new Set<string>();
+
+  /**
+   * The removals of {@link pruneVanishedFolder}, chained: one at a time, in
+   * the order they are asked for. A teammate's deletes of a folder's files
+   * are applied side by side, and the last two could both find nothing left
+   * under the folder and both go to remove it. The second found it gone —
+   * its `rmdir` failed — and took it out of {@link prunedHere}, though the
+   * first had removed it: Obsidian's report of the folder then went out as
+   * the user's delete, a teammate's file recorded under it since included.
+   */
+  private folderPrunes: Promise<unknown> = Promise.resolve();
 
   /**
    * Folders the catch-up's deletes, renames and moves say vanished at their
@@ -4654,28 +4668,51 @@ export class SyncEngine {
    * a child that comes after this one joins this one's.
    *
    * Each delete says which folder went with it (see {@link vanishedFolderOf}).
-   * Not for a folder this engine removed itself, as one a teammate removed
-   * (see {@link prunedHere}): Obsidian reports it all the same.
+   * A folder this engine removed itself, as one a teammate removed (see
+   * {@link prunedHere}), Obsidian reports all the same: nothing goes for
+   * what was never on this disk.
    */
   private async handleLocalFolderDelete(folderPath: string): Promise<void> {
     if (!isInBinding(folderPath, this.binding.localFolder)) return;
+    let children = this.indexedUnder(folderPath);
     if (this.prunedHere.delete(this.folderKey(folderPath))) {
-      this.log.debug('folder delete: a folder removed here as a teammate’s, nothing to send', {
-        folder: folderPath,
-      });
-      return;
-    }
-    const children: string[] = [];
-    // The folder on disk may be spelled in another case than the notes in it
-    // are recorded by (see `spelledHere`).
-    const folderKey = this.caseInsensitive() ? pathKey(folderPath) : null;
-    for (const path of this.fileIndex.byPath.keys()) {
-      if (
-        isInBinding(path, folderPath) ||
-        (folderKey !== null && isInBinding(this.caseKey(path), folderKey))
-      ) {
-        children.push(path);
+      // Removed here as a teammate's, with nothing recorded under it. What is
+      // recorded under it since and has not reached this disk — a teammate's
+      // new file on its way — is not the user's to delete.
+      //
+      // The report may be the user's own delete of the folder, though: the
+      // removal made here was never reported when the folder was back before
+      // Obsidian looked (a teammate's file written into it right after), and
+      // its entry stayed. Passed over, the files written into the folder
+      // since were deleted from disk and nowhere else — a file's own event is
+      // swallowed as the echo of this plugin's write to it a moment before,
+      // which is what the expansion is for — and came back with the next
+      // connect. So they go as any child does: each still on disk stays (see
+      // `sendLocalDelete`). One being written right now is recorded as on
+      // this disk a moment before its bytes land: waited for.
+      const written = (): string[] =>
+        children.filter((path) => {
+          const meta = this.fileIndex.byPath.get(path);
+          return meta !== undefined && meta.notOnDisk !== true;
+        });
+      children = written();
+      if (children.length > 0) {
+        await Promise.allSettled([...this.localCommits]);
+        children = written();
       }
+      if (children.length === 0) {
+        this.log.debug('folder delete: a folder removed here as a teammate’s, nothing to send', {
+          folder: folderPath,
+        });
+        return;
+      }
+      this.log.debug(
+        'folder delete: a folder removed here as a teammate’s holds files written since',
+        {
+          folder: folderPath,
+          files: children.length,
+        },
+      );
     }
     if (children.length === 0) return;
     // Hold every child's delete up front. They go out one ack at a time, and
@@ -4755,6 +4792,25 @@ export class SyncEngine {
         }
       }
     }
+  }
+
+  /**
+   * Every path recorded under `folderPath`, in the index's order. The folder
+   * on disk may be spelled in another case than the notes in it are recorded
+   * by (see `spelledHere`).
+   */
+  private indexedUnder(folderPath: string): string[] {
+    const children: string[] = [];
+    const folderKey = this.caseInsensitive() ? pathKey(folderPath) : null;
+    for (const path of this.fileIndex.byPath.keys()) {
+      if (
+        isInBinding(path, folderPath) ||
+        (folderKey !== null && isInBinding(this.caseKey(path), folderKey))
+      ) {
+        children.push(path);
+      }
+    }
+    return children;
   }
 
   /**
@@ -5220,7 +5276,7 @@ export class SyncEngine {
    *
    * Obsidian reports the folder gone a moment later, as a `delete` of the
    * folder: nothing the user did, and nothing goes to the server for it (see
-   * {@link prunedHere}).
+   * {@link prunedHere}). One removal at a time (see {@link folderPrunes}).
    */
   private async pruneVanishedFolder(
     folder: string | undefined,
@@ -5235,6 +5291,13 @@ export class SyncEngine {
     // The server keeps only a folder of where the file was: anything else is
     // not this operation's.
     if (from !== null && !from.startsWith(`${folder}/`)) return;
+    const run = this.folderPrunes.then(() => this.removeVanishedFolder(folder));
+    this.folderPrunes = run.catch(() => undefined);
+    await run;
+  }
+
+  /** {@link pruneVanishedFolder} of `folder`, checked, in its turn. */
+  private async removeVanishedFolder(folder: string): Promise<void> {
     if (this.holdsFiles(folder)) {
       this.log.debug('a folder a teammate removed holds files here; kept', { folder });
       return;
@@ -5264,7 +5327,19 @@ export class SyncEngine {
       if (!removed.includes(dir)) this.prunedHere.delete(this.folderKey(dir));
     }
     if (removed.length === 0) {
-      this.log.debug('a folder a teammate removed is not empty here; kept', { folder });
+      // Gone already: removed with another file of it, or by the user.
+      let there = true;
+      try {
+        there = await this.vault.exists(folder);
+      } catch {
+        this.throwIfStopped();
+      }
+      this.log.debug(
+        there
+          ? 'a folder a teammate removed is not empty here; kept'
+          : 'a folder a teammate removed is gone here already',
+        { folder },
+      );
       return;
     }
     this.log.info('removed a folder a teammate deleted or renamed', {

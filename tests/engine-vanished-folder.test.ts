@@ -26,6 +26,7 @@ import {
   FakeServer,
   ServerDocs,
   buildHarness,
+  bytes,
   deferred,
   encode,
   flushAsync,
@@ -139,6 +140,7 @@ function said(b: Bench, message: string, from = 0): boolean {
 
 const KEPT_HOLDS = 'a folder a teammate removed holds files here; kept';
 const KEPT_NOT_EMPTY = 'a folder a teammate removed is not empty here; kept';
+const GONE_ALREADY = 'a folder a teammate removed is gone here already';
 const REMOVED = 'removed a folder a teammate deleted or renamed';
 
 function fileEvent(path: string): VaultEvent {
@@ -198,6 +200,19 @@ function live(server: FakeServer): string[] {
     .filter((f) => !f.deleted)
     .map((f) => f.path)
     .sort();
+}
+
+/**
+ * A teammate uploads an attachment to `path`, served for download as
+ * `content`. The engine's first look at the disk for it waits until the
+ * download is served: the server gives the file its id only now.
+ */
+async function uploaded(b: Bench, path: string, content: ArrayBuffer): Promise<string> {
+  const look = b.h.vault.gate('exists');
+  const id = await b.server.teammateUpload(path, content);
+  b.h.routes.set(`GET /api/projects/p1/files/${id}`, () => bytes(content));
+  look.release();
+  return id;
 }
 
 async function reconnect(b: Bench, rows?: number): Promise<void> {
@@ -710,6 +725,84 @@ describe('SyncEngine — a folder a teammate deleted or renamed: removed here on
     expect(sent(b, emits)).toEqual([]);
     expect(live(b.server)).toEqual(['dir/new.md', 'keep.png']);
     expect(b.h.engine.getFileIdForPath('dir/new.md')).not.toBeNull();
+    await b.h.engine.stop();
+  });
+
+  it('two teammate deletes that both find the folder empty: Obsidian’s report of it still sends nothing', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    // A file of the folder this device never got: deleted with the folder
+    // all the same (a folder deleted through the web UI or MCP deletes each
+    // file of it).
+    b.server.add({ id: 'f9', path: 'dir/z.png', fileType: 'BINARY', contentHash: 'h', size: 1 });
+    const mark = b.entries.length;
+    const removing = b.h.vault.gate('rmdir');
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await removing.reached;
+    // The other delete, while the first one's removal is on its way.
+    b.server.teammateDelete('f9', { folder: 'dir' });
+    await flushAsync(20);
+    removing.release();
+    await until(
+      'both deletes done with the folder',
+      () =>
+        said(b, REMOVED, mark) && (said(b, GONE_ALREADY, mark) || said(b, KEPT_NOT_EMPTY, mark)),
+    );
+    expect(b.h.vault.folders.has('dir')).toBe(false);
+    // A teammate creates a file in the folder again; not written here yet.
+    await b.server.teammateCreate('dir/new.md', 'new\n');
+    await until('the new note recorded', () => b.h.engine.getFileIdForPath('dir/new.md') !== null);
+    const emits = b.h.socket().emits.length;
+
+    // Obsidian's watcher reports the folder removed.
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+
+    expect(sent(b, emits)).toEqual([]);
+    expect(live(b.server)).toEqual(['dir/new.md', 'keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('a folder removed here that Obsidian never reported, deleted by the user later: what was written into it since goes', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const mark = b.entries.length;
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the folder removed', () => said(b, REMOVED, mark));
+    // A teammate's file written into the folder right after brings it back
+    // before Obsidian looks: Obsidian never reports it gone.
+    await uploaded(b, 'dir/c.png', encode('pic'));
+    await until('the file written', () => b.h.vault.files.has('dir/c.png'));
+    await b.h.settle();
+    const emits = b.h.socket().emits.length;
+
+    // The user deletes the folder. The file's own event is swallowed as the
+    // echo of the write: only the folder's reaches the engine.
+    b.h.vault.removeFolder('dir');
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/c.png [dir]']);
+    expect(live(b.server)).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('Obsidian’s report of the folder removed while a teammate’s file is being written into it again sends nothing', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const mark = b.entries.length;
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    await until('the folder removed', () => said(b, REMOVED, mark));
+    const writing = b.h.vault.gate('createBinary');
+    const id = await uploaded(b, 'dir/c.png', encode('pic'));
+    await writing.reached;
+    const emits = b.h.socket().emits.length;
+
+    // The report of the removal comes while the file's bytes are on their way
+    // to the disk.
+    const reported = b.h.engine.handleVaultEvent(folderEvent('dir'));
+    await flushAsync(20);
+    writing.release();
+    await finish(b, [reported]);
+
+    expect(sent(b, emits)).toEqual([]);
+    expect(b.server.pathOf(id)).toBe('dir/c.png');
+    expect(b.h.vault.files.has('dir/c.png')).toBe(true);
     await b.h.engine.stop();
   });
 
