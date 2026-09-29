@@ -168,6 +168,26 @@ describe('OperationLog — pending operations', () => {
     log.markSent([op.id]);
     expect(log.pendingPaths('b1').has('a.md')).toBe(false);
   });
+
+  it('knows a create queued under a path: of that binding, queued, and a create', () => {
+    const log = makeLog();
+    const created = log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'a.md' });
+    log.enqueueOperation('b1', { opType: 'RENAME', filePath: 'b.md', newPath: 'c.md' });
+    log.recordInFlight('b1', { opType: 'CREATE', filePath: 'd.md', opId: newOpId() });
+    log.enqueueOperation('b2', { opType: 'CREATE', filePath: 'e.md' });
+    expect(log.queuesCreate('b1', 'a.md')).toBe(true);
+    expect(log.queuesCreate('b1', 'A.md')).toBe(false);
+    expect(log.queuesCreate('b1', 'b.md')).toBe(false);
+    expect(log.queuesCreate('b1', 'c.md')).toBe(false);
+    expect(log.queuesCreate('b1', 'd.md')).toBe(false);
+    expect(log.queuesCreate('b1', 'e.md')).toBe(false);
+    expect(log.queuesCreate('b3', 'a.md')).toBe(false);
+    log.amendOperation(created.id, { filePath: 'f.md' });
+    expect(log.queuesCreate('b1', 'a.md')).toBe(false);
+    expect(log.queuesCreate('b1', 'f.md')).toBe(true);
+    log.markSent([created.id]);
+    expect(log.queuesCreate('b1', 'f.md')).toBe(false);
+  });
 });
 
 describe('OperationLog — file_meta', () => {

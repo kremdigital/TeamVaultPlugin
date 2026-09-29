@@ -4899,6 +4899,9 @@ export class SyncEngine {
         // Nothing to propagate — but log it rather than silently swallowing a
         // delete that couldn't be resolved.
         this.log.debug('local delete: no server fileId, nothing to propagate', path);
+        // A new file whose create was queued: a file the server has under the
+        // name may wait for it (see `createQueuedAt`).
+        await this.releaseName(path);
         return;
       }
       const docState = await this.noteStateVector(meta);
@@ -5247,8 +5250,12 @@ export class SyncEngine {
       // a Pause: the entry follows the note, keeping its `opId`, and the next
       // connect asks the server what became of it (see `settleLandedCreate`).
       // Queued again as a create under the new name, the note went to the
-      // whole team twice, under both names.
-      if (this.followQueuedCreate(oldPath, newPath)) return;
+      // whole team twice, under both names. The name it left may be what
+      // another file waits for (see `createQueuedAt`).
+      if (this.followQueuedCreate(oldPath, newPath)) {
+        await this.releaseName(oldPath);
+        return;
+      }
       // A file this device never synced: under its new name it is a new file.
       // Queued as a rename without an id, it was dropped by the drain and left
       // for the next connect's first upload.
@@ -6399,15 +6406,17 @@ export class SyncEngine {
     if (
       !known &&
       opts.released !== true &&
-      (this.creating.has(path) || this.ownCreates.has(path))
+      (this.creating.has(path) || this.ownCreates.has(path) || this.createQueuedAt(path))
     ) {
-      // This device is creating a file under the name, not recorded yet:
-      // another device's create the server applied first. Indexed now, it
-      // took the copy here for its own, and the first snapshot folded that
-      // copy into it — its text replaced for everyone. It waits for the
-      // create's ack: this device's file is recorded then, under the name or
-      // the conflict name the server gave it, and the name is let go (see
-      // `recordCreateAck`).
+      // This device is creating a file under the name, not recorded yet — or
+      // has created one whose create waits in the queue (see
+      // `createQueuedAt`): another device's create the server applied first.
+      // Indexed now, it took the copy here for its own: the first snapshot
+      // folded that copy into it — its text replaced for everyone — and a
+      // rename or delete of the copy went to the server as one of that file.
+      // It waits for the create's ack: this device's file is recorded then,
+      // under the name or the conflict name the server gave it, and the name
+      // is let go (see `recordCreateAck`).
       this.log.info('a file the server has under a name being created here waits for it', {
         fileId: payload.id,
         path,
@@ -7196,6 +7205,8 @@ export class SyncEngine {
     const renamedHere = this.renameCount.get(fileId) ?? 0;
     let movedMeanwhile = false;
     let holder: IndexedMeta | undefined;
+    /** A new file of this device's is under the name, its create queued. */
+    let createdHere = false;
     await this.withPathLocks([oldPath, newPath], () => {
       // Renamed on this device while this waited: that rename reaches the
       // server after this one, and wins there.
@@ -7213,10 +7224,15 @@ export class SyncEngine {
       if (oldPath === newPath) return Promise.resolve();
       holder = this.nameHolder(newPath, meta);
       if (holder !== undefined) return Promise.resolve();
+      // A new file here whose create waits in the queue holds the name (see
+      // `createQueuedAt`). Moved in, this file parked it aside, unsent, and
+      // its create went out as a save of this one.
+      createdHere = this.createQueuedAt(newPath);
+      if (createdHere) return Promise.resolve();
       return this.commitLocal((io) => this.moveLocalCopy(io, meta, newPath));
     });
-    if (holder !== undefined) {
-      this.waitForName({ kind: 'rename', fileId, path: newPath }, holder);
+    if (holder !== undefined || createdHere) {
+      this.waitForName({ kind: 'rename', fileId, path: newPath }, holder ?? null);
       return;
     }
     // Looked up again, under the names the note has now.
@@ -7282,15 +7298,38 @@ export class SyncEngine {
    * conflict name, under the other file's id, and the fold pushed that text
    * into it — every teammate's copy of the note held the other note's text,
    * and the parked copy was uploaded as a duplicate.
+   *
+   * `holder`: the file indexed under the name; `null` for a new file whose
+   * create waits in the queue (see {@link createQueuedAt}).
    */
-  private waitForName(move: WaitingForName, holder: IndexedMeta): void {
+  private waitForName(move: WaitingForName, holder: IndexedMeta | null): void {
     this.log.info('a file’s name here is still another file’s; its move waits for it', {
       fileId: move.fileId,
       path: move.path,
-      holder: holder.relativePath,
-      renamedHere: this.renamePendingHere(holder.fileId),
+      ...(holder !== null
+        ? { holder: holder.relativePath, renamedHere: this.renamePendingHere(holder.fileId) }
+        : { createQueued: true }),
     });
     this.waitingForName.set(move.path, move);
+  }
+
+  /**
+   * Whether a create of a file of this device's waits in the queue under
+   * `path`: made offline, or while new changes wait behind the ones the
+   * server refused `busy` (see {@link queueFirst}). The file on this disk
+   * under the name is that one, and a file the server has there is another,
+   * which waits for the name (see {@link waitForName}), as it does at a
+   * connect (see `refreshFileIndex`).
+   *
+   * The connect's listing looked in the queue; a file the server announced
+   * later did not. Recorded under the name, it took the new file here for its
+   * own: renamed, that went out as a rename of the teammate's file — and
+   * deleted, as its delete, from every device — while the create was dropped
+   * as finding nothing (a new note given its title while the server was busy,
+   * and a teammate's new "Untitled" broadcast meanwhile).
+   */
+  private createQueuedAt(path: string): boolean {
+    return this.operationLog.queuesCreate(this.binding.id, path);
   }
 
   /** A file of {@link waitingForName} deleted or renamed on the server meanwhile. */
@@ -7307,6 +7346,13 @@ export class SyncEngine {
   private async releaseName(path: string): Promise<void> {
     const move = this.waitingFor(path);
     if (move === undefined || this.nameHolder(move.path) !== undefined) return;
+    // A new file whose create waits in the queue holds the name while it is
+    // on disk (see `createQueuedAt`). Deleted, it holds nothing: its create
+    // finds no file to send (see `replayPending`).
+    if (this.createQueuedAt(move.path)) {
+      if (await this.vault.exists(move.path)) return;
+      if (this.waitingFor(path) !== move || this.nameHolder(move.path) !== undefined) return;
+    }
     this.waitingForName.delete(move.path);
     if (move.kind === 'rename') {
       if (!this.fileIndex.byId.has(move.fileId)) return;
@@ -8842,7 +8888,9 @@ export class SyncEngine {
         case 'CREATE': {
           if (!(await this.vault.exists(op.filePath))) {
             // The file was deleted locally before we managed to flush —
-            // dropping the op is the right thing.
+            // dropping the op is the right thing. A file the server has under
+            // the name may wait for it (see `createQueuedAt`).
+            await this.releaseName(op.filePath);
             return { ok: false, retryable: false, error: 'local_file_missing' };
           }
           // The drain runs after `refreshFileIndex`, so a path the server

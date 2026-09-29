@@ -625,6 +625,16 @@ export class OperationLog {
     return out;
   }
 
+  /**
+   * Whether a create is queued for a binding under `path`: a new file of this
+   * device's the server has not heard of yet. Operations in flight are not
+   * looked at.
+   */
+  queuesCreate(bindingId: string, path: string): boolean {
+    const pending = this.bindings.get(bindingId)?.pending ?? [];
+    return pending.some((op) => op.opType === 'CREATE' && op.filePath === path);
+  }
+
   // -- file meta --------------------------------------------------------------
 
   getFileMeta(bindingId: string, path: string): FileMeta | null {
