@@ -766,6 +766,51 @@ describe('SyncEngine — the connect and the drain of a connection gone', () => 
     appliedOnce(b.server);
     await b.h.engine.stop();
   });
+
+  it('a replay of a connection gone that sends another operation sends nothing on the next one', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']]);
+    const mark = b.server.applied.length;
+    b.h.socket().disconnect();
+    await flushAsync();
+    // A create of a file the server has, queued offline (a checkout rewrote
+    // it): the replay sends it as an update of that file, after its upload.
+    b.h.vault.files.set('img.png', encode('v2'));
+    b.h.log.enqueueOperation('b1', {
+      opType: 'CREATE',
+      filePath: 'img.png',
+      payload: { fileType: 'BINARY' },
+    });
+    const upload = deferred<void>();
+    let uploads = 0;
+    b.h.routes.set('PUT /blobs', async () => {
+      uploads += 1;
+      if (uploads === 1) await upload.promise;
+      return json({ ok: true });
+    });
+    await reconnect(b);
+    await until('the replay’s upload', () => uploads === 1);
+    b.h.socket().disconnect();
+    b.h.socket().connect();
+    const join = await joinToAnswer(b.h);
+
+    upload.resolve();
+    await aWhile();
+    // Not on the new connection, ahead of its catch-up and its drain; the
+    // queue entry it came from is what stays.
+    expect(emitsOf(b.h, 'file:update-binary')).toHaveLength(0);
+    expect(b.h.log.inFlightOperations('b1')).toEqual([]);
+    expect(queue(b.h)).toEqual(['CREATE img.png']);
+
+    join.ack(b.server.joinAnswer('whole journal', { yjsDocs: b.docs.snapshots() }));
+    await b.docs.drive();
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual(['update f2']);
+    expect(emitsOf(b.h, 'file:update-binary')).toHaveLength(1);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
 });
 
 // -- Pause sync and stop ------------------------------------------------------------------

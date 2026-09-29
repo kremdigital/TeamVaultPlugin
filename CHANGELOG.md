@@ -155,9 +155,11 @@ uses [Semantic Versioning](https://semver.org/).
   that catch-up's end away from it, so the new connection stayed in
   `syncing` up to five minutes more with its queued changes unsent. An
   attempt whose connection dropped while it was sending the queue also
-  uploaded new files over the next connection, ahead of that one's queue.
-  Now whatever an interrupted attempt has left to do ends with its
-  connection, and the next one does it.
+  uploaded new files over the next connection, ahead of that one's queue,
+  and sent a queued attachment whose upload outlasted the connection over
+  it too — even while the next catch-up was asking you about a teammate's
+  newer version of that attachment. Now whatever an interrupted attempt has
+  left to do ends with its connection, and the next one does it.
 
 ## [0.4.0] — 2026-09-28
 

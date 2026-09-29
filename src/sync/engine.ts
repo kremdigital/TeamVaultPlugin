@@ -2133,6 +2133,7 @@ export class SyncEngine {
       return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
     }
     this.throwIfStopped();
+    this.dropIfDrainGone(op);
     // Offline meanwhile, or another change was refused `busy`: this one goes
     // behind it, in its place.
     if (!this.mayEmitOp(op)) return { kind: 'queued', entry: this.requeueInFlight(op.opId) };
@@ -2172,6 +2173,27 @@ export class SyncEngine {
       if (!settled && !this.hasStopped) this.requeueInFlight(op.opId);
       throw err;
     }
+  }
+
+  /**
+   * `op`, sent by a replay of the queue (`fromQueue`) and recorded in flight,
+   * is not sent when the drain's connection is gone (see `link`): the queue
+   * entry it came from stays for the next connect's drain, and nothing of
+   * `op` is kept. Throws the connection's end, as {@link emitQueued} does.
+   *
+   * The drain's own emits stopped with its connection; what its replay sent
+   * through the live handlers did not — a queued create of a file the server
+   * has went out as an update of it, a rename into Obsidian's trash as a
+   * delete (see `replayPending`). An attachment's version whose upload
+   * outlasted the connection went out over the next one, ahead of its
+   * catch-up and its drain: over a teammate's newer version that catch-up
+   * was asking the user about.
+   */
+  private dropIfDrainGone(op: OutgoingOp): void {
+    const drain = this.drainSignal;
+    if (op.fromQueue !== true || drain === null || !drain.aborted) return;
+    if (this.operationLog.clearInFlight(this.binding.id, op.opId)) this.leftFlight(op.opId);
+    drain.throwIfAborted();
   }
 
   /** {@link sendOp} refused by the server: see there. */
