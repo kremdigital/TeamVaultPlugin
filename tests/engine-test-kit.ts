@@ -38,7 +38,7 @@
  * from it ({@link restartFromDisk}) sees only what was written.
  */
 import { readFileSync } from 'node:fs';
-import { join as joinPath } from 'node:path';
+import { join as joinPath, posix } from 'node:path';
 import * as Y from 'yjs';
 import { sha256Hex } from '@/sync/hash';
 import { SyncEngine, type EngineStatus } from '@/sync/engine';
@@ -1321,18 +1321,76 @@ function sameOpKind(a: ServerOperation['opType'], b: ServerOperation['opType']):
   return kind(a) === kind(b);
 }
 
+/** Folder names the server refuses in a path a client sends (`paths.ts` in `Project/server`). */
+const SERVER_RESERVED_NAMES = new Set(['.versions', '.staging', '.obsidian', '.trash', '.git']);
+
+/** Code points HFS+ skips when it compares names: see the server's `nameKey`. */
+const HFS_IGNORABLE = /[\u200C-\u200F\u202A-\u202E\u206A-\u206F\uFEFF]/g;
+
+/** An 8.3 short name (`OBSIDI~1`): see the server's `isWindowsAlias`. */
+const SHORT_NAME = /^([^.\s]*~\d+)(?:\.[^.\s]{1,3})?$/;
+
+/** The server's `nameKey`: the key two names a client disk takes for one share. */
+function serverNameKey(segment: string): string {
+  return segment
+    .normalize('NFKC')
+    .normalize('NFD')
+    .toLowerCase()
+    .toUpperCase()
+    .toLowerCase()
+    .replace(HFS_IGNORABLE, '')
+    .normalize('NFC');
+}
+
+/** The server's `isUnsafeForWindows`: a name a Windows client can't keep as spelled. */
+function unsafeForWindows(segment: string): boolean {
+  const short = SHORT_NAME.exec(segment);
+  let control = false;
+  for (let i = 0; i < segment.length; i++) if (segment.charCodeAt(i) < 0x20) control = true;
+  return (
+    segment.includes(':') ||
+    (short !== null && (short[1] ?? '').length <= 8) ||
+    /[*?<>"|]/.test(segment) ||
+    control ||
+    /[. ]$/.test(segment)
+  );
+}
+
+/**
+ * The server's `normalizeVaultPath` for a path a client sends
+ * (`src/lib/files/paths.ts` in `Project/server`, on Linux): the normalized
+ * path, or `undefined` where the server refuses it.
+ */
+function serverPath(input: string): string | undefined {
+  if (input.includes('\0') || input.startsWith('/')) return undefined;
+  const normalized = posix.normalize(input).replaceAll('\\', '/');
+  if (normalized.startsWith('/')) return undefined;
+  const segments = normalized.split('/').filter((s) => s.length > 0);
+  for (const segment of segments) {
+    if (segment === '..' || segment === '.') return undefined;
+    const key = serverNameKey(segment);
+    if (key === '' || SERVER_RESERVED_NAMES.has(key)) return undefined;
+    if (SERVER_RESERVED_NAMES.has(segment.toLowerCase())) return undefined;
+    if (unsafeForWindows(segment) || segment.length > 255) return undefined;
+  }
+  return segments.length === 0 ? undefined : segments.join('/');
+}
+
 /**
  * `{ folder }` of a DELETE, RENAME or MOVE as the server keeps it
  * (`vanishedFolder` in `Project/server`, `sync-protocol.md`, «Папки»): a
- * string that is a strict ancestor of where the file was on the server
- * (`from`) and, for a move, neither where it went (`to`) nor a folder of that.
- * Anything else is dropped: `{}`. (The server's path normalization is left
- * out: the engine sends paths as it records them.)
+ * string the server takes as a path a client sends, normalized (see
+ * {@link serverPath}), that is a strict ancestor of where the file was on the
+ * server (`from`) and, for a move, neither where it went (`to`) nor a folder
+ * of that. The normalized value is the one kept; anything else is dropped:
+ * `{}`.
  */
 function keptFolder(raw: unknown, from: string, to?: string): { folder?: string } {
-  if (typeof raw !== 'string' || raw === '' || !from.startsWith(`${raw}/`)) return {};
-  if (to !== undefined && (to === raw || to.startsWith(`${raw}/`))) return {};
-  return { folder: raw };
+  if (typeof raw !== 'string' || raw === '') return {};
+  const folder = serverPath(raw);
+  if (folder === undefined || !from.startsWith(`${folder}/`)) return {};
+  if (to !== undefined && (to === folder || to.startsWith(`${folder}/`))) return {};
+  return { folder };
 }
 
 /** A log entry as acks and broadcasts carry it. */

@@ -407,6 +407,71 @@ describe('FakeServer — the shapes of the contract’s examples', () => {
     ]);
   });
 
+  it('keeps the folder normalized, as the server does, and drops one the server refuses', () => {
+    const { server, socket, heard } = room();
+    const cases: Array<[string, string, string | undefined]> = [
+      // A path spelled otherwise: kept as the server normalizes it.
+      ['notes/', 'notes/a.md', 'notes'],
+      ['notes//sub', 'notes/sub/a.md', 'notes/sub'],
+      ['notes\\sub', 'notes/sub/b.md', 'notes/sub'],
+      ['./notes', 'notes/c.md', 'notes'],
+      ['живая-040/sub', 'живая-040/sub/c.md', 'живая-040/sub'],
+      // A path the server refuses: dropped.
+      ['/notes', 'notes/d.md', undefined],
+      ['../notes', 'notes/e.md', undefined],
+      ['notes/..', 'notes/f.md', undefined],
+      ['.', 'g.md', undefined],
+      ['.trash', '.trash/h.md', undefined],
+      ['.OBSIDIAN', '.OBSIDIAN/i.md', undefined],
+      ['a/.git', 'a/.git/j.md', undefined],
+      ['OBSIDI~1', 'OBSIDI~1/k.md', undefined],
+      ['notes.', 'notes./l.md', undefined],
+      ['no:tes', 'no:tes/m.md', undefined],
+      ['no\u0007tes', 'no\u0007tes/p.md', undefined],
+      ['no*tes', 'no*tes/q.md', undefined],
+      // Not an ancestor once normalized, or not in the same case.
+      ['Notes', 'notes/n.md', undefined],
+      ['notes/su', 'notes/sub/o.md', undefined],
+    ];
+    for (const [i, [, path]] of cases.entries()) {
+      server.add({ id: `k${i}`, path, fileType: 'TEXT', contentHash: 'h', size: 1 });
+    }
+    for (const [i, [folder, path]] of cases.entries()) {
+      send(server, socket, 'file:delete', {
+        opId: newOpId(),
+        fileId: `k${i}`,
+        filePath: path,
+        folder,
+      });
+    }
+    const expected = cases.map(([, , kept]) => kept);
+    expect(heard.map(([, e]) => (e as { folder?: string }).folder)).toEqual(expected);
+    expect(server.journal.map((row) => (row.payload as { folder?: string }).folder)).toEqual(
+      expected,
+    );
+  });
+
+  it('keeps the normalized folder of a move only when the file did not go into it', () => {
+    const { server, socket, heard } = room();
+    server.add({ id: 'm1', path: 'a/b/x.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    server.add({ id: 'm2', path: 'c/b/y.md', fileType: 'TEXT', contentHash: 'h', size: 1 });
+    send(server, socket, 'file:rename', {
+      opId: newOpId(),
+      fileId: 'm1',
+      filePath: 'a/b/x.md',
+      newPath: 'a/c/x.md',
+      folder: 'a/',
+    });
+    send(server, socket, 'file:move', {
+      opId: newOpId(),
+      fileId: 'm2',
+      filePath: 'c/b/y.md',
+      newPath: 'd/b/y.md',
+      folder: 'c//',
+    });
+    expect(heard.map(([, e]) => (e as { folder?: string }).folder)).toEqual([undefined, 'c']);
+  });
+
   it('merges a create of the same content only when it is not empty', () => {
     const { server, socket } = room();
     const empty = { fileType: 'TEXT', contentHash: 'e'.repeat(64), size: 0 };
