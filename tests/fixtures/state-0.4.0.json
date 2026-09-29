@@ -1,0 +1,77 @@
+{
+  "version": 1,
+  "nextOpId": 24,
+  "bindings": {
+    "b1": {
+      "pending": [
+        {
+          "id": 21,
+          "bindingId": "b1",
+          "opId": "0f3c2a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6",
+          "opType": "RENAME",
+          "filePath": "Notes/a.md",
+          "newPath": "Notes/b.md",
+          "payload": { "fileId": "f3" },
+          "createdAt": 1759050000100
+        },
+        {
+          "id": 23,
+          "bindingId": "b1",
+          "opId": "5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f70819",
+          "opType": "CREATE",
+          "filePath": "Asked.md",
+          "newPath": null,
+          "payload": { "fileType": "TEXT", "contentHash": "h-asked", "size": 6 },
+          "createdAt": 1759050000300,
+          "settleOnly": true
+        }
+      ],
+      "inflight": [
+        {
+          "id": 22,
+          "bindingId": "b1",
+          "opId": "1a2b3c4d-5e6f-4a7b-9c8d-e0f1a2b3c4d5",
+          "opType": "UPDATE",
+          "filePath": "img/photo.png",
+          "newPath": null,
+          "payload": { "fileId": "f7", "contentHash": "h-photo-2", "size": 2048 },
+          "createdAt": 1759050000200
+        }
+      ],
+      "files": [
+        {
+          "relativePath": "Notes/a.md",
+          "serverFileId": "f3",
+          "contentHash": "h-a",
+          "size": 3,
+          "fileType": "TEXT",
+          "lastSyncedAt": 1759050000000,
+          "foldedHash": "h-a"
+        },
+        {
+          "relativePath": "img/photo.png",
+          "serverFileId": "f7",
+          "contentHash": "h-photo-1",
+          "size": 1024,
+          "fileType": "BINARY",
+          "lastSyncedAt": 1759050000000
+        },
+        {
+          "relativePath": "Theirs.md",
+          "serverFileId": "f9",
+          "contentHash": "h-theirs",
+          "size": 7,
+          "fileType": "TEXT",
+          "lastSyncedAt": 1759050000000,
+          "notOnDisk": true
+        }
+      ],
+      "state": {
+        "lastVectorClock": { "device-1": 21, "device-2": 4 },
+        "lastSyncedAt": 1759050000000
+      },
+      "appliedLive": ["cl_31", "cl_32"],
+      "deleteAsked": ["f5"]
+    }
+  }
+}

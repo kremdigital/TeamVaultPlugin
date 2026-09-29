@@ -140,6 +140,18 @@ async function watch(args: CliArgs, projectId: string): Promise<void> {
   socket.onYjsUpdate((msg) =>
     console.log(`[yjs] file=${msg.fileId} bytes=${msg.update.byteLength}`),
   );
+  // The text docs of the join come after its answer, in batches: subscribed
+  // before the join, so an early batch is counted too.
+  let catchupDocs = 0;
+  let catchupBatches = 0;
+  socket.onYjsCatchup((batch) => {
+    if (batch.projectId !== projectId) return;
+    catchupDocs += batch.docs.length;
+    catchupBatches += 1;
+    if (batch.done) {
+      console.log(`[catchup] done — ${catchupDocs} yjs docs in ${catchupBatches} batches`);
+    }
+  });
 
   socket.connect();
   // Wait for connect, then join the project. We don't pass a vector clock —
@@ -150,9 +162,9 @@ async function watch(args: CliArgs, projectId: string): Promise<void> {
     console.error(`project:join failed: ${result.error}`);
     process.exit(1);
   }
-  console.log(
-    `[join] ok — ${result.operations.length} catch-up ops, ${result.yjsDocs?.length ?? 0} yjs docs`,
-  );
+  const docs =
+    result.yjsStream === true ? `${result.yjsCount ?? 0} yjs docs streaming` : 'no yjs docs';
+  console.log(`[join] ok — ${result.operations.length} catch-up ops, ${docs}`);
   console.log('[watch] streaming events (Ctrl+C to exit)…');
 
   // Block forever; SIGINT triggers process.exit in the runtime.

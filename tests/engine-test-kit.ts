@@ -75,6 +75,7 @@ import type {
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import type { Logger } from '@/utils/logger';
+import { joinProjectId, serverJoin, withStreamed } from './join-stream';
 
 // -- Test doubles ---------------------------------------------------------------
 
@@ -583,6 +584,8 @@ export class FakeSocket implements SocketLike {
    */
   statusResponder: (e: Emit) => void = voidAll;
   private seq = 0;
+  /** Counts the connections: a `yjs:catchup` comes only on the one its join came on. */
+  private connection = 0;
   private killed = false;
   private listeners = new Map<string, Set<(...args: unknown[]) => void>>();
 
@@ -612,9 +615,16 @@ export class FakeSocket implements SocketLike {
       this.inRoom = true;
       const join: Emit = { event, payload: args[0], ack, seq };
       const answer = withIdempotency(ack);
+      const connection = this.connection;
       join.ack = (response): void => {
         join.answered = true;
-        answer(response);
+        // As the server answers: the text docs follow the answer as
+        // `yjs:catchup` batches (see `serverJoin`), on the connection the
+        // join came on — a connection gone brings none of them.
+        const sent = serverJoin(response, joinProjectId(args[0]));
+        answer(sent.answer);
+        if (!this.connected || this.connection !== connection) return;
+        for (const batch of sent.batches) this.fire('yjs:catchup', batch);
       };
       this.emits.push(join);
     } else if (event === 'project:leave') {
@@ -647,6 +657,7 @@ export class FakeSocket implements SocketLike {
       return this;
     }
     this.connected = true;
+    this.connection += 1;
     // A new connection is in no room until it joins one.
     this.inRoom = false;
     this.fire('connect');
@@ -1060,7 +1071,8 @@ export async function userRename(h: Harness, from: string, to: string): Promise<
 
 /**
  * The network is back for an engine started with `offline: true`: its socket
- * connects, and the join is answered with `join`.
+ * connects, and the join is answered with `join` — its `yjsDocs` streamed
+ * after the answer, as the server streams them (see `serverJoin`).
  */
 export async function goOnline(
   h: Harness,
@@ -1124,7 +1136,10 @@ export function joinClockOf(h: Harness): Record<string, number> {
   return payload.sinceVectorClock ?? {};
 }
 
-/** Start and answer `project:join`. */
+/**
+ * Start and answer `project:join` with `join`: its `yjsDocs` are streamed
+ * after the answer, as the server streams them (see `serverJoin`).
+ */
 export async function connect(
   h: Harness,
   join: { operations?: ServerOperation[]; yjsDocs?: YjsDocSnapshot[] } = {},
@@ -1444,6 +1459,11 @@ export class FakeServer {
    * The UPDATE rows of notes (a write through REST or MCP) are left out, as
    * the server leaves them out.
    *
+   * The text docs (`yjsDocs`, none by default) are not in the answer: it
+   * says `yjsStream` and `yjsCount`, and the socket streams the docs after it
+   * as `yjs:catchup` batches, as the server does (see `serverJoin`). A test
+   * that spreads the answer into its own streams them itself.
+   *
    * `clock`: the clock to answer for, instead of the one persisted — the one
    * the join carried (see {@link joinClockOf}), as the server answers. They
    * differ after an operation whose ack was lost: the engine bumped its clock
@@ -1453,20 +1473,22 @@ export class FakeServer {
     form: CatchupForm,
     opts: { rows?: number; yjsDocs?: YjsDocSnapshot[]; clock?: Record<string, number> } = {},
   ): Record<string, unknown> {
-    const docs = { yjsDocs: opts.yjsDocs ?? [] };
+    const docs = opts.yjsDocs ?? [];
     const unseen = this.catchupFor(opts.clock).filter(
       (op) => op.opType !== 'UPDATE' || this.files.get(fileIdOf(op))?.fileType !== 'TEXT',
     );
     const kept =
       form === 'cut short' ? unseen.slice(Math.max(0, unseen.length - (opts.rows ?? 1))) : unseen;
-    return {
+    const answer = {
       ok: true,
       opIdempotency: 1,
       operations: kept,
       operationsCatchup: 2,
       ...(kept.length < unseen.length ? { operationsTruncated: true } : {}),
-      ...docs,
+      yjsStream: true,
+      yjsCount: docs.length,
     };
+    return withStreamed(answer, docs);
   }
 
   /**

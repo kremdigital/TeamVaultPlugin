@@ -135,9 +135,9 @@ export interface BindingState {
 
 /**
  * How many operations applied live a binding remembers (see
- * {@link OperationLog.noteAppliedLive}). The oldest go first: on a server
- * that gives only the journal's first rows, an operation past them is never
- * returned, and the list would grow without end.
+ * {@link OperationLog.noteAppliedLive}). The oldest go first: a catch-up cut
+ * short to its newest operations never returns the older ones, and the list
+ * would grow without end.
  */
 export const APPLIED_LIVE_MAX = 1000;
 
@@ -146,13 +146,6 @@ export const APPLIED_LIVE_MAX = 1000;
  * (see {@link OperationLog.noteDeleteAsked}). The oldest go first.
  */
 export const DELETE_ASKED_MAX = 1000;
-
-/**
- * Payload fields of 0.3.x queue entries that said an operation had gone out
- * and might have been applied without its answer. Operation ids replace them;
- * a log written before 0.4.0 has them stripped when it loads (see `hydrate`).
- */
-const LEGACY_SENT_FIELDS = ['sentCounter', 'sentCounters', 'sentHashes', 'sentAt'] as const;
 
 /** Whether `value` is an operation id: a UUID v4, in lower case. */
 export function isOpId(value: unknown): value is string {
@@ -218,8 +211,6 @@ export interface OperationLogOptions {
    * overwriting the newer file with an older snapshot. Default: always.
    */
   ownsFile?: () => boolean;
-  /** Something the log noticed while loading that is worth a line in `sync.log`. */
-  onWarn?: (message: string, detail: Record<string, unknown>) => void;
 }
 
 /** Everything the log knows about one binding. */
@@ -246,7 +237,6 @@ export class OperationLog {
   private readonly flushDelayMs: number;
   private readonly onError: (err: unknown) => void;
   private readonly ownsFile: () => boolean;
-  private readonly onWarn: (message: string, detail: Record<string, unknown>) => void;
 
   private readonly bindings = new Map<string, BindingBucket>();
   /** Mirrors SQLite AUTOINCREMENT: ids keep climbing across deletes. */
@@ -288,7 +278,6 @@ export class OperationLog {
     this.flushDelayMs = options.flushDelayMs ?? DEFAULT_FLUSH_DELAY_MS;
     this.onError = options.onError ?? ((): void => undefined);
     this.ownsFile = options.ownsFile ?? ((): boolean => true);
-    this.onWarn = options.onWarn ?? ((): void => undefined);
   }
 
   /** True when this instance has somewhere to persist to. */
@@ -1012,8 +1001,6 @@ export class OperationLog {
     if (!isRecord(bindings)) return;
 
     let maxId = 0;
-    /** Queue entries of a 0.3.x build that had gone out, answered or not. */
-    let legacySent = 0;
     const opIds = new Set<string>();
     /** The `opId`s given here: not on disk until the next write. */
     const given: string[] = [];
@@ -1031,9 +1018,8 @@ export class OperationLog {
       for (const rawOp of rawOps) {
         const op = toPendingOperation(bindingId, rawOp);
         if (!op) continue;
-        // A queue written before operation ids, or an id seen twice: a new
-        // one. The server has never seen it, so the operation is sent again
-        // as the 0.3.x build would have sent it.
+        // An entry whose id is missing or malformed (a damaged file), or an
+        // id seen twice: a new one, which the server has never seen.
         if (!isOpId(op.opId) || opIds.has(op.opId)) {
           op.opId = newOpId();
           given.push(op.opId);
@@ -1041,7 +1027,6 @@ export class OperationLog {
           this.opIdGeneration.set(op.opId, 0);
         }
         opIds.add(op.opId);
-        if (stripLegacySentFields(op.payload)) legacySent += 1;
         bucket.pending.push(op);
         if (op.id > maxId) maxId = op.id;
       }
@@ -1094,11 +1079,6 @@ export class OperationLog {
       this.givenGeneration = this.generation;
       for (const opId of given) this.opIdGeneration.set(opId, this.generation);
     }
-    if (legacySent > 0) {
-      // Their answers were lost to a 0.3.x build: the server may have applied
-      // them, and they go out once more under new ids (the risk 0.3.x had).
-      this.onWarn(`legacy in-flight entries: ${legacySent}`, { entries: legacySent });
-    }
   }
 }
 
@@ -1124,17 +1104,6 @@ function insertById(queue: PendingOperation[], entry: PendingOperation): void {
   const at = queue.findIndex((op) => op.id > entry.id);
   if (at < 0) queue.push(entry);
   else queue.splice(at, 0, entry);
-}
-
-/** Remove the fields of {@link LEGACY_SENT_FIELDS} from `payload`; whether there were any. */
-function stripLegacySentFields(payload: Record<string, unknown>): boolean {
-  let found = false;
-  for (const field of LEGACY_SENT_FIELDS) {
-    if (!(field in payload)) continue;
-    delete payload[field];
-    found = true;
-  }
-  return found;
 }
 
 function toPendingOperation(bindingId: string, raw: unknown): PendingOperation | null {

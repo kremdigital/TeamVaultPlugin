@@ -443,10 +443,53 @@ describe('FakeServer — the shapes of the contract’s examples', () => {
     const answer = server.joinAnswer('whole journal', { clock: {} });
     const example = protocolFixture('join-ack') as Record<string, unknown>;
     expect(answer).toMatchObject({ ok: true, opIdempotency: 1, operationsCatchup: 2 });
+    // The docs are not in the answer: it says they come streamed.
+    expect(Object.keys(answer).sort()).toEqual(Object.keys(example).sort());
+    expect(answer).toMatchObject({ yjsStream: true, yjsCount: 0 });
     expect(shapeOf((answer.operations as unknown[])[0])).toEqual(
       shapeOf((example.operations as unknown[])[0]),
     );
     expect(socket.emits).toEqual([]);
+  });
+
+  it('streams the docs after the join answer, which never carries them', () => {
+    const { server, socket } = room({ joined: false });
+    const batches: Array<{ projectId: string; docs: Array<{ fileId: string }>; done: boolean }> =
+      [];
+    socket.on('yjs:catchup', (batch: unknown) => batches.push(batch as (typeof batches)[number]));
+    const docs = Array.from({ length: 25 }, (_, i) => ({
+      fileId: `f${i}`,
+      sync1: [0, 0],
+      stateVector: [0],
+    }));
+    const answers: unknown[] = [];
+    socket.emit('project:join', { projectId: 'p1' }, (ack: unknown) => answers.push(ack));
+    socket.emits.at(-1)?.ack(server.joinAnswer('whole journal', { yjsDocs: docs }));
+
+    const example = protocolFixture('join-ack') as Record<string, unknown>;
+    expect(Object.keys(answers[0] as object).sort()).toEqual(Object.keys(example).sort());
+    expect(answers[0]).toMatchObject({ yjsStream: true, yjsCount: 25 });
+    expect(batches.map((b) => [b.projectId, b.docs.length, b.done])).toEqual([
+      ['p1', 20, false],
+      ['p1', 5, true],
+    ]);
+    expect(batches.flatMap((b) => b.docs.map((d) => d.fileId))).toEqual(docs.map((d) => d.fileId));
+
+    // Nothing to stream: one `done` batch, as the server sends.
+    batches.length = 0;
+    socket.emit('project:join', { projectId: 'p1' }, (ack: unknown) => answers.push(ack));
+    socket.emits.at(-1)?.ack(server.joinAnswer('whole journal'));
+    expect(answers[1]).toMatchObject({ yjsStream: true, yjsCount: 0 });
+    expect(batches).toEqual([{ projectId: 'p1', docs: [], done: true }]);
+
+    // A join answered after its connection ended: the stream never comes.
+    batches.length = 0;
+    socket.emit('project:join', { projectId: 'p1' }, (ack: unknown) => answers.push(ack));
+    const late = socket.emits.at(-1);
+    socket.disconnect();
+    socket.connect();
+    late?.ack(server.joinAnswer('whole journal', { yjsDocs: docs }));
+    expect(batches).toEqual([]);
   });
 });
 

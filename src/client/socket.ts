@@ -96,14 +96,15 @@ export interface YjsDocSnapshot {
 }
 
 /**
- * The op-log catch-up this client asks `project:join` for (`operationsCatchup`):
- * every operation its vector clock has not seen, from the whole journal. The
- * engine checks each one against where files are now, and does not apply
- * again what it applied from a live broadcast, so a catch-up of the whole
- * journal is safe for it. Without the flag a server gives the old window of
- * the journal's first 500 rows, where a project with a longer journal gets no
- * new operations at all. A server that predates the flag ignores it and gives
- * that window (see `sync-protocol.md`, «Подключение»).
+ * `operationsCatchup` of a `project:join`. The server gives every join the
+ * operations the client's vector clock has not seen, from the whole journal,
+ * and streams the text docs after its answer (`yjs:catchup`), whatever the
+ * join says (see `sync-protocol.md`, «Подключение»): the engine checks each
+ * operation against where files are now, and does not apply again what it
+ * applied from a live broadcast. The join still says `operationsCatchup: 2`
+ * and `streamYjs: true` — what the server read before 0.4.1 — so a server
+ * rolled back to 0.4.0 answers it the same way, instead of the window of the
+ * journal's first 500 rows and every doc of the vault built into one answer.
  */
 export const OPERATIONS_CATCHUP = 2;
 
@@ -124,18 +125,14 @@ export type JoinResult =
        */
       opIdempotency?: number;
       /**
-       * {@link OPERATIONS_CATCHUP} when `operations` is the whole-journal
-       * catch-up asked for; absent from a server that gave the old window.
-       */
-      operationsCatchup?: number;
-      /**
        * The client had more unseen operations than one catch-up carries:
        * `operations` holds the newest of them, the older ones were left out.
        */
       operationsTruncated?: boolean;
-      /** Inline catch-up (legacy / non-streaming servers). */
-      yjsDocs?: YjsDocSnapshot[];
-      /** Set when the server is streaming the catch-up via `yjs:catchup`. */
+      /**
+       * The text docs follow the answer as `yjs:catchup` batches, the last
+       * one `done`: at every join that does not skip them (`skipYjsCatchup`).
+       */
       yjsStream?: boolean;
       /** Number of docs that will stream (for progress). */
       yjsCount?: number;
@@ -218,7 +215,7 @@ export interface YjsUpdateMessage {
 /**
  * `yjs:fetch` ack — one doc's full server state, same encoding as a catch-up
  * {@link YjsDocSnapshot}. `error: 'timeout'` is synthesized client-side when
- * the server never answers (servers older than the event ignore it).
+ * the server does not answer in time.
  */
 export type YjsFetchResult =
   | { ok: true; sync1: number[]; stateVector?: number[] }
@@ -617,7 +614,7 @@ export class SocketClient {
       });
     });
 
-    // Streamed Yjs catch-up after a `project:join` with `streamYjs: true`.
+    // The text docs a `project:join` brings, streamed after its answer.
     socket.on('yjs:catchup', (raw: unknown) => {
       const data = raw as
         | { projectId?: string; docs?: YjsDocSnapshot[]; done?: boolean }
@@ -682,15 +679,16 @@ export class SocketClient {
 
   // -- Outgoing emits -------------------------------------------------------
 
-  joinProject(
-    projectId: string,
-    sinceVectorClock: VectorClock | null = null,
-    streamYjs = false,
-  ): Promise<JoinResult> {
+  /**
+   * Join the project with its catch-up: the operations `sinceVectorClock` has
+   * not seen in the answer, the text docs after it as `yjs:catchup` batches
+   * (see {@link OPERATIONS_CATCHUP} for the flags it still sends).
+   */
+  joinProject(projectId: string, sinceVectorClock: VectorClock | null = null): Promise<JoinResult> {
     return this.emitWithAck<JoinResult>('project:join', {
       projectId,
       sinceVectorClock,
-      streamYjs,
+      streamYjs: true,
       operationsCatchup: OPERATIONS_CATCHUP,
     });
   }

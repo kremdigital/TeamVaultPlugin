@@ -12,6 +12,7 @@ import {
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import { Logger, type LogEntry, type LogLevel } from '@/utils/logger';
+import { joinProjectId, serverJoin } from './join-stream';
 
 /**
  * A path from the server the plugin refuses is logged at `warn` once while
@@ -114,10 +115,17 @@ class FakeSocket implements SocketLike {
   ackOk(extra: Record<string, unknown> = {}): void {
     const last = this.emits[this.emits.length - 1];
     const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
+    if (!ack) return;
+    if (last?.event !== 'project:join') {
+      ack({ ok: true, ...extra });
+      return;
+    }
     // The server this client needs says so in its join ack (see
-    // `sync-protocol.md` §4.5).
-    const idempotent = last?.event === 'project:join' ? { opIdempotency: 1 } : {};
-    if (ack) ack({ ok: true, ...idempotent, ...extra });
+    // `sync-protocol.md` §4.5), and streams the text docs after it as
+    // `yjs:catchup` batches (see `serverJoin`).
+    const sent = serverJoin({ ok: true, opIdempotency: 1, ...extra }, joinProjectId(last.args[0]));
+    ack(sent.answer);
+    for (const batch of sent.batches) this.fire('yjs:catchup', batch);
   }
 }
 

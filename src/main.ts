@@ -481,7 +481,6 @@ export default class ObsidianSyncPlugin extends Plugin {
       storage: new ObsidianLogStorage(this.app.vault),
       filePath: `${this.app.vault.configDir}/plugins/${this.manifest.id}/state.json`,
       onError: (err) => this.logger?.warn('operation log persistence failed', { err }),
-      onWarn: (message, detail) => this.logger?.warn(message, detail),
       // From here on the previous instance, if any, stops writing the file.
       ownsFile: claimStateFile(window, this.manifest.id),
     });

@@ -13,6 +13,7 @@ import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import { Logger, formatLogEntry, type LogEntry, type LogSink } from '@/utils/logger';
 import { stubWindow } from './window-stub';
+import { joinProjectId, serverJoin } from './join-stream';
 
 /**
  * In-memory vault adapter — file map keyed by vault path. Binary is stored
@@ -144,10 +145,17 @@ class FakeSocket implements SocketLike {
   ackOk(extra: Record<string, unknown> = {}): void {
     const last = this.emits[this.emits.length - 1];
     const ack = last?.args[last.args.length - 1] as ((r: unknown) => void) | undefined;
+    if (!ack) return;
+    if (last?.event !== 'project:join') {
+      ack({ ok: true, ...extra });
+      return;
+    }
     // The server this client needs says so in its join ack (see
-    // `sync-protocol.md` §4.5).
-    const idempotent = last?.event === 'project:join' ? { opIdempotency: 1 } : {};
-    if (ack) ack({ ok: true, ...idempotent, ...extra });
+    // `sync-protocol.md` §4.5), and streams the text docs after it as
+    // `yjs:catchup` batches (see `serverJoin`).
+    const sent = serverJoin({ ok: true, opIdempotency: 1, ...extra }, joinProjectId(last.args[0]));
+    ack(sent.answer);
+    for (const batch of sent.batches) this.fire('yjs:catchup', batch);
   }
   /** Resolve the ack of the last emit with `ok: false` and an error code. */
   ackErr(error: string): void {
@@ -1118,7 +1126,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
     h.doc.setText('b1', 'note.md', 'offline-only edits');
 
     await h.engine.start();
-    // Server signals streaming (no inline yjsDocs).
+    // The server announces one doc; its batch comes later.
     h.socket().ackOk({ operations: [], yjsStream: true, yjsCount: 1 });
     await flushAsync(10);
 
@@ -1138,7 +1146,7 @@ describe('SyncEngine — S4 offline drain → reconnect', () => {
 
     // Now connected…
     expect(h.engine.getStatus()).toBe('connected');
-    // …and the offline ops were pushed back (same round-trip as inline).
+    // …and the offline ops were pushed back.
     const emits = h.socket().emits.filter((e) => e.event === 'yjs:update');
     expect(emits.length).toBeGreaterThanOrEqual(1);
     const payload = emits[0]?.args[0] as { fileId: string; update: number[] };
@@ -3244,7 +3252,7 @@ describe('SyncEngine — disk edits merge with remote edits', () => {
         },
       ],
     });
-    // An inline catch-up finishes each doc's snapshot before `connected`.
+    // The catch-up finishes each doc's snapshot before `connected`.
     await connected;
 
     expect(h.vault.files.has(PATH)).toBe(false);

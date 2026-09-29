@@ -214,17 +214,25 @@ describe('SocketClient — emits', () => {
   it('joinProject sends the right payload and resolves with the server ack', async () => {
     const { client, socket } = captureSocket();
     client.connect();
-    const promise = client.joinProject('p1', { node1: 5 }, true);
+    const promise = client.joinProject('p1', { node1: 5 });
     expect(socket().emits[0]?.event).toBe('project:join');
     expect(socket().emits[0]?.args[0]).toEqual({
       projectId: 'p1',
       sinceVectorClock: { node1: 5 },
+      // What a server rolled back to 0.4.0 reads (see `OPERATIONS_CATCHUP`).
       streamYjs: true,
-      // The whole-journal catch-up (see `OPERATIONS_CATCHUP`).
       operationsCatchup: 2,
     });
-    socket().ackLast({ ok: true, operations: [], yjsDocs: [] });
-    await expect(promise).resolves.toEqual({ ok: true, operations: [], yjsDocs: [] });
+    const answer = {
+      ok: true,
+      opIdempotency: 1,
+      operations: [],
+      operationsCatchup: 2,
+      yjsStream: true,
+      yjsCount: 0,
+    };
+    socket().ackLast(answer);
+    await expect(promise).resolves.toEqual(answer);
   });
 
   it('emitFileCreate serializes binary data as a number array', async () => {
@@ -568,7 +576,7 @@ describe('SocketClient — operation ids', () => {
   it('passes the join’s idempotency mark and the rows’ clientId and opId through', async () => {
     const { client, socket } = captureSocket();
     client.connect();
-    const join = client.joinProject('p1', {}, true);
+    const join = client.joinProject('p1', {});
     const row = {
       id: 'cl_3',
       opType: 'RENAME',

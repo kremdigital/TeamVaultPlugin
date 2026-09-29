@@ -37,6 +37,7 @@ import type {
 import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import type { VaultAdapter } from '@/sync/vault-adapter';
 import { sha256Hex } from '@/sync/hash';
+import { joinProjectId, serverJoin } from './join-stream';
 
 // -- Test doubles ---------------------------------------------------------------
 
@@ -216,11 +217,19 @@ class FakeSocket implements SocketLike {
       const { opIds } = args[0] as { opIds: string[] };
       ack({ ok: true, applied: [], voided: opIds });
     } else if (event === 'project:join') {
-      // The server this client needs says so (see `sync-protocol.md` §4.5).
+      // The server this client needs says so (see `sync-protocol.md` §4.5),
+      // and streams the text docs after its answer (see `serverJoin`) on the
+      // connection the join came on.
       this.emits.push({
         event,
         payload: args[0],
-        ack: (r) => ack(r !== null && typeof r === 'object' ? { opIdempotency: 1, ...r } : r),
+        ack: (r) => {
+          const answer = r !== null && typeof r === 'object' ? { opIdempotency: 1, ...r } : r;
+          const sent = serverJoin(answer, joinProjectId(args[0]));
+          ack(sent.answer);
+          if (!this.connected) return;
+          for (const batch of sent.batches) this.fire('yjs:catchup', batch);
+        },
       });
     } else {
       this.emits.push({ event, payload: args[0], ack });

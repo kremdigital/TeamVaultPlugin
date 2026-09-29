@@ -906,8 +906,8 @@ export class SyncEngine {
 
   /**
    * Resolves the in-flight streamed Yjs catch-up once the server's final
-   * `yjs:catchup` batch (`done`) arrives. Armed before each `project:join`
-   * with `streamYjs`, cleared when the stream finishes (or times out).
+   * `yjs:catchup` batch (`done`) arrives. Armed before each `project:join`,
+   * cleared when the stream finishes (or times out).
    */
   private catchupResolve: (() => void) | null = null;
   /** True once the file index is refreshed — gates catch-up batch processing
@@ -1458,8 +1458,8 @@ export class SyncEngine {
 
       // Fire `project:join` synchronously (no await before it) so tests can
       // observe the emit immediately and the server starts streaming ASAP;
-      // refresh the file index in parallel. `streamYjs: true` asks the server
-      // to deliver the catch-up as batched `yjs:catchup` events.
+      // refresh the file index in parallel. The server streams the text docs
+      // after its answer, as batched `yjs:catchup` events.
       //
       // Operations applied live before this join: the server's catch-up comes
       // after each of them (see `forgetAppliedLive` below).
@@ -1470,7 +1470,7 @@ export class SyncEngine {
       // listing — on a large vault seconds later, and a rename or a delete
       // made meanwhile went to it.
       const joinPromise = this.socket
-        .joinProject(this.binding.projectId, this.vectorClock, true)
+        .joinProject(this.binding.projectId, this.vectorClock)
         .then((joined) => {
           if (joined.ok && joined.opIdempotency === undefined) this.opsSettled = false;
           return joined;
@@ -1552,18 +1552,11 @@ export class SyncEngine {
       await this.reconcileAttachments(online, { onlyNew: !partial, replaced: replacedAway });
       online.throwIfAborted();
 
-      // Hydrate Yjs docs. New servers STREAM them via `yjs:catchup` (handled by
-      // `handleYjsCatchup`); we wait for the `done` batch here. Legacy servers
-      // return them inline in the ack — apply those directly.
-      if (result.yjsStream) {
-        await this.waitForCatchup(catchupDone, online);
-      } else {
-        this.catchupResolve = null;
-        for (const snap of result.yjsDocs ?? []) {
-          await this.applyCatchupDoc(snap);
-          online.throwIfAborted();
-        }
-      }
+      // Hydrate Yjs docs: the server streams them via `yjs:catchup` (handled
+      // by `handleYjsCatchup`); we wait for the `done` batch here. An answer
+      // that announces no stream brings no docs.
+      if (result.yjsStream === true) await this.waitForCatchup(catchupDone, online);
+      else this.catchupResolve = null;
       online.throwIfAborted();
 
       // Подписка на отправку локальных правок — ЛЕНИВО.
@@ -3685,13 +3678,13 @@ export class SyncEngine {
    * wrote the old attachment's bytes over it.
    *
    * The catch-up shows such a file deleted and created again (see
-   * {@link notesRecreated}). It can leave that out — a server that lists
-   * operations from the first 500 of a project's journal leaves every later
-   * one out — so a delete is also held back when the listing shows content
-   * this device never had for the file: changed by a teammate since, or made
-   * anew. A teammate's edit to a note deleted here offline then brings the
-   * note back, rather than going away with it; a new note with the content
-   * of the deleted one (two empty "Untitled") is still deleted.
+   * {@link notesRecreated}). It can leave that out — one cut short to its
+   * newest operations leaves the older ones out — so a delete is also held
+   * back when the listing shows content this device never had for the file:
+   * changed by a teammate since, or made anew. A teammate's edit to a note
+   * deleted here offline then brings the note back, rather than going away
+   * with it; a new note with the content of the deleted one (two empty
+   * "Untitled") is still deleted.
    *
    * Every queued operation of such a file is dropped, and the file the server
    * has comes back here (see {@link takeBackOvertaken}).
@@ -6281,11 +6274,10 @@ export class SyncEngine {
 
   /**
    * Attachments checked against the listing, after a catch-up that may have
-   * left operations out: one cut short to its newest operations (every server
-   * this client connects to gives the whole journal otherwise; one before
-   * 0.3.8's gave the window of its first 500 rows, and is not connected to
-   * now, see `server_outdated`). An attachment reaches this device only through
-   * its CREATE or UPDATE — neither the listing nor the docs carry its bytes.
+   * left operations out: one cut short to its newest operations (the server
+   * gives the whole journal otherwise). An attachment reaches this device
+   * only through its CREATE or UPDATE — neither the listing nor the docs
+   * carry its bytes.
    *
    * One missing here is downloaded: its CREATE was left out, and it never
    * came. Not only one new to this device (see {@link newHere}): the index
@@ -8124,7 +8116,7 @@ export class SyncEngine {
     const result = await this.socket.fetchYjsDoc(this.binding.projectId, meta.fileId);
     this.throwIfStopped();
     if (!result.ok) {
-      // A server that predates `yjs:fetch` never answers; don't make every
+      // A server that did not answer in time (a jammed one): don't make every
       // later save wait out the timeout again before the next connect.
       if (result.error === 'timeout') this.yjsFetchUnavailable = true;
       this.log.debug('yjs:fetch failed', meta.relativePath, result.error);
@@ -9379,10 +9371,8 @@ function textOf(state: Uint8Array): string {
  * broadcast were lost with the connection, was taken for a teammate's: the
  * rename queued for it was dropped and the old name came back — with an edit
  * made since, as a second note for the whole team. Without the mark, and
- * without the DELETE, nothing is concluded: a server that gives the window of
- * the journal's first rows leaves both out, and the histories themselves tell
- * then (see `DocManager.lineageOf`) — that server starts a revived note's
- * history anew.
+ * without the DELETE, nothing is concluded: the histories themselves tell
+ * then (see `DocManager.lineageOf`).
  *
  * Not when this device applied the CREATE live (`appliedLive`), nor from a
  * create of its own — the caller leaves this device's own operations out of

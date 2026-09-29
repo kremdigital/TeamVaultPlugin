@@ -46,23 +46,9 @@ async function remember(h: Harness, path: string, fileId: string, text: string):
   });
 }
 
-/** How the server delivers the docs: in the join's answer, or streamed after it. */
-type Delivery = 'inline' | 'streamed';
-
-/** The server's answer to the join: the whole journal. */
-async function answerJoin(
-  h: Harness,
-  server: FakeServer,
-  delivery: Delivery,
-  docs: YjsDocSnapshot[],
-): Promise<void> {
+/** The server's answer to the join: the whole journal, the docs streamed after it. */
+async function answerJoin(h: Harness, server: FakeServer, docs: YjsDocSnapshot[]): Promise<void> {
   const answer = server.joinAnswer('whole journal');
-  if (delivery === 'inline') {
-    h.socket()
-      .pending('project:join')
-      .ack({ ...answer, yjsDocs: docs });
-    return;
-  }
   h.socket()
     .pending('project:join')
     .ack({ ...answer, yjsStream: true, yjsCount: docs.length });
@@ -75,7 +61,7 @@ async function answerJoin(
  * whose catch-up docs are encoded before the teammate deletes Plan.md and
  * creates it again with `text`.
  */
-async function revivedWhileConnecting(delivery: Delivery, text: string, replaced: boolean) {
+async function revivedWhileConnecting(text: string, replaced: boolean) {
   const h = buildHarness();
   const server = new FakeServer(h);
   const docs = new ServerDocs(server, h, { replaceOnRevive: replaced });
@@ -84,7 +70,7 @@ async function revivedWhileConnecting(delivery: Delivery, text: string, replaced
   await remember(h, 'Other.md', 'f2', 'other\n');
   await docs.add('f2', 'Other.md', 'other\n');
   await h.engine.start();
-  await answerJoin(h, server, delivery, docs.snapshots());
+  await answerJoin(h, server, docs.snapshots());
   await docs.drive();
 
   h.socket().disconnect();
@@ -95,7 +81,7 @@ async function revivedWhileConnecting(delivery: Delivery, text: string, replaced
   h.routes.set(LIST, () => gate.promise.then(() => listing()));
   h.socket().connect();
   await flushAsync();
-  await answerJoin(h, server, delivery, docs.snapshots());
+  await answerJoin(h, server, docs.snapshots());
   await flushAsync(10);
   server.teammateDelete('f1');
   await flushAsync(20);
@@ -113,7 +99,7 @@ async function reconnect(h: Harness, server: FakeServer, docs: ServerDocs): Prom
   await flushAsync();
   h.socket().connect();
   await flushAsync();
-  await answerJoin(h, server, 'streamed', docs.snapshots());
+  await answerJoin(h, server, docs.snapshots());
   await flushAsync(40);
   await docs.drive();
 }
@@ -122,19 +108,15 @@ function conflictCopies(h: Harness): string[] {
   return [...h.vault.files.keys()].filter((p) => p.includes('.conflict-'));
 }
 
-describe.each([
-  ['streamed', 'replaced'],
-  ['inline', 'replaced'],
-  ['streamed', 'continued'],
-] as const)(
-  'SyncEngine — a note revived while this device connects, docs %s, its history %s',
-  (delivery, history) => {
+describe.each(['replaced', 'continued'] as const)(
+  'SyncEngine — a note revived while this device connects, its history %s',
+  (history) => {
     const replaced = history === 'replaced';
     it.each([
       ['the same text', OLD],
       ['another text', 'new plan\n'],
     ])('keeps the new note, created again with %s, and an edit to it once', async (_, text) => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, text, replaced);
+      const { h, server, docs } = await revivedWhileConnecting(text, replaced);
       expect(h.vault.text('Plan.md')).toBe(text);
       expect(docs.text('f1')).toBe(text);
 
@@ -159,7 +141,7 @@ describe.each([
     });
 
     it('sends an edit made to it offline into it', async () => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', replaced);
+      const { h, server, docs } = await revivedWhileConnecting('new plan\n', replaced);
       h.socket().disconnect();
       await flushAsync();
       h.vault.files.set('Plan.md', encode('new plan\nmine\n'));
@@ -179,7 +161,7 @@ describe.each([
     });
 
     it('sends a delete of it made offline', async () => {
-      const { h, server, docs } = await revivedWhileConnecting(delivery, 'new plan\n', replaced);
+      const { h, server, docs } = await revivedWhileConnecting('new plan\n', replaced);
       h.socket().disconnect();
       await flushAsync();
       h.vault.files.delete('Plan.md');
@@ -207,7 +189,7 @@ describe('SyncEngine — a note deleted here and created again while this device
     await remember(h, 'Untitled.md', 'f1', OLD);
     await docs.add('f1', 'Untitled.md', OLD);
     await h.engine.start();
-    await answerJoin(h, server, 'streamed', docs.snapshots());
+    await answerJoin(h, server, docs.snapshots());
     await docs.drive();
 
     h.socket().disconnect();

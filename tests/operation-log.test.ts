@@ -973,38 +973,56 @@ describe('OperationLog — operations in flight on disk', () => {
     );
   });
 
-  it('takes a 0.3.9 queue: gives ids, strips what said an entry went out, warns once', async () => {
-    const raw = readFileSync(join(__dirname, 'fixtures', 'state-0.3.9.json'), 'utf8');
-    const { storage } = makeStorage({ [PATH]: raw });
-    const warnings: Array<[string, Record<string, unknown>]> = [];
-    const onWarn = (message: string, detail: Record<string, unknown>): void => {
-      warnings.push([message, detail]);
-    };
-    const log = new OperationLog({ storage, filePath: PATH, now, onWarn });
+  it('loads a state.json written by 0.4.0 as it is', async () => {
+    const raw = readFileSync(join(__dirname, 'fixtures', 'state-0.4.0.json'), 'utf8');
+    const { storage, files } = makeStorage({ [PATH]: raw });
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
     await log.load();
 
-    const queued = log.dequeueOperations('b1');
-    expect(queued.map((op) => op.id)).toEqual([9, 10, 11, 12]);
-    for (const op of queued) expect(isOpId(op.opId)).toBe(true);
-    expect(new Set(queued.map((op) => op.opId)).size).toBe(4);
-    expect(queued.map((op) => op.payload)).toEqual([
-      { fileId: 'f1', lastSynced: ['h-old'] },
-      { fileType: 'TEXT', contentHash: 'h-untitled', size: 0 },
-      { fileId: 'f3' },
-      { fileId: 'f7', contentHash: 'h-photo-2', size: 2048 },
+    // What was in flight is back in the queue, at its place, ids and payloads kept.
+    expect(log.inFlightOperations('b1')).toEqual([]);
+    expect(
+      log
+        .dequeueOperations('b1')
+        .map((op) => [op.id, op.opType, op.opId, op.payload, op.settleOnly]),
+    ).toEqual([
+      [21, 'RENAME', '0f3c2a1e-5b6d-4c7e-8f90-a1b2c3d4e5f6', { fileId: 'f3' }, undefined],
+      [
+        22,
+        'UPDATE',
+        '1a2b3c4d-5e6f-4a7b-9c8d-e0f1a2b3c4d5',
+        { fileId: 'f7', contentHash: 'h-photo-2', size: 2048 },
+        undefined,
+      ],
+      [
+        23,
+        'CREATE',
+        '5e6f7a8b-9c0d-4e1f-a2b3-c4d5e6f70819',
+        { fileType: 'TEXT', contentHash: 'h-asked', size: 6 },
+        true,
+      ],
     ]);
-    expect(warnings).toEqual([['legacy in-flight entries: 3', { entries: 3 }]]);
-    expect(log.getFileMeta('b1', 'a.md')?.serverFileId).toBe('f3');
-    expect(log.getBindingState('b1')?.lastVectorClock).toEqual({ 'device-1': 7, 'device-2': 4 });
-
-    // The ids given are kept: written once, loaded as they are.
-    log.setFileMeta(makeMeta({ relativePath: 'touch.md' }));
+    expect(log.getFileMeta('b1', 'Notes/a.md')).toMatchObject({
+      serverFileId: 'f3',
+      foldedHash: 'h-a',
+    });
+    expect(log.getFileMeta('b1', 'img/photo.png')).toMatchObject({
+      fileType: 'BINARY',
+      size: 1024,
+    });
+    expect(log.getFileMeta('b1', 'Theirs.md')?.notOnDisk).toBe(true);
+    expect(log.getBindingState('b1')?.lastVectorClock).toEqual({ 'device-1': 21, 'device-2': 4 });
+    expect([...log.appliedLiveIds('b1')]).toEqual(['cl_31', 'cl_32']);
+    expect([...log.deleteAskedIds('b1')]).toEqual(['f5']);
+    // Nothing to write: every id was there, and the file is not rewritten on load.
+    for (const op of log.dequeueOperations('b1'))
+      expect(log.queuedWritten('b1', op.opId)).toBe(true);
+    expect(log.hasUnwrittenChanges()).toBe(false);
+    await log.flush();
+    expect(files.get(PATH)).toBe(raw);
+    // New operations keep climbing past the file's counter.
+    expect(log.enqueueOperation('b1', { opType: 'CREATE', filePath: 'n.md' }).id).toBe(24);
     await log.close();
-    const again = new OperationLog({ storage, filePath: PATH, now, onWarn });
-    await again.load();
-    expect(again.dequeueOperations('b1').map((op) => op.opId)).toEqual(queued.map((op) => op.opId));
-    expect(warnings).toHaveLength(1);
-    expect(again.schemaVersion()).toBe(1);
   });
 
   it('gives a new id to an entry whose id is malformed or seen twice', async () => {
@@ -1240,8 +1258,21 @@ describe('OperationLog — persistNow and unwritten changes', () => {
     await loaded.close();
   });
 
-  it('puts the ids it gives a 0.3.9 queue on disk before one of them can go out', async () => {
-    const raw = readFileSync(join(__dirname, 'fixtures', 'state-0.3.9.json'), 'utf8');
+  it('puts the ids it gives a queue on disk before one of them can go out', async () => {
+    // Entries without an id, or with one seen twice: a damaged file.
+    const raw = JSON.stringify({
+      version: 1,
+      nextOpId: 4,
+      bindings: {
+        b1: {
+          pending: [
+            { id: 1, opType: 'DELETE', filePath: 'a.md', payload: { fileId: 'f1' } },
+            { id: 2, opType: 'DELETE', filePath: 'b.md', payload: {}, opId: opIdOf(7) },
+            { id: 3, opType: 'DELETE', filePath: 'c.md', payload: {}, opId: opIdOf(7) },
+          ],
+        },
+      },
+    });
     const { storage, files } = makeStorage({ [PATH]: raw });
     const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
     await log.load();
