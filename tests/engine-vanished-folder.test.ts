@@ -218,6 +218,55 @@ async function uploaded(b: Bench, path: string, content: ArrayBuffer): Promise<s
   return id;
 }
 
+/**
+ * Obsidian started again after `b`'s engine stopped: a new engine on the same
+ * disk and `state.json`, connected, its catch-up, queue and first upload done.
+ */
+async function restarted(b: Bench): Promise<Bench> {
+  const logger = new Logger('debug', {
+    write: (e) => {
+      b.entries.push(e);
+    },
+  });
+  const h = buildHarness({ predecessor: b.h, logger });
+  b.server.attach(h);
+  await h.engine.start();
+  (await joinToAnswer(h)).ack(b.server.joinAnswer('whole journal'));
+  const next = { ...b, h };
+  await tailDone(next, 0);
+  return next;
+}
+
+/**
+ * `event` handled, and the engine stopped — Pause sync, the plugin disabled,
+ * Obsidian closed — at the handler's look at the disk after `looks` others,
+ * if it gets that far.
+ */
+async function stopAtLook(b: Bench, event: VaultEvent, looks: number): Promise<void> {
+  const look = b.h.vault.gate('exists', looks);
+  const handled = b.h.engine.handleVaultEvent(event).then(
+    () => undefined,
+    () => undefined,
+  );
+  await Promise.race([look.reached, handled]);
+  const stopped = b.h.engine.stop();
+  look.release();
+  await stopped;
+  await handled;
+}
+
+/** A folder `dir` removed here as a teammate's, and a teammate's `dir/c.png` written into it since. */
+async function prunedThenWritten(b: Bench): Promise<string> {
+  const mark = b.entries.length;
+  b.server.teammateDelete('f1', { folder: 'dir' });
+  await until('the folder removed', () => said(b, REMOVED, mark));
+  // Written right after, before Obsidian looks: the folder is back.
+  const id = await uploaded(b, 'dir/c.png', encode('pic'));
+  await until('the file written', () => b.h.vault.files.has('dir/c.png'));
+  await b.h.settle();
+  return id;
+}
+
 async function reconnect(b: Bench, rows?: number): Promise<void> {
   const before = joinsOf(b.h);
   const lookups = tombstoneLookups(b.h);
@@ -984,6 +1033,96 @@ describe('SyncEngine — a folder a teammate deleted or renamed: removed here on
     expect(sent(b, emits)).toEqual([]);
     expect(b.server.pathOf(id)).toBe('dir/c.png');
     expect(b.h.vault.files.has('dir/c.png')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it.each([
+    ['its first look at the disk', 0],
+    ['its second look at the disk', 1],
+  ])(
+    'Obsidian’s late report of the folder removed, sync stopped at %s: the teammate’s file written into it since is deleted nowhere',
+    async (_at, looks) => {
+      const b = await seeded(['dir/a.png', 'keep.png']);
+      const id = await prunedThenWritten(b);
+
+      // Obsidian reports the removal made here only now.
+      await stopAtLook(b, folderEvent('dir'), looks);
+      expect(b.h.vault.files.has('dir/c.png')).toBe(true);
+
+      const next = await restarted(b);
+      expect(sent(next)).toEqual([]);
+      expect(b.server.pathOf(id)).toBe('dir/c.png');
+      expect(b.h.vault.text('dir/c.png')).toBe('pic');
+      await next.h.engine.stop();
+    },
+  );
+
+  it('Obsidian’s late report of the folder removed, with a file written into it since: nothing recorded to send', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    await prunedThenWritten(b);
+    const calls = b.h.calls.length;
+
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+
+    // Nothing that a crash right then, or sync stopped, could send.
+    const recorded = b.h.calls
+      .slice(calls)
+      .filter((call) => call === 'log.recordInFlight' || call === 'log.enqueueOperation');
+    expect(recorded).toEqual([]);
+    expect(b.h.vault.files.has('dir/c.png')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('the user deletes a folder removed here, a file of it back on disk before sync stops: its delete is looked at again, and it stays', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+
+    // The user deletes the folder: Obsidian's report of it is the one of the
+    // removal made here, never reported. After the look at the folder, gone,
+    // the file is back on disk — a teammate's new version of it written right
+    // then — and sync stops at the next look.
+    b.h.vault.removeFolder('dir');
+    const look = b.h.vault.gate('exists', 1);
+    const handled = b.h.engine.handleVaultEvent(folderEvent('dir')).then(
+      () => undefined,
+      () => undefined,
+    );
+    await look.reached;
+    b.h.vault.files.set('dir/c.png', encode('pic'));
+    const stopped = b.h.engine.stop();
+    look.release();
+    await stopped;
+    await handled;
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual([]);
+    expect(b.server.pathOf(id)).toBe('dir/c.png');
+    expect(b.h.vault.text('dir/c.png')).toBe('pic');
+    await next.h.engine.stop();
+  });
+
+  it('a folder’s report with a file of it still on disk: the user’s next change of that file is not taken for an echo', async () => {
+    const b = await seeded(['dir/a.png', 'dir/b.png', 'keep.png']);
+    const emits = b.h.socket().emits.length;
+    // The user deletes the folder, and `dir/b.png` is written back before
+    // Obsidian reports it: only `dir/a.png` is gone.
+    b.h.vault.files.delete('dir/a.png');
+    // Each mark the engine makes (see `RecentlyApplied`): one of a path
+    // swallows the next report of it for a while, taken for the echo of a
+    // change the plugin made.
+    const marked: string[] = [];
+    const mark = b.h.echo.mark.bind(b.h.echo);
+    b.h.echo.mark = (path: string, count?: number): void => {
+      marked.push(path);
+      mark(path, count);
+    };
+
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/a.png']);
+    // The chokidar `unlink` of the file gone is swallowed; the user's delete
+    // of the file still there, a moment later, is not.
+    expect(marked).toEqual(['dir/a.png']);
     await b.h.engine.stop();
   });
 

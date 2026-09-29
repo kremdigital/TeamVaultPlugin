@@ -365,6 +365,12 @@ interface DeleteClaim {
   end(outcome: DeleteOutcome): void;
 }
 
+/** How a local delete goes (see `SyncEngine.sendLocalDelete`). */
+interface DeleteOptions {
+  /** The file of a folder deleted: marked as an echo once found gone from disk. */
+  readonly markEcho?: boolean;
+}
+
 /**
  * Where a local change comes from. A `queue` replay is held by the offline
  * queue itself — its entry stays until the drain marks it sent — so the
@@ -4867,6 +4873,12 @@ export class SyncEngine {
   private async handleLocalFolderDelete(folderPath: string): Promise<void> {
     if (!isInBinding(folderPath, this.binding.localFolder)) return;
     let children = this.indexedUnder(folderPath);
+    /**
+     * A folder removed here as a teammate's (see below), whose report is less
+     * sure to be the user's delete: each child's delete is held unchecked
+     * (see `holdLocalDelete`).
+     */
+    let removedHere = false;
     if (this.prunedHere.delete(this.folderKey(folderPath))) {
       // Removed here as a teammate's, with nothing recorded under it. What is
       // recorded under it since and has not reached this disk — a teammate's
@@ -4898,6 +4910,19 @@ export class SyncEngine {
         });
         return;
       }
+      // The folder is there: the report is Obsidian's late one of the removal
+      // made here, and a teammate's file written since brought the folder
+      // back. A folder the user deletes is gone. Taken for the user's delete,
+      // each file written since was left to its own check (see
+      // `sendLocalDelete`), still on disk: a `stop()` during it queued a plain
+      // DELETE, and the next start deleted the teammate's file for the whole
+      // team.
+      if (await this.folderThere(folderPath)) {
+        this.log.debug('folder delete: a folder removed here as a teammate’s is back', {
+          folder: folderPath,
+        });
+        return;
+      }
       this.log.debug(
         'folder delete: a folder removed here as a teammate’s holds files written since',
         {
@@ -4905,12 +4930,17 @@ export class SyncEngine {
           files: children.length,
         },
       );
+      removedHere = true;
     }
     if (children.length === 0) return;
     // Hold every child's delete up front. They go out one ack at a time, and
     // a `stop()` halfway through must queue the ones not sent yet — the next
     // catch-up would otherwise write them back to disk. Checked already: the
-    // folder is gone, so none of them can still be on disk.
+    // folder is gone, so none of them can still be on disk. Not for a folder
+    // removed here: a file of it may be back on disk before its own check
+    // (see `sendLocalDelete`) — a teammate's new version of it written right
+    // then — and handed over, its delete is looked at again (see
+    // `holdLocalDelete`).
     //
     // Claimed up front too, before the first `await`: an event of a child
     // that comes after this one joins its delete. A child whose delete is
@@ -4927,7 +4957,7 @@ export class SyncEngine {
         underWay.push({ path, claim });
         continue;
       }
-      const change = this.holdLocalDelete(path, { checked: true });
+      const change = this.holdLocalDelete(path, { checked: !removedHere });
       held.push(change);
       if (fileId !== '') claimed.set(change, this.claimDelete(fileId, change.opId));
     }
@@ -4954,21 +4984,19 @@ export class SyncEngine {
           claimed.get(change)?.end('gone');
           continue;
         }
-        // A chokidar `unlink` of a child can still follow. Pre-mark each
-        // child so that echo is swallowed instead of dispatching a second
-        // handleLocalDelete. Marked as its turn comes: a mark made ahead
-        // would take Obsidian's own event of a subfolder's file, which comes
-        // after the subfolder's, instead of the `unlink`.
-        this.recentlyApplied.mark(change.filePath);
-        await this.handleLocalDelete(change.filePath, change);
+        // A chokidar `unlink` of a child can still follow: marked as an echo
+        // (see `sendLocalDelete`), it is swallowed instead of dispatching a
+        // second handleLocalDelete.
+        await this.handleLocalDelete(change.filePath, change, { markEcho: true });
       }
       for (const { path, claim } of underWay) {
         if ((await claim.done) === 'gone') continue;
         // Its handler found it still on disk, or gave up before sending: the
         // folder is gone, so it is deleted from here.
         if (!this.fileIndex.byPath.has(path)) continue;
-        this.recentlyApplied.mark(path);
-        await this.handleLocalDelete(path, this.holdLocalDelete(path, { checked: true }));
+        await this.handleLocalDelete(path, this.holdLocalDelete(path, { checked: !removedHere }), {
+          markEcho: true,
+        });
       }
     } finally {
       for (const change of held) {
@@ -5051,11 +5079,12 @@ export class SyncEngine {
 
   /**
    * `from` is where the delete comes from, or the change a folder delete
-   * already holds for this path.
+   * already holds for this path. `opts`: see {@link sendLocalDelete}.
    */
   private async handleLocalDelete(
     path: string,
     from: LocalSource | HeldChange = 'watcher',
+    opts: DeleteOptions = {},
   ): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
     // Held before the stale-delete check below: that is a disk read `stop()`
@@ -5068,7 +5097,7 @@ export class SyncEngine {
           ? this.holdLocalDelete(path, { checked: false })
           : from;
     try {
-      await this.sendLocalDelete(path, change);
+      await this.sendLocalDelete(path, change, opts);
     } finally {
       this.settle(change);
     }
@@ -5112,13 +5141,23 @@ export class SyncEngine {
    * delete went out as that note's: the server deleted it for the whole team,
    * its history was dropped here, and the file deleted here stayed on the
    * server under its name, where the rename of the other one was refused.
+   *
+   * `markEcho`: a file of a folder deleted (see {@link handleLocalFolderDelete}),
+   * whose chokidar `unlink` can still follow. Marked as an echo once the file
+   * is found gone from disk, not before: a file still there — a folder's
+   * report that came late, a stray event — kept the mark, and it swallowed
+   * the user's next real change of the file.
    */
-  private async sendLocalDelete(path: string, change: HeldChange | null): Promise<void> {
+  private async sendLocalDelete(
+    path: string,
+    change: HeldChange | null,
+    opts: DeleteOptions = {},
+  ): Promise<void> {
     const opId = change?.opId ?? newOpId();
     const indexed = this.fileIndex.byPath.get(path)?.fileId ?? '';
     const underWay = this.deleteClaimedByOther(indexed, opId);
     if (underWay !== undefined) {
-      await this.joinDelete(path, change, underWay);
+      await this.joinDelete(path, change, underWay, opts);
       return;
     }
     let claim = indexed === '' ? null : this.claimDelete(indexed, opId);
@@ -5135,6 +5174,10 @@ export class SyncEngine {
       // strips the path out of `fileIndex` — and the next watcher event
       // then finds an empty index and dispatches a phantom `file:create`.
       if (await this.vault.exists(path)) return;
+      // Only now (see `markEcho`), as the file's turn comes: a mark made ahead
+      // would take Obsidian's own event of a subfolder's file, which comes
+      // after the subfolder's, instead of the `unlink`.
+      if (opts.markEcho === true) this.recentlyApplied.mark(path);
       // The folder that went with the file, if it did: its teammates remove
       // it too (see `vanishedFolderOf`).
       const folder = await this.vanishedFolderOf(parentFolder(path));
@@ -5200,6 +5243,7 @@ export class SyncEngine {
       if (fileId !== '' && claim?.fileId !== fileId) {
         const taken = this.deleteClaimedByOther(fileId, opId);
         if (taken !== undefined) {
+          // Marked already, if it is to be.
           await this.joinDelete(path, change, taken);
           return;
         }
@@ -5313,12 +5357,13 @@ export class SyncEngine {
    * Another handler is deleting the file at `path` (see {@link deleteClaims}):
    * this delete is that one, and waits for it. Only when nothing went out for
    * it — the file was still on disk when that handler looked — does this one
-   * look again, as a delete of its own.
+   * look again, as a delete of its own. `opts`: see {@link sendLocalDelete}.
    */
   private async joinDelete(
     path: string,
     change: HeldChange | null,
     claim: DeleteClaim,
+    opts: DeleteOptions = {},
   ): Promise<void> {
     // Let go at once: held by both, `stop()` queued both, and both went out.
     this.releaseDelete(change);
@@ -5329,7 +5374,7 @@ export class SyncEngine {
         ? null
         : this.holdLocalDelete(path, { checked: change.payload[RECHECK_DELETE] !== true });
     try {
-      await this.sendLocalDelete(path, again);
+      await this.sendLocalDelete(path, again, opts);
     } finally {
       this.settle(again);
     }
