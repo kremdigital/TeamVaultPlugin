@@ -32,6 +32,7 @@ import {
   flushAsync,
   joinToAnswer,
   joinsOf,
+  json,
   nextJoin,
   userRename,
   type Harness,
@@ -895,6 +896,58 @@ describe('SyncEngine — a folder a teammate deleted or renamed while this devic
     (await joinToAnswer(b.h)).ack(b.server.joinAnswer('whole journal'));
     await resumed;
     await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('the lookup of the server’s deleted files failed: the next connect removes the folder with the copy', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    const served = b.h.routes.get(TOMBSTONES);
+    if (served === undefined) throw new Error('no route for the deleted files');
+    b.h.routes.set(TOMBSTONES, () => json({ error: 'internal' }, 500));
+
+    await reconnect(b);
+    // The first upload is put off: the copy stays, and the folder with it.
+    expect(b.h.vault.files.has('dir/a.png')).toBe(true);
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+
+    b.h.routes.set(TOMBSTONES, served);
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('a copy that could not be removed keeps its folder for the next connect; the other folders go at once', async () => {
+    const b = await seeded(['one/a.png', 'two/b.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'one' });
+    b.server.teammateDelete('f2', { folder: 'two' });
+    // The first removal of `one/a.png` fails: held by another program, say.
+    const remove = b.h.vault.delete.bind(b.h.vault);
+    let failed = false;
+    b.h.vault.delete = async (path: string): Promise<void> => {
+      if (path === 'one/a.png' && !failed) {
+        failed = true;
+        throw new Error('EBUSY');
+      }
+      await remove(path);
+    };
+
+    await reconnect(b);
+    await until('the other folder removed', () => !b.h.vault.folders.has('two'));
+    expect(failed).toBe(true);
+    expect(b.h.vault.files.has('one/a.png')).toBe(true);
+    expect(b.h.vault.folders.has('one')).toBe(true);
+
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await until('the folder removed', () => !b.h.vault.folders.has('one'));
 
     expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
     await b.h.engine.stop();

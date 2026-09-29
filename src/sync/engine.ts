@@ -858,8 +858,9 @@ export class SyncEngine {
    * {@link drainThenInitialPush}): the copies of files deleted while this
    * device was away are still on disk during the catch-up, and go only then
    * (see {@link initialPush}). Kept for the next connect's tail when this
-   * one's is cut short (Pause sync, the connection lost): the catch-up does
-   * not bring those operations again.
+   * one's is cut short (Pause sync, the connection lost), and when its first
+   * upload could not remove the copies (see {@link pruneCatchupFolders}): the
+   * catch-up does not bring those operations again.
    */
   private readonly catchupFolders = new Map<string, string>();
 
@@ -2738,9 +2739,10 @@ export class SyncEngine {
     // upload pass sent new files over that connection ahead of its drain.
     if (link.signal.aborted) return;
     try {
-      await this.initialPush(online);
-      // The copies of files deleted while away are gone by now.
-      await this.pruneCatchupFolders();
+      const unsettled = await this.initialPush(online);
+      // The copies of files deleted while away are gone by now, but for those
+      // the first upload could not settle.
+      await this.pruneCatchupFolders(unsettled);
     } finally {
       await this.askAboutRetiredWhileAway(online);
     }
@@ -2754,8 +2756,13 @@ export class SyncEngine {
    * of truth for those — re-uploading here would duplicate them on the
    * server). Errors per-file are swallowed so one bad file doesn't block
    * the rest.
+   *
+   * The paths of copies of files deleted while this device was away (see
+   * {@link deletedWhileAway}) it could not settle — left as they are for the
+   * next connect — or `null` when it settled none: the server's deleted files
+   * could not be looked up.
    */
-  private async initialPush(online: AbortSignal): Promise<void> {
+  private async initialPush(online: AbortSignal): Promise<ReadonlySet<string> | null> {
     const paths = await this.vault.list(this.binding.localFolder);
     const pending = this.operationLog.pendingPaths(this.binding.id);
     // Paths the server currently holds as tombstones. Re-uploading one would
@@ -2771,8 +2778,9 @@ export class SyncEngine {
       // the whole pass; the next reconnect / a live watcher CREATE retries the
       // genuinely-new files.
       this.log.debug('initialPush: tombstone lookup failed; deferring upload pass');
-      return;
+      return null;
     }
+    const unsettled = new Set<string>();
     const deletedAway = this.deletedWhileAway(tombstones.ids, pending);
     // Copies the server had go first, without a question — before anything
     // here waits: the list is not looked at again. Acted on after the uploads
@@ -2791,6 +2799,7 @@ export class SyncEngine {
         } catch {
           online.throwIfAborted();
           // Left as it is: the next connect finds the record again.
+          unsettled.add(away.record.relativePath);
         }
       }
       await this.uploadNewFiles(paths, pending, tombstones.paths, deletedAway, online);
@@ -2801,6 +2810,7 @@ export class SyncEngine {
         } catch {
           online.throwIfAborted();
           // Left as it is: the next connect finds the record again.
+          unsettled.add(away.record.relativePath);
         }
       }
     } finally {
@@ -2808,6 +2818,7 @@ export class SyncEngine {
         if (this.awayCopies.get(path) === away.record.serverFileId) this.awayCopies.delete(path);
       }
     }
+    return unsettled;
   }
 
   /** The upload pass of {@link initialPush}. */
@@ -5350,12 +5361,42 @@ export class SyncEngine {
 
   /**
    * The folders of the catch-up (see {@link catchupFolders}), each removed
-   * if nothing is left in it.
+   * if nothing is left in it, once the first upload has removed the copies
+   * of files deleted while this device was away. `unsettled`: the copies it
+   * could not settle, `null` when it settled none (see {@link initialPush}).
+   * A folder that holds such a copy is kept for the next connect's tail,
+   * which removes the copy: the catch-up does not bring the folder's
+   * operations again. Given up on, as it used to be, the folder stayed here
+   * for good once the copy went.
    */
-  private async pruneCatchupFolders(): Promise<void> {
-    const folders = [...this.catchupFolders];
-    this.catchupFolders.clear();
-    for (const [folder, from] of folders) await this.pruneVanishedFolder(folder, from);
+  private async pruneCatchupFolders(unsettled: ReadonlySet<string> | null): Promise<void> {
+    if (unsettled === null) {
+      if (this.catchupFolders.size > 0) {
+        this.log.debug('folders a teammate removed are left for the next connect', {
+          folders: this.catchupFolders.size,
+        });
+      }
+      return;
+    }
+    for (const [folder, from] of [...this.catchupFolders]) {
+      if ([...unsettled].some((path) => this.isUnder(path, folder))) {
+        this.log.debug(
+          'a folder a teammate removed holds a copy not removed yet; left for the next connect',
+          {
+            folder,
+          },
+        );
+        continue;
+      }
+      this.catchupFolders.delete(folder);
+      await this.pruneVanishedFolder(folder, from);
+    }
+  }
+
+  /** Whether `path` is under `folder`: in any case, on a disk that takes names in any case. */
+  private isUnder(path: string, folder: string): boolean {
+    if (!this.caseInsensitive()) return path.startsWith(`${folder}/`);
+    return this.caseKey(path).startsWith(`${pathKey(folder)}/`);
   }
 
   /**
