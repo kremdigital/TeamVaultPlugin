@@ -1069,26 +1069,43 @@ sync) останавливала движки, и всё сделанное на
    ВНЕ репозитория и открыть её как вальт (Open folder as vault). Ожидается
    уведомление «this vault now syncs as a new device», в `sync.log` —
    `client id replaced` с `"reason":"vault-copied"` и `previous` = старый
-   `clientId`. В `data.json` копии — новый `clientId`, `previousClientIds`
-   со старым, `clientIdRotatedAt`. В `data.json` оригинала — старый
-   `clientId`.
+   `clientId`. В `data.json` копии — новый `clientId`, `clientIdRotatedAt` и
+   пустой `previousClientIds`: под старым id копия ничего не отправляла. В
+   `data.json` оригинала — старый `clientId`.
 4. Вложение. В копии заменить вложение (заметки не трогать), дождаться
    синхронизации, закрыть копию. Открыть оригинал: вложение новое. В
    `sync.log` оригинала нет `another device uses the same id`.
 5. Повторный запуск копии: `clientId` не меняется, уведомления нет.
-6. Старая пара (реактивная ветка, по желанию). В `data.json` копии вернуть
-   старый `clientId`, удалить `clientIdClaimed`, `previousClientIds`,
-   `clientIdRotatedAt` (плагин выключен). Открыть копию, изменить вложение:
-   id не меняется (`claimed`), но на оригинале при следующем подключении —
-   `warn` `another device uses the same id` с `opId` и `opType` строки и
-   уведомление о том, что id сменится при следующем запуске. Перезапустить
-   Obsidian на оригинале: `client id replaced` с `"reason":"twin-seen"`.
-   Если id сменился меньше суток назад — `client id change put off`.
-7. Уборка. Закрыть Obsidian, удалить папку копии, убрать её из списка
+6. `data.json` копии в оригинале (папка плагина, которую синхронизирует
+   облако, или копия, принесённая обратно). Закрыть Obsidian, отложить
+   `data.json` оригинала вне вальтов и положить на его место `data.json`
+   копии. Открыть оригинал: уведомления нет, в `sync.log` —
+   `client id settled for this vault` с `"reason":"from-vault-store"`, в
+   `data.json` оригинала снова его прежний `clientId`. Закрыть Obsidian и
+   вернуть отложенный `data.json`.
+7. Старая пара (реактивная ветка, по желанию). С шага 3 в оригинале ничего не
+   менять: иначе строка копии под старым id может не прийти оригиналу в
+   catch-up (это и есть дефект двойника), и предупреждения не будет. Открыть
+   копию и в консоли разработчика (Ctrl+Shift+I, на macOS Cmd+Opt+I)
+   выполнить `app.saveLocalStorage('team-vault-client-id', null)`: без этого
+   копия возьмёт свой id из хранилища вальта (`from-vault-store`), а не старый
+   из `data.json`. Закрыть Obsidian. В `data.json` копии вернуть старый
+   `clientId`, удалить `clientIdClaimed`, `previousClientIds`,
+   `clientIdRotatedAt`. Открыть копию: в `sync.log` —
+   `client id settled for this vault` с `"reason":"claimed"` и старым
+   `clientId`. Изменить вложение, дождаться синхронизации, закрыть копию.
+   Открыть оригинал: при подключении в `sync.log` —
+   `warn` `another device uses the same id` с `opId` и `opType` строки, и
+   уведомление о том, что изменения, сделанные тем устройством, пока этот
+   вальт был без связи, могли не прийти, а id сменится при следующем запуске.
+   Перезапустить Obsidian на оригинале: `client id replaced` с
+   `"reason":"twin-seen"`. Если id оригинала сменился меньше суток назад —
+   `client id change put off`.
+8. Уборка. Закрыть Obsidian, удалить папку копии, убрать её из списка
    вальтов. Привязку в копии НЕ удалять: общий binding id сотрёт базы
    IndexedDB `test-vault`. Ключ `<id копии>-team-vault-client-id` в
    localStorage Obsidian останется — это безвредно.
-8. Падение сразу после первого запуска 0.4.1 (Chromium пишет localStorage на
+9. Падение сразу после первого запуска 0.4.1 (Chromium пишет localStorage на
    диск с задержкой): если Obsidian убит через секунды после шага 2, при
    следующем запуске `clientId` может смениться один раз
    (`vault-copied`) — это ожидаемо, дальше он не меняется.

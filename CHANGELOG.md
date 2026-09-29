@@ -70,15 +70,21 @@ uses [Semantic Versioning](https://semver.org/).
   storage for this vault (`app.saveLocalStorage`, which a copy doesn't take
   along) and gives a vault whose id belongs to another vault a new one on
   its first start, before it syncs, with a notice and a `client id replaced`
-  line in `sync.log`. A pair made before this version, or copied along with
-  Obsidian's own data, is found when one of them sees a change under its id
-  that it didn't send: its id changes at the next start. An id changes at
-  most once a day, and only once Obsidian's storage has kept it, so a full
-  storage can't make it change on every start. After a change, Team Vault
-  still recognises the changes it sent under the old id — by their operation
-  keys — and keeps its place in the server's log under the old id too, so
-  none of them comes back in a catch-up as a teammate's. The README no longer
-  asks you to reset `"clientId"` by hand.
+  line in `sync.log` — a copy of a copy made the same day too. The id kept
+  in Obsidian's storage wins over the one in `data.json`: a `data.json` from
+  another computer (a plugin folder another tool syncs, a copy carried back)
+  never makes a vault take that computer's id. A pair made before this
+  version, or copied along with Obsidian's own data, is found when one of
+  them sees a change under its id that it didn't send: its id changes at the
+  next start, at most once a day. An id counts as this vault's only once
+  Obsidian's storage has kept it, so a full storage can't make it change on
+  every start. After a change, Team Vault still recognises the changes it
+  sent under the old id — by their operation keys — and keeps its place in
+  the server's log under the ids it sent changes under, so none of them comes
+  back in a catch-up as a teammate's. A copy takes none of its original's
+  ids along, so every change the original makes after the copy was taken
+  reaches the copy. The README no longer asks you to reset `"clientId"` by
+  hand.
 - **A teammate's note written here right before Obsidian crashed is no
   longer sent back as your own.** Team Vault records that it wrote a
   teammate's note to disk about half a second after the write. When Obsidian

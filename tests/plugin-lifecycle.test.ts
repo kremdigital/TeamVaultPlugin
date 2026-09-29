@@ -827,11 +827,12 @@ describe('plugin lifecycle — the client id of a copied vault', () => {
     expect(clientId).not.toBe('client-1');
     expect(clientId).not.toBe('');
     expect(run.engineClientId()).toBe(clientId);
+    // `client-1` is the original's: the copy sent nothing under it.
     expect(run.saved()).toMatchObject({
       clientId,
       clientIdClaimed: true,
       twinClientId: '',
-      previousClientIds: ['client-1'],
+      previousClientIds: [],
     });
     expect(run.saved().clientIdRotatedAt).toBeGreaterThanOrEqual(startedAt);
     expect(run.saved().clientIdRotatedAt).toBeLessThanOrEqual(Date.now());
@@ -848,6 +849,126 @@ describe('plugin lifecycle — the client id of a copied vault', () => {
     expect(again.plugin.settings.clientId).toBe('client-1');
     expect(Notice.shown).toEqual([]);
     await again.stop();
+  });
+
+  // The regression: the copy's data.json, back in the original's plugin
+  // folder (a folder another tool syncs, the copy carried back), listed the
+  // original's id as one left, and the original took the copy's id — two
+  // devices under one id.
+  it('leaves the original its own id when the copy’s data.json comes back to it', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const original = vault(id, dataJson(), 'vault-a', storage);
+    await (await start(original, id)).stop();
+
+    const copyId = `team-vault-identity-${++seq}`;
+    const copy = vault(
+      copyId,
+      original.files.get(`.obsidian/plugins/${id}/data.json`) ?? '',
+      'vault-b',
+      storage,
+    );
+    const copied = await start(copy, copyId);
+    const copyClientId = copied.plugin.settings.clientId;
+    expect(copyClientId).not.toBe('client-1');
+    await copied.stop();
+
+    original.files.set(
+      `.obsidian/plugins/${id}/data.json`,
+      copy.files.get(`.obsidian/plugins/${copyId}/data.json`) ?? '',
+    );
+    Notice.shown = [];
+    const back = await start(original, id);
+    expect(back.plugin.settings.clientId).toBe('client-1');
+    expect(back.engineClientId()).toBe('client-1');
+    expect(back.saved()).toMatchObject({ clientId: 'client-1' });
+    expect(storage.items.get(`vault-a-${CLIENT_ID_KEY}`)).toBe('"client-1"');
+    expect(Notice.shown).toEqual([]);
+    await back.stop();
+
+    // And the copy, its data.json the original's again, keeps its own.
+    copy.files.set(
+      `.obsidian/plugins/${copyId}/data.json`,
+      original.files.get(`.obsidian/plugins/${id}/data.json`) ?? '',
+    );
+    const again = await start(copy, copyId);
+    expect(again.plugin.settings.clientId).toBe(copyClientId);
+    expect(again.engineClientId()).toBe(copyClientId);
+    await again.stop();
+  });
+
+  // The same through a twin: a pair from before whose data.json another tool
+  // syncs; the one that left the shared id listed it as left in data.json,
+  // and the other, given that data.json, took the new id too.
+  it('leaves each of a pair from before its own id once one of them left the shared one', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const a = vault(id, dataJson(), 'vault-a', storage);
+    const bId = `team-vault-identity-${++seq}`;
+    const b = vault(bId, dataJson(), 'vault-b', storage);
+    await (await start(a, id)).stop();
+    const first = await start(b, bId);
+    expect(first.plugin.settings.clientId).toBe('client-1');
+    const manager = internals(first.plugin).engineManager as {
+      deps: { onTwinDetected?: (clientId: string) => void };
+    };
+    manager.deps.onTwinDetected?.('client-1');
+    await jest.advanceTimersByTimeAsync(100);
+    await first.stop();
+
+    const left = await start(b, bId);
+    const bClientId = left.plugin.settings.clientId;
+    expect(bClientId).not.toBe('client-1');
+    expect(left.saved()).toMatchObject({ previousClientIds: ['client-1'] });
+    await left.stop();
+
+    // The synced data.json: B's, in A's plugin folder.
+    a.files.set(
+      `.obsidian/plugins/${id}/data.json`,
+      b.files.get(`.obsidian/plugins/${bId}/data.json`) ?? '',
+    );
+    Notice.shown = [];
+    const run = await start(a, id);
+    expect(run.plugin.settings.clientId).toBe('client-1');
+    expect(run.engineClientId()).toBe('client-1');
+    expect(run.log()).toContain('"reason":"from-vault-store"');
+    expect(Notice.shown).toEqual([]);
+    await run.stop();
+  });
+
+  // A copy of a vault whose id changed within the day synced under that
+  // vault's id until the day was out.
+  it('gives a copy of a copy made the same day an id of its own', async () => {
+    const id = `team-vault-identity-${++seq}`;
+    const storage = localStorageOf();
+    const original = vault(id, dataJson(), 'vault-a', storage);
+    await (await start(original, id)).stop();
+    const copyId = `team-vault-identity-${++seq}`;
+    const copy = vault(
+      copyId,
+      original.files.get(`.obsidian/plugins/${id}/data.json`) ?? '',
+      'vault-b',
+      storage,
+    );
+    const first = await start(copy, copyId);
+    const firstId = first.plugin.settings.clientId;
+    await first.stop();
+
+    jest.setSystemTime(Date.now() + 60 * 60 * 1000);
+    const secondId = `team-vault-identity-${++seq}`;
+    const second = vault(
+      secondId,
+      copy.files.get(`.obsidian/plugins/${copyId}/data.json`) ?? '',
+      'vault-c',
+      storage,
+    );
+    const run = await start(second, secondId);
+    const clientId = run.plugin.settings.clientId;
+    expect([firstId, 'client-1']).not.toContain(clientId);
+    expect(run.engineClientId()).toBe(clientId);
+    expect(run.saved()).toMatchObject({ clientId, previousClientIds: [] });
+    expect(run.log()).toContain('"reason":"vault-copied"');
+    await run.stop();
   });
 
   it('gives the vault a new id at the start after an engine saw another device under it', async () => {

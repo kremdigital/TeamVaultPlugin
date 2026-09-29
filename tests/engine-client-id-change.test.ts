@@ -2,16 +2,18 @@
  * The engine after the vault's client id changed (`settings/client-identity`:
  * a copy of the vault, or another device seen under the id): its own
  * operations are known by their `opId`s whatever id they went out under, its
- * counters under the ids it had before move up with the operations the server
- * applied for it, and nothing of the queue goes out under the new id with an
- * `opId` the server may have applied under the old one. Another device under
- * this device's id is reported to the plugin, which gives the vault a new id
- * on its next start.
+ * counters under the ids it sent under before move up with the operations the
+ * server applied for it — a copy has no such id, and the original's operations
+ * reach it in the catch-up — and nothing of the queue goes out under the new
+ * id with an `opId` the server may have applied under the old one. Another
+ * device under this device's id is reported to the plugin, which gives the
+ * vault a new id on its next start.
  *
  * The engine runs against the {@link FakeServer} on a {@link FakeStorage}: a
  * restart is a new engine, under the new id, from the `state.json` the disk
  * has at that moment.
  */
+import { settleClientIdentity, type VaultStore } from '@/settings/client-identity';
 import { sha256Hex } from '@/sync/hash';
 import { newOpId } from '@/sync/operation-log';
 import type { ServerOperation } from '@/client/socket';
@@ -88,7 +90,9 @@ async function online(notes: Seed): Promise<Bench> {
 
 /**
  * Obsidian quits (`state.json` written) and starts again, the vault's client
- * id changed to `device-1b` meanwhile; the new engine is not started.
+ * id changed to `device-1b` meanwhile: it left `device-1`, which another device
+ * used too, and under which it had sent its operations. The new engine is not
+ * started.
  */
 async function restartAsNewId(b: Bench): Promise<Bench> {
   await b.h.log.persistNow();
@@ -312,6 +316,131 @@ describe('SyncEngine — its own operations after the client id changed', () => 
   });
 });
 
+// -- A copy of the vault -------------------------------------------------------
+
+describe('SyncEngine — a copy of the vault, under the id it was given', () => {
+  /** A vault's local storage in Obsidian, empty: the copy's. */
+  function emptyStore(): VaultStore {
+    const items = new Map<string, string>();
+    return {
+      load: (key) => items.get(key) ?? null,
+      save: (key, value) => {
+        if (value === null) items.delete(key);
+        else items.set(key, value);
+      },
+    };
+  }
+
+  // The regression: the copy took the original's id — in use by the original
+  // — for one it had synced under, and moved its counter under it up with the
+  // queue it took along. An operation of that queue the original sent after
+  // the copy was made, after an attachment it replaced meanwhile, lifted the
+  // copy's counter past the replacement: it never came to the copy in a
+  // catch-up, and the copy kept the old attachment for good.
+  it('gets every operation the original sent after the copy in its catch-up', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const v1 = encode('v1');
+    const v2 = encode('v2');
+    const hash1 = await sha256Hex(v1);
+    const hash2 = await sha256Hex(v2);
+    b.h.vault.files.set('img.png', v1);
+    b.h.log.setFileMeta({
+      bindingId: 'b1',
+      relativePath: 'img.png',
+      serverFileId: 'f2',
+      contentHash: hash1,
+      size: 2,
+      fileType: 'BINARY',
+      lastSyncedAt: 1,
+    });
+    b.server.add({ id: 'f2', path: 'img.png', fileType: 'BINARY', contentHash: hash1, size: 2 });
+    // Offline, the user renames the note: queued, not sent yet.
+    b.h.socket().disconnect();
+    await flushAsync(20);
+    await userRename(b.h, 'a.md', 'b.md');
+    const queued = b.h.log.dequeueOperations('b1');
+    expect(queued.map((op) => op.opType)).toEqual(['RENAME']);
+    const renameOpId = queued[0]?.opId ?? '';
+    const clock = { ...(b.h.log.getBindingState('b1')?.lastVectorClock ?? {}) };
+    await b.h.log.persistNow();
+
+    // The vault is copied now, its data.json and state.json with it, and
+    // opened as a vault of its own: its local storage in Obsidian is empty.
+    const { next: identity } = settleClientIdentity({
+      current: {
+        clientId: 'device-1',
+        clientIdClaimed: true,
+        twinClientId: '',
+        clientIdRotatedAt: 0,
+        previousClientIds: [],
+      },
+      store: emptyStore(),
+      now: Date.now(),
+      newId: () => 'device-1b',
+    });
+    expect(identity.clientId).toBe('device-1b');
+    const { logger, entries } = recorder();
+    const { next: copy } = await restartFromDisk(b.h, b.storage, {
+      server: b.server,
+      docs: b.docs,
+      identity: {
+        clientId: identity.clientId,
+        previousClientIds: identity.previousClientIds,
+        logger,
+      },
+    });
+
+    // The original, meanwhile, under `device-1`: it replaces the attachment,
+    // then sends the rename the copy's queue holds too.
+    const base = clock['device-1'] ?? 0;
+    expect(
+      b.server.serveFrom('file:update-binary', {
+        clientId: 'device-1',
+        opId: newOpId(),
+        vectorClock: clock,
+        fileId: 'f2',
+        filePath: 'img.png',
+        fileType: 'BINARY',
+        contentHash: hash2,
+        size: 2,
+      }),
+    ).toMatchObject({ ok: true });
+    expect(
+      b.server.serveFrom('file:rename', {
+        clientId: 'device-1',
+        opId: renameOpId,
+        vectorClock: { ...clock, 'device-1': base + 1 },
+        fileId: 'f1',
+        filePath: 'a.md',
+        newPath: 'b.md',
+      }),
+    ).toMatchObject({ ok: true });
+    copy.routes.set('GET /api/projects/p1/files/f2', () => bytes(v2));
+
+    const before = joinsOf(copy);
+    await copy.engine.start();
+    const join = await nextJoin(copy, before);
+    // The server applied the rename of the copy's queue — the original's.
+    expect(b.server.statusAnswers.at(-1)?.applied).toEqual([renameOpId]);
+    join.ack(
+      b.server.joinAnswer('whole journal', {
+        clock: joinClockOf(copy),
+        yjsDocs: b.docs.snapshots(),
+      }),
+    );
+    await serveQueue({ ...b, h: copy });
+    await flushAsync(20);
+
+    expect(disk(copy)).toEqual(['b.md=a\n', 'img.png=v2']);
+    expect(copy.log.getFileMeta('b1', 'img.png')?.contentHash).toBe(hash2);
+    expect(live(b.server)).toEqual(['f1:b.md', 'f2:img.png']);
+    expect(queue(copy)).toEqual([]);
+    expect(twinLines(entries)).toEqual([]);
+    appliedOnce(b.server);
+    await copy.engine.stop();
+  });
+});
+
 // -- Rows of the id it had before, of another device --------------------------
 
 describe('SyncEngine — rows under the id the vault had before', () => {
@@ -370,9 +499,9 @@ describe('SyncEngine — rows under the id the vault had before', () => {
     return { h, entries, twins };
   }
 
-  // Not a regression of its own: the copy's id changed, and what the device
-  // left behind under `device-1` (the original, still using it) is a
-  // teammate's to it — applied, nothing reported.
+  // Not a regression of its own: the vault left `device-1` to a twin, and
+  // what the twin sends under it is a teammate's to it — applied, nothing
+  // reported.
   it('applies an update under its previous id with an opId it does not know', async () => {
     const { h, entries, twins } = await catchUpOn('device-1b', (hash) => [
       updateRow('device-1', hash, 4),

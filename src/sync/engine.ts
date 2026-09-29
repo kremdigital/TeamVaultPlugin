@@ -125,12 +125,14 @@ export interface SyncEngineDeps {
   /** This vault's client id. Same value goes into the vector clock keys. */
   clientId: string;
   /**
-   * The ids this vault synced under before `clientId` (see
+   * The ids this vault sent operations under before `clientId` (see
    * `settings/client-identity.ts`), the latest first. A queued operation may
    * have gone out under one of them, its answer lost: once the server says it
    * applied it, this device's counter under that id moves up to the one the
    * operation was logged with, as under `clientId` (see
-   * `SyncEngine.adoptOwnCounter`). Default: none.
+   * `SyncEngine.adoptOwnCounter`). Never an id this vault did not send under:
+   * a copy's queue came from its original, whose operations under its own id
+   * — in use — are to reach the copy in a catch-up. Default: none.
    */
   previousClientIds?: readonly string[];
   /**
@@ -2006,7 +2008,7 @@ export class SyncEngine {
    * own operations out. The other clients' counters are not taken: the
    * catch-up brings their operations.
    *
-   * The counters under the ids this vault synced under before
+   * The counters under the ids this vault sent operations under before
    * ({@link previousClientIds}) too: an operation of the queue that went out
    * under one of them is logged under it. Left behind, it came back in a
    * catch-up after the id changed — once the connect that settled it had

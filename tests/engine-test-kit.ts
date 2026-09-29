@@ -1635,6 +1635,24 @@ export class FakeServer {
   }
 
   /**
+   * A file operation from a client that is not the harness's engine — the
+   * original of a copied vault, say — reaches the server and is applied as
+   * the engine's would be: `payload` as a client sends it (`clientId`,
+   * `opId`, `vectorClock`, …). Returns the answer.
+   */
+  serveFrom(event: string, payload: Record<string, unknown>): unknown {
+    let answer: unknown;
+    this.answer({
+      event,
+      payload,
+      ack: (response) => {
+        answer = response;
+      },
+    });
+    return answer;
+  }
+
+  /**
    * An `ops:status` asked (see `FakeSocket.statusResponder`): answered now,
    * once every operation the client sent before it is applied — the server
    * queues it behind them — or left for {@link serveNext} while

@@ -1,9 +1,10 @@
 /**
  * Which client id a vault syncs under (`settings/client-identity.ts`): the
- * one `data.json` has, bound to the vault in its local storage in Obsidian,
- * which a copy of the vault does not take along — a copy gets a new id. So
- * does a vault another device was seen sending under. At most one change a
- * day, and an id is bound only once it reads back from the storage.
+ * one bound to the vault in its local storage in Obsidian, which a copy of the
+ * vault does not take along — `data.json`'s only while it is bound nowhere. A
+ * copy gets a new id at once, and none of the ids before; a vault another
+ * device was seen sending under gets one at most once a day. An id is bound
+ * only once it reads back from the storage.
  */
 import {
   CLIENT_ID_CHANGE_MIN_INTERVAL_MS,
@@ -187,44 +188,65 @@ describe('resolveClientIdentity', () => {
     });
   });
 
-  it('does not go back to an id the vault moved on from that the storage still holds', () => {
+  // `data.json` of the vault that left `C` — the copy of this one, carried
+  // back, or the other computer of a plugin folder another tool syncs — while
+  // `C` is this vault's own. Taking data.json's id then put two devices under
+  // one id.
+  it('keeps the vault’s own id when data.json lists it among the ids another vault left', () => {
+    expect(
+      resolve(identity({ clientId: 'N1', clientIdClaimed: true, previousClientIds: ['C'] }), 'C'),
+    ).toEqual({
+      clientId: 'C',
+      reason: 'from-vault-store',
+      rotated: false,
+      previous: 'N1',
+      claim: true,
+    });
     expect(
       resolve(identity({ clientId: 'N1', clientIdClaimed: false, previousClientIds: ['C'] }), 'C'),
-    ).toMatchObject({ clientId: 'N1', reason: 'store-outdated', rotated: false, claim: true });
+    ).toMatchObject({ clientId: 'C', reason: 'from-vault-store', rotated: false });
   });
 
-  it('changes the id at most once a day', () => {
-    const copied = identity({ clientIdClaimed: true, clientIdRotatedAt: NOW - DAY + 60_000 });
-    expect(resolve(copied, null)).toEqual({
-      clientId: 'C',
-      reason: 'deferred',
-      deferred: 'vault-copied',
-      rotated: false,
-      previous: null,
-      claim: false,
-    });
+  // A copy of a vault whose id changed within the day — a copy of a copy, or
+  // of a vault that had just left a twin's id — synced under that vault's id
+  // until the day was out: two devices under one id.
+  it('gives a copy a new id at once, however recently its data.json’s id changed', () => {
+    for (const at of [NOW - 60_000, NOW - DAY + 60_000, NOW + 60_000]) {
+      expect(resolve(identity({ clientIdClaimed: true, clientIdRotatedAt: at }), null)).toEqual({
+        clientId: 'N1',
+        reason: 'vault-copied',
+        rotated: true,
+        previous: 'C',
+        claim: true,
+      });
+    }
+  });
+
+  it('changes the id for a twin at most once a day', () => {
     const twin = identity({
       clientIdClaimed: true,
       twinClientId: 'C',
-      clientIdRotatedAt: NOW - 60_000,
+      clientIdRotatedAt: NOW - DAY + 60_000,
     });
-    expect(resolve(twin, 'C')).toMatchObject({
+    expect(resolve(twin, 'C')).toEqual({
       clientId: 'C',
       reason: 'deferred',
       deferred: 'twin-seen',
       rotated: false,
+      previous: null,
+      claim: true,
     });
     // A clock set back does not hold a change off for good.
-    expect(resolve({ ...copied, clientIdRotatedAt: NOW + 3 * DAY }, null)).toMatchObject({
-      reason: 'vault-copied',
+    expect(resolve({ ...twin, clientIdRotatedAt: NOW + 3 * DAY }, 'C')).toMatchObject({
+      reason: 'twin-seen',
       rotated: true,
     });
-    expect(resolve({ ...copied, clientIdRotatedAt: NOW - DAY }, null)).toMatchObject({
-      reason: 'vault-copied',
+    expect(resolve({ ...twin, clientIdRotatedAt: NOW - DAY }, 'C')).toMatchObject({
+      reason: 'twin-seen',
       rotated: true,
     });
     // The first id is not a change.
-    expect(resolve({ ...copied, clientId: '' }, null)).toMatchObject({ reason: 'first-run' });
+    expect(resolve({ ...twin, clientId: '' }, null)).toMatchObject({ reason: 'first-run' });
   });
 });
 
@@ -262,17 +284,94 @@ describe('settleClientIdentity', () => {
     const copy = new MemoryStore();
     const copied = settle(data, copy);
     expect(copied.decision).toMatchObject({ reason: 'vault-copied', rotated: true, previous: 'C' });
+    // `C` is the original's, in use: the copy never sent anything under it.
     expect(copied.next).toEqual({
       clientId: 'N1',
       clientIdClaimed: true,
       twinClientId: '',
       clientIdRotatedAt: NOW,
-      previousClientIds: ['C'],
+      previousClientIds: [],
     });
     expect(copy.load(CLIENT_ID_KEY)).toBe('N1');
     // Each keeps its id from then on.
     expect(settle(copied.next, copy, { now: NOW + 5 * DAY }).next.clientId).toBe('N1');
     expect(settle(data, original, { now: NOW + 5 * DAY }).next.clientId).toBe('C');
+  });
+
+  // The ids a copy's data.json lists are the ones its original sent under,
+  // `C` among them still the original's: counters under them moved up with
+  // the queue the copy took along (`SyncEngine.adoptOwnCounter`) past
+  // operations the original sent after the copy was made — which then never
+  // came to the copy in a catch-up.
+  it('gives a copy none of the ids before: it sent nothing under any of them', () => {
+    const copied = settle(
+      identity({ clientIdClaimed: true, previousClientIds: ['W', 'V'] }),
+      new MemoryStore(),
+    );
+    expect(copied.decision.reason).toBe('vault-copied');
+    expect(copied.next.previousClientIds).toEqual([]);
+  });
+
+  // The regression: a rule took data.json's list of the ids a vault had left
+  // for this vault's own. A data.json from the copy — a plugin folder another
+  // tool syncs between the computers, or the copy carried back — listed the
+  // original's id, and the original took the copy's: two devices under one
+  // id, and after each change of the copy's id the same again.
+  it('keeps two vaults with one data.json on ids of their own, whichever changes its id', () => {
+    const storeA = new MemoryStore();
+    const storeB = new MemoryStore();
+    const newId = ids();
+    // One data.json, as the vault that started last left it.
+    let data = identity();
+    let now = NOW;
+    const start = (store: MemoryStore): string => {
+      now += 60 * 60 * 1000;
+      data = settle(data, store, { now, newId }).next;
+      return data.clientId;
+    };
+    let a = start(storeA);
+    let b = start(storeB);
+    expect([a, b]).toEqual(['C', 'N1']);
+    for (let round = 0; round < 3; round++) {
+      a = start(storeA);
+      expect(a).toBe('C');
+      expect(storeA.load(CLIENT_ID_KEY)).toBe('C');
+      b = start(storeB);
+      expect(b).not.toBe(a);
+      expect(storeB.load(CLIENT_ID_KEY)).toBe(b);
+      // B's engine sees another device under its id; a day on, it leaves it.
+      data = { ...data, twinClientId: b };
+      now += 2 * DAY;
+      const left = b;
+      b = start(storeB);
+      expect(b).not.toBe(left);
+      expect(b).not.toBe(a);
+      expect(data.previousClientIds[0]).toBe(left);
+    }
+    expect(start(storeA)).toBe('C');
+  });
+
+  // The same through a twin: a pair from before 0.4.1 whose data.json one tool
+  // syncs both bound one id; the one that saw the other under it left it, and
+  // its data.json listed the id as left — the other took the new id too.
+  it('keeps a pair from before on ids of their own once one of them leaves the shared one', () => {
+    const storeA = new MemoryStore();
+    const storeB = new MemoryStore();
+    const newId = ids();
+    const before = identity();
+    const a = settle(before, storeA, { newId }).next;
+    const b = settle(before, storeB, { newId }).next;
+    expect([a.clientId, b.clientId]).toEqual(['C', 'C']);
+
+    const left = settle({ ...b, twinClientId: 'C' }, storeB, { now: NOW + DAY, newId });
+    expect(left.decision).toMatchObject({ reason: 'twin-seen', clientId: 'N1', previous: 'C' });
+    expect(left.next.previousClientIds).toEqual(['C']);
+
+    // B's data.json reaches A.
+    const back = settle(left.next, storeA, { now: NOW + DAY + 60_000, newId });
+    expect(back.decision).toMatchObject({ reason: 'from-vault-store', clientId: 'C' });
+    expect(storeA.load(CLIENT_ID_KEY)).toBe('C');
+    expect(settle(back.next, storeB, { now: NOW + 2 * DAY, newId }).next.clientId).toBe('N1');
   });
 
   it('clears the twin once the id is left, and keeps it while the change waits', () => {
@@ -343,11 +442,16 @@ describe('settleClientIdentity', () => {
   });
 
   it('keeps the previous ids to a bounded list, the latest first', () => {
+    const store = new MemoryStore();
     let current = identity({ clientIdClaimed: true });
+    store.save(CLIENT_ID_KEY, current.clientId);
     const newId = ids();
     for (let i = 0; i < PREVIOUS_CLIENT_IDS_MAX + 3; i++) {
-      // Each start another copy: an empty local storage.
-      current = settle(current, new MemoryStore(), { now: NOW + i * 2 * DAY, newId }).next;
+      // Each start a twin seen under the id the vault has.
+      current = settle({ ...current, twinClientId: current.clientId }, store, {
+        now: NOW + i * 2 * DAY,
+        newId,
+      }).next;
     }
     expect(current.previousClientIds).toHaveLength(PREVIOUS_CLIENT_IDS_MAX);
     const last = PREVIOUS_CLIENT_IDS_MAX + 3;

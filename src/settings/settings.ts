@@ -97,9 +97,10 @@ export interface PluginSettings {
   /** Unix ms of the last automatic change of `clientId`; 0 for none. */
   clientIdRotatedAt: number;
   /**
-   * The ids this vault synced under before its `clientId` changed, the
-   * latest first, at most {@link PREVIOUS_CLIENT_IDS_MAX}: an operation of
-   * its queue may have gone out under one of them.
+   * The ids this vault sent operations under before its `clientId` changed
+   * (it left a twin's), the latest first, at most
+   * {@link PREVIOUS_CLIENT_IDS_MAX}: an operation of its queue may have gone
+   * out under one of them. A copy of the vault starts with none.
    */
   previousClientIds: string[];
 }
