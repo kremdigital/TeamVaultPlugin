@@ -21,6 +21,7 @@ import {
   ServerDocs,
   buildHarness,
   connect,
+  dbNameOf,
   encode,
   flushAsync,
   json,
@@ -28,6 +29,9 @@ import {
 } from './engine-test-kit';
 
 jest.setTimeout(30_000);
+
+/** The key of the stamp that says whose history a note's store holds (see `DocManager`). */
+const OWNER = 'team-vault-file-id';
 
 function disk(h: Harness): string[] {
   return [...h.vault.files.keys()].sort().map((p) => `${p}=${h.vault.text(p) ?? ''}`);
@@ -113,6 +117,36 @@ describe('SyncEngine — a note edited online, then offline, then deleted offlin
     await h.engine.stop();
     // Obsidian started again without network: the note's history is in
     // the store only.
+    const next = buildHarness({ predecessor: h, docs: idb.manager(), offline: true });
+    server.attach(next);
+    serverDocs.attach(next);
+    await next.engine.start();
+    await flushAsync();
+    await deleteHere(next);
+
+    next.socket().goOnline();
+    await flushAsync();
+    next
+      .socket()
+      .pending('project:join')
+      .ack({ ok: true, operations: [], yjsDocs: serverDocs.snapshots() });
+    await serverDocs.drive();
+
+    expect(server.pathOf('f1')).toBeNull();
+    expect(disk(next)).toEqual([]);
+    await next.engine.stop();
+  });
+
+  it('sends the delete of a note whose history has no stamp (a store from before 0.3.8), from that history', async () => {
+    const idb = new FakeIndexedDb();
+    const { h, server, serverDocs } = await editedOnlineThenOffline(idb);
+    await h.engine.stop();
+    // Written by a build before 0.3.8: the store under the note's name does
+    // not say whose history it is. Nothing else is recorded under the name,
+    // so it is the note's.
+    const store = idb.dbs.get(dbNameOf('P.md'));
+    expect(store?.custom.get(OWNER)).toBe('f1');
+    store?.custom.delete(OWNER);
     const next = buildHarness({ predecessor: h, docs: idb.manager(), offline: true });
     server.attach(next);
     serverDocs.attach(next);

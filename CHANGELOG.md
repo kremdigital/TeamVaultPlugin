@@ -180,7 +180,9 @@ uses [Semantic Versioning](https://semver.org/).
   stayed on the server. A new file saved under the name of one just deleted
   went to the server as that file's new version, and the delete took it
   along: the new file never reached the team. The delete now goes out for
-  the file you deleted, and the new file goes out as a new one after it.
+  the file you deleted, also when it waits in the queue (offline, say), and
+  the renamed file keeps its name and its history; the new file goes out as
+  a new one after it.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the

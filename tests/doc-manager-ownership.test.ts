@@ -474,3 +474,82 @@ describe('DocManager — lineageOf and startOver', () => {
     ).resolves.toMatchObject({ related: false, owner: null });
   });
 });
+
+describe('DocManager — stateVectorOf (a deleted note’s history, read and left as it is)', () => {
+  it('reads the file’s history from its store without opening a doc for the name', async () => {
+    const idb = new FakeIndexedDb();
+    const stored = seed(idb, 'a.md', 'mine\n', 'f1');
+    const dm = idb.manager();
+
+    const state = await dm.stateVectorOf('b1', 'a.md', 'f1');
+
+    expect(state).toEqual(Y.encodeStateVector(stored));
+    expect(dm.has('b1', 'a.md')).toBe(false);
+    expect(idb.deleted).toEqual([]);
+    expect(idb.textOf(dbNameOf('a.md'))).toBe('mine\n');
+  });
+
+  it('reads nothing of another file’s history, and deletes nothing: in its store or open', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'a.md', 'renamed here\n', 'f2');
+    const dm = idb.manager();
+
+    await expect(dm.stateVectorOf('b1', 'a.md', 'f1')).resolves.toBeNull();
+    expect(dm.has('b1', 'a.md')).toBe(false);
+
+    await dm.open('b1', 'a.md', 'f2');
+    await expect(dm.stateVectorOf('b1', 'a.md', 'f1')).resolves.toBeNull();
+    await flushAsync();
+
+    expect(dm.getText('b1', 'a.md')).toBe('renamed here\n');
+    expect(dm.ownerOf('b1', 'a.md')).toBe('f2');
+    expect(idb.deleted).toEqual([]);
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f2');
+  });
+
+  it('takes a history without a stamp (a store from before 0.3.8) for the file’s, as open does, and stamps nothing', async () => {
+    const idb = new FakeIndexedDb();
+    const stored = seed(idb, 'a.md', 'old\n');
+    const dm = idb.manager();
+
+    await expect(dm.stateVectorOf('b1', 'a.md', 'f1')).resolves.toEqual(
+      Y.encodeStateVector(stored),
+    );
+    expect(dm.has('b1', 'a.md')).toBe(false);
+    await dm.whenSynced('b1', 'a.md');
+    await expect(dm.stateVectorOf('b1', 'a.md', 'f1')).resolves.toEqual(
+      Y.encodeStateVector(stored),
+    );
+    await flushAsync();
+
+    expect(dm.ownerOf('b1', 'a.md')).toBeNull();
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.has(OWNER)).toBe(false);
+  });
+
+  it('opens no store where the renderer lists none under the name', async () => {
+    const idb = new FakeIndexedDb();
+    const dm = idb.manager();
+
+    await expect(dm.stateVectorOf('b1', 'a.md', 'f1')).resolves.toBeNull();
+
+    expect(idb.opened).toEqual([]);
+    expect(idb.dbs.has(dbNameOf('a.md'))).toBe(false);
+  });
+
+  it('reads the history a move carried under the name after it, never the one it replaced', async () => {
+    const idb = new FakeIndexedDb();
+    seed(idb, 'a.md', 'deleted note\n', 'f1');
+    // Without a stamp where it was: the move stamps it where it goes.
+    seed(idb, 'b.md', 'renamed note\n');
+    const dm = idb.manager();
+
+    // The move is asked for first: the read waits for it.
+    const moving = dm.move('b1', 'b.md', 'a.md', 'f2', () => undefined);
+    const reading = dm.stateVectorOf('b1', 'a.md', 'f1');
+    await moving;
+
+    await expect(reading).resolves.toBeNull();
+    expect(idb.textOf(dbNameOf('a.md'))).toBe('renamed note\n');
+    expect(idb.dbs.get(dbNameOf('a.md'))?.custom.get(OWNER)).toBe('f2');
+  });
+});

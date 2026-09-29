@@ -625,6 +625,184 @@ describe('SyncEngine — a folder deleted or renamed here: its operations say wh
     expect(b.h.engine.getFileIdForPath('n/new.png')).toBeNull();
     await b.h.engine.stop();
   });
+
+  it('a new file renamed before its create is answered, then deleted while the folder checks wait, the answer landing meanwhile: the delete is that file’s', async () => {
+    const b = await seeded(['m/x.png', 'keep.png']);
+    b.h.vault.files.set('n/a.png', encode('new'));
+    const creating = b.h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'create',
+      path: 'n/a.png',
+      source: 'obsidian',
+    });
+    await until('the create sent', () => b.h.socket().emits.some((e) => e.event === 'file:create'));
+    // Renamed before the create is answered (a template renaming the note it
+    // has just made): the rename waits for the create.
+    const renamingNew = b.h.vault.rename('n/a.png', 'n/b.png');
+    await flushAsync(20);
+    const emits = b.h.socket().emits.length;
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/b.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/b.png'));
+    await flushAsync(20);
+    // The create's answer lands while the delete waits for its checks: the
+    // new file is recorded under its new name, its rename waiting for its
+    // own check behind the delete's.
+    await b.server.pump();
+    await until('the new file recorded under its new name', () => {
+      return b.h.engine.getFileIdForPath('n/b.png') !== null;
+    });
+    const id = b.h.engine.getFileIdForPath('n/b.png') ?? '';
+    slow.release();
+    await finish(b, [creating, renamingNew, before, deleting]);
+
+    // The delete's check was ahead of the rename's: the delete went first.
+    expect(sent(b, emits)).toEqual([
+      'file:rename m/x.png -> m/y.png',
+      'file:delete n/b.png',
+      'file:rename n/a.png -> n/b.png',
+    ]);
+    const deletes = b.h
+      .socket()
+      .emits.slice(emits)
+      .filter((e) => e.event === 'file:delete')
+      .map((e) => (e.payload as { fileId: string }).fileId);
+    expect(deletes).toEqual([id]);
+    // Gone for the whole team, and from the records here.
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(live(b.server)).toEqual(['keep.png', 'm/y.png']);
+    expect(b.h.engine.getFileIdForPath('n/b.png')).toBeNull();
+    expect(b.h.engine.getFileIdForPath('n/a.png')).toBeNull();
+    await b.h.engine.stop();
+  });
+
+  it('a new file renamed before its create read it, created under the new name, then deleted while the folder checks wait: the delete is that file’s', async () => {
+    const b = await seeded(['m/x.png', 'keep.png']);
+    b.h.vault.files.set('n/a.png', encode('new'));
+    // The create's look at the disk is held: the rename comes first.
+    const look = b.h.vault.gate('exists');
+    const creating = b.h.engine.handleVaultEvent({
+      bindingId: 'b1',
+      type: 'create',
+      path: 'n/a.png',
+      source: 'obsidian',
+    });
+    await look.reached;
+    const renamingNew = b.h.vault.rename('n/a.png', 'n/b.png');
+    await flushAsync(20);
+    look.release();
+    // The create finds nothing under the old name: the file goes out as a
+    // create of the new one.
+    await until('the create of the new name sent', () =>
+      b.h
+        .socket()
+        .emits.some(
+          (e) =>
+            e.event === 'file:create' && (e.payload as { filePath: string }).filePath === 'n/b.png',
+        ),
+    );
+    const emits = b.h.socket().emits.length;
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/b.png');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/b.png'));
+    await flushAsync(20);
+    // The create's answer lands while the delete waits for its checks.
+    await b.server.pump();
+    await until('the new file recorded', () => b.h.engine.getFileIdForPath('n/b.png') !== null);
+    const id = b.h.engine.getFileIdForPath('n/b.png') ?? '';
+    slow.release();
+    await finish(b, [creating, renamingNew, before, deleting]);
+
+    const deletes = b.h
+      .socket()
+      .emits.slice(emits)
+      .filter((e) => e.event === 'file:delete')
+      .map((e) => (e.payload as { fileId: string }).fileId);
+    expect(deletes).toEqual([id]);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(live(b.server)).toEqual(['keep.png', 'm/y.png']);
+    expect(b.h.engine.getFileIdForPath('n/b.png')).toBeNull();
+    await b.h.engine.stop();
+  });
+
+  it('offline: a note renamed onto the name of one deleted while the folder checks wait keeps its history, and the name', async () => {
+    const b = await seeded(['n/plan.md', 'n/plan2.md', 'm/x.png', 'keep.png'], { notes: true });
+    const docs = b.docs as ServerDocs;
+    const save = async (text: string): Promise<void> => {
+      b.h.vault.files.set('n/plan2.md', encode(text));
+      const saving = b.h.engine.handleVaultEvent({
+        bindingId: 'b1',
+        type: 'modify',
+        path: 'n/plan2.md',
+        source: 'obsidian',
+      });
+      await docs.drive();
+      await saving;
+      await b.h.settle();
+    };
+    // The note renamed below is edited online — its history is here — and
+    // then offline: that edit is in its history only.
+    await save('n/plan2.md\nedited\n');
+    expect(docs.text('f2')).toBe('n/plan2.md\nedited\n');
+    b.h.socket().disconnect();
+    await flushAsync();
+    const edited = 'n/plan2.md\nedited\nedited offline\n';
+    await save(edited);
+    expect(b.h.doc.getText('b1', 'n/plan2.md')).toBe(edited);
+
+    const slow = b.h.vault.gate('exists');
+    const before = b.h.vault.rename('m/x.png', 'm/y.png');
+    await slow.reached;
+    b.h.vault.files.delete('n/plan.md');
+    const deleting = b.h.engine.handleVaultEvent(fileEvent('n/plan.md'));
+    await flushAsync(20);
+    // Renamed onto the name meanwhile: recorded there at once, its history
+    // carried there.
+    const renaming = b.h.vault.rename('n/plan2.md', 'n/plan.md');
+    await flushAsync(20);
+    expect(b.h.engine.getFileIdForPath('n/plan.md')).toBe('f2');
+    slow.release();
+    await Promise.all([before, deleting, renaming]);
+    await b.h.settle();
+
+    // The delete ahead of the rename onto its name, as they came.
+    expect(
+      b.h.log
+        .dequeueOperations('b1')
+        .map(
+          (op) => `${op.opType} ${op.filePath}${op.newPath !== null ? ` -> ${op.newPath}` : ''}`,
+        ),
+    ).toEqual(['RENAME m/x.png -> m/y.png', 'DELETE n/plan.md', 'RENAME n/plan2.md -> n/plan.md']);
+    // The renamed note's history is under the name, its own, with the edit.
+    expect(b.h.doc.ownerOf('b1', 'n/plan.md')).toBe('f2');
+    expect(b.h.doc.getText('b1', 'n/plan.md')).toBe(edited);
+
+    const before2 = joinsOf(b.h);
+    const lookups = tombstoneLookups(b.h);
+    b.h.socket().connect();
+    (await nextJoin(b.h, before2)).ack(
+      b.server.joinAnswer('whole journal', { yjsDocs: docs.snapshots() }),
+    );
+    await docs.drive();
+    await tailDone(b, lookups);
+    await docs.drive();
+
+    // The deleted note is gone for the whole team; the renamed one has the
+    // name, not a conflict name, and the edit made offline.
+    expect(b.server.pathOf('f1')).toBeNull();
+    expect(b.server.pathOf('f2')).toBe('n/plan.md');
+    expect(docs.text('f2')).toBe(edited);
+    expect(b.h.engine.getFileIdForPath('n/plan.md')).toBe('f2');
+    expect([...b.h.vault.files.keys()].filter((p) => p.startsWith('n/'))).toEqual(['n/plan.md']);
+    expect(b.h.vault.text('n/plan.md')).toBe(edited);
+    await b.h.engine.stop();
+  });
 });
 
 // -- A teammate's device --------------------------------------------------------------

@@ -915,6 +915,16 @@ export class SyncEngine {
   private readonly renamedAfterCreate = new Set<string>();
 
   /**
+   * Renames waiting for a create (see {@link renameAfterCreate}), by the name
+   * they go to. Each resolves with what the create came to as soon as its
+   * file is recorded under that name, `null` when it is not: the rename itself
+   * goes out later, behind the folder checks (see {@link folderChecks}), and
+   * its entry in {@link creating} resolves only then. A delete of the new
+   * name meanwhile is that file's (see {@link createdUnder}).
+   */
+  private readonly recordedAfterCreate = new Map<string, Promise<CreatedHere | null>>();
+
+  /**
    * Files the server has under a name another file still holds here, by the
    * name — see {@link waitForName}. Rebuilt on each connect.
    */
@@ -3952,21 +3962,31 @@ export class SyncEngine {
 
   /**
    * The state vector of note `meta`'s history, client → clock, for a queued
-   * delete (see {@link serverDocWithin}); the store is loaded for it when the
-   * doc is not open. `null` for an attachment, or when there is no history of
-   * the note's to read.
+   * delete (see {@link serverDocWithin}): read from the doc open under its
+   * name, or from its store, and only if the history there is still the
+   * note's — never a doc opened for the name (see `DocManager.stateVectorOf`).
+   * `null` for an attachment, or when there is no history of the note's to
+   * read.
+   *
+   * The delete waits for its checks, and a note renamed onto the name
+   * meanwhile is recorded there at once, its history carried there and
+   * stamped for it. Opened for the deleted note, as it used to be, that doc
+   * was taken for another file's: the renamed note's history was deleted,
+   * edits not sent yet with it, and the doc stamped for the deleted note.
    */
   private async noteStateVector(
     meta: IndexedMeta | undefined,
   ): Promise<Record<string, number> | null> {
     if (meta?.fileType !== 'TEXT') return null;
-    const path = this.docPathOf(meta);
     try {
-      const opened = await this.docManager.open(this.binding.id, path, meta.fileId);
-      if (opened.discarded) return null;
-      const { doc } = this.docManager.get(this.binding.id, path);
+      const state = await this.docManager.stateVectorOf(
+        this.binding.id,
+        this.docPathOf(meta),
+        meta.fileId,
+      );
+      if (state === null) return null;
       const vector: Record<string, number> = {};
-      for (const [client, clock] of Y.decodeStateVector(Y.encodeStateVector(doc))) {
+      for (const [client, clock] of Y.decodeStateVector(state)) {
         vector[String(client)] = clock;
       }
       return Object.keys(vector).length > 0 ? vector : null;
@@ -3974,6 +3994,33 @@ export class SyncEngine {
       this.throwIfStopped();
       return null;
     }
+  }
+
+  /**
+   * Add note `meta`'s {@link noteStateVector} to its DELETE queued as
+   * `entry` — queued first, in its place: a rename onto the name that waits
+   * for its own check goes behind it. Queued after the history was read, the
+   * delete went behind that rename, and the server, which had the deleted
+   * note under the name still, gave the renamed one a conflict name. Nothing
+   * is added once the entry has left the queue.
+   */
+  private async addNoteState(
+    entry: PendingOperation | null,
+    meta: IndexedMeta | undefined,
+  ): Promise<void> {
+    if (entry === null) return;
+    const docState = await this.noteStateVector(meta);
+    this.throwIfStopped();
+    if (docState === null) return;
+    // What the queue holds now: a connect may have added to it meanwhile (see
+    // `settleLandedUpdate`).
+    const queued = this.operationLog
+      .dequeueOperations(this.binding.id)
+      .find((op) => op.id === entry.id);
+    if (queued === undefined) return;
+    this.operationLog.amendOperation(entry.id, {
+      payload: { ...queued.payload, [DOC_STATE]: docState },
+    });
   }
 
   /**
@@ -5194,15 +5241,8 @@ export class SyncEngine {
           },
         );
         if (sent.kind === 'acked') return;
-        if (sent.kind === 'queued' && sent.entry !== null) {
-          // Back in the queue, as a delete made offline is queued.
-          const docState = await this.noteStateVector(meta);
-          if (docState !== null) {
-            this.operationLog.amendOperation(sent.entry.id, {
-              payload: { ...sent.entry.payload, [DOC_STATE]: docState },
-            });
-          }
-        }
+        // Back in the queue, as a delete made offline is queued.
+        if (sent.kind === 'queued') await this.addNoteState(sent.entry, meta);
         // Queued, or refused for good (the server has no such file): gone here.
         await this.forgetDeletedHere(fileId, path, sending);
         this.forgetWaiting(fileId);
@@ -5219,17 +5259,7 @@ export class SyncEngine {
         await this.releaseName(path);
         return;
       }
-      const docState = await this.noteStateVector(meta);
-      this.queue(
-        'DELETE',
-        path,
-        null,
-        {
-          ...payload,
-          ...(docState !== null ? { [DOC_STATE]: docState } : {}),
-        },
-        opId,
-      );
+      await this.addNoteState(this.queue('DELETE', path, null, payload, opId), meta);
       await this.forgetDeletedHere(fileId, path, sending);
       this.forgetWaiting(fileId);
       await this.releaseName(path);
@@ -5248,10 +5278,15 @@ export class SyncEngine {
    * The file a create of `path` under way here (see {@link creating}) records,
    * once it has: its `fileId`, `''` until then — and for good when no create
    * of the name is under way, or it records none (queued, refused, found gone).
+   * A rename into the name waiting for a create (see
+   * {@link renameAfterCreate}) records the created file under it as soon as
+   * the create is answered (see {@link recordedAfterCreate}), long before
+   * the rename is done: its folder check waits behind the delete's.
    */
   private createdUnder(path: string): { fileId: string } {
     const created = { fileId: '' };
-    void this.creating.get(path)?.then((done) => {
+    const pending = this.recordedAfterCreate.get(path) ?? this.creating.get(path);
+    void pending?.then((done) => {
       if (done !== null) created.fileId = done.fileId;
     });
     return created;
@@ -5667,6 +5702,18 @@ export class SyncEngine {
     newPath: string,
   ): Promise<void> {
     this.renamedAfterCreate.add(oldPath);
+    // What a delete of the new name asks meanwhile (see `recordedAfterCreate`).
+    let answer!: (result: CreatedHere | null) => void;
+    const recording = new Promise<CreatedHere | null>((resolve) => {
+      answer = resolve;
+    });
+    this.recordedAfterCreate.set(newPath, recording);
+    const recorded = (result: CreatedHere | null): void => {
+      answer(result);
+      if (this.recordedAfterCreate.get(newPath) === recording) {
+        this.recordedAfterCreate.delete(newPath);
+      }
+    };
     try {
       await this.trackCreate(newPath, async (): Promise<CreatedHere | null> => {
         const result = await created;
@@ -5677,11 +5724,24 @@ export class SyncEngine {
         const meta =
           result !== null && !result.merged ? this.fileIndex.byId.get(result.fileId) : undefined;
         if (meta !== undefined) {
-          if (meta.relativePath !== newPath) {
-            await this.renameRecorded(meta, meta.relativePath, newPath);
-          }
+          // Recorded under the new name before the rename's first `await` (see
+          // `switchRecords`), and sent after its folder check, which waits
+          // behind every check asked for before it. A delete of the new name
+          // meanwhile is of this file (see `createdUnder`). Told only once
+          // the rename was done, the delete — its own check ahead of the
+          // rename's — found nothing to delete, and the file stayed on the
+          // server, at the whole team's.
+          const renamed =
+            meta.relativePath !== newPath
+              ? this.renameRecorded(meta, meta.relativePath, newPath)
+              : Promise.resolve();
+          recorded(result);
+          await renamed;
           return result;
         }
+        // Nothing recorded: a delete of the new name from now on asks the
+        // create below, if any (see `creating`).
+        recorded(null);
         // Queued after it went out, its ack lost: it may be on the server under
         // the old name. The entry follows the note, and the next connect asks
         // the server about it (see `settleLandedCreate`).
@@ -5693,6 +5753,7 @@ export class SyncEngine {
         return null;
       });
     } finally {
+      recorded(null);
       this.renamedAfterCreate.delete(oldPath);
     }
   }
@@ -8912,7 +8973,8 @@ export class SyncEngine {
   /**
    * Queue a local change for the drain. `opId`: the change's (see
    * `HeldChange`); a new one when absent. A change the queue holds already
-   * under that id — put back there by `sendOp` — is not queued twice.
+   * under that id — put back there by `sendOp` — is not queued twice. The
+   * entry, `null` when it could not be put back (see `queueOp`).
    */
   private queue(
     opType: OperationType,
@@ -8920,11 +8982,11 @@ export class SyncEngine {
     newPath: string | null,
     payload: Record<string, unknown>,
     opId: string = newOpId(),
-  ): void {
+  ): PendingOperation | null {
     // The fence refuses this too; spelled out because the queue is what the
     // next engine replays without asking.
     this.throwIfStopped();
-    this.queueOp({ opType, filePath, newPath, payload, opId });
+    return this.queueOp({ opType, filePath, newPath, payload, opId });
   }
 
   /**

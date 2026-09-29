@@ -727,7 +727,46 @@ export class DocManager {
               : await readMark(cached.persistence);
           return { owner: cached.owner, text: cached.ytext.toJSON(), written };
         }
-        return await this.peekStore(bindingId, filePath);
+        return await this.peekStore(bindingId, filePath, async (doc, persistence) => ({
+          owner: await readStamp(persistence),
+          text: doc.getText('content').toJSON(),
+          written: await readMark(persistence),
+        }));
+      } catch {
+        return null;
+      }
+    });
+  }
+
+  /**
+   * The state vector of file `fileId`'s history under `filePath`
+   * (`Y.encodeStateVector`), read the way {@link peek} reads: from the doc
+   * open under the name, or from the store under that exact name on a doc of
+   * its own — never a doc opened for the name, started anew or stamped.
+   * `null` when the history there is stamped for another file, when there is
+   * no store under the name, and when it could not be read. A history
+   * without a stamp is taken for the file's, as {@link open} takes it: every
+   * history made or carried (see {@link move}) since 0.3.8 is stamped.
+   *
+   * {@link open} would delete another file's history under the name: a note
+   * renamed onto it has its history carried there, and reading the deleted
+   * note's state that way wiped the renamed one's.
+   */
+  stateVectorOf(bindingId: string, filePath: string, fileId: string): Promise<Uint8Array | null> {
+    const key = this.cacheKey(bindingId, filePath);
+    const own = (owner: string | null): boolean => owner === fileId || owner === null;
+    return this.serially([key], async (): Promise<Uint8Array | null> => {
+      try {
+        const cached = this.cache.get(key);
+        if (cached) {
+          // Not loaded in time: used as it is, as `open` does.
+          await this.settle(cached);
+          if (cached.dead || !own(cached.owner)) return null;
+          return Y.encodeStateVector(cached.doc);
+        }
+        return await this.peekStore(bindingId, filePath, async (doc, persistence) =>
+          own(await readStamp(persistence)) ? Y.encodeStateVector(doc) : null,
+        );
       } catch {
         return null;
       }
@@ -1155,9 +1194,14 @@ export class DocManager {
 
   /**
    * {@link peek} of a name no doc is open under: the store, if the renderer
-   * lists one under that very name, read on a doc of its own and closed.
+   * lists one under that very name, read by `read` on a doc of its own, and
+   * closed.
    */
-  private async peekStore(bindingId: string, filePath: string): Promise<StoredDoc | null> {
+  private async peekStore<T>(
+    bindingId: string,
+    filePath: string,
+    read: (doc: Y.Doc, persistence: DocPersistence) => Promise<T>,
+  ): Promise<T | null> {
     const key = this.cacheKey(bindingId, filePath);
     const name = this.dbName(bindingId, filePath);
     // A delete of the name under way: the store is going, and a store opened
@@ -1179,9 +1223,7 @@ export class DocManager {
       try {
         persistence = this.persistenceFactory(name, doc);
         if (persistence === null || !(await waitSynced(persistence))) return null;
-        const owner = await readStamp(persistence);
-        const written = await readMark(persistence);
-        return { owner, text: doc.getText('content').toJSON(), written };
+        return await read(doc, persistence);
       } finally {
         // Closed without waiting: y-indexeddb closes once its database has
         // opened, which a wedged IndexedDB never does, and the check this
