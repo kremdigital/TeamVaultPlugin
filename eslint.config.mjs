@@ -130,6 +130,15 @@ export default defineConfig([
   },
 
   {
+    // The end-to-end suite talks to a real server from Node (`pnpm test:e2e`):
+    // `requestUrl` exists only inside Obsidian, so its clients use `fetch`.
+    files: ['tests/e2e/**'],
+    rules: {
+      'no-restricted-globals': 'off',
+    },
+  },
+
+  {
     // Node CLIs and build/release tooling: they print to the terminal and run
     // outside Obsidian, so none of the plugin-runtime rules apply.
     files: ['scripts/**', '*.mjs'],

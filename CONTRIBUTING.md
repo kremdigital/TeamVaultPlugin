@@ -71,6 +71,12 @@ real install.
   vault, watchers — is passed in as a fake.
 - A change that only makes sense in a running Obsidian (UI, focus, plugin
   reload) also gets a scenario in [MANUAL-TEST.md](./MANUAL-TEST.md).
+- `pnpm test:e2e` runs the sync engine against a real server, the sync
+  stand of a TeamVaultServer checkout next door, with network faults
+  (`tests/e2e/`). It is not a gate: it needs PostgreSQL and the server — see
+  step 2 of [RELEASING.md](./RELEASING.md#cutting-a-release). A scenario there
+  checks what the unit tests already pin down, on the real server; the
+  regression test of a fix still goes into `pnpm test`.
 
 ## Code conventions
 

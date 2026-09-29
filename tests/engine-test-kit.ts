@@ -1015,7 +1015,11 @@ function abortable<T>(work: Promise<T>, signal: AbortSignal | undefined): Promis
 }
 
 /** Start the vault's `ObsidianWatcher`, wired to the engine as `main.ts` does. */
-function watchVault(vault: MemoryVault, ra: RecentlyApplied, binding: VaultBinding): EchoRoute {
+export function watchVault(
+  vault: MemoryVault,
+  ra: RecentlyApplied,
+  binding: VaultBinding,
+): EchoRoute {
   const route: EchoRoute = {
     engine: null,
     binding,

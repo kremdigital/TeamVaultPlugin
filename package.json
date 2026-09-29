@@ -19,6 +19,7 @@
     "test": "jest",
     "test:watch": "jest --watch",
     "test:coverage": "jest --coverage",
+    "test:e2e": "jest -c jest.e2e.config.mjs --runInBand",
     "cli": "tsx scripts/cli-emulator.ts",
     "version": "node scripts/version-bump.mjs && git add manifest.json versions.json",
     "prepare": "husky"

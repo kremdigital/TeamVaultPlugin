@@ -6,14 +6,33 @@ Community directory ([community.obsidian.md](https://community.obsidian.md)).
 ## Cutting a release
 
 1. Make sure `main` is green: `pnpm typecheck && pnpm lint && pnpm format:check && pnpm test`.
-2. Update `CHANGELOG.md`: turn the `## [Unreleased]` notes into a
+2. Run the end-to-end suite: `pnpm test:e2e`. It drives the plugin's sync
+   engine against a real server — lost answers, packets that never arrived,
+   Pause sync in the middle of a chain of renames, `busy`, offline edits, two
+   devices at once (`tests/e2e/`, about 30 s). It needs:
+   - PostgreSQL running locally, with a database the suite may wipe:
+     `createdb team_vault_e2e` once (the default URL is
+     `postgresql://team_vault:team_vault@localhost:5432/team_vault_e2e`; set
+     `TV_E2E_DATABASE_URL` for another one — local, and named `*_e2e`);
+   - a TeamVaultServer checkout next to this one (`../server`, or
+     `TV_SERVER_DIR`) at the revision production runs or will run, with
+     `pnpm install` done there. The suite starts its sync stand
+     (`tests/stand/sync-stand.ts`) and migrates the database itself.
+
+   It is not one of the gates and the release workflow does not run it; a
+   release that changes the sync engine or the protocol needs it green, and
+   the manual scenarios of [MANUAL-TEST.md](./MANUAL-TEST.md) on two test
+   vaults all the same — the suite's vault is in memory, not Obsidian's.
+   `TV_E2E_TRACE=1` prints what each device logs.
+
+3. Update `CHANGELOG.md`: turn the `## [Unreleased]` notes into a
    `## [X.Y.Z] — YYYY-MM-DD` section and leave an empty `## [Unreleased]`
    heading above it for the next changes. The release workflow publishes
    exactly the version's section (up to the next `## [` heading) as the
    release body — `node scripts/release-notes.mjs X.Y.Z` prints it — and fails
    if the section is missing or empty. The changelog is in English: the
    release page and the directory's audience read it.
-3. Bump the version. `pnpm version` runs `scripts/version-bump.mjs`, which
+4. Bump the version. `pnpm version` runs `scripts/version-bump.mjs`, which
    syncs `manifest.json#version` and appends a `versions.json` entry
    mapping the new version to the current `minAppVersion`, then stages
    both files:
@@ -26,7 +45,7 @@ Community directory ([community.obsidian.md](https://community.obsidian.md)).
    default. The `-m` message keeps the commit within Conventional Commits,
    which commitlint checks.
 
-4. Push the **plain** version tag (no `v` prefix) — this is what the
+5. Push the **plain** version tag (no `v` prefix) — this is what the
    catalogue requires:
 
    ```bash
@@ -57,7 +76,7 @@ Community directory ([community.obsidian.md](https://community.obsidian.md)).
    lightweight tag rather than `git tag -a`, and the release is published
    at once with its notes instead of as a draft to fill in by hand.
 
-5. After the workflow finishes, check the release:
+6. After the workflow finishes, check the release:
    - it has `main.js`, `manifest.json` and `styles.css`, and its body is the
      version's changelog section;
    - the attestation verifies, from a directory holding the downloaded
@@ -267,6 +286,8 @@ appear.
 - [ ] `CHANGELOG.md` has a `## [X.Y.Z] — YYYY-MM-DD` section for the new
       version (`node scripts/release-notes.mjs X.Y.Z` prints it), in English.
 - [ ] All gates green.
+- [ ] `pnpm test:e2e` green against the server production runs (or will run),
+      for a release that changes the sync engine or the protocol.
 - [ ] A release that needs the server updated: production runs that server
       (see [Releases that need the server updated](#releases-that-need-the-server-updated)).
 - [ ] `minAppVersion` still accurate for any new API usage.
