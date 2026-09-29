@@ -1436,17 +1436,17 @@ export class SyncEngine {
       const unanswered = this.operationLog.dequeueOperations(this.binding.id);
       if (unanswered.length > 0) {
         try {
-          await this.settleUnanswered(unanswered, online);
+          await this.settleUnanswered(unanswered, link.signal);
         } catch (err) {
           if (!(err instanceof OpsStatusError)) throw err;
-          online.throwIfAborted();
+          link.signal.throwIfAborted();
           this.log.warn('could not check the queued operations with the server', {
             error: err.reason,
           });
           this.setStatus('error', await this.opsStatusFailure(err, online));
           return;
         }
-        online.throwIfAborted();
+        link.signal.throwIfAborted();
       }
       this.opsSettled = true;
       // Arm the streamed-catch-up completion signal before the join so a fast
@@ -1480,7 +1480,7 @@ export class SyncEngine {
       // flow at once, while the listing is still on its way.
       this.trackConnectFlow(filesPromise, { detach: false });
       const [result] = await Promise.all([joinPromise, filesPromise]);
-      online.throwIfAborted();
+      link.signal.throwIfAborted();
       // A server that does not keep operations idempotent (`opIdempotency`)
       // would apply a resend twice: nothing is sent to it — the queue keeps
       // what is made here until the server is updated.
@@ -1513,7 +1513,7 @@ export class SyncEngine {
       // Before any catch-up doc or operation lands: the files the queue's
       // operations were made to may be gone from under their ids.
       await this.settleOvertakenQueue(online);
-      online.throwIfAborted();
+      link.signal.throwIfAborted();
 
       // Index is ready — let catch-up batches through, draining any that
       // arrived during the join↔refresh window.
@@ -1521,8 +1521,8 @@ export class SyncEngine {
       const buffered = this.pendingCatchup;
       this.pendingCatchup = [];
       for (const batch of buffered) {
-        await this.processCatchupBatch(batch, online);
-        online.throwIfAborted();
+        await this.processCatchupBatch(batch, link.signal);
+        link.signal.throwIfAborted();
       }
 
       if (!result.ok) {
@@ -1542,7 +1542,7 @@ export class SyncEngine {
       for (const op of result.operations) {
         if (own.has(op)) this.mergeClock(op);
         else await this.applyServerOperation(op, catchup);
-        online.throwIfAborted();
+        link.signal.throwIfAborted();
       }
       // A catch-up cut short to its newest operations may have left some out:
       // attachments are checked against the listing instead (see
@@ -1550,14 +1550,14 @@ export class SyncEngine {
       // this device only, and those deleted and created again under their id.
       const partial = result.operationsTruncated === true;
       await this.reconcileAttachments(online, { onlyNew: !partial, replaced: replacedAway });
-      online.throwIfAborted();
+      link.signal.throwIfAborted();
 
       // Hydrate Yjs docs: the server streams them via `yjs:catchup` (handled
       // by `handleYjsCatchup`); we wait for the `done` batch here. An answer
       // that announces no stream brings no docs.
-      if (result.yjsStream === true) await this.waitForCatchup(catchupDone, online);
+      if (result.yjsStream === true) await this.waitForCatchup(catchupDone, link.signal);
       else this.catchupResolve = null;
-      online.throwIfAborted();
+      link.signal.throwIfAborted();
 
       // Подписка на отправку локальных правок — ЛЕНИВО.
       //
@@ -1616,8 +1616,9 @@ export class SyncEngine {
       // Cut short by `stop()` or by Pause sync — not a sync failure.
       if (online.aborted) return;
       // Cut short by the connection dropping: the status says so already, and
-      // the next connect starts over.
-      if (!this.socketLink.isConnected()) return;
+      // the next connect starts over — maybe running by now, its status its
+      // own.
+      if (link.signal.aborted || !this.socketLink.isConnected()) return;
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
   }
@@ -2609,26 +2610,31 @@ export class SyncEngine {
    * Waits for the streamed catch-up to finish, but never hangs the whole
    * connect on a stalled stream — after {@link CATCHUP_TIMEOUT_MS} we proceed
    * to `connected` regardless (the initial-push drain reconciles the rest).
-   * `online`: the connection the catch-up comes on (see `online`).
+   * `connection`: the connection the catch-up comes on (see `link`).
    */
-  private waitForCatchup(done: Promise<void>, online: AbortSignal): Promise<void> {
+  private waitForCatchup(done: Promise<void>, connection: AbortSignal): Promise<void> {
     return new Promise<void>((resolve) => {
       let settled = false;
       const finish = (): void => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timer);
-        online.removeEventListener('abort', finish);
+        connection.removeEventListener('abort', finish);
         this.catchupResolve = null;
         resolve();
       };
       const timer = window.setTimeout(finish, CATCHUP_TIMEOUT_MS);
-      // `stop()` and Pause sync end the wait at once: the connect flow
-      // unwinds instead of waiting out the guard for batches that no longer
-      // come. Waited out, a pause during the catch-up reported the binding
-      // connected five minutes later, and its drain ran while paused.
-      if (online.aborted) finish();
-      else online.addEventListener('abort', finish, { once: true });
+      // `stop()`, Pause sync and the connection dropping end the wait at
+      // once: the connect flow unwinds instead of waiting out the guard for
+      // batches that no longer come. Waited out, a pause during the catch-up
+      // reported the binding connected five minutes later, and its drain ran
+      // while paused. A connection dropped during the catch-up of a large
+      // vault left the flow waiting beside the next connect's: the guard
+      // then took the next catch-up's signal away — that connect waited five
+      // minutes more — and the flow reported the binding connected in the
+      // middle of the next catch-up.
+      if (connection.aborted) finish();
+      else connection.addEventListener('abort', finish, { once: true });
       void done.then(finish);
     });
   }
@@ -2662,6 +2668,9 @@ export class SyncEngine {
       // retried on the next reconnect. `initialPush` itself skips paths
       // that are still queued.
     }
+    // The connection is gone: the next connect's tail uploads. Run on, the
+    // upload pass sent new files over that connection ahead of its drain.
+    if (link.signal.aborted) return;
     try {
       await this.initialPush(online);
       // The copies of files deleted while away are gone by now.

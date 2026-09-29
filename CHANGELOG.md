@@ -146,6 +146,18 @@ uses [Semantic Versioning](https://semver.org/).
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the
   server, and came back with the next connection.
+- **A connection that drops while Team Vault catches up no longer holds up
+  the next one.** On a large vault the catch-up after connecting takes a
+  while, and the connection can drop in the middle of it (Obsidian, busy
+  writing notes, may miss the server's heartbeat). The interrupted attempt
+  then kept waiting beside the next one: up to five minutes later it reported
+  the vault as connected while the new catch-up was still running, and took
+  that catch-up's end away from it, so the new connection stayed in
+  `syncing` up to five minutes more with its queued changes unsent. An
+  attempt whose connection dropped while it was sending the queue also
+  uploaded new files over the next connection, ahead of that one's queue.
+  Now whatever an interrupted attempt has left to do ends with its
+  connection, and the next one does it.
 
 ## [0.4.0] — 2026-09-28
 

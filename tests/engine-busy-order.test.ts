@@ -200,6 +200,27 @@ async function aWhile(): Promise<void> {
   await flushAsync(60);
 }
 
+/** How long the engine waits for a streamed catch-up at most (`CATCHUP_TIMEOUT_MS`). */
+const CATCHUP_GUARD_MS = 5 * 60 * 1000;
+
+/**
+ * The timers set for `ms`, held for the test to run (`held`) instead of
+ * running out; every other timer runs as it does. `restore` ends the hold.
+ */
+function holdTimers(ms: number): { held: Array<() => void>; restore: () => void } {
+  const held: Array<() => void> = [];
+  const real = globalThis.setTimeout;
+  const spy = jest.spyOn(globalThis, 'setTimeout').mockImplementation(((
+    handler: () => void,
+    delay?: number,
+  ) => {
+    if (delay !== ms) return real(handler, delay);
+    held.push(handler);
+    return 0;
+  }) as unknown as typeof setTimeout);
+  return { held, restore: () => spy.mockRestore() };
+}
+
 // -- New changes wait behind the refused ones ------------------------------------------
 
 describe('SyncEngine — after busy, new changes wait behind the refused ones', () => {
@@ -652,6 +673,96 @@ describe('SyncEngine — when the queue is tried again after busy', () => {
     expect(queue(b.h)).toEqual([]);
     expect(live(b.server)).toEqual([`n${String(n)}.md`]);
     expect(disk(b.h)).toEqual([`n${String(n)}.md=n\n`]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+});
+
+// -- The connect and the drain of a connection gone ----------------------------------------
+
+describe('SyncEngine — the connect and the drain of a connection gone', () => {
+  it('a catch-up cut short by the connection dropping ends with it: the next connect’s catch-up and queue are its own', async () => {
+    const b = await online([
+      ['a.md', 'f1', 'a\n'],
+      ['c.md', 'f2', 'c\n'],
+    ]);
+    const mark = b.server.applied.length;
+    const guards = holdTimers(CATCHUP_GUARD_MS);
+    try {
+      // The server announces a streamed catch-up; the connection drops before its end.
+      b.h.socket().disconnect();
+      b.h.socket().connect();
+      (await joinToAnswer(b.h)).ack({ ...b.server.joinAnswer('whole journal'), yjsStream: true });
+      await until('the first catch-up', () => guards.held.length === 1);
+      b.h.vault.files.set('new.md', encode('new\n'));
+      b.h.socket().disconnect();
+      b.h.socket().connect();
+      (await joinToAnswer(b.h)).ack({ ...b.server.joinAnswer('whole journal'), yjsStream: true });
+      await until('the second catch-up', () => guards.held.length === 2);
+
+      // The first connect's guard runs out, its stream long gone.
+      guards.held[0]?.();
+      await aWhile();
+      expect(b.h.engine.getStatus()).toBe('syncing');
+      expect(b.h.socket().created()).toEqual([]);
+      // A change refused busy meanwhile waits behind the queue, which the
+      // second connect sends once its catch-up is done.
+      b.server.bar(1);
+      await renameOut(b, 'a.md', 'b.md');
+      expect(b.server.serveNext()).toBe(true);
+      await aWhile();
+      expect(emitsOf(b.h, 'file:rename')).toHaveLength(1);
+
+      b.h.socket().fire('yjs:catchup', { projectId: 'p1', docs: [], done: true });
+      await until('connected', () => b.h.engine.getStatus() === 'connected');
+      await b.server.pump();
+      await b.h.settle();
+      await b.docs.drive();
+      expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> b.md', 'create new.md']);
+      expect(queue(b.h)).toEqual([]);
+      appliedOnce(b.server);
+      await b.h.engine.stop();
+    } finally {
+      guards.restore();
+    }
+  });
+
+  it('a drain cut short by the connection dropping uploads nothing after it: the next connect sends the queue first', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']], [['img.png', 'f2', 'v1']]);
+    const mark = b.server.applied.length;
+    b.h.socket().disconnect();
+    await flushAsync();
+    b.h.vault.files.set('img.png', encode('v2'));
+    await b.h.engine.handleVaultEvent(event('modify', 'img.png'));
+    expect(queue(b.h)).toEqual(['UPDATE img.png']);
+    b.h.vault.files.set('new.md', encode('new\n'));
+    // The upload of each connect's drain, held.
+    const held = [deferred<void>(), deferred<void>()];
+    let uploads = 0;
+    b.h.routes.set('PUT /blobs', async () => {
+      const upload = held[uploads];
+      uploads += 1;
+      await upload?.promise;
+      return json({ ok: true });
+    });
+    await reconnect(b);
+    await until('the first drain’s upload', () => uploads === 1);
+    b.h.socket().disconnect();
+    await reconnect(b);
+
+    held[0]?.resolve();
+    await until('the second drain’s upload', () => uploads === 2);
+    await aWhile();
+    // Nothing of the first connect's tail on this connection.
+    expect(b.h.socket().created()).toEqual([]);
+    expect(emitsOf(b.h, 'file:update-binary')).toHaveLength(0);
+
+    held[1]?.resolve();
+    await b.server.pump();
+    await b.h.settle();
+    await b.docs.drive();
+    expect(b.server.applied.slice(mark)).toEqual(['update f2', 'create new.md']);
+    expect(queue(b.h)).toEqual([]);
     appliedOnce(b.server);
     await b.h.engine.stop();
   });
