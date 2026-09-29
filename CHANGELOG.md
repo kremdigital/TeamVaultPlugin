@@ -180,6 +180,15 @@ uses [Semantic Versioning](https://semver.org/).
   it too — even while the next catch-up was asking you about a teammate's
   newer version of that attachment. Now whatever an interrupted attempt has
   left to do ends with its connection, and the next one does it.
+- **A note renamed or deleted the moment it is created no longer leaves an
+  error in the developer console.** When a template renamed the note it had
+  just created (or you renamed or deleted a new note right away), Team Vault
+  could find the note gone while reading it to send, and stopped with
+  `Uncaught (in promise) Error: ENOENT` in the console and nothing in
+  `sync.log`. The note still reached the team once, under its new name. Now
+  such a note is treated as gone, as when it is gone before Team Vault gets
+  to it: the rename goes out as the note's creation under the new name, and
+  a note deleted at once sends nothing.
 
 ## [0.4.0] — 2026-09-28
 

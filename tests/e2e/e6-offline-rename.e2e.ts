@@ -2,6 +2,12 @@
  * E6 (MANUAL-TEST S18, step 6, in part). Renames made offline: a note created
  * and renamed goes up once under its last name, and a note the teammate edits
  * meanwhile keeps the edit under its new name — no duplicate, no conflict copy.
+ *
+ * The same for a note renamed the moment it is made, as a template does, with
+ * no wait for the plugin in between: online and offline. The rename can come
+ * before the create looked for the file, while it reads it, or once it is
+ * sent or queued; whichever it is, the note goes up once, under its new name,
+ * and no handler fails.
  */
 import { expectConverged } from './converged';
 import { eventually } from './eventually';
@@ -46,5 +52,31 @@ describe('E6: renames made offline', () => {
     expect(b.text('e2.md')).toBe('made offline\n');
     const ops = await stand.ops(projectId);
     expect(ops.some((op) => op.filePath === 'e.md' || op.newPath === 'e.md')).toBe(false);
+  });
+
+  it('a note renamed the moment it is made goes up once, under its new name', async () => {
+    team = await openTeam([
+      { name: 'A', member: 0 },
+      { name: 'B', member: 1 },
+    ]);
+    const [a, b] = team.devices as [LiveClient, LiveClient];
+    const { stand, projectId } = team;
+
+    a.write('Untitled.md', 'made by a template\n');
+    await a.rename('Untitled.md', 'Meeting.md');
+    await expectConverged(stand, projectId, [a, b]);
+    expect(b.paths()).toEqual(['Meeting.md']);
+    expect(b.text('Meeting.md')).toBe('made by a template\n');
+
+    a.net.offline();
+    await eventually(() => expect(a.status).not.toBe('connected'));
+    a.write('Untitled.md', 'made offline\n');
+    await a.rename('Untitled.md', 'Offline.md');
+    a.net.online();
+    await expectConverged(stand, projectId, [a, b]);
+    expect(b.paths()).toEqual(['Meeting.md', 'Offline.md']);
+    expect(b.text('Offline.md')).toBe('made offline\n');
+    const ops = await stand.ops(projectId);
+    expect(ops.filter((op) => op.opType === 'CREATE')).toHaveLength(2);
   });
 });

@@ -4259,7 +4259,19 @@ export class SyncEngine {
     // here). Emitting would upload empty bytes and tip the server into a
     // conflict-rename round-trip.
     if (!(await this.vault.exists(path))) return null;
-    const buffer = await this.vault.readBinary(path);
+    let buffer: ArrayBuffer;
+    try {
+      buffer = await this.vault.readBinary(path);
+    } catch (err) {
+      // Gone between the check and the read: renamed or deleted right after
+      // it was made (a template renaming the note it has just created). The
+      // same stale create: the rename goes out as the create of the new name
+      // (see `renameAfterCreate`), a delete sends nothing. Thrown on, it
+      // ended the handler with an error in the console and nothing sent.
+      if (await this.vault.exists(path)) throw err;
+      this.log.debug('create of a file gone before it was read; nothing to send', path);
+      return null;
+    }
     const hash = await sha256Hex(buffer);
     const payload = { fileType, contentHash: hash, size: buffer.byteLength };
     if (change) change.payload = payload;
