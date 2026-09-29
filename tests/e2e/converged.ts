@@ -6,8 +6,8 @@
  * operations and late packets could turn into; the server applies an `opId`
  * once (its unique index makes a second row impossible), so a check of unique
  * ids would never fail. The journal is read for the effect instead: one delete
- * per file, no rename from one name to another twice, no operation of one
- * device on the same paths twice.
+ * per file, no device renaming a file to the same name twice, no create or
+ * delete of one device on the same path twice (see {@link repeatsIn}).
  */
 import { sha256Hex } from '@/sync/hash';
 import { eventually, quietFor } from './eventually';
@@ -40,11 +40,27 @@ export function fileIdOf(op: ServerOpRow): string | undefined {
 }
 
 /**
- * Operations applied twice, by their effect: a second delete of a file, a
- * second rename of a file from one name to the same other name, and one
- * device's second create, delete, rename or move on the same paths (a no-op
- * excepted: it changed nothing; an attachment saved twice is two updates).
- * Each as a line that names the rows.
+ * The name a rename or move asked for: the row's `newPath`, or — the name
+ * taken on the server — the one it gave way to (`originalNewPath`).
+ */
+function nameAskedFor(op: ServerOpRow): string {
+  const asked = op.payload['originalNewPath'];
+  return typeof asked === 'string' ? asked : String(op.newPath);
+}
+
+/**
+ * Operations applied twice, by their effect: a second delete of a file, one
+ * device's second rename or move of a file to the same name, and one device's
+ * second create or delete of the same path (a no-op excepted: it changed
+ * nothing; an attachment saved twice is two updates). Each as a line that
+ * names the rows.
+ *
+ * A rename is known by the file and the name it asked for, not by the row's
+ * `filePath`: the server writes there where the file was when it applied the
+ * rename. Sent again, the rename of `n.md` to `m.md` comes back as
+ * `m.md -> m.md` (a no-op, which counts: the device asked for the name twice)
+ * or, a teammate having renamed the note to `r5.md` meanwhile, as
+ * `r5.md -> m.md` — never as the first row again.
  */
 export function repeatsIn(ops: readonly ServerOpRow[]): string[] {
   const seen = new Map<string, number>();
@@ -53,12 +69,12 @@ export function repeatsIn(ops: readonly ServerOpRow[]): string[] {
   };
   for (const op of ops) {
     const fileId = fileIdOf(op) ?? '?';
+    const device = String(op.clientId);
     if (op.opType === 'DELETE') count(`DELETE of file ${fileId}`);
     if (op.opType === 'RENAME' || op.opType === 'MOVE') {
-      count(`rename of file ${fileId}: ${op.filePath} -> ${String(op.newPath)}`);
-    }
-    if (op.opType !== 'UPDATE' && op.outcome?.kind !== 'no_op') {
-      count(`${rowOf(op)} by ${String(op.clientId)}`);
+      count(`rename of file ${fileId} to ${nameAskedFor(op)} by ${device}`);
+    } else if (op.opType !== 'UPDATE' && op.outcome?.kind !== 'no_op') {
+      count(`${rowOf(op)} by ${device}`);
     }
   }
   return [...seen].filter(([, n]) => n > 1).map(([key, n]) => `${key} (${n} times)`);
