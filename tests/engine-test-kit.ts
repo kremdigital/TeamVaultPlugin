@@ -588,6 +588,12 @@ export class FakeSocket implements SocketLike {
    * that connected and is still asking `ops:status` (see {@link FakeServer}).
    */
   inRoom = false;
+  /**
+   * The joins of this connection still unanswered, and whether one was
+   * taken: a refused join leaves the socket out of the room unless one of
+   * them holds it there, as the server's `holdRoom` does.
+   */
+  private roomJoins = { pending: 0, joined: false };
   /** `false` while there is no network: `connect()` fails until {@link goOnline}. */
   reachable = true;
   /** A connect was asked for while unreachable; {@link goOnline} completes it. */
@@ -638,7 +644,20 @@ export class FakeSocket implements SocketLike {
       const join: Emit = { event, payload: args[0], ack, seq };
       const answer = withIdempotency(ack);
       const connection = this.connection;
+      const joins = this.roomJoins;
+      joins.pending += 1;
       join.ack = (response): void => {
+        if (join.answered !== true) {
+          joins.pending -= 1;
+          // A refused join leaves the socket as it found it: out of the room,
+          // unless another join of the connection took it in or is under way
+          // (`sync-protocol.md`, «Отказ»). A refusal other than `join_failed`
+          // never took it in.
+          if ((response as { ok?: unknown } | null)?.ok === true) joins.joined = true;
+          else if (joins === this.roomJoins && joins.pending === 0 && !joins.joined) {
+            this.inRoom = false;
+          }
+        }
         join.answered = true;
         // As the server answers: the text docs follow the answer as
         // `yjs:catchup` batches (see `serverJoin`), on the connection the
@@ -652,6 +671,7 @@ export class FakeSocket implements SocketLike {
     } else if (event === 'project:leave') {
       // Out of the room: the server's broadcasts no longer reach the socket.
       this.inRoom = false;
+      this.roomJoins.joined = false;
       this.emits.push({ event, payload: args[0], ack, seq });
       ack({ ok: true });
     } else {
@@ -682,6 +702,7 @@ export class FakeSocket implements SocketLike {
     this.connection += 1;
     // A new connection is in no room until it joins one.
     this.inRoom = false;
+    this.roomJoins = { pending: 0, joined: false };
     this.fire('connect');
     return this;
   }
@@ -862,6 +883,11 @@ export interface HarnessOptions {
    */
   queueStuckRetryMs?: number;
   /**
+   * The engine's pauses before it joins again after a join the server could
+   * not answer (`SyncEngineDeps.joinRetryMs`).
+   */
+  joinRetryMs?: readonly number[];
+  /**
    * The client id the engine syncs under; `device-1` by default. The
    * {@link FakeServer} takes each of {@link THIS_USERS_CLIENTS} for this
    * device's user.
@@ -1000,6 +1026,7 @@ export function buildHarness(opts: HarnessOptions = {}): Harness {
       : {}),
     ...(opts.queueRetryMs ? { queueRetryMs: opts.queueRetryMs } : {}),
     ...(opts.queueStuckRetryMs !== undefined ? { queueStuckRetryMs: opts.queueStuckRetryMs } : {}),
+    ...(opts.joinRetryMs ? { joinRetryMs: opts.joinRetryMs } : {}),
   });
   engine.onStatus((status) => h.statuses.push(status));
 

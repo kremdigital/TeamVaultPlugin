@@ -1,5 +1,6 @@
 import { Notice } from 'obsidian';
 import { t } from '@/i18n';
+import { describeSyncDetail } from './sync-detail';
 
 /**
  * Tiny wrapper over Obsidian's `Notice` that respects the
@@ -48,9 +49,10 @@ export class NoticeService {
     this.show(t('notice.conflict', { file: filePath }));
   }
 
+  /** `error`: a status detail (see {@link describeSyncDetail}) or a message. */
   error(error: string): void {
     // Always shown.
-    this.show(t('notice.error', { error }));
+    this.show(t('notice.error', { error: describeSyncDetail(error) }));
   }
 
   private maybeShow(message: string): void {

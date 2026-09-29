@@ -43,6 +43,20 @@ describe('NoticeService', () => {
     expect(show.mock.calls[0]?.[0]).toContain('boom');
   });
 
+  it('says join_failed in words, in either language, and that sync tries again', () => {
+    const shown: Record<string, string> = {};
+    for (const lang of ['ru', 'en'] as const) {
+      setLanguage(lang);
+      const { svc, show } = build({ enabled: false });
+      svc.error('join_failed');
+      shown[lang] = show.mock.calls[0]?.[0] ?? '';
+    }
+    expect(shown.ru).not.toContain('join_failed');
+    expect(shown.ru).toContain('повторит попытку');
+    expect(shown.en).not.toContain('join_failed');
+    expect(shown.en).toContain('try again');
+  });
+
   it('always shows conflict notices regardless of the setting', () => {
     const { svc, show } = build({ enabled: false });
     svc.conflict('note.md');

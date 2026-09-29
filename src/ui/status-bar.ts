@@ -1,6 +1,7 @@
 import { type App, Menu, setIcon } from 'obsidian';
 import { t } from '@/i18n';
 import type { AggregateState, AggregateStatus, EngineManager } from '@/sync/engine-manager';
+import { describeSyncDetail } from './sync-detail';
 
 /**
  * Status-bar widget showing the aggregate engine state and an
@@ -60,8 +61,9 @@ export class StatusBar {
       cls: 'team-vault-status__label',
     });
     if (this.currentStatus.detail) {
-      this.el.setAttr('aria-label', this.currentStatus.detail);
-      this.el.setAttr('title', this.currentStatus.detail);
+      const detail = describeSyncDetail(this.currentStatus.detail);
+      this.el.setAttr('aria-label', detail);
+      this.el.setAttr('title', detail);
     } else {
       this.el.removeAttribute('aria-label');
       this.el.removeAttribute('title');

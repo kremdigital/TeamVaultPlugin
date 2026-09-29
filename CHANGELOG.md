@@ -149,6 +149,20 @@ uses [Semantic Versioning](https://semver.org/).
   changes go out again after three tries, and the rest is tried again every
   five minutes until it goes out, instead of waiting for the next
   connection. Edits to a note's text are not affected.
+- **Team Vault joins the project again on its own when the server couldn't
+  load it.** When the server failed to read what connecting to the project
+  needs (a database hiccup, say), the vault stayed in "Sync error" and heard
+  nothing from the team — no catch-up, and none of a teammate's changes —
+  until you paused and resumed sync or the connection dropped: hours,
+  perhaps. The notice and the status bar said only `join_failed`. Now Team
+  Vault tries again after 2, 5, 15, 30 and then every 60 seconds, without
+  reconnecting, until the server answers; the notice (shown once, not at
+  each try) and the status bar's tooltip say in words that the server could
+  not load the project and that Team Vault will try again. File changes you
+  make meanwhile wait in the queue and go out once the vault has caught up;
+  edits to a note's text go out as before. It takes the server of this
+  release (see **Changed**), which answers `join_failed` instead of passing
+  on its database error; with the server of 0.4.0 nothing changes.
 - **Deleting a folder deletes each file in it once.** When you deleted a
   folder in Obsidian, the first file in it and every file in its subfolders
   could be sent to the server as two deletes (three for a file two subfolders

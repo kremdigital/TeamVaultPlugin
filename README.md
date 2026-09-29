@@ -373,6 +373,15 @@ were lost, after four tries. Nothing is lost or sent twice: the plugin asks
 again at the next connect (**Pause sync** and **Resume sync** make one). If
 it keeps failing, check the server's logs and that it is running.
 
+**"Error: the server could not load the project; Team Vault will try again on
+its own"** — the server couldn't read what connecting to the project needs,
+usually because of its database. Team Vault tries again by itself, without
+reconnecting, after 2, 5, 15, 30 and then every 60 seconds, and `sync.log`
+says `the server could not answer the join; joining again` at each try.
+Meanwhile your file changes wait in the offline queue and go out once the
+vault has caught up. If it keeps failing, check the server's logs and its
+database.
+
 **Status stays at `connecting…`** — the plugin handles the WebSocket
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`
 headers cleanly, the socket can't establish. Check Caddy / nginx logs.

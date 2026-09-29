@@ -115,6 +115,17 @@ export const OPERATIONS_CATCHUP = 2;
  */
 export const OP_IDEMPOTENCY = 1;
 
+/**
+ * The refusal of a `project:join` the server could not answer: it failed to
+ * read what the answer needs (its database, say). Unlike the other refusals
+ * (`invalid_payload`, `project_not_found`, `user_not_found`, `forbidden`),
+ * asking again may get the answer, on the same connection
+ * (`sync-protocol.md`, «Подключение», «Отказ»). The server has taken the
+ * socket out of the project's room: none of its broadcasts reaches this
+ * device until a join is taken.
+ */
+export const JOIN_FAILED = 'join_failed';
+
 export type JoinResult =
   | {
       ok: true;

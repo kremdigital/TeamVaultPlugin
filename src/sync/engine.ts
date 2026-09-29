@@ -2,6 +2,7 @@ import type { ServerConfig, VaultBinding } from '@/settings/settings';
 import { ApiClient, ApiError } from '@/client/api';
 import type { ApiFile } from '@/client/types';
 import {
+  JOIN_FAILED,
   OPS_STATUS_MAX,
   SocketClient,
   type AckOk,
@@ -200,10 +201,38 @@ export interface SyncEngineDeps {
    * `SyncEngine.queueStuck`). Default: 5 minutes.
    */
   queueStuckRetryMs?: number;
+  /**
+   * The pauses (ms) before each new try of the connect flow, on the same
+   * connection, after the server refused `project:join` with a refusal that
+   * asking again may get past (`join_failed`, see
+   * `SyncEngine.joinAgainLater`); the last one repeats. Default: 2, 5, 15, 30
+   * and 60 s.
+   */
+  joinRetryMs?: readonly number[];
 }
 
 /** See {@link SyncEngineDeps.opsStatusRetryMs}. */
 const OPS_STATUS_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000];
+
+/** See {@link SyncEngineDeps.joinRetryMs}. */
+const JOIN_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000];
+
+/**
+ * The refusals of `project:join` that asking again may get past
+ * (`sync-protocol.md`, «Подключение», «Отказ»): the server could not read
+ * what its answer needs. Every other one answers the request itself, and
+ * asking again changes nothing.
+ */
+const JOIN_RETRYABLE: ReadonlySet<string> = new Set([JOIN_FAILED]);
+
+/**
+ * A new try of the connect flow on the connection `link`, the `attempt`-th
+ * one in a row (see {@link SyncEngine.joinAgainLater}).
+ */
+interface JoinRetry {
+  link: AbortController;
+  attempt: number;
+}
 
 /** See {@link SyncEngineDeps.queueRetryMs}. */
 const QUEUE_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000];
@@ -1059,6 +1088,9 @@ export class SyncEngine {
   /** See {@link SyncEngineDeps.queueStuckRetryMs}. */
   private readonly queueStuckRetryMs: number;
 
+  /** See {@link SyncEngineDeps.joinRetryMs}. */
+  private readonly joinRetryMs: readonly number[];
+
   /** The detail of the last status reported (see {@link setStatus}). */
   private statusDetail: string | undefined = undefined;
 
@@ -1096,6 +1128,7 @@ export class SyncEngine {
     this.opsStatusTimeoutMs = deps.opsStatusTimeoutMs;
     this.queueRetryMs = deps.queueRetryMs ?? QUEUE_RETRY_MS;
     this.queueStuckRetryMs = deps.queueStuckRetryMs ?? QUEUE_STUCK_RETRY_MS;
+    this.joinRetryMs = deps.joinRetryMs ?? JOIN_RETRY_MS;
     this.log = (deps.logger ?? SILENT_LOGGER).child({
       component: 'engine',
       bindingId: this.binding.id,
@@ -1431,7 +1464,13 @@ export class SyncEngine {
 
   // -- Connection / catch-up -----------------------------------------------
 
-  private async onSocketConnect(): Promise<void> {
+  /**
+   * The connect flow: `ops:status` for the queue, the join with its
+   * catch-up, the drain. Run on each connect, and again on the same
+   * connection (`retry`) after a join the server could not answer (see
+   * {@link joinAgainLater}).
+   */
+  private async onSocketConnect(retry?: JoinRetry): Promise<void> {
     // The connection this flow works for: Pause sync ends it (see `online`),
     // and the flow then unwinds at its next step.
     const online = this.online.signal;
@@ -1451,7 +1490,10 @@ export class SyncEngine {
     /** This connect's catch-up completion signal, while it is the armed one. */
     let armed: (() => void) | null = null;
     try {
-      this.setStatus('syncing');
+      // A new try keeps the error on show until its join is taken: flipped
+      // to `syncing` and back at each try, it had the plugin announce the
+      // same error again every minute while the server stayed down.
+      if (retry === undefined) this.setStatus('syncing');
       // Re-gate streamed catch-up for this connect: batches that arrive before
       // the file index is ready get buffered (see `handleYjsCatchup`).
       this.indexReady = false;
@@ -1465,6 +1507,8 @@ export class SyncEngine {
       // does the ack of an operation sent on the old connection: left counted
       // as on its way, a rename kept every teammate's rename of the file from
       // applying, and a create or delete took a teammate's for this device's.
+      // A new try on the same connection has had the answers of what went
+      // out on it (see `joinAgain`).
       this.localRenames.clear();
       this.ownCreates.clear();
       this.ownDeletes.clear();
@@ -1475,9 +1519,13 @@ export class SyncEngine {
       // What became of the queued operations, some of which may have lost
       // their answers — the server is asked before anything else (see
       // `settleUnanswered`). Live changes are queued meanwhile. Nothing is
-      // asked when nothing waits: the join goes out at once.
+      // asked when nothing waits: the join goes out at once. What the server
+      // answered on this connection stays known on a new try on it: sent
+      // while the refused join was on its way and answered, a change is in
+      // neither the queue nor on its way, and its row in the new catch-up
+      // would be taken for another device's under this device's id.
       this.opsSettled = false;
-      this.ownKnown.clear();
+      if (retry === undefined) this.ownKnown.clear();
       const unanswered = this.operationLog.dequeueOperations(this.binding.id);
       if (unanswered.length > 0) {
         try {
@@ -1488,7 +1536,11 @@ export class SyncEngine {
           this.log.warn('could not check the queued operations with the server', {
             error: err.reason,
           });
-          this.setStatus('error', await this.opsStatusFailure(err, online));
+          // The join that tells the server's kind (see `opsStatusFailure`)
+          // may be refused with `join_failed` too.
+          const failure = await this.opsStatusFailure(err, online);
+          this.setStatus('error', failure);
+          this.joinAgainLater(failure, link, retry);
           return;
         }
         link.signal.throwIfAborted();
@@ -1526,6 +1578,8 @@ export class SyncEngine {
       this.trackConnectFlow(filesPromise, { detach: false });
       const [result] = await Promise.all([joinPromise, filesPromise]);
       link.signal.throwIfAborted();
+      // A new try's join is taken: from here on it syncs as any connect does.
+      if (retry !== undefined && result.ok) this.setStatus('syncing');
       // A server that does not keep operations idempotent (`opIdempotency`)
       // would apply a resend twice: nothing is sent to it — the queue keeps
       // what is made here until the server is updated.
@@ -1573,6 +1627,7 @@ export class SyncEngine {
       if (!result.ok) {
         this.catchupResolve = null;
         this.setStatus('error', result.error);
+        this.joinAgainLater(result.error, link, retry);
         return;
       }
 
@@ -1665,6 +1720,57 @@ export class SyncEngine {
       if (link.signal.aborted || !this.socketLink.isConnected()) return;
       this.setStatus('error', describeError(err, 'sync_failed'));
     }
+  }
+
+  /**
+   * After a refusal of the join that asking again may get past (`error` in
+   * {@link JOIN_RETRYABLE}: the server could not read what its answer
+   * needs), run the connect flow again on the same connection once the next
+   * of {@link joinRetryMs} has passed, the last one again and again until a
+   * join is taken. The server has taken the socket out of the project's room:
+   * until then no teammate's change reaches this device. It used to stay so
+   * until Pause sync and Resume sync, or until the connection dropped.
+   *
+   * Changes made meanwhile wait in the queue, as they wait while a connect
+   * checks the queue, and go out after the catch-up of the join taken. Sent
+   * at once, one could still be on its way when the try reads the listing,
+   * which has the file where it was: a rename was undone on disk.
+   *
+   * The try belongs to the connection (`link`): it is called off when the
+   * connection drops, on Pause sync, on `stop()` and by a new connect, whose
+   * own flow runs instead. `retry`: the try the refused flow was, if any.
+   */
+  private joinAgainLater(error: string, link: AbortController, retry: JoinRetry | undefined): void {
+    if (!JOIN_RETRYABLE.has(error)) return;
+    this.opsSettled = false;
+    const attempt = (retry?.attempt ?? 0) + 1;
+    const pauses = this.joinRetryMs;
+    const pause = pauses[Math.min(attempt, pauses.length) - 1] ?? 0;
+    this.log.warn('the server could not answer the join; joining again', {
+      error,
+      attempt,
+      pause,
+    });
+    this.trackConnectFlow(this.joinAgain({ link, attempt }, pause));
+  }
+
+  /**
+   * The try {@link joinAgainLater} set up, once `pause` has passed and every
+   * change that went out on the connection before the refusal has its answer
+   * (see {@link liveOpsSettled}): the listing the try reads has them all.
+   */
+  private async joinAgain(retry: JoinRetry, pause: number): Promise<void> {
+    const { link } = retry;
+    try {
+      await waitFor(pause, link.signal);
+      // Throws, too, when the link ended right as the pause passed.
+      await this.liveOpsSettled(link.signal);
+    } catch {
+      // The connection dropped, sync was paused or stopped, or a new connect
+      // came: whatever joins now is that one's.
+      return;
+    }
+    await this.onSocketConnect(retry);
   }
 
   // -- Queued operations, some of which may have lost their answers ---------

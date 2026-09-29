@@ -87,6 +87,7 @@
   "status.connected": "Синхронизировано",
   "status.offline": "Нет соединения",
   "status.error": "Ошибка синхронизации",
+  "status.detail.joinFailed": "сервер не смог загрузить проект; Team Vault повторит попытку сам",
   "status.menu.bindings": "Хранилища",
   "status.menu.syncNow": "Синхронизировать сейчас",
   "status.menu.pause": "Приостановить",

@@ -583,6 +583,44 @@ describe('FakeServer — as the server does', () => {
     expect(heard).toHaveLength(1);
   });
 
+  it('takes a socket out of the room when its join fails, unless another join holds it', () => {
+    const { server, socket, heard } = room({ joined: false });
+    const join = (): Emit => {
+      socket.emit('project:join', { projectId: 'p1' }, () => undefined);
+      const sent = socket.emits.at(-1);
+      if (sent?.event !== 'project:join') throw new Error('no join');
+      return sent;
+    };
+    // The server could not read what the answer needs: out of the room it
+    // went into (`join_failed`, «Отказ»).
+    join().ack({ ok: false, error: 'join_failed' });
+    expect(socket.inRoom).toBe(false);
+    send(server, socket, 'file:create', { opId: newOpId(), filePath: 'a.md', ...TEXT });
+    expect(heard).toEqual([]);
+
+    // A join still under way holds the room when another fails.
+    const pending = join();
+    join().ack({ ok: false, error: 'join_failed' });
+    expect(socket.inRoom).toBe(true);
+    // So does one taken.
+    pending.ack({ ok: true, operations: [] });
+    join().ack({ ok: false, error: 'join_failed' });
+    expect(socket.inRoom).toBe(true);
+    send(server, socket, 'file:create', { opId: newOpId(), filePath: 'b.md', ...TEXT });
+    expect(heard.map(([event]) => event)).toEqual(['file:created']);
+
+    // Until the socket leaves; a new connection starts out of the room.
+    socket.emit('project:leave', { projectId: 'p1' }, () => undefined);
+    join().ack({ ok: false, error: 'join_failed' });
+    expect(socket.inRoom).toBe(false);
+    socket.disconnect();
+    socket.connect();
+    const taken = join();
+    taken.ack({ ok: true, operations: [] });
+    join().ack({ ok: false, error: 'join_failed' });
+    expect(socket.inRoom).toBe(true);
+  });
+
   it('drops the tombstone where a rename goes, conflict name or not', () => {
     const { server, socket, harness } = room();
     server.add({ id: 'f1', path: 'x.md', fileType: 'TEXT', contentHash: 'h1', size: 1 });

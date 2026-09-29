@@ -87,6 +87,7 @@
   "status.connected": "Synced",
   "status.offline": "Offline",
   "status.error": "Sync error",
+  "status.detail.joinFailed": "the server could not load the project; Team Vault will try again on its own",
   "status.menu.bindings": "Vaults",
   "status.menu.syncNow": "Sync now",
   "status.menu.pause": "Pause",
