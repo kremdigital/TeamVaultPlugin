@@ -391,8 +391,6 @@ interface Catchup {
   renamedFrom: ReadonlyMap<string, ReadonlySet<string>>;
   /** Operations this device applied from their live broadcasts. */
   appliedLive: ReadonlySet<string>;
-  /** Cut short to its newest operations (`operationsTruncated`). */
-  truncated: boolean;
 }
 
 /** A rename missed while the engine was away — see `renamedWhileAway`. */
@@ -1582,7 +1580,6 @@ export class SyncEngine {
         superseded: supersededOps(result.operations),
         renamedFrom: renameSources(result.operations),
         appliedLive,
-        truncated: result.operationsTruncated === true,
       };
       for (const op of result.operations) {
         if (own.has(op)) this.mergeClock(op);
@@ -5404,14 +5401,15 @@ export class SyncEngine {
    * (`payload.folder`, see {@link pruneVanishedFolder}): noted for the end of
    * the connect's tail. Whether this device had the file or not — one deleted
    * while it was away is not in the listing, and its copy goes in
-   * `initialPush`. From a catch-up cut short, only for a file this device has.
+   * `initialPush` — and from a catch-up cut short to its newest operations
+   * too (`sync-protocol.md`, «Папки»): the folder goes only if nothing is
+   * left in it, on disk or in the index the connect's listing made. Only an
+   * operation the cut left out says nothing, and its folder stays.
    */
-  private noteCatchupFolder(op: ServerOperation, catchup: Catchup): void {
+  private noteCatchupFolder(op: ServerOperation): void {
     if (op.opType !== 'DELETE' && op.opType !== 'RENAME' && op.opType !== 'MOVE') return;
-    const payload = (op.payload ?? {}) as { fileId?: unknown; folder?: unknown };
-    const folder = stringOf(payload.folder);
+    const folder = stringOf((op.payload as { folder?: unknown } | null)?.folder);
     if (folder === '' || this.catchupFolders.has(folder)) return;
-    if (catchup.truncated && !this.fileIndex.byId.has(stringOf(payload.fileId))) return;
     this.catchupFolders.set(folder, op.filePath);
   }
 
@@ -6419,7 +6417,7 @@ export class SyncEngine {
    */
   private async applyServerOperation(op: ServerOperation, catchup: Catchup): Promise<void> {
     const live = catchup.appliedLive.has(op.id);
-    this.noteCatchupFolder(op, catchup);
+    this.noteCatchupFolder(op);
     switch (op.opType) {
       case 'CREATE': {
         const payload = (op.payload ?? {}) as { fileType?: FileType; fileId?: string };

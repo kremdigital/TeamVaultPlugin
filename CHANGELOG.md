@@ -42,10 +42,10 @@ uses [Semantic Versioning](https://semver.org/).
   teammate's new file on its way to your disk. A folder emptied by deleting
   or moving its last file stays, as it stays for whoever did it. A device
   that was offline removes the folder when it reconnects, unless it was away
-  so long that the server sent it only the newest changes. It takes the
-  server of this release (see **Changed**); with the server of 0.4.0,
-  folders stay behind as before. Changes 0.4.0 left in the queue go out as
-  they are.
+  so long that the server sent it only the newest changes, and the folder's
+  were not among them. It takes the server of this release (see
+  **Changed**); with the server of 0.4.0, folders stay behind as before.
+  Changes 0.4.0 left in the queue go out as they are.
 
 ### Removed
 

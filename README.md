@@ -501,7 +501,8 @@ edits in `…conflict-<ts>.<ext>`.
   turning the plugin off or switching the binding off.
 - A folder a teammate deleted or renamed stays behind, empty, on a device
   that was away so long that the server sent it only the newest changes, and
-  on one whose Team Vault or server predates this; delete it by hand.
+  the folder's were not among them, and on one whose Team Vault or server
+  predates this; delete it by hand.
 - Project creation is server-only — the plugin binds to existing projects.
 - The conflict modal is bare-bones (no image preview, no inline diff).
 - The history view is read-only — restoring a version requires the web UI.

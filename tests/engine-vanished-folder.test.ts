@@ -953,7 +953,7 @@ describe('SyncEngine — a folder a teammate deleted or renamed while this devic
     await b.h.engine.stop();
   });
 
-  it('a catch-up cut short: a deleted file’s folder is left as it is', async () => {
+  it('a catch-up cut short: the folder of a deleted file among its operations goes all the same', async () => {
     const b = await seeded(['dir/a.png', 'x.png', 'keep.png']);
     b.h.socket().disconnect();
     b.server.teammateDelete('f2');
@@ -961,10 +961,43 @@ describe('SyncEngine — a folder a teammate deleted or renamed while this devic
 
     // The newest operation only: the listing tells the rest.
     await reconnect(b, 1);
+    await until('the folder removed', () => !b.h.vault.folders.has('dir'));
+
+    expect([...b.h.vault.files.keys()]).toEqual(['keep.png']);
+    await b.h.engine.stop();
+  });
+
+  it('a catch-up cut short without the folder’s operation: the folder is left as it is', async () => {
+    const b = await seeded(['dir/a.png', 'x.png', 'keep.png']);
+    b.h.socket().disconnect();
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    b.server.teammateDelete('f2');
+
+    // The newest operation only: the folder's is not among it.
+    await reconnect(b, 1);
     await until('the copy removed', () => !b.h.vault.files.has('dir/a.png'));
     await b.h.settle();
 
     expect(b.h.vault.folders.has('dir')).toBe(true);
+    await b.h.engine.stop();
+  });
+
+  it('a catch-up cut short: a folder that holds a file of the listing stays, the file comes', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    b.h.socket().disconnect();
+    // A teammate adds a file to the folder; another device, which never got
+    // it, deletes the folder.
+    await uploaded(b, 'dir/new.png', encode('pic'));
+    b.server.teammateDelete('f1', { folder: 'dir' });
+    const mark = b.entries.length;
+
+    // The newest operation only: the listing tells the rest.
+    await reconnect(b, 1);
+    await until('the folder looked at', () => said(b, KEPT_HOLDS, mark));
+
+    expect(b.h.vault.folders.has('dir')).toBe(true);
+    expect(b.h.vault.text('dir/new.png')).toBe('pic');
+    expect(b.h.vault.files.has('dir/a.png')).toBe(false);
     await b.h.engine.stop();
   });
 });
