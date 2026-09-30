@@ -159,13 +159,24 @@ uses [Semantic Versioning](https://semver.org/).
   until you paused and resumed sync or the connection dropped: hours,
   perhaps. The notice and the status bar said only `join_failed`. Now Team
   Vault tries again after 2, 5, 15, 30 and then every 60 seconds, without
-  reconnecting, until the server answers; the notice (shown once, not at
-  each try) and the status bar's tooltip say in words that the server could
-  not load the project and that Team Vault will try again. File changes you
-  make meanwhile wait in the queue and go out once the vault has caught up;
-  edits to a note's text go out as before. It takes the server of this
-  release (see **Changed**), which answers `join_failed` instead of passing
-  on its database error; with the server of 0.4.0 nothing changes.
+  reconnecting, for as long as the server can't answer for now. With its
+  database still down, the other steps of connecting fail along with the
+  join — the list of the project's files (an HTTP 5xx answer, or the server
+  not reached) and the check of the changes waiting in the queue (an error
+  of the server's own, or `busy` or no answer four times over) — and Team
+  Vault keeps trying through them too. It stops when the server refuses for
+  good (the project deleted, your access removed) or another error ends the
+  connect; the status bar then shows that error, and no new notice comes.
+  The notice (shown once, not at each try) and the status bar's tooltip say
+  in words that the server could not load the project and that Team Vault
+  will try again, whichever step failed. File changes you make meanwhile
+  wait in the queue and go out once the vault has caught up; edits to a
+  note's text go out as before. It takes the server of this release (see
+  **Changed**), which answers `join_failed` instead of passing on its
+  database error; with the server of 0.4.0 nothing changes. When the server
+  refuses that check of the queue for good because your account is gone
+  (`user_not_found`) or the request was malformed (`invalid_payload`), the
+  status now says so, as for the join, instead of `ops_status_failed`.
 - **Deleting a folder deletes each file in it once.** When you deleted a
   folder in Obsidian, the first file in it and every file in its subfolders
   could be sent to the server as two deletes (three for a file two subfolders

@@ -367,20 +367,31 @@ comes after about a minute and a half: the plugin first asks the server
 about them, an older server never answers, and the plugin then checks the
 server's version.
 
-**"Error: ops_status_failed"** — the server is up to date but didn't answer
+**"Error: ops_status_failed"** — the server is up to date but couldn't answer
 the question the plugin asks at each connect about changes whose answers
-were lost, after four tries. Nothing is lost or sent twice: the plugin asks
-again at the next connect (**Pause sync** and **Resume sync** make one). If
-it keeps failing, check the server's logs and that it is running.
+were lost: it was busy or silent for four tries, or failed on its own (its
+database, say). Nothing is lost or sent twice: the plugin asks again at the
+next connect (**Pause sync** and **Resume sync** make one). Once the server
+has failed to load the project, Team Vault asks again by itself instead (see
+the next entry). If it keeps failing, check the server's logs and that it is
+running.
 
 **"Error: the server could not load the project; Team Vault will try again on
 its own"** — the server couldn't read what connecting to the project needs,
 usually because of its database. Team Vault tries again by itself, without
-reconnecting, after 2, 5, 15, 30 and then every 60 seconds, and `sync.log`
-says `the server could not answer the join; joining again` at each try.
-Meanwhile your file changes wait in the offline queue and go out once the
-vault has caught up. If it keeps failing, check the server's logs and its
-database.
+reconnecting, after 2, 5, 15, 30 and then every 60 seconds. While the
+database stays down, the other steps of connecting fail too — the list of the
+project's files (an HTTP 5xx answer, or the server not reached), the check of
+changes waiting in the queue (an error of the server's own, or `busy` or no
+answer four times over) — and Team Vault keeps trying through them, with the
+same message. `sync.log` says `the server could not answer for now; joining
+again` at each try, with the step that failed and its error. It stops trying
+only when the server refuses for good (the project was deleted or your access
+to it removed, say) or another error ends the connect: the status bar's
+tooltip then shows that error, no new notice comes, and **Pause sync** and
+**Resume sync** connect again. Meanwhile your file changes wait in the offline
+queue and go out once the vault has caught up. If it keeps failing, check the
+server's logs and its database.
 
 **Status stays at `connecting…`** — the plugin handles the WebSocket
 upgrade; if your reverse proxy doesn't pass `Upgrade` / `Connection`

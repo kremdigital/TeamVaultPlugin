@@ -1219,14 +1219,36 @@ describe('SyncEngine — a server without opIdempotency', () => {
     await h.engine.stop();
   });
 
-  it('reports the refusal of ops:status as the join would: project_not_found, no join', async () => {
+  // Each refusal for good the server has for `ops:status`, the same as the
+  // join's (`sync-protocol.md`, «Сверка неотвеченных операций»).
+  // `user_not_found` and `invalid_payload` were shown as `ops_status_failed`,
+  // a server that could not answer — and a new try after `join_failed` asks
+  // again after that one.
+  it.each(['project_not_found', 'forbidden', 'user_not_found', 'invalid_payload'])(
+    'reports the refusal of ops:status as the join would: %s, no join',
+    async (refusal) => {
+      const { h, details, asked } = await queuedAgainst((e) =>
+        e.ack({ ok: false, error: refusal }),
+      );
+      await h.engine.start();
+      await until(() => h.engine.getStatus() === 'error');
+      expect(asked()).toBe(1);
+      expect(details.at(-1)).toBe(refusal);
+      expect(joinsOf(h)).toBe(0);
+      expect(queue(h)).toEqual(['DELETE a.md']);
+      await h.engine.stop();
+    },
+  );
+
+  it('reports an error of the server’s own as ops_status_failed, and asks no more in this connect', async () => {
     const { h, details, asked } = await queuedAgainst((e) =>
-      e.ack({ ok: false, error: 'project_not_found' }),
+      e.ack({ ok: false, error: "Can't reach database server at `db:5432`" }),
     );
     await h.engine.start();
     await until(() => h.engine.getStatus() === 'error');
+    await flushAsync(20);
     expect(asked()).toBe(1);
-    expect(details.at(-1)).toBe('project_not_found');
+    expect(details.at(-1)).toBe('ops_status_failed');
     expect(joinsOf(h)).toBe(0);
     expect(queue(h)).toEqual(['DELETE a.md']);
     await h.engine.stop();

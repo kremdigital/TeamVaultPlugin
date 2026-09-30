@@ -11,6 +11,7 @@ import {
   type FileCreatePayload,
   type FileDeletePayload,
   type FileEvent as SocketFileEvent,
+  type JoinResult,
   type OpsStatusResult,
   type ServerLogEntry,
   type ServerOperation,
@@ -226,13 +227,33 @@ const JOIN_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000, 60_000];
 const JOIN_RETRYABLE: ReadonlySet<string> = new Set([JOIN_FAILED]);
 
 /**
+ * The `yjs:catchup` streams of one connection (see
+ * {@link SyncEngine.catchupStreamsEnded}): `begun`, one for each join taken
+ * on it whose answer announced one (`yjsStream`); `ended`, one for each
+ * `done` batch that came on it.
+ */
+interface CatchupStreams {
+  begun: number;
+  ended: number;
+}
+
+/**
  * A new try of the connect flow on the connection `link`, the `attempt`-th
- * one in a row (see {@link SyncEngine.joinAgainLater}).
+ * one in a row (see {@link SyncEngine.joinAgainLater}). `streams`: the
+ * catch-up streams of that connection.
  */
 interface JoinRetry {
   link: AbortController;
   attempt: number;
+  streams: CatchupStreams;
 }
+
+/**
+ * The step of a try of the connect flow that the server could not answer
+ * for now (see {@link SyncEngine.joinAgainLater}): the question about the
+ * queue, the join, or the listing of the project's files.
+ */
+type TryStep = 'ops:status' | 'project:join' | 'listing';
 
 /** See {@link SyncEngineDeps.queueRetryMs}. */
 const QUEUE_RETRY_MS: readonly number[] = [2_000, 5_000, 15_000, 30_000];
@@ -275,10 +296,27 @@ type DrainOutcome =
   | { kind: 'offline' };
 
 /**
- * What the server says when it refuses `ops:status` for good: the status
- * shows it as the join would (see {@link SyncEngine.opsStatusFailure}).
+ * What the server says when it refuses `ops:status` for good — an answer to
+ * the request itself, the same as the join's (`sync-protocol.md`, «Сверка
+ * неотвеченных операций»): the status shows it as the join would (see
+ * {@link SyncEngine.opsStatusFailure}), and no new try of the connect flow
+ * asks again (see {@link SyncEngine.joinAgainLater}). Every other refusal —
+ * `busy`, the text of an error the server's database gave — is one it could
+ * not answer for now.
  */
-const OPS_STATUS_REFUSALS: ReadonlySet<string> = new Set(['project_not_found', 'forbidden']);
+const OPS_STATUS_REFUSALS: ReadonlySet<string> = new Set([
+  'invalid_payload',
+  'project_not_found',
+  'user_not_found',
+  'forbidden',
+]);
+
+/**
+ * The status detail of an `ops:status` the server did not answer: asked
+ * again after `busy` or no answer until the tries ran out, or refused with
+ * an error of its own (see {@link SyncEngine.opsStatusFailure}).
+ */
+const OPS_STATUS_FAILED = 'ops_status_failed';
 
 /**
  * A file operation about to go out through {@link SyncEngine.sendOp}: what
@@ -323,7 +361,7 @@ class OpsStatusError extends Error {
     readonly reason: string,
     readonly answered: boolean,
   ) {
-    super('ops_status_failed');
+    super(OPS_STATUS_FAILED);
     this.name = 'OpsStatusError';
   }
 }
@@ -979,6 +1017,13 @@ export class SyncEngine {
    * cleared when the stream finishes (or times out).
    */
   private catchupResolve: (() => void) | null = null;
+  /**
+   * The `yjs:catchup` streams of the connection open now, counted (see
+   * {@link catchupStreamsEnded}): a new one for each connection.
+   */
+  private catchupStreams: CatchupStreams = { begun: 0, ended: 0 };
+  /** Wakes each try waiting in {@link catchupStreamsEnded} when a stream ends. */
+  private readonly streamWaiters = new Set<() => void>();
   /** True once the file index is refreshed — gates catch-up batch processing
    *  so a doc always finds its metadata (no join↔refresh race). */
   private indexReady = false;
@@ -1503,6 +1548,11 @@ export class SyncEngine {
     this.queueStuck = false;
     this.pumpStep = 0;
     this.pumpFailures = 0;
+    // The catch-up streams of this connection (see `catchupStreamsEnded`): a
+    // new try on it counts on. Before any await: nothing of a new
+    // connection's comes before its first join.
+    const streams = retry?.streams ?? { begun: 0, ended: 0 };
+    this.catchupStreams = streams;
     /** This connect's catch-up completion signal, while it is the armed one. */
     let armed: (() => void) | null = null;
     try {
@@ -1552,11 +1602,22 @@ export class SyncEngine {
           this.log.warn('could not check the queued operations with the server', {
             error: err.reason,
           });
-          // The join that tells the server's kind (see `opsStatusFailure`)
-          // may be refused with `join_failed` too.
           const failure = await this.opsStatusFailure(err, online);
-          this.setStatus('error', failure);
-          this.joinAgainLater(failure, link, retry);
+          if (JOIN_RETRYABLE.has(failure)) {
+            // The join that tells the server's kind (see `opsStatusFailure`)
+            // was refused `join_failed`.
+            this.joinAgainLater('project:join', failure, link, retry, streams);
+          } else if (retry !== undefined && failure === OPS_STATUS_FAILED) {
+            // A try after `join_failed`, and the server could not answer this
+            // one's question either: its database, still down, fails it as it
+            // failed the join. It is asked again with the next try. Ended here,
+            // the tries stopped at the first one made while the database was
+            // still down — whenever a change had been queued meanwhile — and
+            // the vault stayed out of the project's room.
+            this.joinAgainLater('ops:status', err.reason, link, retry, streams);
+          } else {
+            this.setStatus('error', failure);
+          }
           return;
         }
         link.signal.throwIfAborted();
@@ -1586,14 +1647,45 @@ export class SyncEngine {
         .joinProject(this.binding.projectId, this.vectorClock)
         .then((joined) => {
           if (joined.ok && joined.opIdempotency === undefined) this.opsSettled = false;
+          // Counted whatever the flow makes of the answer, and whether or not
+          // it is still there to read it: the stream comes on this connection
+          // all the same (see `catchupStreamsEnded`).
+          if (joined.ok && joined.yjsStream === true) streams.begun += 1;
           return joined;
         });
       const filesPromise = this.refreshFileIndex(online);
-      // Known to `resume()` on its own: a join failed by a pause ends this
-      // flow at once, while the listing is still on its way.
+      // Known to `resume()` on its own, as it was when a join failed by a
+      // pause ended this flow at once.
       this.trackConnectFlow(filesPromise, { detach: false });
-      const [result] = await Promise.all([joinPromise, filesPromise]);
+      // A listing the server could not give for now — it answered 5xx, or was
+      // not reached — waits for the join's answer, which tells what to make
+      // of it (see `triesAfterListing`): when the server's database is down,
+      // the listing fails with the join. Taken at once, as any failure of the
+      // listing was, it ended the flow, the join's `join_failed` was never
+      // read, and no new try came. Any other failure of the listing, and a
+      // join that fails, still end the flow at once: nothing the other
+      // answer says changes that.
+      const listingFailedForNow = filesPromise.then(
+        () => null,
+        (err: unknown) => {
+          if (err instanceof ApiError && err.retryable) return err;
+          throw err;
+        },
+      );
+      const [result, listingError] = await Promise.all([joinPromise, listingFailedForNow]);
       link.signal.throwIfAborted();
+      if (listingError !== null) {
+        if (!this.triesAfterListing(result, retry)) throw listingError;
+        if (this.catchupResolve === armed) this.catchupResolve = null;
+        this.joinAgainLater(
+          result.ok ? 'listing' : 'project:join',
+          result.ok ? describeError(listingError, 'sync_failed') : result.error,
+          link,
+          retry,
+          streams,
+        );
+        return;
+      }
       // A new try's join is taken: from here on it syncs as any connect does.
       if (retry !== undefined && result.ok) this.setStatus('syncing');
       // A server that does not keep operations idempotent (`opIdempotency`)
@@ -1642,8 +1734,11 @@ export class SyncEngine {
 
       if (!result.ok) {
         this.catchupResolve = null;
-        this.setStatus('error', result.error);
-        this.joinAgainLater(result.error, link, retry);
+        if (JOIN_RETRYABLE.has(result.error)) {
+          this.joinAgainLater('project:join', result.error, link, retry, streams);
+        } else {
+          this.setStatus('error', result.error);
+        }
         return;
       }
 
@@ -1739,13 +1834,24 @@ export class SyncEngine {
   }
 
   /**
-   * After a refusal of the join that asking again may get past (`error` in
+   * A try of the connect flow the server could not answer for now: the join
+   * refused with a refusal asking again may get past (`error` in
    * {@link JOIN_RETRYABLE}: the server could not read what its answer
-   * needs), run the connect flow again on the same connection once the next
-   * of {@link joinRetryMs} has passed, the last one again and again until a
-   * join is taken. The server has taken the socket out of the project's room:
-   * until then no teammate's change reaches this device. It used to stay so
-   * until Pause sync and Resume sync, or until the connection dropped.
+   * needs), or — in a try after such a refusal, or with it — another `step`
+   * the server failed as it failed the join: `ops:status` (see
+   * {@link onSocketConnect}), the listing (see {@link triesAfterListing}).
+   * The connect flow runs again on the same connection once the next of
+   * {@link joinRetryMs} has passed, the last one again and again until a
+   * join is taken, or until the server refuses for good. The server has
+   * taken the socket out of the project's room: until then no teammate's
+   * change reaches this device. It used to stay so until Pause sync and
+   * Resume sync, or until the connection dropped.
+   *
+   * The status says `join_failed` whichever step failed — the join is what
+   * the tries are for — and stays so from try to try: flipped to another
+   * code, the status bar showed the code (`ops_status_failed`, `server (HTTP
+   * 500)`) where it had said in words that Team Vault tries again. The step
+   * and its error go to `sync.log`.
    *
    * Changes made meanwhile wait in the queue, as they wait while a connect
    * checks the queue, and go out after the catch-up of the join taken. Sent
@@ -1754,26 +1860,53 @@ export class SyncEngine {
    *
    * The try belongs to the connection (`link`): it is called off when the
    * connection drops, on Pause sync, on `stop()` and by a new connect, whose
-   * own flow runs instead. `retry`: the try the refused flow was, if any.
+   * own flow runs instead. `retry`: the try the refused flow was, if any;
+   * `streams`: the catch-up streams of the connection.
    */
-  private joinAgainLater(error: string, link: AbortController, retry: JoinRetry | undefined): void {
-    if (!JOIN_RETRYABLE.has(error)) return;
+  private joinAgainLater(
+    step: TryStep,
+    error: string,
+    link: AbortController,
+    retry: JoinRetry | undefined,
+    streams: CatchupStreams,
+  ): void {
+    this.setStatus('error', JOIN_FAILED);
     this.opsSettled = false;
     const attempt = (retry?.attempt ?? 0) + 1;
     const pauses = this.joinRetryMs;
     const pause = pauses[Math.min(attempt, pauses.length) - 1] ?? 0;
-    this.log.warn('the server could not answer the join; joining again', {
+    this.log.warn('the server could not answer for now; joining again', {
+      step,
       error,
       attempt,
       pause,
     });
-    this.trackConnectFlow(this.joinAgain({ link, attempt }, pause));
+    this.trackConnectFlow(this.joinAgain({ link, attempt, streams }, pause));
   }
 
   /**
-   * The try {@link joinAgainLater} set up, once `pause` has passed and every
+   * Whether a try of the connect flow whose listing the server could not
+   * give for now — it answered 5xx, or was not reached (see
+   * {@link onSocketConnect}) — fails for now as a whole, to be made again
+   * (see {@link joinAgainLater}): its join was refused `join_failed`, or
+   * taken in a try after such a refusal. When the database is down, the
+   * listing fails with the join and with `ops:status`. Otherwise the flow
+   * ends with the listing's error, as before: after a join refused for good,
+   * and — outside a chain of tries — after a join taken, the next connect
+   * then listing again. A listing refused for good (401, 403, 404) ends the
+   * flow before this is asked.
+   */
+  private triesAfterListing(result: JoinResult, retry: JoinRetry | undefined): boolean {
+    if (!result.ok) return JOIN_RETRYABLE.has(result.error);
+    return retry !== undefined;
+  }
+
+  /**
+   * The try {@link joinAgainLater} set up, once `pause` has passed, every
    * change that went out on the connection before the refusal has its answer
-   * (see {@link liveOpsSettled}): the listing the try reads has them all.
+   * (see {@link liveOpsSettled}) — the listing the try reads has them all —
+   * and the catch-up stream of a join taken by the failed try has ended (see
+   * {@link catchupStreamsEnded}).
    */
   private async joinAgain(retry: JoinRetry, pause: number): Promise<void> {
     const { link } = retry;
@@ -1781,12 +1914,65 @@ export class SyncEngine {
       await waitFor(pause, link.signal);
       // Throws, too, when the link ended right as the pause passed.
       await this.liveOpsSettled(link.signal);
+      await this.catchupStreamsEnded(retry.streams, link.signal);
     } catch {
       // The connection dropped, sync was paused or stopped, or a new connect
       // came: whatever joins now is that one's.
       return;
     }
     await this.onSocketConnect(retry);
+  }
+
+  /**
+   * Resolves once every `yjs:catchup` stream of the connection has ended
+   * (`streams`), or after {@link CATCHUP_TIMEOUT_MS}; throws once `signal`
+   * aborts. A try whose join was taken and whose listing then failed leaves
+   * that join's stream coming: the server streams the docs after its answer
+   * whatever becomes of the flow. The next try's join streams on the same
+   * connection, and the batches carry nothing to tell one stream from the
+   * other: started first, the next try took the old stream's rest for its
+   * own — its `done` above all, which ended the wait for the catch-up before
+   * the new stream had come, and the flow went on to the first upload with
+   * the vault's notes not caught up.
+   *
+   * Counted, not paired: the answer of a join and the batches after it are
+   * separate events of the socket, and a `done` can be read before the flow
+   * that sent the join has seen the answer.
+   */
+  private async catchupStreamsEnded(streams: CatchupStreams, signal: AbortSignal): Promise<void> {
+    let expired = false;
+    let wakeNow: (() => void) | null = null;
+    const timer =
+      streams.ended < streams.begun
+        ? window.setTimeout(() => {
+            expired = true;
+            wakeNow?.();
+          }, CATCHUP_TIMEOUT_MS)
+        : undefined;
+    try {
+      while (streams.ended < streams.begun && !expired) {
+        signal.throwIfAborted();
+        await new Promise<void>((resolve) => {
+          const wake = (): void => {
+            this.streamWaiters.delete(wake);
+            signal.removeEventListener('abort', wake);
+            wakeNow = null;
+            resolve();
+          };
+          wakeNow = wake;
+          this.streamWaiters.add(wake);
+          signal.addEventListener('abort', wake, { once: true });
+        });
+      }
+    } finally {
+      window.clearTimeout(timer);
+    }
+    if (expired) {
+      this.log.warn('joining again without the end of the previous catch-up', {
+        streams: streams.begun - streams.ended,
+      });
+    }
+    signal.throwIfAborted();
   }
 
   // -- Queued operations, some of which may have lost their answers ---------
@@ -1888,25 +2074,28 @@ export class SyncEngine {
 
   /**
    * The status detail for an `ops:status` that failed ({@link OpsStatusError}).
-   * The server's own refusal (`project_not_found`, `forbidden`) as the join
-   * would give it. A server that answered no try at all may be one older than
-   * the question — it has no handler for it, and says nothing: a join without
-   * catch-up (`skipOperations`, `skipYjsCatchup`, as the web editor's) tells.
-   * Without `opIdempotency` in its answer it is `server_outdated`, as when the
-   * queue is empty, and nothing goes out to it. With it, the server is one
-   * that could not answer: out of its room again, since its broadcasts would
-   * be read against a queue not settled, and `ops_status_failed` — the next
-   * connect asks again.
+   * The server's own refusal for good ({@link OPS_STATUS_REFUSALS}) as the
+   * join would give it. A server that answered no try at all may be one older
+   * than the question — it has no handler for it, and says nothing: a join
+   * without catch-up (`skipOperations`, `skipYjsCatchup`, as the web
+   * editor's) tells. Without `opIdempotency` in its answer it is
+   * `server_outdated`, as when the queue is empty, and nothing goes out to it.
+   * With it, the server is one that could not answer: out of its room again,
+   * since its broadcasts would be read against a queue not settled, and
+   * {@link OPS_STATUS_FAILED}, as for a server that answered `busy` until the
+   * tries ran out or refused with an error of its own — the next connect
+   * asks again, and a new try after `join_failed` too (see
+   * {@link joinAgainLater}).
    */
   private async opsStatusFailure(err: OpsStatusError, online: AbortSignal): Promise<string> {
     if (OPS_STATUS_REFUSALS.has(err.reason)) return err.reason;
-    if (err.answered) return 'ops_status_failed';
+    if (err.answered) return OPS_STATUS_FAILED;
     const probe = await this.socket.probeProject(this.binding.projectId);
     online.throwIfAborted();
     if (!probe.ok) return probe.error;
     if (probe.opIdempotency === undefined) return 'server_outdated';
     void this.socket.leaveProject(this.binding.projectId).catch(() => undefined);
-    return 'ops_status_failed';
+    return OPS_STATUS_FAILED;
   }
 
   /**
@@ -2435,12 +2624,20 @@ export class SyncEngine {
    */
   private async handleYjsCatchup(batch: YjsCatchupBatch): Promise<void> {
     if (batch.projectId !== this.binding.projectId) return;
+    // Whatever becomes of the batch (see `catchupStreamsEnded`).
+    if (batch.done) this.catchupStreamEnded();
     if (!this.indexReady) {
       this.pendingCatchup.push(batch);
       return;
     }
     // It came on the connection open now.
     await this.processCatchupBatch(batch, this.online.signal);
+  }
+
+  /** A `done` batch came on the connection open now: see {@link catchupStreamsEnded}. */
+  private catchupStreamEnded(): void {
+    this.catchupStreams.ended += 1;
+    for (const wake of [...this.streamWaiters]) wake();
   }
 
   /**
