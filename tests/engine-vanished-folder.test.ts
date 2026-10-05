@@ -71,7 +71,12 @@ interface Bench {
  */
 async function seeded(
   paths: readonly string[],
-  opts: { notes?: boolean; localFolder?: string; storage?: FakeStorage } = {},
+  opts: {
+    notes?: boolean;
+    localFolder?: string;
+    storage?: FakeStorage;
+    queueRetryMs?: readonly number[];
+  } = {},
 ): Promise<Bench> {
   const entries: LogEntry[] = [];
   const logger = new Logger('debug', {
@@ -83,6 +88,7 @@ async function seeded(
     logger,
     ...(opts.localFolder !== undefined ? { localFolder: opts.localFolder } : {}),
     ...(opts.storage !== undefined ? { log: await logOn(opts.storage, NEVER_FLUSHED) } : {}),
+    ...(opts.queueRetryMs !== undefined ? { queueRetryMs: opts.queueRetryMs } : {}),
   });
   if (opts.storage !== undefined) onDisk.push(h);
   const server = new FakeServer(h);
@@ -1386,13 +1392,15 @@ describe('SyncEngine — the user deletes a folder removed here: its deletes rea
   });
 
   it('the server busy with the delete of a file of it: the queue sends it again, and the file stays deleted', async () => {
-    const b = await seeded(['dir/a.png', 'keep.png']);
+    // No pause before the queue is tried again: the test waits on the
+    // engine, not on a 2 s timer racing a fixed number of rounds.
+    const b = await seeded(['dir/a.png', 'keep.png'], { queueRetryMs: [0] });
     const id = await prunedThenWritten(b);
     b.server.bar(1);
 
     b.h.vault.removeFolder('dir');
     await finish(b, dispatch(b.h, [folderEvent('dir')]));
-    for (let round = 0; round < 20 && b.server.pathOf(id) !== null; round++) {
+    for (let round = 0; round < 200 && b.server.pathOf(id) !== null; round++) {
       await b.server.pump();
       await b.h.settle();
     }
