@@ -1003,6 +1003,106 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
   }
 
   /**
+   * The engine logs this when a delete waits for the create of its name under
+   * way (see `sendLocalDelete`).
+   */
+  const WAITS_FOR_CREATE = 'local delete: waits for the create of the name under way';
+
+  /** Whether the engine wrote `message` to `sync.log`. */
+  function logged(b: Bench, message: string): boolean {
+    return b.entries.some((e) => e.message === message);
+  }
+
+  /**
+   * The user deletes `path` in Obsidian. Resolves once its handler is done or
+   * waits for the create of the name under way; `handled` resolves when the
+   * handler is done.
+   */
+  async function deleteHere(b: Bench, path: string): Promise<{ handled: Promise<void> }> {
+    b.h.vault.files.delete(path);
+    let done = false;
+    const handled = b.h.engine.handleVaultEvent(event('delete', path)).finally(() => {
+      done = true;
+    });
+    await until(
+      `the delete of ${path} handled, or waiting`,
+      () => done || logged(b, WAITS_FOR_CREATE),
+    );
+    return { handled };
+  }
+
+  /**
+   * Wait for `handled`, the server answering what the engine sends meanwhile:
+   * a delete goes out at once or behind the queue, as the gate is then.
+   */
+  async function served(b: Bench, handled: Promise<void>): Promise<void> {
+    let done = false;
+    const end = (): void => {
+      done = true;
+    };
+    void handled.then(end, end);
+    await until('the handler done', () => {
+      b.server.serveNext();
+      return done;
+    });
+    await handled;
+  }
+
+  /** The id of the live file the server has under `path`. */
+  function liveAt(server: FakeServer, path: string): string {
+    const file = [...server.files.values()].find((f) => f.path === path && !f.deleted);
+    if (file === undefined) throw new Error(`no live file at ${path}`);
+    return file.id;
+  }
+
+  /** A teammate's new note under `path`, made over REST: listed, its broadcast not here yet. */
+  async function listedOnly(b: Bench, id: string, path: string): Promise<void> {
+    const text = encode('theirs\n');
+    b.server.add({
+      id,
+      path,
+      fileType: 'TEXT',
+      contentHash: await sha256Hex(text),
+      size: text.byteLength,
+    });
+  }
+
+  /** The next start: a new engine on the same vault, log and docs; connected, the catch-up done. */
+  async function restart(b: Bench): Promise<Bench> {
+    const logger = new Logger('debug', {
+      write: (e) => {
+        b.entries.push(e);
+      },
+    });
+    const h = buildHarness({ predecessor: b.h, logger, queueRetryMs: [0] });
+    b.server.attach(h);
+    b.docs.attach(h);
+    const next = { ...b, h };
+    await h.engine.start();
+    await answerJoin(next);
+    return next;
+  }
+
+  /**
+   * The next read of `path`: read as the disk is then, the bytes held back
+   * until released. The file may be gone meanwhile.
+   */
+  function holdRead(h: Harness, path: string): Gate {
+    const read = h.vault.readBinary.bind(h.vault);
+    const reached = deferred<void>();
+    const open = deferred<void>();
+    const spy = jest.spyOn(h.vault, 'readBinary').mockImplementation(async (p: string) => {
+      const data = await read(p);
+      if (p !== path) return data;
+      spy.mockRestore();
+      reached.resolve();
+      await open.promise;
+      return data;
+    });
+    return { reached: reached.promise, release: () => open.resolve() };
+  }
+
+  /**
    * The next look at whether `path` is on disk, after `skip` of them: answered
    * as the disk is then, the answer held back until released. The file may
    * be back meanwhile.
@@ -1235,7 +1335,7 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     await b.h.engine.stop();
   });
 
-  it('created, turned away busy while its delete reads the listing, a teammate’s new note under its name meanwhile: no delete of theirs', async () => {
+  it('created, turned away busy while its delete waits for it, a teammate’s new note under its name meanwhile: no delete of theirs', async () => {
     const b = await online([['a.md', 'f1', 'a\n']]);
     const mark = b.server.applied.length;
     b.server.bar();
@@ -1245,11 +1345,21 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
     await emitted(b.h, 'file:create');
     // Deleted: nothing is recorded under the name, and its create is on its
-    // way, not queued — the delete reads the listing, held.
+    // way — the delete waits for it. Should it read the listing, the listing
+    // is held.
+    const read = b.h.requests.length;
     const listing = holdListing(b);
+    let asked = false;
+    void listing.asked.then(() => {
+      asked = true;
+    });
     b.h.vault.files.delete('Untitled.md');
     const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
-    await listing.asked;
+    await until('the delete waits for the create', () => asked || logged(b, WAITS_FOR_CREATE));
+    // A teammate's new note under the name waits for ours.
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
 
     // The server turns the rename away busy, and then the create: the rename
     // goes out again, and the create waits in the queue behind it.
@@ -1259,14 +1369,11 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     await creating;
     await emitted(b.h, 'file:rename', 2);
     expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
-    // A teammate's new note under the name waits for ours.
-    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
-    await aWhile();
-    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
 
-    // The listing has it under the name.
+    // The listing, if asked, has it under the name.
     listing.answer();
     await deleting;
+    expect(listingsSince(b, read)).toBe(0);
     expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
     // The name is free here now: the teammate's note comes in.
     await writtenHere(b, 'Untitled.md', 'theirs\n');
@@ -1472,6 +1579,430 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     ]);
     expect(disk(b.h)).toEqual([`${aside}=again\n`, 'Untitled.md=other\n', 'z.md=a\n']);
     expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe('f2');
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('created, turned away busy while its delete waits for it, the server listing a teammate’s note under its name, not announced yet: no delete of it', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.server.bar();
+    await renameOut(b, 'a.md', 'z.md');
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    // A teammate's new note under the name, made over REST: its broadcast
+    // comes after the listing has it.
+    await listedOnly(b, 's9', 'Untitled.md');
+    const read = b.h.requests.length;
+    const listing = holdListing(b);
+    let asked = false;
+    void listing.asked.then(() => {
+      asked = true;
+    });
+    b.h.vault.files.delete('Untitled.md');
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await until('the delete waits for the create', () => asked || logged(b, WAITS_FOR_CREATE));
+
+    // The server turns the rename away busy, and then the create.
+    expect(b.server.serveNext()).toBe(true);
+    await until('the rename queued', () => queue(b.h).includes('RENAME a.md -> z.md'));
+    expect(b.server.serveNext()).toBe(true);
+    await creating;
+    listing.answer();
+    await deleting;
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
+    expect(listingsSince(b, read)).toBe(0);
+
+    await through(b);
+    expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> z.md']);
+    expect(b.server.pathOf('s9')).toBe('Untitled.md');
+    expect(disk(b.h)).toEqual(['z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('deleted while the queue sends its create, not answered yet: the delete is of the file it records, and the note stays deleted', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const read = b.h.requests.length;
+    // The queue goes out: the rename, then the new note's create — its entry
+    // queued until it is answered.
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    await emitted(b.h, 'file:create');
+    expect(queue(b.h)).toEqual(['CREATE Untitled.md']);
+
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // The create answered.
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await served(b, handled);
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual([
+      'f1 a.md -> z.md',
+      'create Untitled.md',
+      `delete ${ours}`,
+    ]);
+    expect(listingsSince(b, read)).toBe(0);
+    expect(live(b.server)).toEqual(['z.md']);
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(queue(b.h)).toEqual([]);
+
+    // Nothing brings it back.
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await b.h.settle();
+    expect(disk(b.h)).toEqual(['z.md=a\n']);
+    expect(live(b.server)).toEqual(['z.md']);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('deleted while the queue reads it to send its create: the delete is of the file the create records', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    // The queue goes out; the drain has read the note, and the user deletes
+    // it before the bytes are on their way.
+    const reading = holdRead(b.h, 'Untitled.md');
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    await reading.reached;
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    reading.release();
+    await emitted(b.h, 'file:create');
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await served(b, handled);
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual([
+      'f1 a.md -> z.md',
+      'create Untitled.md',
+      `delete ${ours}`,
+    ]);
+    expect(live(b.server)).toEqual(['z.md']);
+    expect(disk(b.h)).toEqual(['z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('deleted while the queue sends its create, a teammate’s note under its name: the server stores ours under a conflict name, and the delete takes it', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    await emitted(b.h, 'file:create');
+
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // The create answered: stored under a conflict name, theirs has the name.
+    expect(b.server.serveNext()).toBe(true);
+    const aside = 'Untitled.conflict-device-1.md';
+    const ours = liveAt(b.server, aside);
+    await served(b, handled);
+    await b.server.pump();
+    await b.h.settle();
+    await writtenHere(b, 'Untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      'f1 a.md -> z.md',
+      `create ${aside}`,
+      `delete ${ours}`,
+    ]);
+    expect(live(b.server)).toEqual(['Untitled.md', 'z.md']);
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(b.h.engine.getFileIdForPath(aside)).toBeNull();
+    expect(queue(b.h)).toEqual([]);
+
+    // Nothing brings ours back.
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await b.h.settle();
+    expect(disk(b.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('stopped while its delete waits for the create the queue sent, which never reached the server: nothing of a teammate’s note under its name is deleted at the next start', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    b.server.delay(await emitted(b.h, 'file:create'));
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    expect(logged(b, WAITS_FOR_CREATE)).toBe(true);
+
+    await b.h.engine.stop();
+    void handled.catch(() => undefined);
+    // Nothing queued for the delete: the create settles it.
+    expect(queue(b.h)).toEqual(['CREATE Untitled.md']);
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await writtenHere(next, 'Untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual(['create Untitled.md', 'f1 a.md -> z.md']);
+    expect(b.server.pathOf(theirs)).toBe('Untitled.md');
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(disk(next.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped while its delete waits for the create the queue sent, which reached the server after: the next start deletes ours, not the teammate’s note under its name', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    const out = await emitted(b.h, 'file:create');
+    b.server.delay(out);
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    expect(logged(b, WAITS_FOR_CREATE)).toBe(true);
+
+    await b.h.engine.stop();
+    void handled.catch(() => undefined);
+    expect(queue(b.h)).toEqual(['CREATE Untitled.md']);
+    // The create reaches the server; its answer goes nowhere.
+    b.server.deliverLate(out);
+    const aside = 'Untitled.conflict-device-1.md';
+    const ours = liveAt(b.server, aside);
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await writtenHere(next, 'Untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      'f1 a.md -> z.md',
+      `create ${aside}`,
+      `delete ${ours}`,
+    ]);
+    expect(live(b.server)).toEqual(['Untitled.md', 'z.md']);
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(disk(next.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped while the delete of a new note whose create is queued looks at the disk: nothing is queued for it, and a teammate’s note under its name stays', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    // The delete's look at the disk held; stopped meanwhile.
+    const look = holdAnswer(b.h, 'Untitled.md');
+    b.h.vault.files.delete('Untitled.md');
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    void deleting.catch(() => undefined);
+    await look.reached;
+    const stopping = b.h.engine.stop();
+    look.release();
+    await stopping;
+    // Nothing queued for the delete: the create settles it.
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
+
+    b.server.lift();
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await writtenHere(next, 'Untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual(['create Untitled.md', 'f1 a.md -> z.md']);
+    expect(b.server.pathOf(theirs)).toBe('Untitled.md');
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(disk(next.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('deleted while its create is on its way, not answered yet: the delete is of the file it records, whatever the listing has', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    const read = b.h.requests.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await served(b, handled);
+    await creating;
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual(['create Untitled.md', `delete ${ours}`]);
+    expect(listingsSince(b, read)).toBe(0);
+    expect(live(b.server)).toEqual(['a.md']);
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('a delete of a name nothing is recorded under reads the listing; a new note made there meanwhile, its create queued: no delete of what the listing has', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.server.bar();
+    await renameOut(b, 'a.md', 'z.md');
+    expect(b.server.serveNext()).toBe(true);
+    await emitted(b.h, 'file:rename', 2);
+    await listedOnly(b, 's9', 'Untitled.md');
+    // A delete of a name not recorded here (a stale index, say): the server
+    // is asked what it has there, the answer held.
+    const listing = holdListing(b);
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await listing.asked;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    await b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
+    listing.answer();
+    await deleting;
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
+
+    await through(b);
+    const aside = 'Untitled.conflict-device-1.md';
+    expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> z.md', `create ${aside}`]);
+    expect(b.server.pathOf('s9')).toBe('Untitled.md');
+    expect(disk(b.h)).toEqual([`${aside}=mine\n`, 'z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('a delete of a name nothing is recorded under reads the listing; a new note made there meanwhile, its create on its way: no delete of what the listing has', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    await listedOnly(b, 's9', 'Untitled.md');
+    const listing = holdListing(b);
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await listing.asked;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    listing.answer();
+    // The server answers what comes: ours stored under a conflict name, s9
+    // has the name.
+    await served(b, deleting);
+    await creating;
+    await b.server.pump();
+    await b.h.settle();
+    const aside = 'Untitled.conflict-device-1.md';
+    expect(b.server.applied.slice(mark)).toEqual([`create ${aside}`]);
+    expect(b.server.pathOf('s9')).toBe('Untitled.md');
+    expect(emitsOf(b.h, 'file:delete')).toEqual([]);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('a delete of a name nothing is recorded under, a new note made there before it looks at the server, its create on its way: the server is not asked', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    const read = b.h.requests.length;
+    await listedOnly(b, 's9', 'Untitled.md');
+    // The delete's look at the disk held; the new note comes meanwhile.
+    const look = holdAnswer(b.h, 'Untitled.md');
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await look.reached;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    look.release();
+    // The server answers what comes: ours stored under a conflict name, s9
+    // has the name.
+    await served(b, deleting);
+    await creating;
+    await b.server.pump();
+    await b.h.settle();
+    const aside = 'Untitled.conflict-device-1.md';
+    expect(b.server.applied.slice(mark)).toEqual([`create ${aside}`]);
+    expect(b.server.pathOf('s9')).toBe('Untitled.md');
+    expect(emitsOf(b.h, 'file:delete')).toEqual([]);
+    expect(listingsSince(b, read)).toBe(0);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('Pause sync while its delete waits for the create the queue sent, which reached the server: on resume ours goes, and a teammate’s note under its name comes in', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await aWhile();
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    const out = await emitted(b.h, 'file:create');
+    b.server.delay(out);
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    expect(logged(b, WAITS_FOR_CREATE)).toBe(true);
+
+    // Paused: the create's answer never comes, and the delete sends nothing.
+    b.h.engine.pause();
+    await handled;
+    expect(queue(b.h)).toEqual(['CREATE Untitled.md']);
+    // The create reached the server all the same.
+    b.server.deliverLate(out);
+    const aside = 'Untitled.conflict-device-1.md';
+    const ours = liveAt(b.server, aside);
+
+    await b.h.engine.resume();
+    await answerJoin(b);
+    await b.server.pump();
+    await b.h.settle();
+    await writtenHere(b, 'Untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      'f1 a.md -> z.md',
+      `create ${aside}`,
+      `delete ${ours}`,
+    ]);
+    expect(live(b.server)).toEqual(['Untitled.md', 'z.md']);
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(disk(b.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('renamed before its create is answered, then deleted under the new name, the answer after the delete’s checks: the delete is of the file the create records', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    const read = b.h.requests.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    // Given its title before the server has answered: the rename waits for the create.
+    const renaming = b.h.vault.rename('Untitled.md', 'Title.md');
+    await aWhile();
+    expect(emitsOf(b.h, 'file:rename')).toEqual([]);
+
+    const { handled } = await deleteHere(b, 'Title.md');
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await served(b, handled);
+    await creating;
+    await renaming;
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(mark)).toContain(`delete ${ours}`);
+    expect(b.server.pathOf(ours)).toBeNull();
+    expect(listingsSince(b, read)).toBe(0);
+    expect(live(b.server)).toEqual(['a.md']);
+    expect(b.h.engine.getFileIdForPath('Title.md')).toBeNull();
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(disk(b.h)).toEqual(['a.md=a\n']);
     expect(queue(b.h)).toEqual([]);
     appliedOnce(b.server);
     await b.h.engine.stop();

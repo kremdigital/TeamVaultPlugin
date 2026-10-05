@@ -456,7 +456,29 @@ type WaitingForName =
 interface CreatedHere {
   fileId: string;
   merged: boolean;
+  /**
+   * Recorded nowhere here: the server stored the file under a conflict name,
+   * and its copy was gone from this disk when the answer came — deleted while
+   * the create was on its way. The delete of the name waiting for the create
+   * deletes it (see `SyncEngine.sendLocalDelete`).
+   */
+  gone?: true;
 }
+
+/**
+ * The file a create of a name under way here records (see
+ * `SyncEngine.createdUnder`): its `fileId`, `''` until then, and `done`, which
+ * resolves once the create has come to something — `null` when no create of
+ * the name is under way. `gone`: see {@link CreatedHere}.
+ */
+interface CreatedUnder {
+  readonly fileId: string;
+  readonly gone: boolean;
+  readonly done: Promise<void> | null;
+}
+
+/** No create of the name under way: see {@link CreatedUnder}. */
+const NO_CREATE: CreatedUnder = { fileId: '', gone: false, done: null };
 
 /** What {@link SyncEngine.applyServerOperation} knows of the whole catch-up. */
 interface Catchup {
@@ -618,6 +640,13 @@ export class SyncEngine {
   private readonly local: LocalIO;
   /** Local changes taken on and not settled yet — see {@link hold}. */
   private readonly held = new Set<HeldChange>();
+  /**
+   * Held deletes of a new file of this device's: nothing was recorded under
+   * the name when the delete came, and a create of it was under way or queued
+   * (see {@link sendLocalDelete}). `stop()` does not hand them over (see
+   * {@link handOverHeldChanges}).
+   */
+  private readonly newFileDeletes = new Set<HeldChange>();
   /** Local phases still running — see {@link commitLocal}. `stop()` waits for them. */
   private readonly localCommits = new Set<Promise<unknown>>();
   private readonly diskSnapshotDebounceMs: number;
@@ -4766,19 +4795,32 @@ export class SyncEngine {
       await this.releaseName(path);
       return { fileId, merged: false };
     }
-    const moved = await this.withPathLocks([path, stored], () =>
-      this.commitLocal(async (io) => {
-        if (this.fileIndex.byPath.has(path) || this.fileIndex.byPath.has(stored)) return false;
-        if (!(await io.vault.exists(path)) || (await io.vault.exists(stored))) return false;
+    const placed = await this.withPathLocks([path, stored], () =>
+      this.commitLocal(async (io): Promise<'moved' | 'kept' | 'gone'> => {
+        if (this.fileIndex.byPath.has(path) || this.fileIndex.byPath.has(stored)) return 'kept';
+        if (await io.vault.exists(stored)) return 'kept';
+        if (!(await io.vault.exists(path))) return 'gone';
         this.log.info('own create stored under a conflict name', { path, stored });
         io.echo.mark(path, ECHO_COUNT_RENAME);
         io.echo.mark(stored, ECHO_COUNT_RENAME);
         await io.vault.ensureParentFolder(stored);
         await this.renameOnDisk(io, path, stored);
-        return true;
+        return 'moved';
       }),
     );
-    if (!moved) return null;
+    if (placed === 'gone') {
+      // Deleted here while the create was on its way: nothing to record. The
+      // delete of the name, which waits for this create (see
+      // `sendLocalDelete`), takes the file the server stored by its id.
+      // Left at that, it stayed on the server under the conflict name, came
+      // to every teammate, and back here at the next connect.
+      this.log.info('own create stored under a conflict name; its copy is gone here', {
+        path,
+        stored,
+      });
+      return { fileId, merged: false, gone: true };
+    }
+    if (placed !== 'moved') return null;
     // Moved on disk first: stopped in between, the next connect finds the
     // file under the conflict name (see `settleLandedCreate`).
     await this.recordCreatedFile(fileId, stored, fileType, contentHash, size, settle);
@@ -5360,7 +5402,12 @@ export class SyncEngine {
     let claim = indexed === '' ? null : this.claimDelete(indexed, opId);
     // Nothing recorded under the name: the file a create of the name under
     // way here records, once it has, is the one deleted (see below).
-    const created = indexed === '' ? this.createdUnder(path) : { fileId: '' };
+    const created = indexed === '' ? this.createdUnder(path) : NO_CREATE;
+    // A new file of this device's, its create under way or queued: the server
+    // knows it by no id the delete can tell yet. Not handed over by `stop()`
+    // (see `handOverHeldChanges`).
+    const newFile = indexed === '' && (created.done !== null || this.createQueuedAt(path));
+    if (change !== null && newFile) this.newFileDeletes.add(change);
     let outcome: DeleteOutcome = 'kept';
     try {
       // Stale-delete guard: if the file is still on disk, the watcher
@@ -5382,40 +5429,62 @@ export class SyncEngine {
       // since — deleted or renamed by a teammate — there is nothing to send
       // for it. Any other file recorded under the name since came after the
       // file was gone from here, and is not deleted with it.
-      const meta =
+      let meta =
         indexed !== ''
           ? this.indexedAt(indexed, path)
           : created.fileId !== ''
             ? this.indexedAt(created.fileId, path)
             : undefined;
       let fileId = meta?.fileId ?? '';
-      // Checked: from here on `stop()` hands it over as a plain DELETE.
+      // Checked: from here on `stop()` hands it over as a plain DELETE — but
+      // the delete of a new file (see `newFile` above).
       if (change) change.payload = withFolder(deletePayload(fileId, meta), folder);
-      // The path may be absent from the local index (a folder-delete child, or
-      // a stale index). Resolve the id from the server's live file list before
-      // giving up — otherwise the DELETE is queued with an empty fileId and is
-      // later dropped as `no_file_id`, so the deletion never propagates.
-      // Not a name a file of the server's waits for (see `waitForName`): the
-      // file deleted here was another one, and the server's was never here.
-      // Nor one a new file of this device's holds, its create queued (see
-      // `createQueuedAt`): that is the file deleted here, which the server has
-      // not heard of — what it lists under the name is another device's, its
-      // broadcast on its way or waiting for the name. Looked up, it was
-      // deleted for the whole team.
-      // Only when nothing was recorded under the name when the delete came.
-      if (
+      if (!fileId && indexed === '' && created.done !== null) {
+        // A create of the name was under way when the delete came: the file
+        // it records is the one deleted here, and there is none to delete
+        // when it records none — queued again (`busy`, the connection lost,
+        // Pause sync), refused, or the file found gone. Waited for, not looked
+        // up in the listing. The drain sends a queued create, and its entry
+        // stays queued until answered: the listing was not asked then, and
+        // the note came back once the answer was recorded — the delete lost.
+        // Nor does the listing tell the file the create makes from another
+        // device's under the name, whose broadcast may come after it (a note
+        // made over REST): the create turned away `busy` meanwhile, that one
+        // was deleted for the whole team.
+        this.log.debug('local delete: waits for the create of the name under way', path);
+        await created.done;
+        this.throwIfStopped();
+        meta = created.fileId !== '' ? this.indexedAt(created.fileId, path) : undefined;
+        // Stored under a conflict name and recorded nowhere here, the copy
+        // gone (see `recordCreateAck`): by its id.
+        fileId = meta?.fileId ?? (created.gone ? created.fileId : '');
+      } else if (
+        // The path may be absent from the local index (a folder-delete child,
+        // or a stale index). Resolve the id from the server's live file list
+        // before giving up — otherwise the DELETE is queued with an empty
+        // fileId and is later dropped as `no_file_id`, so the deletion never
+        // propagates. Not a name a file of the server's waits for (see
+        // `waitForName`): the file deleted here was another one, and the
+        // server's was never here. Nor one a new file of this device's holds,
+        // its create queued (see `createQueuedAt`) or under way since the
+        // delete came: what the server lists under the name is not the file
+        // deleted here — another device's, its broadcast on its way or waiting
+        // for the name, or that new file. Looked up, it was deleted for the
+        // whole team. Only when nothing was recorded under the name when the
+        // delete came.
         !fileId &&
         indexed === '' &&
         this.socket.isConnected() &&
         this.waitingFor(path) === undefined &&
-        !this.createQueuedAt(path)
+        !this.createQueuedAt(path) &&
+        !this.creating.has(path)
       ) {
         fileId = await this.resolveServerFileId(path);
         this.throwIfStopped();
         // A file this device records is known here under its own name: not
-        // the one deleted here, unless its create from here landed meanwhile.
-        // The server may list a note renamed onto the name here already.
-        if (fileId !== '' && fileId !== created.fileId && this.fileIndex.byId.has(fileId)) {
+        // the one deleted here. The server may list a note renamed onto the
+        // name here already.
+        if (fileId !== '' && this.fileIndex.byId.has(fileId)) {
           this.log.debug('local delete: the server lists a file recorded here under the name', {
             path,
             fileId,
@@ -5424,11 +5493,20 @@ export class SyncEngine {
         }
         // Nor a file this device keeps out of the index (see `outOfScope`):
         // one that came under the name while the listing was on its way, and
-        // waits for it (see `waitForName`) — a create from here went back to
-        // the queue meanwhile, turned away `busy`. Never on this disk, it is
-        // not the file deleted here.
+        // waits for it (see `waitForName`). Never on this disk, it is not the
+        // file deleted here.
         if (fileId !== '' && this.outOfScope.has(fileId)) {
           this.log.debug('local delete: the server lists a file kept out of the index here', {
+            path,
+            fileId,
+          });
+          fileId = '';
+        }
+        // Nor when a new file of this device's took the name while the
+        // listing was on its way, its create queued or under way: what the
+        // server lists is that file, or another device's its create waits for.
+        if (fileId !== '' && (this.createQueuedAt(path) || this.creating.has(path))) {
+          this.log.debug('local delete: a new file took the name while the server was asked', {
             path,
             fileId,
           });
@@ -5523,6 +5601,7 @@ export class SyncEngine {
       await this.releaseName(path);
     } finally {
       claim?.end(outcome);
+      if (change) this.newFileDeletes.delete(change);
     }
   }
 
@@ -5536,16 +5615,24 @@ export class SyncEngine {
    * The file a create of `path` under way here (see {@link creating}) records,
    * once it has: its `fileId`, `''` until then — and for good when no create
    * of the name is under way, or it records none (queued, refused, found gone).
+   * `done` once it has come to that, `null` when none is under way.
    * A rename into the name waiting for a create (see
    * {@link renameAfterCreate}) records the created file under it as soon as
    * the create is answered (see {@link recordedAfterCreate}), long before
    * the rename is done: its folder check waits behind the delete's.
    */
-  private createdUnder(path: string): { fileId: string } {
-    const created = { fileId: '' };
+  private createdUnder(path: string): CreatedUnder {
     const pending = this.recordedAfterCreate.get(path) ?? this.creating.get(path);
-    void pending?.then((done) => {
-      if (done !== null) created.fileId = done.fileId;
+    if (pending === undefined) return NO_CREATE;
+    const created: { fileId: string; gone: boolean; done: Promise<void> | null } = {
+      fileId: '',
+      gone: false,
+      done: null,
+    };
+    created.done = pending.then((done) => {
+      if (done === null) return;
+      created.fileId = done.fileId;
+      created.gone = done.gone === true;
     });
     return created;
   }
@@ -9716,30 +9803,36 @@ export class SyncEngine {
             this.throwIfStopped();
             return { ok: true };
           }
-          const data = await this.vault.readBinary(op.filePath);
-          // Hash the bytes we're *actually* sending, not the stale
-          // `payload.contentHash` captured at enqueue time: a file created
-          // then edited while offline enqueues several CREATEs whose payload
-          // hashes diverge. The first to go out records the file, and the
-          // others go through modify (above).
-          const fileType = (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath);
-          const contentHash = await sha256Hex(data);
-          let inlineData: ArrayBuffer | undefined;
-          try {
-            // Binary bytes go to the REST staging area; text rides inline.
-            inlineData = await this.stageBinaryBlob(fileType, contentHash, data);
-          } catch {
-            this.throwIfStopped();
-            return { ok: false, retryable: true, error: 'blob_staging_failed' };
-          }
-          this.throwIfStopped();
           // Known in `creating` like a live create: a save or a rename of the
           // note while this one waits for its ack waits for it. Taken for a
           // note the server has never heard of, a save went out as a second
           // create — a conflict copy for everyone — and a rename left the old
-          // name on the server.
-          const sent: { ack?: FileAck } = {};
+          // name on the server. From before the file is read, as a live
+          // create is: a delete of the note after that is of the file this
+          // create records (see `createdUnder`). Known only once the bytes
+          // were on their way, the note deleted while they were read and
+          // hashed was not that file to its delete: the create went out with
+          // them, and its answer brought the note back.
+          const sent: { ack?: FileAck; staged?: false } = {};
           await this.trackCreate(op.filePath, async () => {
+            const data = await this.vault.readBinary(op.filePath);
+            // Hash the bytes we're *actually* sending, not the stale
+            // `payload.contentHash` captured at enqueue time: a file created
+            // then edited while offline enqueues several CREATEs whose payload
+            // hashes diverge. The first to go out records the file, and the
+            // others go through modify (above).
+            const fileType = (op.payload['fileType'] as FileType) ?? classifyFileType(op.filePath);
+            const contentHash = await sha256Hex(data);
+            let inlineData: ArrayBuffer | undefined;
+            try {
+              // Binary bytes go to the REST staging area; text rides inline.
+              inlineData = await this.stageBinaryBlob(fileType, contentHash, data);
+            } catch {
+              this.throwIfStopped();
+              sent.staged = false;
+              return null;
+            }
+            this.throwIfStopped();
             const ack = await this.emitQueued(op, (opId) =>
               this.emitCreate({
                 projectId: this.binding.projectId,
@@ -9774,6 +9867,9 @@ export class SyncEngine {
             if (!settled) this.settleDrained(op, ack);
             return created;
           });
+          if (sent.staged === false) {
+            return { ok: false, retryable: true, error: 'blob_staging_failed' };
+          }
           const ack = sent.ack ?? { ok: false, error: 'no_ack' };
           return ack.ok ? { ok: true } : this.drainRefusal(op, ack.error);
         }
@@ -10098,6 +10194,14 @@ export class SyncEngine {
   private handOverHeldChanges(): void {
     const bindingId = this.binding.id;
     for (const change of this.held) {
+      // The delete of a new file of this device's (see `newFileDeletes`), not
+      // sent or queued under an id yet. Queued by the name, it took the file
+      // the next connect records there: another device's, let into the name
+      // once the create, queued, found no file to send. The create settles
+      // it: the next connect asks the server what became of one that went
+      // out, and one that landed, its file gone here, goes out as a delete
+      // (see `settleLandedCreate`); one that did not finds nothing to send.
+      if (this.newFileDeletes.has(change)) continue;
       try {
         // On its way, or queued already after a try: it is there under its id.
         if (this.operationLog.findByOpId(bindingId, change.opId) !== null) continue;
@@ -10114,6 +10218,7 @@ export class SyncEngine {
       }
     }
     this.held.clear();
+    this.newFileDeletes.clear();
     // Every operation this engine has on its way goes back to the queue, in
     // its place: its answer never reaches a stopped engine, and the next one
     // asks the server what became of it (see `settleUnanswered`).

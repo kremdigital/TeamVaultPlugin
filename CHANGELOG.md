@@ -196,6 +196,18 @@ uses [Semantic Versioning](https://semver.org/).
   the file you deleted, also when it waits in the queue (offline, say), and
   the renamed file keeps its name and its history; the new file goes out as
   a new one after it.
+- **A note you delete right after creating it, before the server has
+  answered, is deleted for everyone.** When the server was slow to answer,
+  Team Vault looked up the note's name on the server instead of waiting for
+  the answer. It could find nothing there yet, and the note came back once
+  the answer came, on your device and your teammates'. Or it found a
+  teammate's new note under the same name and deleted that one for
+  everyone. A note the server had stored as `Untitled.conflict-<device>.md`,
+  because a teammate's note had the name, stayed there for everyone. Now
+  Team Vault waits for the answer and deletes the note it created; if the
+  creation didn't go through, nothing is sent. If sync is paused or
+  Obsidian closes meanwhile, the next connection asks the server what
+  became of the note and deletes it there.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the

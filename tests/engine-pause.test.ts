@@ -1840,16 +1840,39 @@ describe('A file found under the name of a teammate’s file not on this disk ye
     const created = h.engine.handleVaultEvent(vaultEvent('create', 'photo.png'));
     await flushAsync(20);
     expect(h.socket().pending('file:create', 'photo.png')).toBeDefined();
-    // Deleted before the server answers the create.
+    // Deleted before the server answers the create: the delete is of the file
+    // the create makes, and waits for its answer. Looked up in the server's
+    // listing, the name found the teammate's file, and the delete went to it.
     h.vault.files.delete('photo.png');
-    await h.engine.handleVaultEvent(vaultEvent('delete', 'photo.png'));
-    // Looked up in the server's listing, the name found the teammate's file,
-    // and the delete went to it.
-    expect(h.socket().emits.filter((e) => e.event === 'file:delete')).toEqual([]);
+    const deleting = h.engine.handleVaultEvent(vaultEvent('delete', 'photo.png'));
+    let deleted = false;
+    const done = (): void => {
+      deleted = true;
+    };
+    void deleting.then(done, done);
     held.resolve();
-    await h.settle();
+    // The server answers what comes: ours stored under a conflict name, the
+    // teammate's file has the name.
+    while (!deleted) {
+      server.serveNext();
+      await flushAsync(1);
+    }
+    await deleting;
     await created;
+    await h.settle();
+    const deletes = h
+      .socket()
+      .emits.filter((e) => e.event === 'file:delete')
+      .map((e) => (e.payload as { fileId: string }).fileId);
+    expect(deletes).not.toContain(theirs);
     expect(server.pathOf(theirs)).toBe('photo.png');
+    // Ours, gone from this disk, is gone from the server too.
+    expect(
+      [...server.files.values()]
+        .filter((f) => !f.deleted)
+        .map((f) => f.path)
+        .sort(),
+    ).toEqual(['a.md', 'photo.png']);
     expect(h.eventErrors).toEqual([]);
     await h.engine.stop();
   });
