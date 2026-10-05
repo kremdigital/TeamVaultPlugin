@@ -1008,6 +1008,12 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
    */
   const WAITS_FOR_CREATE = 'local delete: waits for the create of the name under way';
 
+  /**
+   * The engine logs this when a teammate's file the server has under the name
+   * of a new file here waits for it (see `applyServerCreate`).
+   */
+  const THEIRS_WAITS = 'a file the server has under a name being created here waits for it';
+
   /** Whether the engine wrote `message` to `sync.log`. */
   function logged(b: Bench, message: string): boolean {
     return b.entries.some((e) => e.message === message);
@@ -1449,6 +1455,41 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     look.release();
     await deleting;
     // Not taken for the new note on this disk.
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(b.h.vault.text('Untitled.md')).toBe('again\n');
+
+    await through(b);
+    const aside = 'Untitled.conflict-device-1.md';
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      'f1 a.md -> z.md',
+      `create ${aside}`,
+    ]);
+    expect(b.server.pathOf(theirs)).toBe('Untitled.md');
+    expect(disk(b.h)).toEqual([`${aside}=again\n`, 'Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('made again under its name, reported as a save, while the disk is read to let the name go: the new one holds it', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await until('their note waits', () => logged(b, THEIRS_WAITS));
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+
+    // As above, the note made again reported as a save of the name: the
+    // delete of a note whose create is queued takes no file, and holds no
+    // save of the name up.
+    const look = holdAnswer(b.h, 'Untitled.md', 1);
+    b.h.vault.files.delete('Untitled.md');
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await look.reached;
+    b.h.vault.files.set('Untitled.md', encode('again\n'));
+    await b.h.engine.handleVaultEvent(event('modify', 'Untitled.md'));
+    look.release();
+    await deleting;
     expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
     expect(b.h.vault.text('Untitled.md')).toBe('again\n');
 
@@ -2003,6 +2044,365 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     expect(b.h.engine.getFileIdForPath('Title.md')).toBeNull();
     expect(b.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
     expect(disk(b.h)).toEqual(['a.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  /**
+   * The next clear of the doc under `path` — the one the record of a note's
+   * create makes (see `startDoc`) — held until released.
+   */
+  function holdClear(h: Harness, path: string): Gate {
+    const clear = h.doc.clear.bind(h.doc);
+    const reached = deferred<void>();
+    const open = deferred<void>();
+    const spy = jest
+      .spyOn(h.doc, 'clear')
+      .mockImplementation(async (bindingId: string, p: string) => {
+        if (p !== path) return clear(bindingId, p);
+        spy.mockRestore();
+        reached.resolve();
+        await open.promise;
+        return clear(bindingId, p);
+      });
+    return { reached: reached.promise, release: () => open.resolve() };
+  }
+
+  /** {@link served}, the engine's `yjs:fetch` answered as well. */
+  async function answered(b: Bench, handled: Promise<void>): Promise<void> {
+    let done = false;
+    const end = (): void => {
+      done = true;
+    };
+    void handled.then(end, end);
+    await until('the handler done', () => {
+      b.server.serveNext();
+      b.docs.answerFetches();
+      return done;
+    });
+    await handled;
+  }
+
+  /**
+   * What the server and this device have once a note deleted while its create
+   * was on its way, then made again under its name, is through: the first
+   * file deleted, the new note created under the name with its own text.
+   */
+  async function madeAgain(b: Bench, before: string[], first: string): Promise<void> {
+    await b.server.pump();
+    await b.h.settle();
+    await b.docs.drive();
+    await b.h.settle();
+    expect(b.server.applied.slice(before.length)).toEqual([
+      `delete ${first}`,
+      'create Untitled.md',
+    ]);
+    const again = liveAt(b.server, 'Untitled.md');
+    expect(b.docs.text(again)).toBe('new\n');
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(again);
+    expect(disk(b.h)).toContain('Untitled.md=new\n');
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+  }
+
+  it('created again under its name while its delete waits for the create of the first: the first is deleted, the new note goes out as one of its own', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // Made again under the name before the server has answered the first.
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const again = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    expect(b.server.serveNext()).toBe(true);
+    const first = liveAt(b.server, 'Untitled.md');
+    const before = [...b.server.applied];
+    await served(b, handled);
+    await answered(b, again);
+    await creating;
+    await madeAgain(b, before, first);
+    expect(live(b.server)).toEqual(['Untitled.md', 'a.md']);
+
+    // Nothing changes at the next connect.
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(before.length)).toEqual([
+      `delete ${first}`,
+      'create Untitled.md',
+    ]);
+    expect(disk(b.h)).toEqual(['Untitled.md=new\n', 'a.md=a\n']);
+    await b.h.engine.stop();
+  });
+
+  it('created again under its name while its delete waits for the create the queue sent: the first is deleted, the new note goes out as one of its own', async () => {
+    const b = await queuedNewNote([]);
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const again = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    expect(b.server.serveNext()).toBe(true);
+    const first = liveAt(b.server, 'Untitled.md');
+    const before = [...b.server.applied];
+    await served(b, handled);
+    await answered(b, again);
+    await madeAgain(b, before, first);
+    expect(live(b.server)).toEqual(['Untitled.md', 'z.md']);
+
+    b.h.socket().disconnect();
+    await reconnect(b);
+    await b.server.pump();
+    await b.h.settle();
+    expect(b.server.applied.slice(before.length)).toEqual([
+      `delete ${first}`,
+      'create Untitled.md',
+    ]);
+    expect(disk(b.h)).toEqual(['Untitled.md=new\n', 'z.md=a\n']);
+    await b.h.engine.stop();
+  });
+
+  it('created again under its name and saved while the answer to the first create is recorded, its delete waiting: the save is the new note’s', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // The answer recorded; its doc is being opened as the new note is saved.
+    const clearing = holdClear(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const first = liveAt(b.server, 'Untitled.md');
+    const before = [...b.server.applied];
+    await clearing.reached;
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const saved = b.h.engine.handleVaultEvent(event('modify', 'Untitled.md'));
+    clearing.release();
+    await served(b, handled);
+    await answered(b, saved);
+    await creating;
+    await madeAgain(b, before, first);
+    await b.h.engine.stop();
+  });
+
+  it('stopped while the answer to the create the queue sent is recorded, its delete waiting for it: the next start deletes it', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    b.server.lift();
+    expect(b.server.serveNext()).toBe(true);
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // Its `unlink` too: two deletes of the name wait for the create.
+    const unlinked = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    // The answer recorded; stopped while its doc is opened.
+    const clearing = holdClear(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await clearing.reached;
+    const stopping = b.h.engine.stop();
+    clearing.release();
+    await stopping;
+    await Promise.all([handled, unlinked]);
+    expect(queue(b.h)).toEqual(['DELETE Untitled.md']);
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual([
+      'f1 a.md -> z.md',
+      'create Untitled.md',
+      `delete ${ours}`,
+    ]);
+    expect(live(b.server)).toEqual(['z.md']);
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(disk(next.h)).toEqual(['z.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped while the answer to its create is recorded, its delete waiting for it: the next start deletes it', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    void creating.catch(() => undefined);
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    const clearing = holdClear(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const ours = liveAt(b.server, 'Untitled.md');
+    await clearing.reached;
+    const stopping = b.h.engine.stop();
+    clearing.release();
+    await stopping;
+    void handled.catch(() => undefined);
+    expect(queue(b.h)).toContain('DELETE Untitled.md');
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual(['create Untitled.md', `delete ${ours}`]);
+    expect(live(b.server)).toEqual(['a.md']);
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBeNull();
+    expect(disk(next.h)).toEqual(['a.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped while a note made again under its name waits for the delete of the first, the answer to the first create recorded: the next start deletes the first and uploads the new note', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const again = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    const clearing = holdClear(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const first = liveAt(b.server, 'Untitled.md');
+    await clearing.reached;
+    const stopping = b.h.engine.stop();
+    clearing.release();
+    await stopping;
+    await Promise.all([creating, handled, again]);
+    expect(queue(b.h)).toContain('DELETE Untitled.md');
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await next.docs.drive();
+    await next.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      `delete ${first}`,
+      'create Untitled.md',
+    ]);
+    const made = liveAt(b.server, 'Untitled.md');
+    expect(b.docs.text(made)).toBe('new\n');
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBe(made);
+    expect(disk(next.h)).toEqual(['Untitled.md=new\n', 'a.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped once a note made again under its name was renamed, the answer to the first create recorded and its delete waiting: nothing is deleted at the next start', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    const clearing = holdClear(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    const first = liveAt(b.server, 'Untitled.md');
+    await clearing.reached;
+    // Made again and given its title while the answer is recorded: the file
+    // recorded under the name moves with the note.
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const renaming = b.h.vault.rename('Untitled.md', 'Title.md');
+    await until('the note recorded under its title', () => {
+      return b.h.engine.getFileIdForPath('Title.md') === first;
+    });
+    const stopping = b.h.engine.stop();
+    clearing.release();
+    await stopping;
+    await Promise.all([creating, handled, renaming, b.h.settle()]);
+    expect(queue(b.h).filter((e) => e.startsWith('DELETE'))).toEqual([]);
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await next.docs.drive();
+    await next.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create Untitled.md',
+      `${first} Untitled.md -> Title.md`,
+    ]);
+    expect(live(b.server)).toEqual(['Title.md', 'a.md']);
+    expect(next.h.engine.getFileIdForPath('Title.md')).toBe(first);
+    expect(disk(next.h)).toEqual(['Title.md=new\n', 'a.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('stopped while the delete of a note turned away busy lets the name go, the note made again with the text of a teammate’s note under the name, its create answered with theirs: nothing of theirs is deleted at the next start', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    const mark = b.server.applied.length;
+    b.server.bar();
+    await renameOut(b, 'a.md', 'z.md');
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const { handled } = await deleteHere(b, 'Untitled.md');
+    // A teammate's new note under the name waits for ours.
+    const theirs = await b.server.teammateCreate('Untitled.md', 'theirs\n');
+    await until('their note waits', () => logged(b, THEIRS_WAITS));
+    // The rename and the create turned away busy: the delete, which waited
+    // for the create, has no file to delete, and lets the name go — its look
+    // at the disk held.
+    const look = holdAnswer(b.h, 'Untitled.md');
+    expect(b.server.serveNext()).toBe(true);
+    await until('the rename queued', () => queue(b.h).includes('RENAME a.md -> z.md'));
+    expect(b.server.serveNext()).toBe(true);
+    await creating;
+    await look.reached;
+    // Made again, with the teammate's text: the queue sends the create, and
+    // the server answers with their note.
+    b.h.vault.files.set('Untitled.md', encode('theirs\n'));
+    await b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    b.server.lift();
+    await until('their note recorded under the name', () => {
+      b.server.serveNext();
+      return b.h.engine.getFileIdForPath('Untitled.md') === theirs;
+    });
+    const stopping = b.h.engine.stop();
+    look.release();
+    await stopping;
+    await handled;
+    expect(queue(b.h).filter((e) => e.startsWith('DELETE'))).toEqual([]);
+
+    const next = await restart(b);
+    await b.server.pump();
+    await next.h.settle();
+    await next.docs.drive();
+    await next.h.settle();
+    expect(b.server.applied.slice(mark)).toEqual(['create Untitled.md', 'f1 a.md -> z.md']);
+    expect(live(b.server)).toEqual(['Untitled.md', 'z.md']);
+    expect(b.docs.text(theirs)).toBe('theirs\n');
+    expect(next.h.engine.getFileIdForPath('Untitled.md')).toBe(theirs);
+    expect(disk(next.h)).toEqual(['Untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(next.h)).toEqual([]);
+    appliedOnce(b.server);
+    await next.h.engine.stop();
+  });
+
+  it('a new note whose create is queued, deleted and made again under its name while its delete looks at the disk: the new note goes out once, with its own text', async () => {
+    const b = await queuedNewNote([]);
+    const mark = b.server.applied.length;
+    // The delete's look at the disk held; the note is made again meanwhile.
+    const look = holdAnswer(b.h, 'Untitled.md');
+    b.h.vault.files.delete('Untitled.md');
+    const deleting = b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    await look.reached;
+    b.h.vault.files.set('Untitled.md', encode('new\n'));
+    const again = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    look.release();
+    await Promise.all([deleting, again]);
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md', 'CREATE Untitled.md']);
+
+    await through(b);
+    expect(b.server.applied.slice(mark)).toEqual(['f1 a.md -> z.md', 'create Untitled.md']);
+    const made = liveAt(b.server, 'Untitled.md');
+    expect(b.docs.text(made)).toBe('new\n');
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(made);
+    expect(emitsOf(b.h, 'file:delete')).toEqual([]);
     expect(queue(b.h)).toEqual([]);
     appliedOnce(b.server);
     await b.h.engine.stop();

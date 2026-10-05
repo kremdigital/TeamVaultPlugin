@@ -1853,7 +1853,9 @@ describe('A file found under the name of a teammate’s file not on this disk ye
     held.resolve();
     // The server answers what comes: ours stored under a conflict name, the
     // teammate's file has the name.
+    const end = Date.now() + 10_000;
     while (!deleted) {
+      if (Date.now() > end) throw new Error('timed out waiting for the delete');
       server.serveNext();
       await flushAsync(1);
     }

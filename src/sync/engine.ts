@@ -468,17 +468,44 @@ interface CreatedHere {
 /**
  * The file a create of a name under way here records (see
  * `SyncEngine.createdUnder`): its `fileId`, `''` until then, and `done`, which
- * resolves once the create has come to something — `null` when no create of
- * the name is under way. `gone`: see {@link CreatedHere}.
+ * resolves once the create has come to something (`settled` from then on) —
+ * `null` when no create of the name is under way. `gone`: see
+ * {@link CreatedHere}. `recorded`: the id of the file the create recorded under
+ * the name, as soon as it has (see `SyncEngine.recordCreatedFile`) — before
+ * the create's handler is through, while the note's doc opens.
  */
 interface CreatedUnder {
-  readonly fileId: string;
-  readonly gone: boolean;
+  fileId: string;
+  gone: boolean;
+  settled: boolean;
+  recorded: string;
   readonly done: Promise<void> | null;
 }
 
 /** No create of the name under way: see {@link CreatedUnder}. */
-const NO_CREATE: CreatedUnder = { fileId: '', gone: false, done: null };
+function noCreate(): CreatedUnder {
+  return { fileId: '', gone: false, settled: true, recorded: '', done: null };
+}
+
+/**
+ * A delete of a new file of this device's under way (see
+ * `SyncEngine.sendLocalDelete`): nothing was recorded under `path` when it
+ * came, and a create of the name was under way (`created`) or queued.
+ * `change`: the delete's, `null` for a replay of the queue's. `done` resolves
+ * once the delete is through.
+ *
+ * `holdsSaves`: a save under the name waits for it (see
+ * `SyncEngine.newFileDeleted`) — a delete that waits for the file the create
+ * under way records. Not one of a file whose create is queued: that create
+ * records no file the delete takes.
+ */
+interface NewFileDelete {
+  readonly path: string;
+  readonly change: HeldChange | null;
+  readonly created: CreatedUnder;
+  readonly holdsSaves: boolean;
+  readonly done: Promise<void>;
+}
 
 /** What {@link SyncEngine.applyServerOperation} knows of the whole catch-up. */
 interface Catchup {
@@ -641,12 +668,14 @@ export class SyncEngine {
   /** Local changes taken on and not settled yet — see {@link hold}. */
   private readonly held = new Set<HeldChange>();
   /**
-   * Held deletes of a new file of this device's: nothing was recorded under
-   * the name when the delete came, and a create of it was under way or queued
-   * (see {@link sendLocalDelete}). `stop()` does not hand them over (see
+   * Deletes of a new file of this device's under way: nothing was recorded
+   * under the name when the delete came, and a create of it was under way or
+   * queued (see {@link sendLocalDelete}). A file saved or made again under the
+   * name meanwhile waits for it (see {@link newFileDeleted}). `stop()` hands
+   * one over only once the create has recorded the file it deletes (see
    * {@link handOverHeldChanges}).
    */
-  private readonly newFileDeletes = new Set<HeldChange>();
+  private readonly newFileDeletes = new Set<NewFileDelete>();
   /** Local phases still running — see {@link commitLocal}. `stop()` waits for them. */
   private readonly localCommits = new Set<Promise<unknown>>();
   private readonly diskSnapshotDebounceMs: number;
@@ -4551,6 +4580,28 @@ export class SyncEngine {
     await this.createLocal(path, from);
   }
 
+  /**
+   * Wait for the deletes of a new file under `path` that wait for the file
+   * the create of the name under way records (see {@link newFileDeletes}):
+   * a file saved or made again under the name meanwhile is a new one once
+   * they are through. The file the create records is under the name before
+   * the delete has claimed it (see `deleteClaims`): from the answer on, while
+   * its doc opens, and while the handlers that waited for the create go on
+   * ahead of the delete — the create of the note made again under the name
+   * among them, which finds the file recorded and goes on as a save of it
+   * (see `createLocal`). Taken for a save of the recorded file, the new note
+   * went to the server as that file's text, the delete took it along, and the
+   * new note never reached the server (a note deleted and made again as
+   * "Untitled" before the server had answered the first).
+   */
+  private async newFileDeleted(path: string): Promise<void> {
+    for (;;) {
+      const deleting = [...this.newFileDeletes].filter((d) => d.path === path && d.holdsSaves);
+      if (deleting.length === 0) return;
+      await Promise.all(deleting.map((d) => d.done));
+    }
+  }
+
   /** {@link handleLocalCreate} past its checks: send the create, or the save of a known file. */
   private async createLocal(path: string, from: LocalSource): Promise<void> {
     // A file never written here waits for its check at start: it may be the
@@ -4892,6 +4943,19 @@ export class SyncEngine {
     this.fileIndex.byPath.set(path, meta);
     this.fileIndex.byId.set(fileId, meta);
     this.operationLog.setFileMeta(meta);
+    // The file a delete of the name waits for, if the create of the name it
+    // waits for is this one (see `newFileDeletes`): known to `stop()` from now
+    // on, in the same block as the answer settles the create (see
+    // `handOverHeldChanges`). Known only once the create's handler was through
+    // — the note's doc opened — a `stop()` in between handed the delete over
+    // as nothing, the create was settled, and the next start wrote the note
+    // back from its record.
+    for (const deleting of this.newFileDeletes) {
+      const { created } = deleting;
+      if (deleting.path === path && created.done !== null && !created.settled) {
+        created.recorded = fileId;
+      }
+    }
     onRecorded?.();
     if (fileType === 'TEXT') {
       this.startedSinceJoin.add(fileId);
@@ -4939,6 +5003,14 @@ export class SyncEngine {
 
   private async handleLocalModify(path: string, from: LocalSource = 'watcher'): Promise<void> {
     if (!isInBinding(path, this.binding.localFolder)) return;
+    // A new file of this device's deleted under the name, its delete waiting
+    // for the file its create records (see `newFileDeleted`): a save under
+    // the name meanwhile is of a file made again there.
+    if ([...this.newFileDeletes].some((d) => d.path === path && d.holdsSaves)) {
+      await this.newFileDeleted(path);
+      await this.handleLocalModify(path, from);
+      return;
+    }
     const meta = this.fileIndex.byPath.get(path);
     // The file recorded under the name is being deleted from here (see
     // `deleteClaims`), its delete waiting for its checks — behind every
@@ -5433,12 +5505,26 @@ export class SyncEngine {
     let claim = indexed === '' ? null : this.claimDelete(indexed, opId);
     // Nothing recorded under the name: the file a create of the name under
     // way here records, once it has, is the one deleted (see below).
-    const created = indexed === '' ? this.createdUnder(path) : NO_CREATE;
+    const created = indexed === '' ? this.createdUnder(path) : noCreate();
     // A new file of this device's, its create under way or queued: the server
-    // knows it by no id the delete can tell yet. Not handed over by `stop()`
-    // (see `handOverHeldChanges`).
+    // knows it by no id the delete can tell yet. Handed over by `stop()` only
+    // as a delete of the file the create has recorded (see
+    // `handOverHeldChanges`); a file made again under the name meanwhile waits
+    // for it (see `newFileDeleted`).
     const newFile = indexed === '' && (created.done !== null || this.createQueuedAt(path));
-    if (change !== null && newFile) this.newFileDeletes.add(change);
+    let through: () => void = () => undefined;
+    const deleting: NewFileDelete | null = newFile
+      ? {
+          path,
+          change,
+          created,
+          holdsSaves: created.done !== null,
+          done: new Promise<void>((resolve) => {
+            through = resolve;
+          }),
+        }
+      : null;
+    if (deleting !== null) this.newFileDeletes.add(deleting);
     let outcome: DeleteOutcome = 'kept';
     /** Sent or queued: the record of it made ahead, if any, is that one's from then on. */
     let handedOn = false;
@@ -5469,8 +5555,9 @@ export class SyncEngine {
             ? this.indexedAt(created.fileId, path)
             : undefined;
       let fileId = meta?.fileId ?? '';
-      // Checked: from here on `stop()` hands it over as a plain DELETE — but
-      // the delete of a new file (see `newFile` above).
+      // Checked: from here on `stop()` hands it over as a plain DELETE — the
+      // delete of a new file once its create has recorded it (see `newFile`
+      // above).
       if (change) this.passDelete(change, withFolder(deletePayload(fileId, meta), folder));
       if (!fileId && indexed === '' && created.done !== null) {
         // A create of the name was under way when the delete came: the file
@@ -5636,7 +5723,8 @@ export class SyncEngine {
       await this.releaseName(path);
     } finally {
       claim?.end(outcome);
-      if (change) this.newFileDeletes.delete(change);
+      if (deleting !== null) this.newFileDeletes.delete(deleting);
+      through();
       if (!handedOn) this.dropRecordAhead(change);
     }
   }
@@ -5685,7 +5773,8 @@ export class SyncEngine {
    * The file a create of `path` under way here (see {@link creating}) records,
    * once it has: its `fileId`, `''` until then — and for good when no create
    * of the name is under way, or it records none (queued, refused, found gone).
-   * `done` once it has come to that, `null` when none is under way.
+   * `done` once it has come to that, `null` when none is under way. `recorded`
+   * as soon as the file is recorded under `path` (see `recordCreatedFile`).
    * A rename into the name waiting for a create (see
    * {@link renameAfterCreate}) records the created file under it as soon as
    * the create is answered (see {@link recordedAfterCreate}), long before
@@ -5693,17 +5782,15 @@ export class SyncEngine {
    */
   private createdUnder(path: string): CreatedUnder {
     const pending = this.recordedAfterCreate.get(path) ?? this.creating.get(path);
-    if (pending === undefined) return NO_CREATE;
-    const created: { fileId: string; gone: boolean; done: Promise<void> | null } = {
-      fileId: '',
-      gone: false,
-      done: null,
-    };
-    created.done = pending.then((done) => {
-      if (done === null) return;
-      created.fileId = done.fileId;
-      created.gone = done.gone === true;
+    if (pending === undefined) return noCreate();
+    let created!: CreatedUnder;
+    const done = pending.then((result) => {
+      created.settled = true;
+      if (result === null) return;
+      created.fileId = result.fileId;
+      created.gone = result.gone === true;
     });
+    created = { fileId: '', gone: false, settled: false, recorded: '', done };
     return created;
   }
 
@@ -10260,22 +10347,35 @@ export class SyncEngine {
    */
   private handOverHeldChanges(): void {
     const bindingId = this.binding.id;
+    /** The files whose delete is handed over as the delete of a new file. */
+    const newFilesHandedOver = new Set<string>();
     for (const change of this.held) {
-      // The delete of a new file of this device's (see `newFileDeletes`), not
-      // sent or queued under an id yet. Queued by the name, it took the file
-      // the next connect records there: another device's, let into the name
-      // once the create, queued, found no file to send. The create settles
-      // it: the next connect asks the server what became of one that went
-      // out, and one that landed, its file gone here, goes out as a delete
-      // (see `settleLandedCreate`); one that did not finds nothing to send.
-      if (this.newFileDeletes.has(change)) continue;
       try {
         // On its way, or queued already after a try: it is there under its id.
         if (this.operationLog.findByOpId(bindingId, change.opId) !== null) continue;
-        this.operationLog.enqueueOperation(bindingId, {
-          ...change,
-          payload: { ...change.payload },
-        });
+        let payload = { ...change.payload };
+        const deleting = [...this.newFileDeletes].find((d) => d.change === change);
+        if (deleting !== undefined) {
+          // The delete of a new file of this device's (see `newFileDeletes`),
+          // not sent or queued yet: by the file its create has recorded, if it
+          // has. Queued by the name, it took the file the next connect records
+          // there: another device's, let into the name once the create,
+          // queued, found no file to send. Before the record, the create
+          // settles it: the next connect asks the server what became of one
+          // that went out, and one that landed, its file gone here, goes out
+          // as a delete (see `settleLandedCreate`); one that did not finds
+          // nothing to send. Once recorded, the answer has settled the create:
+          // left out, nothing deleted the note, and the next start wrote it
+          // back from its record.
+          const handed = this.newFileDeleteHandedOver(deleting, payload);
+          if (handed === null) continue;
+          const fileId = queuedFileId(handed);
+          // Two deletes of the name (Obsidian's and the `unlink`): one goes.
+          if (newFilesHandedOver.has(fileId)) continue;
+          newFilesHandedOver.add(fileId);
+          payload = handed;
+        }
+        this.operationLog.enqueueOperation(bindingId, { ...change, payload });
       } catch (err) {
         this.log.warn('could not queue a change held at stop', {
           opType: change.opType,
@@ -10297,6 +10397,24 @@ export class SyncEngine {
       }
     }
     this.inflightHere.clear();
+  }
+
+  /**
+   * The payload `stop()` queues the delete of a new file `deleting` with (see
+   * {@link handOverHeldChanges}), `payload` its own: by the file the create it
+   * waits for has recorded under the name (see `CreatedUnder.recorded`) —
+   * `null` while it has recorded none, and once that file has moved on from
+   * the name (a note made again there and renamed: the delete would take it).
+   */
+  private newFileDeleteHandedOver(
+    deleting: NewFileDelete,
+    payload: Record<string, unknown>,
+  ): Record<string, unknown> | null {
+    const { recorded } = deleting.created;
+    if (recorded === '') return null;
+    const meta = this.indexedAt(recorded, deleting.path);
+    if (meta === undefined) return null;
+    return { ...payload, ...deletePayload(recorded, meta) };
   }
 
   /**

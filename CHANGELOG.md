@@ -205,9 +205,10 @@ uses [Semantic Versioning](https://semver.org/).
   everyone. A note the server had stored as `Untitled.conflict-<device>.md`,
   because a teammate's note had the name, stayed there for everyone. Now
   Team Vault waits for the answer and deletes the note it created; if the
-  creation didn't go through, nothing is sent. If sync is paused or
-  Obsidian closes meanwhile, the next connection asks the server what
-  became of the note and deletes it there.
+  creation didn't go through, nothing is sent. A note you create again
+  under the same name meanwhile goes to the server as a new note with its
+  own text. If sync is paused or Obsidian closes meanwhile, the deletion
+  goes out with the next connection.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the
