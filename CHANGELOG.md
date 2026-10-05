@@ -212,6 +212,15 @@ uses [Semantic Versioning](https://semver.org/).
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the
   server, and came back with the next connection.
+- **A file left alone while you delete a folder is no longer deleted after
+  Obsidian restarts.** When you deleted a folder, Team Vault sent nothing for
+  a file of it that was back on disk by the time it got to it (written again
+  a moment before), nor for one a teammate had just renamed out of the
+  folder. But if Obsidian closed or crashed, or the plugin was turned off,
+  before the rest of the folder had gone out, the next start deleted that
+  file on the server for the whole team: a file still on your disk then went
+  up again as a new file, without its history, and the teammate's renamed
+  file was gone. Now nothing goes out for such a file.
 - **A connection that drops while Team Vault catches up no longer holds up
   the next one.** On a large vault the catch-up after connecting takes a
   while, and the connection can drop in the middle of it (Obsidian, busy

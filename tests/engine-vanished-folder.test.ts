@@ -24,6 +24,8 @@ import { Logger, type LogEntry } from '@/utils/logger';
 import type { VaultEvent } from '@/watcher/obsidian-events';
 import {
   FakeServer,
+  FakeStorage,
+  NEVER_FLUSHED,
   ServerDocs,
   buildHarness,
   bytes,
@@ -33,12 +35,24 @@ import {
   joinToAnswer,
   joinsOf,
   json,
+  logOn,
   nextJoin,
+  restartFromDisk,
   userRename,
   type Harness,
 } from './engine-test-kit';
 
 jest.setTimeout(60_000);
+
+/** Engines whose log is on a {@link FakeStorage}: stopped after the test, their logs closed. */
+const onDisk: Harness[] = [];
+
+afterEach(async () => {
+  for (const h of onDisk.splice(0)) {
+    await h.engine.stop().catch(() => undefined);
+    await h.log.close().catch(() => undefined);
+  }
+});
 
 interface Bench {
   h: Harness;
@@ -52,10 +66,12 @@ interface Bench {
  * attachments — and the engine connected, its catch-up and first upload done.
  * Without `notes`, no doc of the server's reaches the engine: a note a
  * teammate creates is recorded here and never written (it waits for its doc).
+ * `storage`: `state.json` is written there (see {@link crashed}), only when
+ * the engine waits for it — the debounced write never comes.
  */
 async function seeded(
   paths: readonly string[],
-  opts: { notes?: boolean; localFolder?: string } = {},
+  opts: { notes?: boolean; localFolder?: string; storage?: FakeStorage } = {},
 ): Promise<Bench> {
   const entries: LogEntry[] = [];
   const logger = new Logger('debug', {
@@ -66,7 +82,9 @@ async function seeded(
   const h = buildHarness({
     logger,
     ...(opts.localFolder !== undefined ? { localFolder: opts.localFolder } : {}),
+    ...(opts.storage !== undefined ? { log: await logOn(opts.storage, NEVER_FLUSHED) } : {}),
   });
+  if (opts.storage !== undefined) onDisk.push(h);
   const server = new FakeServer(h);
   const docs = opts.notes === true ? new ServerDocs(server, h) : null;
   for (const [i, path] of paths.entries()) {
@@ -1152,6 +1170,497 @@ describe('SyncEngine — a folder a teammate deleted or renamed: removed here on
 
     expect(b.h.vault.folders.has('notes')).toBe(true);
     await b.h.engine.stop();
+  });
+});
+
+/** A folder `dir` removed here as a teammate's, and a teammate's note `dir/c.md` written into it since. */
+async function prunedThenWrittenNote(b: Bench): Promise<string> {
+  const mark = b.entries.length;
+  b.server.teammateDelete('f1', { folder: 'dir' });
+  await until('the folder removed', () => said(b, REMOVED, mark));
+  const id = await b.server.teammateCreate('dir/c.md', 'c\n');
+  await b.docs?.drive();
+  await until('the note written', () => b.h.vault.files.has('dir/c.md'));
+  await b.h.settle();
+  return id;
+}
+
+/**
+ * The process dies now, `b`'s `state.json` on `storage` as it is: a new engine
+ * starts from that disk and connects, its catch-up, queue and first upload done.
+ */
+async function crashed(b: Bench, storage: FakeStorage): Promise<Bench> {
+  const logger = new Logger('debug', {
+    write: (e) => {
+      b.entries.push(e);
+    },
+  });
+  const { next } = await restartFromDisk(b.h, storage, {
+    server: b.server,
+    identity: { logger },
+  });
+  onDisk.push(next);
+  // The downloads the server serves (see `uploaded`).
+  for (const [route, respond] of b.h.routes)
+    if (!next.routes.has(route)) next.routes.set(route, respond);
+  await next.engine.start();
+  (await joinToAnswer(next)).ack(b.server.joinAnswer('whole journal'));
+  const after = { ...b, h: next };
+  await tailDone(after, 0);
+  return after;
+}
+
+/**
+ * The user deletes folder `dir`: only the folder's report reaches the engine
+ * (the files' own events are swallowed as echoes of this plugin's writes).
+ * Once the first `file:delete` has gone out, its packet is held — it never
+ * reaches the server — and `cut` comes: the connection drops, sync is paused,
+ * or sync stops.
+ */
+async function deleteFolderCutAtFirst(b: Bench, cut: 'drop' | 'pause' | 'stop'): Promise<void> {
+  b.h.vault.removeFolder('dir');
+  const run = b.h.engine.handleVaultEvent(folderEvent('dir')).then(
+    () => undefined,
+    () => undefined,
+  );
+  await until('the first delete sent', () =>
+    b.h.socket().emits.some((e) => e.event === 'file:delete'),
+  );
+  b.server.delay(b.h.socket().pending('file:delete'));
+  if (cut === 'drop') b.h.socket().disconnect();
+  else if (cut === 'pause') b.h.engine.pause();
+  else await b.h.engine.stop();
+  await run;
+}
+
+/** Resume sync after Pause sync: connected again, the catch-up, queue and first upload done. */
+async function resumed(b: Bench): Promise<void> {
+  const lookups = tombstoneLookups(b.h);
+  const resuming = b.h.engine.resume();
+  (await joinToAnswer(b.h)).ack(b.server.joinAnswer('whole journal'));
+  await resuming;
+  await tailDone(b, lookups);
+}
+
+/** The queue's entries: `OP path`, ` recheck` for one that asks the replay to look again. */
+function queued(h: Harness): string[] {
+  return h.log
+    .dequeueOperations('b1')
+    .map((op) => `${op.opType} ${op.filePath}${op.payload['recheck'] === true ? ' recheck' : ''}`);
+}
+
+describe('SyncEngine — the user deletes a folder removed here: its deletes reach the server', () => {
+  it.each([
+    ['the connection drops', 'an attachment', false, 'drop'],
+    ['the connection drops', 'a note', true, 'drop'],
+    ['sync is paused', 'an attachment', false, 'pause'],
+  ] as const)(
+    '%s while the delete of %s of it waits for its answer: the next connect sends it, and the file stays deleted',
+    async (_how, _kind, notes, cut) => {
+      const b = notes
+        ? await seeded(['dir/a.md', 'keep.md'], { notes: true })
+        : await seeded(['dir/a.png', 'keep.png']);
+      const path = notes ? 'dir/c.md' : 'dir/c.png';
+      const id = notes ? await prunedThenWrittenNote(b) : await prunedThenWritten(b);
+
+      await deleteFolderCutAtFirst(b, cut);
+      expect(queued(b.h)).toEqual([`DELETE ${path}`]);
+      const socket = b.h.socket();
+      const emits = socket.emits.length;
+
+      if (cut === 'pause') await resumed(b);
+      else await reconnect(b);
+
+      expect(sent(b, b.h.socket() === socket ? emits : 0)).toEqual([`file:delete ${path} [dir]`]);
+      expect(b.server.pathOf(id)).toBeNull();
+      expect(b.h.vault.files.has(path)).toBe(false);
+      expect(b.h.log.dequeueOperations('b1')).toEqual([]);
+      await b.h.engine.stop();
+    },
+  );
+
+  it('sync stops while the delete of a file of it waits for its answer: the next start sends it, and the file stays deleted', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+
+    await deleteFolderCutAtFirst(b, 'stop');
+    expect(queued(b.h)).toEqual(['DELETE dir/c.png']);
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual(['file:delete dir/c.png [dir]']);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(b.h.vault.files.has('dir/c.png')).toBe(false);
+    await next.h.engine.stop();
+  });
+
+  it('Obsidian dies while the delete of a file of it waits for its answer: the next start sends it, and the file stays deleted', async () => {
+    const storage = new FakeStorage();
+    const b = await seeded(['dir/a.png', 'keep.png'], { storage });
+    const id = await prunedThenWritten(b);
+    await b.h.log.persistNow();
+
+    b.h.vault.removeFolder('dir');
+    void b.h.engine.handleVaultEvent(folderEvent('dir')).catch(() => undefined);
+    await until('the first delete sent', () =>
+      b.h.socket().emits.some((e) => e.event === 'file:delete'),
+    );
+    b.server.delay(b.h.socket().pending('file:delete'));
+
+    const next = await crashed(b, storage);
+    expect(sent(next)).toEqual(['file:delete dir/c.png [dir]']);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(next.h.vault.files.has('dir/c.png')).toBe(false);
+    await next.h.engine.stop();
+  });
+
+  it.each([['sync stops'], ['Obsidian dies']])(
+    '%s while the first of two files’ deletes waits for its answer: the next start sends both',
+    async (how) => {
+      const storage = new FakeStorage();
+      const b = await seeded(['dir/a.png', 'keep.png'], { storage });
+      const c = await prunedThenWritten(b);
+      const d = await uploaded(b, 'dir/d.png', encode('pic2'));
+      await until('the second file written', () => b.h.vault.files.has('dir/d.png'));
+      await b.h.settle();
+      await b.h.log.persistNow();
+
+      let next: Bench;
+      if (how === 'sync stops') {
+        await deleteFolderCutAtFirst(b, 'stop');
+        expect(queued(b.h)).toEqual(['DELETE dir/c.png', 'DELETE dir/d.png']);
+        next = await restarted(b);
+      } else {
+        b.h.vault.removeFolder('dir');
+        void b.h.engine.handleVaultEvent(folderEvent('dir')).catch(() => undefined);
+        await until('the first delete sent', () =>
+          b.h.socket().emits.some((e) => e.event === 'file:delete'),
+        );
+        b.server.delay(b.h.socket().pending('file:delete'));
+        next = await crashed(b, storage);
+      }
+
+      expect(sent(next).sort()).toEqual([
+        'file:delete dir/c.png [dir]',
+        'file:delete dir/d.png [dir]',
+      ]);
+      expect(b.server.pathOf(c)).toBeNull();
+      expect(b.server.pathOf(d)).toBeNull();
+      expect(live(b.server)).toEqual(['keep.png']);
+      expect(next.h.vault.files.has('dir/c.png')).toBe(false);
+      expect(next.h.vault.files.has('dir/d.png')).toBe(false);
+      await next.h.engine.stop();
+    },
+  );
+
+  it('the connection drops while the first of two files’ deletes waits for its answer: both go with the next connect', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    await prunedThenWritten(b);
+    await uploaded(b, 'dir/d.png', encode('pic2'));
+    await until('the second file written', () => b.h.vault.files.has('dir/d.png'));
+    await b.h.settle();
+
+    await deleteFolderCutAtFirst(b, 'drop');
+    expect(queued(b.h)).toEqual(['DELETE dir/c.png', 'DELETE dir/d.png']);
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/c.png [dir]', 'file:delete dir/d.png [dir]']);
+    expect(live(b.server)).toEqual(['keep.png']);
+    expect(b.h.vault.files.has('dir/c.png')).toBe(false);
+    expect(b.h.vault.files.has('dir/d.png')).toBe(false);
+    await b.h.engine.stop();
+  });
+
+  it('the server busy with the delete of a file of it: the queue sends it again, and the file stays deleted', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+    b.server.bar(1);
+
+    b.h.vault.removeFolder('dir');
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+    for (let round = 0; round < 20 && b.server.pathOf(id) !== null; round++) {
+      await b.server.pump();
+      await b.h.settle();
+    }
+
+    expect(sent(b).filter((s) => s.startsWith('file:delete'))).toEqual([
+      'file:delete dir/c.png [dir]',
+      'file:delete dir/c.png [dir]',
+    ]);
+    expect(live(b.server)).toEqual(['keep.png']);
+    expect(b.h.vault.files.has('dir/c.png')).toBe(false);
+    expect(b.h.log.dequeueOperations('b1')).toEqual([]);
+    await b.h.engine.stop();
+  });
+
+  it('a file of it back on disk by its own turn, sync stopping while the next file’s delete waits: the file back is deleted nowhere', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const c = await prunedThenWritten(b);
+    await uploaded(b, 'dir/d.png', encode('pic2'));
+    await until('the second file written', () => b.h.vault.files.has('dir/d.png'));
+    await b.h.settle();
+    // The deletes recorded ahead, the first file is back on disk before its
+    // turn: a teammate's version of it written right then.
+    const persist = b.h.log.persistNow.bind(b.h.log);
+    let back = false;
+    b.h.log.persistNow = (): Promise<void> => {
+      if (!back && b.h.log.inFlightOperations('b1').length > 0) {
+        back = true;
+        b.h.vault.files.set('dir/c.png', encode('pic'));
+      }
+      return persist();
+    };
+
+    await deleteFolderCutAtFirst(b, 'stop');
+    expect(back).toBe(true);
+    // The folder is back with the file: it goes nowhere.
+    expect(sent(b).filter((s) => s.startsWith('file:delete'))).toEqual(['file:delete dir/d.png']);
+    expect(queued(b.h)).toEqual(['DELETE dir/d.png']);
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual(['file:delete dir/d.png']);
+    expect(b.server.pathOf(c)).toBe('dir/c.png');
+    expect(b.h.vault.text('dir/c.png')).toBe('pic');
+    expect(live(b.server)).toEqual(['dir/c.png', 'keep.png']);
+    await next.h.engine.stop();
+  });
+
+  it('a file of it found on disk at its first look, sync stopping before its turn: its delete is looked at again, and it stays', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+    // The file is back on disk when its delete first looks — a teammate's
+    // version of it written right then — and sync stops at the next look,
+    // before the delete's turn.
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    let looked = false;
+    const stop: { done: Promise<void> | null } = { done: null };
+    b.h.vault.exists = (path: string): Promise<boolean> => {
+      if (path === 'dir/c.png' && !looked) {
+        looked = true;
+        b.h.vault.files.set('dir/c.png', encode('pic'));
+      } else if (looked && stop.done === null) {
+        stop.done = b.h.engine.stop();
+      }
+      return exists(path);
+    };
+
+    b.h.vault.removeFolder('dir');
+    await b.h.engine.handleVaultEvent(folderEvent('dir')).catch(() => undefined);
+    expect(stop.done).not.toBeNull();
+    await stop.done;
+    expect(sent(b).filter((s) => s.startsWith('file:delete'))).toEqual([]);
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual([]);
+    expect(b.server.pathOf(id)).toBe('dir/c.png');
+    expect(b.h.vault.text('dir/c.png')).toBe('pic');
+    await next.h.engine.stop();
+  });
+
+  it('a file of it found on disk at its first look and gone by its turn: its delete goes as checked, the connection dropping while it waits included', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+    // The first look at the file finds it back on disk; by its turn, it is gone again.
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    let looks = 0;
+    b.h.vault.exists = (path: string): Promise<boolean> => {
+      if (path === 'dir/c.png') {
+        looks += 1;
+        if (looks === 1) b.h.vault.files.set('dir/c.png', encode('pic'));
+        else if (looks === 2) b.h.vault.removeFolder('dir');
+      }
+      return exists(path);
+    };
+
+    await deleteFolderCutAtFirst(b, 'drop');
+    expect(looks).toBeGreaterThanOrEqual(2);
+    expect(queued(b.h)).toEqual(['DELETE dir/c.png']);
+    const emits = b.h.socket().emits.length;
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual(['file:delete dir/c.png [dir]']);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(b.h.vault.files.has('dir/c.png')).toBe(false);
+    await b.h.engine.stop();
+  });
+
+  it('a file of it found on disk at its first look and gone by its turn: its delete goes out once what its look found is on disk, and Obsidian dying then does not lose it', async () => {
+    const storage = new FakeStorage();
+    const b = await seeded(['dir/a.png', 'keep.png'], { storage });
+    const id = await prunedThenWritten(b);
+    await b.h.log.persistNow();
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    let looks = 0;
+    b.h.vault.exists = (path: string): Promise<boolean> => {
+      if (path === 'dir/c.png') {
+        looks += 1;
+        if (looks === 1) b.h.vault.files.set('dir/c.png', encode('pic'));
+        else if (looks === 2) b.h.vault.removeFolder('dir');
+      }
+      return exists(path);
+    };
+    // Each `state.json` that lands: whether the delete of the file in it asks
+    // for a recheck, and how many deletes had gone out by then.
+    const landed: Array<{ deletes: number; recheck: boolean | null }> = [];
+    storage.onState = (state): void => {
+      const inflight = (state.bindings['b1']?.inflight ?? []) as Array<{
+        filePath: string;
+        payload?: Record<string, unknown>;
+      }>;
+      const op = inflight.find((o) => o.filePath === 'dir/c.png');
+      landed.push({
+        deletes: b.h.socket().emits.filter((e) => e.event === 'file:delete').length,
+        recheck: op === undefined ? null : op.payload?.['recheck'] === true,
+      });
+    };
+
+    b.h.vault.removeFolder('dir');
+    void b.h.engine.handleVaultEvent(folderEvent('dir')).catch(() => undefined);
+    await until('the delete sent', () => b.h.socket().emits.some((e) => e.event === 'file:delete'));
+    b.server.delay(b.h.socket().pending('file:delete'));
+    storage.onState = null;
+
+    // Recorded ahead with the recheck — the file was on disk at its first
+    // look — and on disk without it before the delete went out.
+    const ahead = landed.findIndex((s) => s.recheck === true);
+    const checked = landed.findIndex((s) => s.recheck === false);
+    expect(ahead).toBeGreaterThanOrEqual(0);
+    expect(checked).toBeGreaterThan(ahead);
+    expect(landed[checked]?.deletes).toBe(0);
+
+    const next = await crashed(b, storage);
+    expect(sent(next)).toEqual(['file:delete dir/c.png [dir]']);
+    expect(b.server.pathOf(id)).toBeNull();
+    expect(next.h.vault.files.has('dir/c.png')).toBe(false);
+    await next.h.engine.stop();
+  });
+
+  it('a file whose own delete found it on disk, its folder gone by then: the folder’s delete of it is looked at again when sync stops at its look', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+
+    // A stray report of the file comes first: its handler looks at the disk
+    // while the user deletes the folder.
+    const own = b.h.vault.gate('exists');
+    const stray = b.h.engine.handleVaultEvent(fileEvent('dir/c.png')).then(
+      () => undefined,
+      () => undefined,
+    );
+    await own.reached;
+    b.h.vault.removeFolder('dir');
+    const folder = b.h.engine.handleVaultEvent(folderEvent('dir')).then(
+      () => undefined,
+      () => undefined,
+    );
+    await until('the folder’s delete waiting for the file’s', () =>
+      said(b, 'folder delete → expanding'),
+    );
+    // The file is on disk when its own handler looks: nothing goes for it.
+    b.h.vault.files.set('dir/c.png', encode('pic'));
+    const again = b.h.vault.gate('exists');
+    own.release();
+    await stray;
+    // The folder's delete of the file looks at it again — and the file is
+    // there (a teammate's version written right then) when sync stops.
+    await again.reached;
+    const stopped = b.h.engine.stop();
+    again.release();
+    await stopped;
+    await folder;
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual([]);
+    expect(b.server.pathOf(id)).toBe('dir/c.png');
+    expect(b.h.vault.text('dir/c.png')).toBe('pic');
+    await next.h.engine.stop();
+  });
+
+  it('Obsidian’s late report of the folder removed, the connection dropping right after: the next connect sends nothing', async () => {
+    const b = await seeded(['dir/a.png', 'keep.png']);
+    const id = await prunedThenWritten(b);
+    const emits = b.h.socket().emits.length;
+
+    await finish(b, dispatch(b.h, [folderEvent('dir')]));
+    b.h.socket().disconnect();
+    await b.h.settle();
+    expect(b.h.log.dequeueOperations('b1')).toEqual([]);
+
+    await reconnect(b);
+
+    expect(sent(b, emits)).toEqual([]);
+    expect(b.server.pathOf(id)).toBe('dir/c.png');
+    expect(b.h.vault.text('dir/c.png')).toBe('pic');
+    await b.h.engine.stop();
+  });
+});
+
+describe('SyncEngine — a folder deleted: a file its own look finds nothing to send for is not sent later', () => {
+  it('a file of the folder still on disk at its look, sync stopping while another file’s delete waits: the file kept is deleted nowhere', async () => {
+    const b = await seeded(['dir/b.png', 'dir/a.png', 'keep.png']);
+    // The user deletes the folder, and `dir/b.png` is written back before
+    // Obsidian reports it: only `dir/a.png` is gone.
+    b.h.vault.files.delete('dir/a.png');
+    const run = b.h.engine.handleVaultEvent(folderEvent('dir')).then(
+      () => undefined,
+      () => undefined,
+    );
+    await until('the delete of the gone file sent', () =>
+      b.h.socket().emits.some((e) => e.event === 'file:delete'),
+    );
+    b.server.delay(b.h.socket().pending('file:delete'));
+    await b.h.engine.stop();
+    await run;
+    expect(queued(b.h)).toEqual(['DELETE dir/a.png']);
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual(['file:delete dir/a.png']);
+    expect(b.server.pathOf('f1')).toBe('dir/b.png');
+    expect(b.h.vault.text('dir/b.png')).toBe('dir/b.png\n');
+    expect(live(b.server)).toEqual(['dir/b.png', 'keep.png']);
+    await next.h.engine.stop();
+  });
+
+  it('a file of the folder a teammate renames while its delete looks at the disk, sync stopping while another file’s delete waits: the renamed file is deleted nowhere', async () => {
+    const b = await seeded(['dir/a.png', 'dir/b.png', 'keep.png']);
+    // The teammate's rename of `dir/a.png` lands while its delete looks at the
+    // disk: from then on the file is theirs, under another name.
+    const exists = b.h.vault.exists.bind(b.h.vault);
+    let renamed = false;
+    b.h.vault.exists = async (path: string): Promise<boolean> => {
+      if (path === 'dir/a.png' && !renamed) {
+        renamed = true;
+        b.server.teammateRename('f1', 'other/a.png');
+        await until(
+          'the rename applied',
+          () => b.h.engine.getFileIdForPath('other/a.png') === 'f1',
+        );
+      }
+      return exists(path);
+    };
+    b.h.vault.removeFolder('dir');
+    const run = b.h.engine.handleVaultEvent(folderEvent('dir')).then(
+      () => undefined,
+      () => undefined,
+    );
+    await until('the delete of the other file sent', () =>
+      b.h.socket().emits.some((e) => e.event === 'file:delete'),
+    );
+    b.server.delay(b.h.socket().pending('file:delete'));
+    await b.h.engine.stop();
+    await run;
+    expect(renamed).toBe(true);
+    expect(sent(b).filter((s) => s.startsWith('file:delete'))).toEqual([
+      'file:delete dir/b.png [dir]',
+    ]);
+    expect(queued(b.h)).toEqual(['DELETE dir/b.png']);
+
+    const next = await restarted(b);
+    expect(sent(next)).toEqual(['file:delete dir/b.png [dir]']);
+    expect(b.server.pathOf('f1')).toBe('other/a.png');
+    expect(live(b.server)).toEqual(['keep.png', 'other/a.png']);
+    await next.h.engine.stop();
   });
 });
 

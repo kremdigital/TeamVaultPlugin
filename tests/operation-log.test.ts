@@ -969,6 +969,70 @@ interface StoredDoc {
 }
 
 describe('OperationLog — operations in flight on disk', () => {
+  it('amends the payload of an operation in flight: on disk only once a write after it went through', async () => {
+    const { storage, files } = makeStorage();
+    const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+    const out = log.recordInFlight('b1', {
+      opType: 'DELETE',
+      filePath: 'dir/c.png',
+      payload: { fileId: 'f1', lastSynced: ['h1'], recheck: true, folder: 'dir' },
+      opId: opIdOf(1),
+    });
+    await log.persistNow();
+    expect(log.inFlightWritten('b1', out.opId)).toBe(true);
+
+    // The same values, whatever the order of their keys: nothing to write.
+    expect(
+      log.amendInFlight('b1', out.opId, {
+        folder: 'dir',
+        recheck: true,
+        lastSynced: ['h1'],
+        fileId: 'f1',
+      }),
+    ).toBe(false);
+    expect(log.inFlightWritten('b1', out.opId)).toBe(true);
+
+    // Writes stay on their way until released.
+    let release: () => void = () => undefined;
+    const held = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const write = storage.write.bind(storage);
+    storage.write = async (p, data): Promise<void> => {
+      await held;
+      return write(p, data);
+    };
+    expect(
+      log.amendInFlight('b1', out.opId, { fileId: 'f1', lastSynced: ['h1'], folder: 'dir' }),
+    ).toBe(true);
+    // Not on disk yet: the operation waits for the write.
+    expect(log.inFlightWritten('b1', out.opId)).toBe(false);
+    expect(log.findByOpId('b1', out.opId)?.payload).toEqual({
+      fileId: 'f1',
+      lastSynced: ['h1'],
+      folder: 'dir',
+    });
+    const written = log.persistNow();
+    release();
+    await written;
+    expect(log.inFlightWritten('b1', out.opId)).toBe(true);
+    const doc = JSON.parse(files.get(PATH) ?? '{}') as {
+      bindings: { b1: { inflight: Array<{ opId: string; payload: Record<string, unknown> }> } };
+    };
+    expect(doc.bindings.b1.inflight.map((op) => op.payload)).toEqual([
+      { fileId: 'f1', lastSynced: ['h1'], folder: 'dir' },
+    ]);
+
+    // Back in the queue, or never in flight: nothing to amend.
+    log.requeueInFlight('b1', out.opId);
+    expect(log.amendInFlight('b1', out.opId, { fileId: 'f2' })).toBe(false);
+    expect(log.amendInFlight('b1', opIdOf(2), { fileId: 'f2' })).toBe(false);
+    expect(log.dequeueOperations('b1').map((op) => op.payload)).toEqual([
+      { fileId: 'f1', lastSynced: ['h1'], folder: 'dir' },
+    ]);
+    await log.close();
+  });
+
   it('writes an operation in flight at once, before its emit', async () => {
     const { storage, files } = makeStorage();
     const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });

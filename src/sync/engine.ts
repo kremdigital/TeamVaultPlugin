@@ -2503,7 +2503,8 @@ export class SyncEngine {
     }
     this.inflightHere.add(op.opId);
     try {
-      // Written together with others recorded ahead: nothing to wait for.
+      // Written together with others recorded ahead, and not changed since
+      // (see `passDelete`): nothing to wait for.
       if (!this.operationLog.inFlightWritten(bindingId, op.opId)) {
         await this.operationLog.persistNow();
       }
@@ -5176,8 +5177,8 @@ export class SyncEngine {
     // a `stop()` halfway through must queue the ones not sent yet — the next
     // catch-up would otherwise write them back to disk. Checked already: the
     // folder is gone, so none of them can still be on disk. Not for a folder
-    // removed here: a file of it may be back on disk before its own check
-    // (see `sendLocalDelete`) — a teammate's new version of it written right
+    // removed here: a file of it may be back on disk before its own look (see
+    // `lookAtHeldDeletes`) — a teammate's new version of it written right
     // then — and handed over, its delete is looked at again (see
     // `holdLocalDelete`).
     //
@@ -5205,6 +5206,7 @@ export class SyncEngine {
       folderPath,
       `(${children.length} files, ${underWay.length} on their way already)`,
     );
+    if (removedHere) await this.lookAtHeldDeletes(held);
     // The folder that went — this one, or one above it that went with it —
     // in the records made ahead too: from them, the queue sends it.
     if (held.length > 0) {
@@ -5254,6 +5256,33 @@ export class SyncEngine {
   }
 
   /**
+   * The deletes `held` of a folder removed here (see
+   * {@link handleLocalFolderDelete}), each file looked at on disk before they
+   * are recorded ahead (see {@link recordDeletesAhead}): one gone is checked
+   * from then on, as a delete is once its own look finds the file gone (see
+   * `sendLocalDelete`). Recorded with the recheck, as they all were, the
+   * deletes cut off on their way — the connection dropped, sync stopped,
+   * Obsidian closed or died — went back to the queue asking for it. The next
+   * connect's catch-up wrote the files back before the queue looked, and the
+   * deletes were dropped as of files on disk: the folder's files came back,
+   * deleted here and never on the server. One on disk, or one the disk could
+   * not tell about, keeps the recheck: its own look decides, as it comes.
+   */
+  private async lookAtHeldDeletes(held: readonly HeldChange[]): Promise<void> {
+    for (const change of held) {
+      let there: boolean;
+      try {
+        there = await this.vault.exists(change.filePath);
+      } catch {
+        this.throwIfStopped();
+        continue;
+      }
+      this.throwIfStopped();
+      if (!there) change.payload = withoutRecheck(change.payload);
+    }
+  }
+
+  /**
    * Every path recorded under `folderPath`, in the index's order. The folder
    * on disk may be spelled in another case than the notes in it are recorded
    * by (see `spelledHere`).
@@ -5277,7 +5306,9 @@ export class SyncEngine {
    * written to `state.json` in one go, before the first of them goes out:
    * they go out one after another (see `sendOp`), and a write before each
    * cost a folder of hundreds of files seconds. The `opId`s recorded; none
-   * when nothing can go out now.
+   * when nothing can go out now. Each record follows its delete's own look
+   * at the disk: it carries what the look found (see `passDelete`), and goes
+   * when the look finds nothing to send (see `dropRecordAhead`).
    */
   private async recordDeletesAhead(held: readonly HeldChange[]): Promise<string[]> {
     if (!this.mayEmitLive('watcher')) return [];
@@ -5409,6 +5440,8 @@ export class SyncEngine {
     const newFile = indexed === '' && (created.done !== null || this.createQueuedAt(path));
     if (change !== null && newFile) this.newFileDeletes.add(change);
     let outcome: DeleteOutcome = 'kept';
+    /** Sent or queued: the record of it made ahead, if any, is that one's from then on. */
+    let handedOn = false;
     try {
       // Stale-delete guard: if the file is still on disk, the watcher
       // event is almost certainly a stray chokidar `unlink` from an
@@ -5438,7 +5471,7 @@ export class SyncEngine {
       let fileId = meta?.fileId ?? '';
       // Checked: from here on `stop()` hands it over as a plain DELETE — but
       // the delete of a new file (see `newFile` above).
-      if (change) change.payload = withFolder(deletePayload(fileId, meta), folder);
+      if (change) this.passDelete(change, withFolder(deletePayload(fileId, meta), folder));
       if (!fileId && indexed === '' && created.done !== null) {
         // A create of the name was under way when the delete came: the file
         // it records is the one deleted here, and there is none to delete
@@ -5527,12 +5560,13 @@ export class SyncEngine {
       // From here on the delete is sent, queued, or there is none to make.
       outcome = 'gone';
       const payload = withFolder(deletePayload(fileId, meta), folder);
-      if (change) change.payload = payload;
+      if (change) this.passDelete(change, payload);
       if (fileId) this.deletedIds.add(fileId);
       const sending = claim;
       // A replay of the queue's (see `hold`): the head of the queue.
       const from: LocalSource = change === null ? 'queue' : 'watcher';
       if (this.mayEmitLive(from) && fileId) {
+        handedOn = true;
         const sent = await this.sendOp(
           {
             opType: 'DELETE',
@@ -5595,6 +5629,7 @@ export class SyncEngine {
         await this.releaseName(path);
         return;
       }
+      handedOn = true;
       await this.addNoteState(this.queue('DELETE', path, null, payload, opId), meta);
       await this.forgetDeletedHere(fileId, path, sending);
       this.forgetWaiting(fileId);
@@ -5602,6 +5637,41 @@ export class SyncEngine {
     } finally {
       claim?.end(outcome);
       if (change) this.newFileDeletes.delete(change);
+      if (!handedOn) this.dropRecordAhead(change);
+    }
+  }
+
+  /**
+   * Held delete `change`, past its look at the disk, carries `payload` from
+   * now on — and so does the record of it made ahead (see
+   * {@link recordDeletesAhead}): that record is what `stop()`, a dropped
+   * connection and `busy` put in the queue, and what a crash leaves there.
+   * Changed, it goes out once it is on disk (see `sendOp`). Left as made, a
+   * delete of a folder removed here kept its recheck (see `holdLocalDelete`)
+   * after its look had found the file gone: cut off on its way, it asked for
+   * one, the next connect's catch-up wrote the file back first, and the
+   * delete was dropped as of a file still on disk — the file came back. Not
+   * for a delete with no file to name: its record goes (see
+   * {@link dropRecordAhead}).
+   */
+  private passDelete(change: HeldChange, payload: Record<string, unknown>): void {
+    change.payload = payload;
+    if (queuedFileId(payload) === '' || this.sending.has(change.opId)) return;
+    this.operationLog.amendInFlight(this.binding.id, change.opId, payload);
+  }
+
+  /**
+   * The record made ahead of held delete `change` (see
+   * {@link recordDeletesAhead}) goes, if there is one: nothing goes out for
+   * the delete — its look found the file on disk, or no file to delete under
+   * the name. Left until the folder's delete was done, a `stop()` meanwhile
+   * put it in the queue, and the next start deleted for the whole team a file
+   * its look had found on disk.
+   */
+  private dropRecordAhead(change: HeldChange | null): void {
+    if (change === null || this.sending.has(change.opId)) return;
+    if (this.operationLog.clearInFlight(this.binding.id, change.opId)) {
+      this.leftFlight(change.opId);
     }
   }
 
@@ -5674,10 +5744,7 @@ export class SyncEngine {
   private releaseDelete(change: HeldChange | null): void {
     if (change === null) return;
     this.settle(change);
-    if (this.sending.has(change.opId)) return;
-    if (this.operationLog.clearInFlight(this.binding.id, change.opId)) {
-      this.leftFlight(change.opId);
-    }
+    this.dropRecordAhead(change);
   }
 
   /**
@@ -10416,6 +10483,15 @@ function withFolder(
 ): Record<string, unknown> {
   const { [FOLDER]: _dropped, ...rest } = payload;
   return folder === null ? rest : { ...rest, [FOLDER]: folder };
+}
+
+/**
+ * `payload` of a held DELETE without {@link RECHECK_DELETE}: its look at the
+ * disk found the file gone.
+ */
+function withoutRecheck(payload: Record<string, unknown>): Record<string, unknown> {
+  const { [RECHECK_DELETE]: _dropped, ...rest } = payload;
+  return rest;
 }
 
 /** `folder` of a `file:delete`, `file:rename` or `file:move`, when there is one. */

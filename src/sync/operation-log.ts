@@ -403,6 +403,23 @@ export class OperationLog {
   }
 
   /**
+   * Replace the payload of operation `opId` in flight with `payload`, when it
+   * differs: recorded ahead of the checks it waited for (a folder's deletes,
+   * see `SyncEngine.recordDeletesAhead`), it carries what they found. On disk
+   * with the next write, not before: {@link inFlightWritten} says so until
+   * then, and the operation waits for that write before it goes out. `false`
+   * when no such operation is in flight, or it carries that payload already.
+   */
+  amendInFlight(bindingId: string, opId: string, payload: Record<string, unknown>): boolean {
+    const entry = this.bindings.get(bindingId)?.inflight.find((op) => op.opId === opId);
+    if (!entry || sameValue(entry.payload, payload)) return false;
+    entry.payload = { ...payload };
+    this.touch({ immediate: true });
+    this.opIdGeneration.set(opId, this.generation);
+    return true;
+  }
+
+  /**
    * The answer of an operation in flight came, and what it settled is
    * recorded: the entry goes. The write waits out the debounce, and takes the
    * entry's result — recorded in the same synchronous block — along with it.
@@ -1110,6 +1127,21 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function toNumber(value: unknown, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
+}
+
+/** Whether `a` and `b` hold the same values, whatever the order of their keys. */
+function sameValue(a: unknown, b: unknown): boolean {
+  if (a === b) return true;
+  if (Array.isArray(a) || Array.isArray(b)) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    return a.every((value, i) => sameValue(value, b[i]));
+  }
+  if (!isRecord(a) || !isRecord(b)) return false;
+  const keys = Object.keys(a);
+  if (keys.length !== Object.keys(b).length) return false;
+  return keys.every(
+    (key) => Object.prototype.hasOwnProperty.call(b, key) && sameValue(a[key], b[key]),
+  );
 }
 
 /** A copy of `op` the caller may change without touching the log. */
