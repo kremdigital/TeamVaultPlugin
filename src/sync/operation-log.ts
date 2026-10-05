@@ -423,14 +423,17 @@ export class OperationLog {
    * The answer of an operation in flight came, and what it settled is
    * recorded: the entry goes. The write waits out the debounce, and takes the
    * entry's result — recorded in the same synchronous block — along with it.
+   * `now`: written at once instead — an entry recorded ahead that goes
+   * unsent (see `SyncEngine.dropRecordAhead`), whose place on disk a crash
+   * would otherwise keep until the debounce ran out.
    */
-  clearInFlight(bindingId: string, opId: string): boolean {
+  clearInFlight(bindingId: string, opId: string, opts: { now?: boolean } = {}): boolean {
     const bucket = this.bindings.get(bindingId);
     const at = bucket?.inflight.findIndex((op) => op.opId === opId) ?? -1;
     if (!bucket || at < 0) return false;
     bucket.inflight.splice(at, 1);
     this.opIdGeneration.delete(opId);
-    this.touch();
+    this.touch({ immediate: opts.now === true });
     return true;
   }
 

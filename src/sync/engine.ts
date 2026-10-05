@@ -5280,7 +5280,15 @@ export class SyncEngine {
       folderPath,
       `(${children.length} files, ${underWay.length} on their way already)`,
     );
-    if (removedHere) await this.lookAtHeldDeletes(held);
+    if (removedHere) {
+      // The folder, found gone just now (see `folderThere` above), goes with
+      // the deletes from the start; the one above it that went too, if any,
+      // once looked up below. Handed over by a `stop()` during the looks
+      // without it, the deletes found gone went out without the folder, and
+      // it stayed, empty, at every teammate's.
+      for (const change of held) change.payload = withFolder(change.payload, folderPath);
+      await this.lookAtHeldDeletes(held);
+    }
     // The folder that went — this one, or one above it that went with it —
     // in the records made ahead too: from them, the queue sends it.
     if (held.length > 0) {
@@ -5757,10 +5765,16 @@ export class SyncEngine {
    * the name. Left until the folder's delete was done, a `stop()` meanwhile
    * put it in the queue, and the next start deleted for the whole team a file
    * its look had found on disk.
+   *
+   * Taken off `state.json` at once, not after the debounce: the deletes
+   * recorded with it go out without a write of their own (see
+   * `OperationLog.inFlightWritten`), and until the debounce ran out
+   * `state.json` still held the record. Obsidian dying then left it there,
+   * and the next start deleted the file all the same.
    */
   private dropRecordAhead(change: HeldChange | null): void {
     if (change === null || this.sending.has(change.opId)) return;
-    if (this.operationLog.clearInFlight(this.binding.id, change.opId)) {
+    if (this.operationLog.clearInFlight(this.binding.id, change.opId, { now: true })) {
       this.leftFlight(change.opId);
     }
   }

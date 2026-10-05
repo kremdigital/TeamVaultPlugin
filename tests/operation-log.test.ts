@@ -1033,6 +1033,57 @@ describe('OperationLog — operations in flight on disk', () => {
     await log.close();
   });
 
+  it('takes an operation in flight off the disk at once when asked to, not after the debounce', async () => {
+    const win = stubWindow();
+    try {
+      const { storage, files } = makeStorage();
+      const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
+      const inflightOnDisk = (): string[] => {
+        const doc = JSON.parse(files.get(PATH) ?? '{}') as {
+          bindings: { b1: { inflight?: Array<{ filePath: string }> } };
+        };
+        return (doc.bindings.b1.inflight ?? []).map((op) => op.filePath);
+      };
+      const record = (n: number, path: string): string =>
+        log.recordInFlight('b1', {
+          opType: 'DELETE',
+          filePath: path,
+          payload: { fileId: `f${n}` },
+          opId: opIdOf(n),
+        }).opId;
+      const answered = record(1, 'dir/a.png');
+      const dropped = record(2, 'dir/b.png');
+      const kept = record(3, 'dir/c.png');
+      await log.persistNow();
+      expect(inflightOnDisk()).toEqual(['dir/a.png', 'dir/b.png', 'dir/c.png']);
+      let renames = 0;
+      const rename = storage.rename.bind(storage);
+      storage.rename = async (from, to): Promise<void> => {
+        await rename(from, to);
+        renames += 1;
+      };
+
+      // Answered: the removal waits out the debounce.
+      expect(log.clearInFlight('b1', answered)).toBe(true);
+      expect(win.setTimeout.mock.calls.map(([, ms]) => ms)).toEqual([60_000]);
+      // Dropped unsent: written at once, without anyone flushing, the removal
+      // waiting for the debounce along with it.
+      expect(log.clearInFlight('b1', dropped, { now: true })).toBe(true);
+      for (let round = 0; round < 50 && renames === 0; round++) {
+        await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      expect(renames).toBe(1);
+      expect(inflightOnDisk()).toEqual(['dir/c.png']);
+      expect(log.hasUnwrittenChanges()).toBe(false);
+      // The one left was on disk already, and still is.
+      expect(log.inFlightWritten('b1', kept)).toBe(true);
+      expect(log.clearInFlight('b1', dropped, { now: true })).toBe(false);
+      await log.close();
+    } finally {
+      win.restore();
+    }
+  });
+
   it('writes an operation in flight at once, before its emit', async () => {
     const { storage, files } = makeStorage();
     const log = new OperationLog({ storage, filePath: PATH, now, flushDelayMs: 60_000 });
