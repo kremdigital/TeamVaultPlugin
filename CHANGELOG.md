@@ -6,6 +6,8 @@ uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.4.1] — 2026-10-05
+
 ### Changed
 
 - **This version needs the Team Vault server updated first.** Update the
