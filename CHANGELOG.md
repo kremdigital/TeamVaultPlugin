@@ -208,7 +208,8 @@ uses [Semantic Versioning](https://semver.org/).
   creation didn't go through, nothing is sent. A note you create again
   under the same name meanwhile goes to the server as a new note with its
   own text. If sync is paused or Obsidian closes meanwhile, the deletion
-  goes out with the next connection.
+  goes out with the next connection, except for a note you also renamed
+  before the server answered: that one can still come back.
 - **On Windows and macOS, a teammate's new note named like your new note in
   another letter case no longer takes your note's place.** While your
   `Untitled.md` was on its way to the server or waiting in the queue, a
@@ -222,7 +223,7 @@ uses [Semantic Versioning](https://semver.org/).
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the
   server, and came back with the next connection.
-- **A file left alone while you delete a folder is no longer deleted after
+- **A file left alone while you delete a folder is less often deleted after
   Obsidian restarts.** When you deleted a folder, Team Vault sent nothing for
   a file of it that was back on disk by the time it got to it (written again
   a moment before), nor for one a teammate had just renamed out of the
@@ -230,7 +231,10 @@ uses [Semantic Versioning](https://semver.org/).
   before the rest of the folder had gone out, the next start deleted that
   file on the server for the whole team: a file still on your disk then went
   up again as a new file, without its history, and the teammate's renamed
-  file was gone. Now nothing goes out for such a file.
+  file was gone. Now nothing goes out for such a file once Team Vault has got
+  to it in the folder. If Obsidian closes or crashes, or the plugin is turned
+  off, while earlier files of the folder are still going out, this can still
+  happen.
 - **A connection that drops while Team Vault catches up no longer holds up
   the next one.** On a large vault the catch-up after connecting takes a
   while, and the connection can drop in the middle of it (Obsidian, busy
