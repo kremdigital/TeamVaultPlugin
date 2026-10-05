@@ -209,6 +209,15 @@ uses [Semantic Versioning](https://semver.org/).
   under the same name meanwhile goes to the server as a new note with its
   own text. If sync is paused or Obsidian closes meanwhile, the deletion
   goes out with the next connection.
+- **On Windows and macOS, a teammate's new note named like your new note in
+  another letter case no longer takes your note's place.** While your
+  `Untitled.md` was on its way to the server or waiting in the queue, a
+  teammate's `untitled.md` was taken for a note under a free name. On these
+  disks the two names are one file: deleting or renaming your note deleted
+  or renamed theirs for everyone, and when your note was still waiting at
+  the next connection, its text replaced theirs for everyone. Their note now
+  waits until the name is free on your disk, as it does for a note you
+  already had.
 - **A folder deleted while the connection dropped, sync was paused or the
   server was busy is deleted on the server in full.** Files of the folder not
   yet sent at that moment were removed from this device but never from the

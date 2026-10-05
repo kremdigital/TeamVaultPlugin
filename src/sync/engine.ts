@@ -3519,11 +3519,13 @@ export class SyncEngine {
     // Names of files created here while offline, not sent yet: a file the
     // listing has there that this device has no record of is a teammate's,
     // made meanwhile, and the copy here is not its (see `recordCreateAck`).
+    // Told as the disk tells names apart (see `nameKey`).
+    const nameKey = this.nameKey() ?? ((path: string): string => path);
     const createdHere = new Set(
       this.operationLog
         .dequeueOperations(this.binding.id)
         .filter((op) => op.opType === 'CREATE')
-        .map((op) => op.filePath),
+        .map((op) => nameKey(op.filePath)),
     );
     const renamed: ApiFile[] = [];
     // Old paths of the files renamed while away: whatever the listing shows
@@ -3587,7 +3589,7 @@ export class SyncEngine {
         continue;
       }
       const createdHereFirst =
-        createdHere.has(f.path) &&
+        createdHere.has(nameKey(f.path)) &&
         this.operationLog.getFileMeta(this.binding.id, f.path)?.serverFileId !== f.id;
       // Recorded as never written here, and a file is under the name now:
       // saved while Obsidian was closed or the plugin off — another one,
@@ -7371,7 +7373,7 @@ export class SyncEngine {
     if (
       !known &&
       opts.released !== true &&
-      (this.creating.has(path) || this.ownCreates.has(path) || this.createQueuedAt(path))
+      (this.creatingAt(path) !== undefined || this.ownCreateAt(path) || this.createQueuedAt(path))
     ) {
       // This device is creating a file under the name, not recorded yet — or
       // has created one whose create waits in the queue (see
@@ -8302,7 +8304,53 @@ export class SyncEngine {
    * and a teammate's new "Untitled" broadcast meanwhile).
    */
   private createQueuedAt(path: string): boolean {
-    return this.operationLog.queuesCreate(this.binding.id, path);
+    return this.operationLog.queuesCreate(this.binding.id, path, this.nameKey());
+  }
+
+  /**
+   * How one name is told from another for the new files of this device's
+   * (see {@link createQueuedAt}, {@link creatingAt}, {@link ownCreateAt}), as
+   * for the files it records (see {@link nameHolder}): by {@link caseKey} on a
+   * disk that takes names differing only in case for one file — `Untitled.md`
+   * there opens `untitled.md` — and as spelled (`undefined`) on any other.
+   * Told apart by spelling there, a teammate's `untitled.md` that came while a
+   * new `Untitled.md` of this device's was queued or on its way was taken for
+   * a free name: recorded under it, it was the file the events of the note
+   * here named (see `spelledHere`), and the note's delete or rename went out
+   * as one of the teammate's file — deleted or renamed for everyone.
+   */
+  private nameKey(): ((path: string) => string) | undefined {
+    return this.caseInsensitive() ? (path) => this.caseKey(path) : undefined;
+  }
+
+  /**
+   * A create of `path` under way here (see {@link creating}), the name told
+   * as the disk tells it (see {@link nameKey}).
+   */
+  private creatingAt(path: string): Promise<CreatedHere | null> | undefined {
+    const exact = this.creating.get(path);
+    const keyOf = this.nameKey();
+    if (exact !== undefined || keyOf === undefined) return exact;
+    const key = keyOf(path);
+    for (const [name, created] of this.creating) {
+      if (keyOf(name) === key) return created;
+    }
+    return undefined;
+  }
+
+  /**
+   * Whether a `file:create` of `path` is on its way (see {@link ownCreates}),
+   * the name told as the disk tells it (see {@link nameKey}).
+   */
+  private ownCreateAt(path: string): boolean {
+    if (this.ownCreates.has(path)) return true;
+    const keyOf = this.nameKey();
+    if (keyOf === undefined) return false;
+    const key = keyOf(path);
+    for (const name of this.ownCreates.keys()) {
+      if (keyOf(name) === key) return true;
+    }
+    return false;
   }
 
   /**
@@ -8314,14 +8362,14 @@ export class SyncEngine {
    * gone, the other file moved in over it.
    */
   private async queuedCreateGone(path: string): Promise<boolean> {
-    const queued = this.operationLog.queuedCreates(this.binding.id, path);
+    const queued = this.operationLog.queuedCreates(this.binding.id, path, this.nameKey());
     if (queued.length === 0) return false;
-    const underWay = this.creating.get(path);
+    const underWay = this.creatingAt(path);
     if (await this.vault.exists(path)) return false;
-    const creating = this.creating.get(path);
+    const creating = this.creatingAt(path);
     if (creating !== undefined && creating !== underWay) return false;
     return this.operationLog
-      .queuedCreates(this.binding.id, path)
+      .queuedCreates(this.binding.id, path, this.nameKey())
       .every((entry) => queued.includes(entry));
   }
 
@@ -9952,8 +10000,15 @@ export class SyncEngine {
           // conflict-rename the duplicate (`<name>.conflict-<clientId>` —
           // 56 junk copies in the 2026-06-12 incident). Route through the
           // modify path instead: Yjs diff for text, binary UPDATE otherwise.
-          if (this.fileIndex.byPath.has(op.filePath)) {
-            await this.handleLocalModify(op.filePath, 'queue');
+          // So for a file recorded under the name in another case, on a disk
+          // that takes names in any case (see `nameHolder`): let in once the
+          // new file under the name was gone (see `releaseName`), it is the
+          // file the disk has there now. Sent, its bytes went out as a new
+          // file under this spelling — a copy of the teammate's file for
+          // everyone.
+          const holder = this.nameHolder(op.filePath);
+          if (holder !== undefined) {
+            await this.handleLocalModify(holder.relativePath, 'queue');
             this.throwIfStopped();
             return { ok: true };
           }

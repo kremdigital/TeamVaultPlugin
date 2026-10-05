@@ -23,6 +23,7 @@ import {
   FakeServer,
   ServerDocs,
   buildHarness,
+  caseInsensitiveDisk,
   connect,
   deferred,
   encode,
@@ -2403,6 +2404,138 @@ describe('SyncEngine — a new file waiting behind the queue holds its name here
     expect(b.docs.text(made)).toBe('new\n');
     expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(made);
     expect(emitsOf(b.h, 'file:delete')).toEqual([]);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  /**
+   * {@link queuedNewNote} on a disk that takes names differing only in case
+   * for one file (Windows, macOS).
+   */
+  async function queuedNewNoteAnyCase(): Promise<Bench> {
+    const b = await queuedNewNote([]);
+    caseInsensitiveDisk(b.h.vault);
+    return b;
+  }
+
+  /** A teammate's new note `untitled.md`, broadcast; resolves once handled. */
+  async function theirsInAnotherCase(b: Bench): Promise<string> {
+    const theirs = await b.server.teammateCreate('untitled.md', 'theirs\n');
+    await until(
+      'their note handled',
+      () => logged(b, THEIRS_WAITS) || b.h.engine.getFileIdForPath('untitled.md') !== null,
+    );
+    return theirs;
+  }
+
+  it('on a disk that takes names in any case, a teammate’s new note under its name in another case waits; deleted here, ours sends no delete of theirs', async () => {
+    const b = await queuedNewNoteAnyCase();
+    const mark = b.server.applied.length;
+    const theirs = await theirsInAnotherCase(b);
+
+    b.h.vault.files.delete('Untitled.md');
+    await b.h.engine.handleVaultEvent(event('delete', 'Untitled.md'));
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Untitled.md']);
+    // The name is free here now: theirs comes in, on the disk before the
+    // queue goes out. Its create, still queued, finds their note under the
+    // name, and sends nothing.
+    await writtenHere(b, 'untitled.md', 'theirs\n');
+
+    await through(b);
+    expect(b.server.applied.slice(mark)).toEqual(['create untitled.md', 'f1 a.md -> z.md']);
+    expect(b.server.pathOf(theirs)).toBe('untitled.md');
+    expect(b.h.engine.getFileIdForPath('untitled.md')).toBe(theirs);
+    expect(emitsOf(b.h, 'file:delete')).toEqual([]);
+    expect(disk(b.h)).toEqual(['untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('on a disk that takes names in any case, a teammate’s new note under its name in another case waits; renamed here, ours goes out as a create, not as a rename of theirs', async () => {
+    const b = await queuedNewNoteAnyCase();
+    const mark = b.server.applied.length;
+    const theirs = await theirsInAnotherCase(b);
+
+    await b.h.vault.rename('Untitled.md', 'Title.md');
+    await until(
+      'the rename handled',
+      () => queue(b.h).length !== 2 || !queue(b.h).includes('CREATE Untitled.md'),
+    );
+    expect(queue(b.h)).toEqual(['RENAME a.md -> z.md', 'CREATE Title.md']);
+
+    await through(b);
+    await writtenHere(b, 'untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create untitled.md',
+      'f1 a.md -> z.md',
+      'create Title.md',
+    ]);
+    expect(b.server.pathOf(theirs)).toBe('untitled.md');
+    expect(disk(b.h)).toEqual(['Title.md=mine\n', 'untitled.md=theirs\n', 'z.md=a\n']);
+    expect(queue(b.h)).toEqual([]);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('on a disk that takes names in any case, a teammate’s new note under its name in another case while ours is on its way waits; ours keeps its text', async () => {
+    const b = await online([['a.md', 'f1', 'a\n']]);
+    caseInsensitiveDisk(b.h.vault);
+    const mark = b.server.applied.length;
+    b.h.vault.files.set('Untitled.md', encode('mine\n'));
+    const creating = b.h.engine.handleVaultEvent(event('create', 'Untitled.md'));
+    await emitted(b.h, 'file:create');
+    const theirs = await theirsInAnotherCase(b);
+
+    await served(b, creating);
+    await b.server.pump();
+    await b.h.settle();
+    await b.docs.drive();
+    await b.h.settle();
+    const ours = liveAt(b.server, 'Untitled.md');
+    expect(b.server.applied.slice(mark)).toEqual(['create untitled.md', 'create Untitled.md']);
+    expect(b.docs.text(ours)).toBe('mine\n');
+    expect(b.docs.text(theirs)).toBe('theirs\n');
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(ours);
+    expect(b.h.engine.getFileIdForPath('untitled.md')).toBeNull();
+    expect(disk(b.h)).toEqual(['Untitled.md=mine\n', 'a.md=a\n']);
+
+    // Deleted here: ours goes, and theirs comes in.
+    b.h.vault.files.delete('Untitled.md');
+    await served(b, b.h.engine.handleVaultEvent(event('delete', 'Untitled.md')));
+    await writtenHere(b, 'untitled.md', 'theirs\n');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create untitled.md',
+      'create Untitled.md',
+      `delete ${ours}`,
+    ]);
+    expect(b.h.engine.getFileIdForPath('untitled.md')).toBe(theirs);
+    expect(disk(b.h)).toEqual(['a.md=a\n', 'untitled.md=theirs\n']);
+    appliedOnce(b.server);
+    await b.h.engine.stop();
+  });
+
+  it('on a disk that takes names in any case, a teammate’s note made under its name in another case while away waits at the connect; ours goes out under its own', async () => {
+    const b = await queuedNewNoteAnyCase();
+    const mark = b.server.applied.length;
+    b.h.socket().disconnect();
+    const theirs = await b.server.teammateCreate('untitled.md', 'theirs\n');
+    // The server's queue moves again by the next connect.
+    b.server.lift();
+    await reconnect(b);
+    await through(b);
+    const ours = liveAt(b.server, 'Untitled.md');
+    expect(b.server.applied.slice(mark)).toEqual([
+      'create untitled.md',
+      'f1 a.md -> z.md',
+      'create Untitled.md',
+    ]);
+    expect(b.docs.text(ours)).toBe('mine\n');
+    expect(b.docs.text(theirs)).toBe('theirs\n');
+    expect(b.h.engine.getFileIdForPath('Untitled.md')).toBe(ours);
+    expect(b.h.engine.getFileIdForPath('untitled.md')).toBeNull();
+    expect(disk(b.h)).toEqual(['Untitled.md=mine\n', 'z.md=a\n']);
     expect(queue(b.h)).toEqual([]);
     appliedOnce(b.server);
     await b.h.engine.stop();

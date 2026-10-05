@@ -645,18 +645,23 @@ export class OperationLog {
   /**
    * Whether a create is queued for a binding under `path`: a new file of this
    * device's the server has not heard of yet. Operations in flight are not
-   * looked at.
+   * looked at. `keyOf`: names it gives one key are one name — on a disk that
+   * takes names differing only in case for one file.
    */
-  queuesCreate(bindingId: string, path: string): boolean {
-    const pending = this.bindings.get(bindingId)?.pending ?? [];
-    return pending.some((op) => op.opType === 'CREATE' && op.filePath === path);
+  queuesCreate(bindingId: string, path: string, keyOf?: (path: string) => string): boolean {
+    return this.queuedCreates(bindingId, path, keyOf).length > 0;
   }
 
   /** The entries of the creates {@link queuesCreate} looks at, by `id`, in queue order. */
-  queuedCreates(bindingId: string, path: string): number[] {
+  queuedCreates(bindingId: string, path: string, keyOf?: (path: string) => string): number[] {
     const pending = this.bindings.get(bindingId)?.pending ?? [];
+    const key = keyOf?.(path);
     return pending
-      .filter((op) => op.opType === 'CREATE' && op.filePath === path)
+      .filter(
+        (op) =>
+          op.opType === 'CREATE' &&
+          (op.filePath === path || (keyOf !== undefined && keyOf(op.filePath) === key)),
+      )
       .map((op) => op.id);
   }
 
